@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "workflow": {
+    "id": "quote",
+    "name": "shop/quote",
+    "version": "1.0.0",
+    "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "inputSchema": {"type": "object"},
+    "outputSchema": {"type": "object"},
+    "instructions": [
+      {"id": "calculate", "kind": "call", "node": "quote-node"},
+      {"id": "respond", "kind": "output", "references": [{"step": "calculate", "path": ["totalCents"]}]}
+    ]
+  },
+  "nodes": [{
+    "id": "quote-node",
+    "version": "1.0.0",
+    "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "inputSchema": {"type": "object"},
+    "outputSchema": {"type": "object"}
+  }],
+  "bindings": [{"id": "http-quote", "kind": "http", "workflow": "quote"}]
+}
