@@ -1,0 +1,58 @@
+{
+  "schemaVersion": "journal/v1",
+  "cases": [
+    {
+      "name": "concurrent duplicate admission",
+      "callers": 32,
+      "accepted": 1,
+      "runIds": 1,
+      "conflictingReuse": "request_conflict",
+      "observableEffects": 0
+    },
+    {
+      "name": "committed result replay",
+      "attempts": 2,
+      "providerOperationKeys": 1,
+      "observableEffectDispatches": 1,
+      "replayState": "committed"
+    },
+    {
+      "name": "uncertain external outcome",
+      "state": "uncertain",
+      "redispatch": "rejected",
+      "reconciliationRequired": true
+    },
+    {
+      "name": "new replay lineage",
+      "runIdentity": "fresh",
+      "lineage": "source_run_id",
+      "operationIdentity": "fresh"
+    },
+    {
+      "name": "stale attempt result",
+      "stalePublish": "rejected",
+      "currentAttemptWins": true
+    },
+    {
+      "name": "integrity failure",
+      "truncatedStore": "fails_closed"
+    },
+    {
+      "name": "write failure",
+      "simulatedDiskFull": "fails_closed",
+      "acknowledged": false
+    }
+  ],
+  "crashBarriers": [
+    {"name": "admission", "before": "not accepted", "after": "accepted"},
+    {"name": "effect intent", "before": "absent", "after": "intent"},
+    {"name": "attempt dispatch", "before": "intent", "after": "dispatched"},
+    {"name": "result commit", "before": "dispatched", "after": "committed"},
+    {"name": "completion acknowledgment", "before": "accepted", "after": "completed"}
+  ],
+  "limits": [
+    "External effects are not executed by this journal; effect providers must use the stable provider operation key.",
+    "Uncertain outcomes require reconciliation and are never silently retried.",
+    "Crash evidence covers one local SQLite filesystem and does not prove disk-loss survival or multi-host failover."
+  ]
+}

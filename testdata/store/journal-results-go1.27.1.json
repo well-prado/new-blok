@@ -1,0 +1,27 @@
+{
+  "toolchain": "go1.27.1",
+  "goos": "linux",
+  "goarch": "arm64",
+  "filesystem": "overlayfs in the validation container, backed by the local Docker storage",
+  "durability": "WAL, synchronous=FULL, busy_timeout=5000, foreign_keys=ON",
+  "commands": [
+    "go test ./internal/journal -count=1 -v",
+    "go test -race ./internal/journal"
+  ],
+  "results": {
+    "concurrentAdmission": "passed: one accepted run across 32 callers",
+    "commitBarriers": "passed: admission, intent, dispatch, result and completion before/after kill cases",
+    "committedReplay": "passed: no redispatch",
+    "uncertainOutcome": "passed: redispatch rejected",
+    "retryIdentity": "passed: unique attempt IDs and stable provider operation key",
+    "freshReplayLineage": "passed",
+    "staleWriter": "passed: stale result rejected",
+    "integrityFailure": "passed: truncated database failed closed",
+    "writeFailure": "passed: simulated disk-full write was not acknowledged"
+  },
+  "effectCounts": {
+    "duplicateAdmission": 0,
+    "committedReplayRedispatch": 0,
+    "uncertainRedispatch": 0
+  }
+}
