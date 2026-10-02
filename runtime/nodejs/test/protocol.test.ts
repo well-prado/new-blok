@@ -5,13 +5,14 @@ import { createServer } from "node:net";
 import { Worker, DEFAULT_LIMITS } from "../worker.js";
 import { loadProtocol, validateFrameBytes, type Frame, type ReceivedFrame } from "../protocol.js";
 import { nodes } from "../../../testdata/worker/nodejs/nodes.js";
+import { defineNode, type AnyNode } from "../../../sdk/nodejs/index.js";
 
 const token="synthetic-test-token-0000000000001";
 const artifact=`sha256:${"a".repeat(64)}`;
-async function fixture(generation="1", replayEntries=8192){
+async function fixture(generation="1", replayEntries=8192,extra:readonly AnyNode[]=[]){
  const listener=createServer();await new Promise<void>(resolve=>listener.listen(0,"127.0.0.1",resolve));const address=listener.address();if(!address||typeof address==="string")throw new Error("test listener");await new Promise<void>(resolve=>listener.close(()=>resolve()));
  const endpoint=`127.0.0.1:${address.port}`;
- const worker=new Worker({nodes,token,principal:"app-1",capabilities:["http:synthetic"],artifactDigest:artifact,generation,address:endpoint,replayEntries});await worker.listen();
+ const worker=new Worker({nodes:[...nodes,...extra],token,principal:"app-1",capabilities:["http:synthetic"],artifactDigest:artifact,generation,address:endpoint,replayEntries});await worker.listen();
  const client=new (loadProtocol().blok.runtime.v1.Worker)(endpoint,grpc.credentials.createInsecure());
  const hello={protocol:"blok.runtime",major:1,minor:0,artifactDigest:artifact,catalogDigest:worker.catalog.catalogDigest,generation,capabilities:["http:synthetic"],limits:DEFAULT_LIMITS};
  const connect=(auth=token,principal="app-1")=>{const metadata=new grpc.Metadata();metadata.set("authorization",`Bearer ${auth}`);metadata.set("x-blok-principal",principal);const stream=client.Connect(metadata);stream.on("error",()=>{});return stream;};
@@ -36,4 +37,26 @@ test("actual deadline and Cancel terminate cooperative nodes without publishing 
 test("wire rejects multiple envelopes and malformed length before decoding",()=>{
  for(const bytes of [Buffer.alloc(0),Buffer.from([10,1]),Buffer.from([10,0,18,0]),Buffer.from([58,0]),Buffer.from([10,128,128,128,128,128])])assert.throws(()=>validateFrameBytes(bytes));
  assert.doesNotThrow(()=>validateFrameBytes(Buffer.from([10,0])));
+});
+test("actual paused socket consumer fails closed at bounded outbound bytes",async()=>{
+ let calls=0;
+ const bulk=defineNode<Record<string,never>,{data:string},null>({name:"fixture/bulk",version:"1.0.0",description:"Synthetic bounded slow-consumer workload",input:{type:"object"},output:{type:"object",properties:{data:{type:"string"}},required:["data"]},deterministic:true,dependencies:null,execute(){calls++;return {data:"x".repeat(800000)};}});
+ const f=await fixture("1",8192,[bulk]);try{
+  const s=f.connect();const ready=receive(s);s.write({hello:f.hello});await ready;s.pause();
+  const rejected=new Promise<grpc.ServiceError>((resolve,reject)=>{const timer=setTimeout(()=>reject(new Error("slow consumer was not bounded")),8000);s.once("error",(error:grpc.ServiceError)=>{clearTimeout(timer);resolve(error);});});
+  for(let i=0;i<32;i++)s.write({call:{...call(`bulk-${i}`),node:"fixture/bulk",input:Buffer.from("{}"),deadlineUnixNanos:(BigInt(Date.now()+10000)*1000000n).toString()}});
+  // Resume after a controlled pause. HTTP/2 status
+  // itself can be flow-controlled behind the paused response messages.
+  await new Promise(resolve=>setTimeout(resolve,1500));s.resume();const error=await rejected;
+  assert.equal(error.code,grpc.status.RESOURCE_EXHAUSTED);assert.ok(calls>0 && calls<=32);
+ }finally{f.close();}
+});
+test("actual socket rejects truncated and oversized serialized messages",async()=>{
+ for(const fixtureBytes of [Buffer.from([10,1]),Buffer.alloc((1<<20)+1)]){
+  const f=await fixture();try{const metadata=new grpc.Metadata();metadata.set("authorization",`Bearer ${token}`);metadata.set("x-blok-principal","app-1");
+   const stream=f.client.makeBidiStreamRequest<Buffer,ReceivedFrame>("/blok.runtime.v1.Worker/Connect",value=>value,value=>loadProtocol().blok.runtime.v1.Worker.service.Connect.responseDeserialize(value),metadata);
+   const error=await new Promise<grpc.ServiceError>((resolve,reject)=>{const timer=setTimeout(()=>{stream.cancel();reject(new Error("malformed message not rejected"));},2000);stream.on("error",(error:grpc.ServiceError)=>{clearTimeout(timer);resolve(error);});stream.write(fixtureBytes);});
+   assert.equal(error.code,fixtureBytes.length>1<<20?grpc.status.RESOURCE_EXHAUSTED:grpc.status.INTERNAL);
+  }finally{f.close();}
+ }
 });

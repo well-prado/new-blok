@@ -12,6 +12,7 @@ import (
 	"github.com/well-prado/new-blok/contract/schema"
 	runtime "github.com/well-prado/new-blok/internal/runtime"
 	"github.com/well-prado/new-blok/node"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -20,6 +21,15 @@ type Config = runtime.Config
 type GRPCFactory = runtime.GRPCFactory
 type ProcessFactory = runtime.ProcessFactory
 type Supervisor = runtime.Supervisor
+type TransportPrincipal = runtime.Principal
+type Credential = runtime.Credential
+type TokenAuthenticator = runtime.TokenAuthenticator
+type AuthenticatedSession = runtime.AuthenticatedSession
+type BlobStore = runtime.BlobStore
+
+var NewTokenAuthenticator = runtime.NewTokenAuthenticator
+var NewBlobStore = runtime.NewBlobStore
+var BlobHandler = runtime.BlobHandler
 
 var New = runtime.New
 var ErrCapacity = runtime.ErrCapacity
@@ -36,6 +46,14 @@ func WithIdentity(ctx context.Context, id Identity) context.Context {
 var sequence atomic.Uint64
 
 func Define[I, O any](supervisor *Supervisor, descriptor node.Descriptor) (node.Definition[I, O], error) {
+	return DefineScoped[I, O](supervisor, descriptor, nil)
+}
+
+// DefineScoped binds narrow application-reviewed capabilities to this node's
+// worker calls. They are not read from payload data. The authenticated
+// connection still verifies they are a subset of the negotiated grant.
+func DefineScoped[I, O any](supervisor *Supervisor, descriptor node.Descriptor, capabilities []contract.Capability) (node.Definition[I, O], error) {
+	capabilities = append([]contract.Capability(nil), capabilities...)
 	if supervisor == nil {
 		return node.Definition[I, O]{}, errors.New("worker supervisor required")
 	}
@@ -76,10 +94,14 @@ func Define[I, O any](supervisor *Supervisor, descriptor node.Descriptor) (node.
 		if !ok {
 			deadline = time.Now().Add(30 * time.Second)
 		}
-		result, err := supervisor.Call(ctx, contract.Call{CallID: id.CallID, AttemptID: id.AttemptID, IdempotencyKey: id.OperationKey, Generation: ready.Generation, Node: descriptor.Name, NodeVersion: descriptor.Version, Deadline: deadline, Input: payload})
+		result, err := supervisor.Call(ctx, contract.Call{CallID: id.CallID, AttemptID: id.AttemptID, IdempotencyKey: id.OperationKey, Generation: ready.Generation, Node: descriptor.Name, NodeVersion: descriptor.Version, Deadline: deadline, Input: payload, Capabilities: capabilities})
 		if err != nil {
 			if len(descriptor.Effects) > 0 {
-				return zero, &node.DomainError{Class: "uncertain", Code: "worker_transport", Uncertain: true}
+				failure := &node.DomainError{Class: "uncertain", Code: "worker_transport", Uncertain: true}
+				if ctx.Err() != nil {
+					failure.Err = ctx.Err()
+				}
+				return zero, failure
 			}
 			return zero, err
 		}
@@ -91,7 +113,7 @@ func Define[I, O any](supervisor *Supervisor, descriptor node.Descriptor) (node.
 			if e.Class == contract.ErrorDeadline {
 				return zero, context.DeadlineExceeded
 			}
-			return zero, &node.DomainError{Class: string(e.Class), Code: e.Code, Retryable: e.SafeToRetry(), Uncertain: e.Class == contract.ErrorUncertain}
+			return zero, &node.DomainError{Class: strings.ToLower(string(e.Class)), Code: e.Code, Retryable: e.SafeToRetry(), Uncertain: e.Class == contract.ErrorUncertain}
 		}
 		normalized, err := out.Normalize(result.Output)
 		if err != nil {
