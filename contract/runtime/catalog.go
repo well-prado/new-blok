@@ -3,7 +3,7 @@ package runtime
 import (
 	"encoding/json"
 	"errors"
-	"github.com/well-prado/new-blok/contract/artifact"
+	artifactcontract "github.com/well-prado/new-blok/contract/artifact"
 	"github.com/well-prado/new-blok/contract/schema"
 	"github.com/well-prado/new-blok/node"
 	"sort"
@@ -39,7 +39,7 @@ func CatalogDigest(descriptors []node.Descriptor) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	canonical, err := artifact.CanonicalJSON(raw)
+	canonical, err := artifactcontract.CanonicalJSON(raw)
 	if err != nil {
 		return "", err
 	}
