@@ -1,0 +1,12 @@
+{
+  "source": "synthetic fixtures authored for E01-T03",
+  "license": "Apache-2.0",
+  "privateData": false,
+  "expected": {
+    "good": {"outputRecords": 0, "errorRecords": 0, "effectRecords": 0},
+    "bad-engine": {"outputRecords": 0, "errorRecords": 1, "effectRecords": 0},
+    "bad-transitive": {"outputRecords": 0, "errorRecords": 1, "effectRecords": 0},
+    "bad-node-unified": {"outputRecords": 0, "errorRecords": 1, "effectRecords": 0},
+    "bad-node-classic": {"outputRecords": 0, "errorRecords": 1, "effectRecords": 0}
+  }
+}
