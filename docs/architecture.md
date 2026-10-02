@@ -1,0 +1,164 @@
+# Building complete applications with New Blok
+
+Design baseline · 2026-10-01 · proposed APIs
+
+This is the implementation baseline derived from the Go application design proposal and architecture experiments. The roadmap owns delivery and exit evidence. Examples below describe the intended API; they become supported only when the corresponding issues pass. The earlier working name Lattice is replaced here by New Blok, whose final brand remains open.
+
+## 1. Application model
+
+A node is a typed function with explicit dependencies. A workflow records sequencing and control flow. A trigger binding translates authenticated protocol input into a workflow's domain input. An application registers these components and owns its executable.
+
+Builders run during preparation and record structural documents. They do not execute nodes or external effects. Complex calculations belong in ordinary Go nodes; the engine never evaluates raw Go or JavaScript strings. Nodes never import or invoke another node. Child workflows are explicit workflow instructions.
+
+```text
+Go functions + generated bindings → validated structural program
+                                           ↓
+Selected triggers → admission → Go engine → native nodes / gRPC workers
+                                  ↓                    ↓
+                             durable store       injected dependencies
+                                  ↓
+                      inspection / telemetry / audit
+```
+
+The same workflow may have multiple trigger bindings with separately validated mappings and policy. Domain types do not carry HTTP headers, broker connections or transport-specific state. A verified principal travels through a separate trusted execution channel; caller data cannot establish it.
+
+## 2. Package and product boundaries
+
+Begin with one versioned Go module and small public packages only where responsibilities exist: `node`, `flow`, `app`, `contract`, trigger adapters, the embedded store, observation adapters, worker integration, and testing helpers. Compiler, interpreter and journal implementation remain internal. Introduce packages when their implementation issues require them; do not create empty directories now.
+
+The engine imports neither HTTP servers, broker clients, storage implementations, frontend assets, ORM packages nor AI provider SDKs. Narrow ports and explicit registration make adapters selectable. `app.Use` is composition, not discovery by global `init`. Installing an extension does not activate it. Applications import/register selected packages and rebuild; native dynamic Go plugins are not the universal plugin mechanism.
+
+Studio UI, the hosted registry service and BLOK Cloud live in separate repositories. This repository owns their versioned inspection, package, deployment and operations contracts. Dev inspection starts read-only. Studio should be simple, accessible and visually restrained, with a notebook showing input → processing → output, attempts, logs, errors and timings. Its future UI work uses the frontend-design skill and can use shadcn components. Production monitoring consumes optional telemetry exporters and authorized APIs, never inherited development permissions.
+
+## 3. Native node and workflow authoring
+
+Intended node surface:
+
+```go
+type QuoteInput struct {
+    SKU string `json:"sku"`
+    Quantity int `json:"quantity"`
+}
+type Quote struct { TotalCents int64 `json:"totalCents"` }
+
+func CalculateQuote(ctx context.Context, in QuoteInput) (Quote, error) {
+    if err := ctx.Err(); err != nil { return Quote{}, err }
+    if in.SKU != "coffee" || in.Quantity < 1 || in.Quantity > 100 {
+        return Quote{}, fmt.Errorf("invalid quote input")
+    }
+    return Quote{TotalCents: int64(in.Quantity) * 1500}, nil
+}
+var CalculateQuoteNode = node.Define(
+    "shop/calculate-quote", "1.0.0", CalculateQuote, node.Pure(),
+)
+```
+
+Descriptors identify nodes independently of paths and declare input/output schemas, effects, capability requirements, opaque secret references, runtime, idempotency behavior, limits and agent policy. Pure is a declaration, not sandboxing proof. Validation must enforce supported constraints beyond struct decoding.
+
+Intended whole-value workflow surface:
+
+```go
+var QuoteWorkflow = flow.MustDefine[QuoteInput, Quote](
+    flow.Spec{Name: "shop/quote", Version: "1.0.0", Durability: flow.Memory},
+    func(w *flow.Builder, input flow.Ref[QuoteInput]) flow.Ref[Quote] {
+        return flow.Call(w, "calculate", CalculateQuoteNode, input)
+    },
+)
+```
+
+Returning a reference declares the output. `Define` also returns an error for tooling. Whole-value wiring works without generation. Field-level composition uses generated typed accessors and argument structs accepting references or explicit `flow.Lit` values. Ordinary Go fields cannot hold both `string` and `Ref[string]`. Generation uses Go package/type analysis, never executes arbitrary package initialization, marks generated files and is deterministic.
+
+Unified layout: `nodes/<runtime>/<node>/`; classic layout: `runtimes/<runtime>/nodes/<node>/`. Workflow source remains under a dedicated application workflow directory. Layout does not change node identity. Files inside one node may import each other and approved utility/domain packages, but cannot import another node. CLI migration is transactional and validates ownership/collisions.
+
+The application composition root registers nodes, workflows and adapters; configuration supplies operational settings and cannot silently add code. A Go-only application uses normal `go mod`, `go test`, `go build`, `context.Context` and constructors, and requires no Node.js, broker, container or registry account unless selected modules need them.
+
+## 4. Structural program and schema semantics
+
+The human-readable document is independent from protobuf transport encoding. Adopt one versioned structural IR after reconciling the lab `workflow/v1` and proposed application shape in E02. Bindings are separate from workflows. Compile references to indexed instructions once per artifact and validate before admission; never compile schemas per step.
+
+Define missing versus null, signed integer ranges, exact money, timestamps, defaults, unknown fields, optional objects, collections, unions and binary/blob references. JSON Schema defaults are annotations; normalization is a specified operation. Static compatibility supports a declared subset; unprovable edges yield a diagnostic or runtime validation requirement.
+
+Logical values are immutable. Maps, slices and pointers require isolation between nodes and branches. Typed native fast paths must preserve this rule, and benchmarks include required validation/copies. Portable encodings serve journals and worker boundaries. Stable diagnostics name code, file/line, workflow, step, field, expected/actual and remediation.
+
+## 5. Control flow
+
+Call, condition, iteration, try, wait, parallel and child workflow are explicit instructions. Step IDs are globally unique in a definition; attempt identities also contain iteration and invocation paths. Arm handles cannot escape scope. A typed `Choose` joins compatible outputs. Bounded `Each` preserves input order; parallel joins declare outputs and cancellation behavior. No unlimited concurrency or recursive invocation.
+
+Runtime decisions use typed comparisons and versioned pure operations. Optional defaults and string templates are explicit. First parallel policy is fail-fast with cooperative sibling cancellation. Catch handles business failures; suspension and cancellation remain distinct. Finally does not run because work merely suspends and cannot be promised after process death.
+
+## 6. Admission and all nine triggers
+
+One admission path authenticates/authorizes, maps and validates input, deduplicates, checks capacity and selects execution durability in a documented order. Admission returns accepted work separately from completion. Disconnect behavior is binding-specific: cancel memory work or stop waiting for durable work.
+
+| Trigger | Adapter responsibility |
+| --- | --- |
+| HTTP | routes, body/parameter mapping, limits, status/headers/cookies |
+| Webhook | original-body signature verification, replay window and event deduplication |
+| Worker | lease, acknowledgment transfer, retry ownership and dead letter |
+| Cron | timezone, daylight saving, overlap, missed occurrences and stable tick identity |
+| Pub/sub | subscription, cursor, acknowledgment and provider flow control |
+| gRPC | protobuf mapping, deadlines, status and cancellation |
+| SSE | HTTP event framing, cursors, reconnect and slow-client bounds |
+| WebSocket | connection/message/disconnect, identity, framing and backpressure |
+| MCP | tools/resources, schemas, caller authorization and output mapping |
+
+HTTP and one durable job path ship first. Other adapters pass shared conformance plus actual protocol integration tests. They implement no second interpreter, mapper or retry engine. Multiple bindings can share a listener where protocols permit; independent TLS/listeners remain selectable. Queue acknowledgment follows an explicit transfer model and stable delivery deduplication.
+
+## 7. Durability, effects and artifacts
+
+Memory mode permits in-flight loss. Journal mode resumes accepted work after process restart with its volume intact; it does not imply disk-loss survival or multi-host failover. Choose one embedded backend through a measured spike (SQLite candidate, Pebble alternative), implement the winner and keep the port replaceable.
+
+Intent precedes effect dispatch where required. Progress and outputs are committed before acknowledgment. Group commit amortizes persistence without weakening barriers. Runs retain exact program, artifact, schema and checkpoint identities; branch choices, iteration paths, attempts and joins survive restart. Timers/retry delays suspend without occupying an active worker. Signals are authorized, durable, deduplicated and support arrival-before-wait races.
+
+An external success followed by a crash before result commit creates an uncertain outcome. Provider idempotency, business unique keys, transactional outboxes or explicit reconciliation may establish the result. Never promise universal exactly-once external effects or treat cancellation as reversal. Stale attempts cannot publish outputs.
+
+Deployment manifests bind workflow document, native binary, worker artifacts, schemas, module locks, runtime versions, compiler and checkpoint formats. Immutable versions cannot be overwritten. Initial upgrades drain/retain compatible executables or refuse startup with actionable diagnostics. A later multi-version manager retains old workers for old runs. Replay creates a new run with lineage; partial reruns require separate tested effect semantics.
+
+Retention, compaction, backup, corruption checks and restore must preserve verified checkpoints and audit obligations. Business tables remain application-owned; the journal is not an ORM or a substitute for domain persistence.
+
+## 8. Workers and runtime coverage
+
+Go runs natively. Node.js is the first external worker over persistent authenticated gRPC, with reusable channels and explicit topology. Protocol negotiation defines catalog digests, call/attempt/generation identity, deadlines, cancellation, capacity, frame direction, reconnect, errors, payload/blob bounds and idempotency. Lost transport can leave an effect uncertain. No fresh process per step.
+
+Target workers include Node.js/TypeScript, Python3, Rust, Java, Kotlin, C#, PHP, Ruby, Swift, Dart and Elixir; Go also has an optional remote worker conformance path. Bun and Deno are separate JavaScript worker selections with tested compatibility. Language SDKs describe node contracts and never reinterpret workflows. Install dependencies with existing language managers; the Blok package client coordinates manifests/locks, not replacement package managers.
+
+Each runtime issue requires full schema, cancellation, overload, restart, generation, security and error conformance on a declared supported matrix. Version strings alone never prove compatibility. Unsupported platforms fail diagnostically rather than appearing available.
+
+## 9. Security, AI tools and inspection
+
+Native code shares application trust. Remote processes become security boundaries only with credentials, filesystem/network/OS isolation and scoped policy. Separate application authorization from input validation. Secret providers resolve opaque references only for authorized executions; inputs, outputs, errors, logs and inspection have redaction/access policies.
+
+Agent catalogs fail closed for missing/invalid policy. A node is a typed tool; a workflow is a composed tool with typed input/output, declared effects and inherited limits. Child calls cannot widen authority. Approvals bind action/input/workflow/artifact digests, approver, scope and lifetime and persist reliably. Assertions, evidence and trusted provenance are checked before result publication; model output is not authority.
+
+CLI and read-only development MCP expose versioned inspection/validation projections with source/test references and stable diagnostics. Bounded repair validates every proposal against the real compiler. Generic nodes and custom nodes use the same descriptor and review path. Complete recipes cover authenticated CRUD, jobs, signed webhooks, schedules, streaming and MCP with explicit storage/migration/module dependencies.
+
+Dev inspection streams bounded per-step input, started/processing events, output, attempts, timing, logs and errors. Sensitive content is authorized/redacted and opt-in. Production telemetry supports OpenTelemetry-compatible export without importing providers into the engine. Optional events may drop/sample under pressure; required audit and state transitions use reliable paths with explicit failure policy.
+
+## 10. Registry, deployment and scale
+
+Node/workflow packages have namespaced immutable identities, schemas, capability manifests, artifacts, dependency bounds and integrity digests. CLI add/remove/update/verify works offline from locked/cache data, rejects traversal/signature/digest/cycle/version conflicts, stages atomic changes and never executes install hooks without explicit policy. Go packages remain normal modules; foreign dependencies retain native lockfiles. Hosted publishing, ownership/moderation/search infrastructure and billing belong to the separate registry product.
+
+App-owned binaries support health/readiness/metrics, bounded admission, signal-driven drain, graceful worker shutdown and durable-volume configuration. Cloud consumes reproducible deployment manifests, artifacts, readiness and operational APIs; framework self-hosting remains first-class. No proprietary service is required for core operation.
+
+Millions of requests per second is a fleet-scale design target, not a bootstrap claim. Partition ownership, fencing, replicated persistence, timers, blobs, load balancing, fairness and resharding require independent failure and capacity tests. Distinguish accepted requests, completed workflows, steps and external calls. Model retention and audit/telemetry cost per event.
+
+Benchmarks include useful native quote HTTP, journaled orders, bounded parallel work, worker equivalents, suspended runs, mixed tenants, slow clients, invalid/large payloads and overload. Publish hardware/topology/configuration, tool versions, warmup, repeated distributions, throughput, p50/p95/p99, CPU, RSS, allocations, queue depth, errors and crash recovery. Use controlled runners/noise policy for regressions. Optimization requires profiles.
+
+## 11. Evidence carried forward
+
+The architecture lab demonstrated slices of Go execution, journal replay, Node.js gRPC, trigger normalization, CLI layouts, inspection, approvals and container operations. It did not establish application-level speedup over current Blok. Equal four-step source fixtures do not establish behavioral parity. Its deterministic three-goal authoring evaluation yielded two valid plans and one rejected plan; it does not measure live model reliability. Native listener coverage, complete schema enforcement, artifact retention, distributed failover, signing and production capacity still require implementation evidence.
+
+The roadmap therefore includes executable current-Blok parity workloads, live-provider AI evaluation, crash injection, per-runtime conformance and controlled fleet load gates. Lab status labels do not waive these requirements.
+
+## 12. Decisions and technical references
+
+Open decisions have explicit owners: canonical schema/IR (E02), Go API ergonomics (E03), embedded backend (E07), worker topology/codec (E08), registry trust/distribution (E13), distributed persistence/ownership (E18), and release capacity envelope (E20). Resolve each through a decision record and executable evidence before dependent behavior is frozen.
+
+- [Go module/package layout](https://go.dev/doc/modules/layout)
+- [Go release history](https://go.dev/doc/devel/release)
+- [ProtoJSON presence and numeric mapping](https://protobuf.dev/programming-guides/json/)
+- [JSON Schema annotations/defaults](https://json-schema.org/understanding-json-schema/reference/annotations)
+- [gRPC cancellation](https://grpc.io/docs/guides/cancellation/)
+- [gRPC performance and channel reuse](https://grpc.io/docs/guides/performance/)
+
+Read `ROADMAP.md` for issue-specific implementation boundaries, tests and release evidence.
