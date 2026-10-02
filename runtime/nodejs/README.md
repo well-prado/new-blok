@@ -20,8 +20,12 @@ node dist/runtime/nodejs/main.js dist/testdata/worker/nodejs/nodes.js --discover
 Declare each node's directory in `ownership.json` and its entry module in
 `entries`. `npm run ownership -- path/to/application-ownership.json` checks
 resolved imports/re-exports (including transitive utility and literal dynamic
-imports); unresolved and computed dependencies fail closed. Runtime node-to-node
-invocation also fails. This is an authoring check, not a sandbox for native code.
+imports). Value imports follow executable `import`/`require` package exports,
+not declaration files or the `types` condition; explicit type-only imports and
+re-exports create no execution edge. Existing JavaScript takes precedence over
+unbuilt TypeScript source. Unresolved and computed dependencies fail closed.
+Runtime node-to-node invocation also fails. This is an authoring check, not a
+sandbox for native code.
 Discovery imports explicit composition code; it does not invoke nodes, but
 application module initialization must itself be effect-free.
 
