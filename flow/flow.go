@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/well-prado/new-blok/contract"
 	"github.com/well-prado/new-blok/node"
 )
 
@@ -64,6 +65,57 @@ type Definition[I, O any] struct {
 }
 
 func (d Definition[I, O]) Program() Program { return cloneProgram(d.program) }
+
+// Lower converts a structurally authored definition into the engine's
+// transport-independent internal program. It only lowers the instruction
+// forms supported by the native execution path; it never invokes a node.
+func (d Definition[I, O]) Lower() (contract.InternalProgram, error) {
+	program := d.Program()
+	internal := contract.InternalProgram{
+		WorkflowID: program.Spec.Name,
+		Version:    program.Spec.Version,
+	}
+	for index, instruction := range program.Instructions {
+		if instruction.Kind != "call" {
+			return contract.InternalProgram{}, fmt.Errorf("flow: instruction %q of kind %q cannot be lowered", instruction.ID, instruction.Kind)
+		}
+		internal.Instructions = append(internal.Instructions, contract.InternalInstruction{
+			Index: index,
+			ID:    instruction.ID,
+			Kind:  instruction.Kind,
+			Node:  instruction.Node.Name,
+		})
+	}
+	step, path, err := lowerReference(program.Output)
+	if err != nil {
+		return contract.InternalProgram{}, fmt.Errorf("flow: output: %w", err)
+	}
+	internal.Instructions = append(internal.Instructions, contract.InternalInstruction{
+		Index: len(internal.Instructions),
+		ID:    "output",
+		Kind:  "output",
+		References: []contract.Reference{{
+			Step: step,
+			Path: path,
+		}},
+	})
+	return internal, nil
+}
+
+func lowerReference(source string) (string, []string, error) {
+	const prefix = "$step."
+	if !strings.HasPrefix(source, prefix) {
+		return "", nil, fmt.Errorf("output %q must reference a call result", source)
+	}
+	parts := strings.Split(strings.TrimPrefix(source, prefix), ".")
+	if len(parts) == 0 || parts[0] == "" {
+		return "", nil, fmt.Errorf("output %q has no step", source)
+	}
+	if len(parts) == 1 {
+		return parts[0], nil, nil
+	}
+	return parts[0], parts[1:], nil
+}
 
 func Define[I, O any](spec Spec, build func(*Builder, Ref[I]) Ref[O]) (Definition[I, O], error) {
 	if build == nil {

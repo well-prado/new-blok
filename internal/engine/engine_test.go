@@ -1,4 +1,4 @@
-package engine
+package engine_test
 
 import (
 	"context"
@@ -8,6 +8,7 @@ import (
 
 	"github.com/well-prado/new-blok/contract"
 	"github.com/well-prado/new-blok/examples/quote"
+	"github.com/well-prado/new-blok/internal/engine"
 	"github.com/well-prado/new-blok/node"
 )
 
@@ -27,8 +28,8 @@ func TestEngineRunsRealQuoteNodeAndCommitsDeclaredOutput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	engine := New(map[string]node.Any{"shop/calculate-quote": definition.Any()})
-	result, err := engine.Run(context.Background(), quoteProgram(), quote.Input{SKU: "coffee", Quantity: 2})
+	runner := engine.New(map[string]node.Any{"shop/calculate-quote": definition.Any()})
+	result, err := runner.Run(context.Background(), quoteProgram(), quote.Input{SKU: "coffee", Quantity: 2})
 	if err != nil || result.Output != int64(3000) {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
@@ -53,7 +54,7 @@ func TestEnginePublishesNoOutputOnErrorPanicInvalidOutputOrCancellation(t *testi
 		}),
 	} {
 		t.Run(name, func(t *testing.T) {
-			result, err := New(map[string]node.Any{"test/node": definition}).Run(context.Background(), program, quote.Input{SKU: "coffee", Quantity: 2})
+			result, err := engine.New(map[string]node.Any{"test/node": definition}).Run(context.Background(), program, quote.Input{SKU: "coffee", Quantity: 2})
 			if err == nil || len(result.State) != 0 || result.Output != nil {
 				t.Fatalf("result=%+v err=%v", result, err)
 			}
@@ -64,7 +65,7 @@ func TestEnginePublishesNoOutputOnErrorPanicInvalidOutputOrCancellation(t *testi
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	result, err := New(map[string]node.Any{"test/node": makeNode(func(context.Context, quote.Input) (map[string]any, error) { return map[string]any{"value": 1}, nil })}).Run(ctx, program, quote.Input{})
+	result, err := engine.New(map[string]node.Any{"test/node": makeNode(func(context.Context, quote.Input) (map[string]any, error) { return map[string]any{"value": 1}, nil })}).Run(ctx, program, quote.Input{})
 	if err == nil || !strings.Contains(err.Error(), "canceled") || len(result.State) != 0 {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
