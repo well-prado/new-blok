@@ -189,6 +189,30 @@ var schemaStatements = []string{
 	)`,
 	`CREATE INDEX IF NOT EXISTS journal_operations_run ON journal_operations(run_id)`,
 	`CREATE INDEX IF NOT EXISTS journal_attempts_operation ON journal_attempts(operation_key, attempt_number)`,
+	`CREATE TABLE IF NOT EXISTS journal_waits (
+		wait_id TEXT PRIMARY KEY,
+		run_id TEXT NOT NULL,
+		name TEXT NOT NULL,
+		due_at INTEGER NOT NULL,
+		state TEXT NOT NULL,
+		signal_id TEXT NOT NULL DEFAULT '',
+		payload_json BLOB,
+		created_at INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL,
+		FOREIGN KEY (run_id) REFERENCES journal_runs(run_id),
+		UNIQUE (run_id, name)
+	)`,
+	`CREATE TABLE IF NOT EXISTS journal_signals (
+		run_id TEXT NOT NULL,
+		signal_id TEXT NOT NULL,
+		name TEXT NOT NULL,
+		principal TEXT NOT NULL,
+		payload_json BLOB NOT NULL,
+		state TEXT NOT NULL,
+		created_at INTEGER NOT NULL,
+		PRIMARY KEY (run_id, signal_id)
+	)`,
+	`CREATE INDEX IF NOT EXISTS journal_waits_due ON journal_waits(state, due_at)`,
 }
 
 func (j *Journal) Admit(ctx context.Context, request AdmissionRequest) (Admission, error) {
