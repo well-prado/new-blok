@@ -1,4 +1,4 @@
-# ADR 0005: Injected effect nodes (#62 / E10-T02)
+# ADR 0010: Injected effect nodes (#62 / E10-T02)
 
 Status: implemented pre-alpha additive surface. No commercial provider integration
 or universal exactly-once claim. Existing HTTP response classifications are
