@@ -1,0 +1,22 @@
+{
+  "toolchain": "go1.27.1",
+  "goos": "linux",
+  "goarch": "arm64",
+  "directory": "/tmp",
+  "filesystem": "runtime temporary directory; mount type is not inferred by this tool",
+  "sqlite": {
+    "durability": "WAL, synchronous=FULL, busy_timeout=5000, foreign_keys=ON",
+    "single": {"operations": 100, "workers": 1, "elapsed": 104509396},
+    "batch": {"operations": 100, "workers": 1, "elapsed": 1241474},
+    "concurrent": {"operations": 400, "workers": 4, "elapsed": 978227110},
+    "bytes": 4096
+  },
+  "bbolt": {
+    "durability": "NoSync=false, NoGrowSync=false, single-writer transactions",
+    "single": {"operations": 100, "workers": 1, "elapsed": 366113516},
+    "batch": {"operations": 100, "workers": 1, "elapsed": 3236293},
+    "concurrent": {"operations": 400, "workers": 4, "elapsed": 561656670},
+    "bytes": 65536
+  },
+  "units": "elapsed is nanoseconds"
+}
