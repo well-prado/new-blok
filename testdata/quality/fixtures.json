@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "roadmap": "E01-T04",
+  "fixtures": [
+    {
+      "id": "format-failure",
+      "kind": "rejected",
+      "expected": {"outputRecords": 0, "errorRecords": 1, "effectRecords": 0, "errorCode": "format_failure"}
+    },
+    {
+      "id": "race-failure",
+      "kind": "rejected",
+      "expected": {"outputRecords": 0, "errorRecords": 1, "effectRecords": 0, "errorCode": "race_failure"}
+    },
+    {
+      "id": "fuzz-budget",
+      "kind": "accepted",
+      "expected": {"outputRecords": 1, "errorRecords": 0, "effectRecords": 0, "budgetSeconds": 5, "seed": "contract-golden-v1"}
+    },
+    {
+      "id": "dependency-verification-failure",
+      "kind": "rejected",
+      "expected": {"outputRecords": 0, "errorRecords": 1, "effectRecords": 0, "errorCode": "module_verification_failure"}
+    }
+  ]
+}
