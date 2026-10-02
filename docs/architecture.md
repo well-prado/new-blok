@@ -78,6 +78,13 @@ The human-readable document is independent from protobuf transport encoding. Ado
 
 Define missing versus null, signed integer ranges, exact money, timestamps, defaults, unknown fields, optional objects, collections, unions and binary/blob references. JSON Schema defaults are annotations; normalization is a specified operation. Static compatibility supports a declared subset; unprovable edges yield a diagnostic or runtime validation requirement.
 
+The implemented bounded subset requires exactly one union branch to match,
+including null. A null schema rejects non-null values. The pure catalog's
+generic numeric envelope preserves exact JSON integers; its supplied inner
+schema owns integer range/wire rules. Template expansion preflights the byte
+budget before allocating output. See [ADR 0007](decisions/0007-catalog-null-and-template-bounds.md)
+for the correction, supported array limits and pending Node mirror integration.
+
 Logical values are immutable. Maps, slices and pointers require isolation between nodes and branches. Typed native fast paths must preserve this rule, and benchmarks include required validation/copies. Portable encodings serve journals and worker boundaries. Stable diagnostics name code, file/line, workflow, step, field, expected/actual and remediation.
 
 ## 5. Control flow
@@ -102,7 +109,7 @@ One admission path authenticates/authorizes, maps and validates input, deduplica
 | WebSocket | connection/message/disconnect, identity, framing and backpressure |
 | MCP | tools/resources, schemas, caller authorization and output mapping |
 
-HTTP and one durable job path ship first. Other adapters pass shared conformance plus actual protocol integration tests. They implement no second interpreter, mapper or retry engine. Multiple bindings can share a listener where protocols permit; independent TLS/listeners remain selectable. Queue acknowledgment follows an explicit transfer model and stable delivery deduplication.
+HTTP and one durable job path ship first. Other adapters pass shared conformance plus actual protocol integration tests. They implement no second interpreter, mapper or retry engine. The shared `trigger` contract, the per-kind completion/disconnect table and the `contract/conformance.RunTrigger` harness are recorded in [ADR 0005](decisions/0005-trigger-adapter-contract.md). Multiple bindings can share a listener where protocols permit; independent TLS/listeners remain selectable. Queue acknowledgment follows an explicit transfer model and stable delivery deduplication.
 
 ## 7. Durability, effects and artifacts
 

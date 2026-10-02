@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "roadmap": "E09-T02",
+  "inputSchema": {"type":"object","properties":{"sku":{"type":"string"},"quantity":{"type":"integer","minimum":1,"maximum":100}},"required":["sku","quantity"]},
+  "body": "{\"sku\":\"coffee\",\"quantity\":2}",
+  "maxBodyBytes": 1024,
+  "toleranceMinutes": 5,
+  "requests": [
+    {"name":"valid signed event","mutation":"none","status":202,"result":"accepted","submissions":1},
+    {"name":"same event replayed","mutation":"replay","status":200,"result":"duplicate","submissions":0},
+    {"name":"body whitespace re-serialized","mutation":"whitespace","status":401,"result":"unauthorized","submissions":0},
+    {"name":"body byte altered","mutation":"body","status":401,"result":"unauthorized","submissions":0},
+    {"name":"signed with an unknown key","mutation":"wrong-key","status":401,"result":"unauthorized","submissions":0},
+    {"name":"timestamp header altered","mutation":"timestamp-header","status":401,"result":"unauthorized","submissions":0},
+    {"name":"event id header altered","mutation":"id-header","status":401,"result":"unauthorized","submissions":0},
+    {"name":"correctly signed but older than the window","mutation":"stale","status":400,"result":"stale_event","submissions":0},
+    {"name":"correctly signed but newer than the window","mutation":"future","status":400,"result":"stale_event","submissions":0},
+    {"name":"captured event replayed after the window","mutation":"replay-after-window","status":400,"result":"stale_event","submissions":0},
+    {"name":"no signature","mutation":"no-signature","status":401,"result":"unauthorized","submissions":0},
+    {"name":"signature not base64","mutation":"malformed-signature","status":401,"result":"unauthorized","submissions":0},
+    {"name":"only an unknown signature version","mutation":"unknown-version","status":401,"result":"unauthorized","submissions":0},
+    {"name":"more signatures than the bound","mutation":"too-many-signatures","status":401,"result":"unauthorized","submissions":0},
+    {"name":"non-numeric timestamp","mutation":"bad-timestamp","status":401,"result":"unauthorized","submissions":0},
+    {"name":"correctly signed far-future timestamp","mutation":"far-future","status":401,"result":"unauthorized","submissions":0},
+    {"name":"maximum int64 timestamp","mutation":"max-int64","status":401,"result":"unauthorized","submissions":0},
+    {"name":"one valid signature among the bound of bogus ones","mutation":"valid-among-bogus","status":202,"result":"accepted","submissions":1},
+    {"name":"event id longer than the bound","mutation":"long-id","status":401,"result":"unauthorized","submissions":0},
+    {"name":"body larger than the bound","mutation":"oversized","status":413,"result":"too_large","submissions":0},
+    {"name":"signed malformed JSON","mutation":"malformed-json","status":400,"result":"invalid_input","submissions":0},
+    {"name":"signed wrong-typed field","mutation":"wrong-type","status":400,"result":"invalid_input","submissions":0},
+    {"name":"signed empty body","mutation":"empty","status":400,"result":"invalid_input","submissions":0},
+    {"name":"GET instead of POST","mutation":"get","status":405,"result":"method_not_allowed","submissions":0},
+    {"name":"unknown path","mutation":"path","status":404,"result":"not_found","submissions":0}
+  ],
+  "rotation": [
+    {"name":"new key before its window","minutes":-1,"keys":["new"],"status":401},
+    {"name":"old key before rotation","minutes":-1,"keys":["old"],"status":202},
+    {"name":"old key during overlap","minutes":5,"keys":["old"],"status":202},
+    {"name":"new key during overlap","minutes":5,"keys":["new"],"status":202},
+    {"name":"both signatures during overlap","minutes":5,"keys":["old","new"],"status":202},
+    {"name":"old key after retirement","minutes":15,"keys":["old"],"status":401},
+    {"name":"both signatures after retirement","minutes":15,"keys":["old","new"],"status":202},
+    {"name":"new key after retirement","minutes":15,"keys":["new"],"status":202},
+    {"name":"retry of an event accepted under the old key, signed with the new key","event":"rot_2","minutes":6,"keys":["new"],"status":200}
+  ],
+  "expected": {"output": 8, "duplicates": 2, "errors": 24, "effects": 8},
+  "limits": [
+    "Status 2xx is sent only after the durable submission commits; 202 is a new event and 200 a duplicate of a committed one.",
+    "Every verification failure is the same 401 'unauthorized' response so a caller learns nothing about which check failed; a well-formed timestamp outside the window is 400 'stale_event' and is rejected before any signature is hashed.",
+    "Timestamps above webhook.MaxTimestamp are malformed (401); the window compares instants, so no timestamp can overflow past it."
+  ]
+}

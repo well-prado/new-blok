@@ -111,3 +111,39 @@ func FuzzNormalizeBounded(f *testing.F) {
 	})
 }
 func boolPtr(v bool) *bool { return &v }
+
+func FuzzNullUnionNormalization(f *testing.F) {
+	for _, seed := range []string{`null`, `"blok"`, `true`, `1`, `[]`, `{}`, `"9223372036854775807"`} {
+		f.Add([]byte(seed))
+	}
+	null := Schema{Type: "null"}
+	union := Schema{AnyOf: []Schema{{Type: "null"}, {Type: "string"}}}
+	ambiguous := Schema{AnyOf: []Schema{{Type: "null"}, {Type: "null"}}}
+	f.Fuzz(func(t *testing.T, input []byte) {
+		if len(input) > MaxPayloadBytes {
+			t.Skip()
+		}
+		var value any
+		if err := json.Unmarshal(input, &value); err != nil {
+			return
+		}
+		_, err := null.Normalize(input)
+		if (err == nil) != (value == nil) {
+			t.Fatalf("null schema accepted non-null or rejected null: %s, %v", input, err)
+		}
+		_, isString := value.(string)
+		got, err := union.Normalize(input)
+		if (err == nil) != (value == nil || isString) {
+			t.Fatalf("union result: %s, %v", input, err)
+		}
+		if err == nil {
+			again, err := union.Normalize(got)
+			if err != nil || string(again) != string(got) {
+				t.Fatalf("normalization not stable: %s -> %s, %v", got, again, err)
+			}
+		}
+		if _, err := ambiguous.Normalize(input); err == nil {
+			t.Fatalf("ambiguous null union accepted: %s", input)
+		}
+	})
+}
