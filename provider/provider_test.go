@@ -1,0 +1,75 @@
+package provider
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+)
+
+func manifest() Manifest {
+	return Manifest{Capabilities: []string{"payment:charge"}, SecretRefs: []string{"PAYMENT_TOKEN"}, MaxRequestBytes: 1024}
+}
+
+func TestHTTPProviderPassesIdempotencyAndClassifiesResponses(t *testing.T) {
+	var gotKey string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotKey = r.Header.Get("Idempotency-Key")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+	p := HTTP{Manifest: manifest()}
+	resp, err := p.Execute(context.Background(), Request{Method: http.MethodPost, URL: server.URL, Body: []byte(`{}`), IdempotencyKey: "op-1"})
+	if err != nil || resp.Status != 200 || gotKey != "op-1" {
+		t.Fatalf("response=%+v err=%v key=%q", resp, err, gotKey)
+	}
+}
+
+func TestHTTPProviderClassifiesBusinessAndTransientFailures(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		class  ErrorClass
+	}{{400, Business}, {500, Transient}, {429, Transient}} {
+		t.Run(http.StatusText(tc.status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(tc.status) }))
+			defer server.Close()
+			p := HTTP{Manifest: manifest()}
+			_, err := p.Execute(context.Background(), Request{Method: http.MethodGet, URL: server.URL})
+			if !IsClass(err, tc.class) {
+				t.Fatalf("got %v want %s", err, tc.class)
+			}
+		})
+	}
+}
+
+func TestEffectRequiresInjectedProviderAndBoundsSecrets(t *testing.T) {
+	if _, err := (Effect{Manifest: manifest()}).Execute(context.Background(), Request{}); err == nil {
+		t.Fatal("missing provider accepted")
+	}
+	m := manifest()
+	m.MaxRequestBytes = 1
+	p := HTTP{Manifest: m}
+	_, err := p.Execute(context.Background(), Request{Method: http.MethodPost, URL: "http://example.invalid", Body: []byte("too long")})
+	if !IsClass(err, Invalid) {
+		t.Fatalf("bound error: %v", err)
+	}
+	if strings.Contains(RedactedError(&Error{Class: Business, Code: "failed", Err: errors.New("PAYMENT_TOKEN=secret")}), "secret") {
+		t.Fatal("credential leaked")
+	}
+}
+
+func TestCanceledExternalRequestIsUncertain(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { <-r.Context().Done() }))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	p := HTTP{Manifest: manifest()}
+	_, err := p.Execute(ctx, Request{Method: http.MethodPost, URL: server.URL, IdempotencyKey: "op-2"})
+	if !IsClass(err, Uncertain) {
+		t.Fatalf("got %v want uncertain", err)
+	}
+}
