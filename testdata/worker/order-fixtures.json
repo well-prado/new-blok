@@ -1,0 +1,43 @@
+{
+  "schemaVersion": "worker-order/v1",
+  "cases": [
+    {
+      "name": "duplicate delivery",
+      "deliveries": 2,
+      "acceptedJobs": 1,
+      "committedOrders": 1,
+      "outboxEvents": 1,
+      "observableOrderEffects": 1,
+      "expectedErrorCount": 0
+    },
+    {
+      "name": "provider timeout",
+      "dispatchAttempts": 2,
+      "stableEventIdentity": true,
+      "committedOutboxEvents": 1,
+      "observableEffectCount": 1,
+      "expectedErrorCount": 1
+    },
+    {
+      "name": "validation failure",
+      "handlerAttempts": 1,
+      "deadLettered": true,
+      "committedOrders": 0,
+      "outboxEvents": 0,
+      "expectedErrorCount": 1
+    },
+    {
+      "name": "crash before worker acknowledgment",
+      "preCommitBusinessRows": 0,
+      "postRecoveryBusinessRows": 1,
+      "postRecoveryJobState": "completed",
+      "duplicateAcknowledgments": 0,
+      "expectedErrorCount": 0
+    }
+  ],
+  "limits": [
+    "The local worker uses SQLite durable transactions and does not claim multi-host queue ownership.",
+    "External publishers must deduplicate by the stable event ID; a crash after publish and before outbox commit remains uncertain.",
+    "Dead-letter messages contain safe framework diagnostics, not arbitrary handler error text."
+  ]
+}
