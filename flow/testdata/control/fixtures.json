@@ -1,0 +1,16 @@
+{
+  "cases": [
+    {
+      "name": "scoped-if-each-parallel",
+      "expectedOutputCount": 1,
+      "expectedErrorCount": 0,
+      "expectedEffectCount": 0
+    },
+    {
+      "name": "duplicate-arm-id",
+      "expectedOutputCount": 0,
+      "expectedErrorCount": 1,
+      "expectedEffectCount": 0
+    }
+  ]
+}
