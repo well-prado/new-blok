@@ -1,0 +1,22 @@
+{
+  "cases": [
+    {
+      "name": "partial-startup-reverse-close",
+      "expectedOutputCount": 0,
+      "expectedErrorCount": 1,
+      "expectedEffectCount": 0
+    },
+    {
+      "name": "bounded-drain",
+      "expectedOutputCount": 1,
+      "expectedErrorCount": 0,
+      "expectedEffectCount": 0
+    },
+    {
+      "name": "signal-shutdown",
+      "expectedOutputCount": 0,
+      "expectedErrorCount": 0,
+      "expectedEffectCount": 0
+    }
+  ]
+}
