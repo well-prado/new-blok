@@ -1,0 +1,22 @@
+{
+  "cases": [
+    {
+      "name": "nested-native-copy",
+      "expectedOutputCount": 1,
+      "expectedErrorCount": 0,
+      "expectedEffectCount": 0
+    },
+    {
+      "name": "cycle-rejected",
+      "expectedOutputCount": 0,
+      "expectedErrorCount": 1,
+      "expectedEffectCount": 0
+    },
+    {
+      "name": "blob-policy-rejected",
+      "expectedOutputCount": 0,
+      "expectedErrorCount": 1,
+      "expectedEffectCount": 0
+    }
+  ]
+}
