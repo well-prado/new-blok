@@ -1,0 +1,19 @@
+{
+  "toolchain": "go1.27.1",
+  "goos": "linux",
+  "goarch": "arm64",
+  "filesystem": "runtime temporary directory; mount type is not inferred by this test",
+  "durability": "WAL, synchronous=FULL, busy_timeout=5000, foreign_keys=ON",
+  "command": "go test ./store/sqlite -run 'TestProcessKillBeforeDuringAndAfterCommit|TestCorruptedDatabaseFailsIntegrityCheck|TestBackendPersistsTransactionsAndCreatesVerifiedBackup' -count=1",
+  "results": [
+    {"case": "before commit", "status": "passed", "recoveredRows": 0, "integrity": "ok"},
+    {"case": "during commit boundary race", "status": "passed", "recoveredRows": "0 or 1", "integrity": "ok"},
+    {"case": "after commit", "status": "passed", "recoveredRows": 1, "integrity": "ok"},
+    {"case": "truncated database", "status": "passed", "integrity": "failed closed"},
+    {"case": "backup and restore", "status": "passed", "recoveredRows": 1, "integrity": "ok"}
+  ],
+  "limitations": [
+    "The test exercises one local filesystem and does not prove disk-loss survival or multi-host failover.",
+    "The commit-boundary race intentionally permits the SQLite recovery outcome of either 0 or 1 committed row."
+  ]
+}
