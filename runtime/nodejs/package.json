@@ -1,0 +1,25 @@
+{
+  "name": "@blok/nodejs-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": "22.x || 24.x" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "tsc -p tsconfig.json --noEmit && node scripts/check-source.mjs && npm run ownership",
+    "ownership": "node scripts/check-ownership.mjs",
+    "test": "npm run build && node --test dist/runtime/nodejs/test/*.test.js test/*.test.mjs",
+    "generate": "node scripts/generate.mjs",
+    "check:generated": "node scripts/generate.mjs --check",
+    "discover": "node dist/runtime/nodejs/main.js ../../testdata/worker/nodejs/nodes.ts --discover"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "1.14.5",
+    "@grpc/proto-loader": "0.8.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.18.10",
+    "typescript": "5.9.3"
+  }
+}
