@@ -58,7 +58,7 @@ not inline payloads, and no user input can choose the endpoint or credential.
 The store enforces aggregate byte and 1024-entry bounds before allocation;
 `ResolveAuthorized` accounts repeated references against the caller's byte bound.
 
-Native checks: `npm ci --ignore-scripts`, `npm test` (14), lint, build, generated
+Native checks: `npm ci --ignore-scripts`, `npm test` (15), lint, build, generated
 drift and `npm audit` (zero findings), on both supported Node majors. Go checks:
 focused race, full vet/race/build and diff check. Go-only runs explicitly skip
 foreign-runtime gates; the opt-in gates are required as separate evidence.
