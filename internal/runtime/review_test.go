@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -207,6 +209,73 @@ func TestShutdownStalledDrainReapsRealProcess(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestBackgroundShutdownBoundsActiveEffectAndReapsRealProcess(t *testing.T) {
+	f := factory(t, freeAddress(t))
+	marker := filepath.Join(t.TempDir(), "synthetic-effect")
+	f.Env = append(f.Env, "WORKER_IGNORE_TERM=1", "WORKER_EFFECT_MARK="+marker)
+	s, err := New(Config{Hello: hello(), Factory: f})
+	if err != nil {
+		t.Fatal(err)
+	}
+	startup, stop := context.WithTimeout(context.Background(), 3*time.Second)
+	defer stop()
+	if err := s.Start(startup); err != nil {
+		t.Fatal(err)
+	}
+	p := s.conn.(*processConnection)
+	t.Cleanup(func() { _ = p.cmd.Process.Kill(); <-p.exited })
+	callCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	request := call("background-active-effect")
+	request.Node = "effect"
+	request.IdempotencyKey = "synthetic-operation"
+	callDone := make(chan outcome, 1)
+	go func() {
+		result, err := s.Call(callCtx, request)
+		callDone <- outcome{result: result, err: err}
+	}()
+	// The child writes the effect marker before blocking on its long call
+	// deadline. Shutdown must abort this real in-flight RPC, not an idle worker.
+	for deadline := time.Now().Add(3 * time.Second); ; {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("real worker never reached the effect handler")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- s.Shutdown(context.Background()) }()
+	select {
+	case err := <-shutdownDone:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("background active drain: %v", err)
+		}
+	case <-time.After(cleanupTimeout + time.Second):
+		t.Fatal("background shutdown waited indefinitely for the active effect")
+	}
+	select {
+	case <-p.exited:
+	default:
+		t.Fatal("shutdown returned before the child was reaped")
+	}
+	select {
+	case got := <-callDone:
+		if !errors.Is(got.err, contract.ErrUncertain) || len(got.result.Output) != 0 {
+			t.Fatalf("dispatched effect must remain uncertain: %+v %v", got.result, got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("active call goroutine leaked after force-close")
+	}
+	if data, err := os.ReadFile(marker); err != nil || string(data) != request.IdempotencyKey {
+		t.Fatalf("shutdown must not claim the dispatched effect was undone: %q %v", data, err)
+	}
+	if _, err := s.Call(context.Background(), call("after-background-shutdown")); !errors.Is(err, ErrNotStarted) {
+		t.Fatalf("stopped worker admitted another call: %v", err)
 	}
 }
 
