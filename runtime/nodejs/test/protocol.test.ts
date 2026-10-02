@@ -34,6 +34,12 @@ test("actual deadline and Cancel terminate cooperative nodes without publishing 
   result=receive(s);s.write({call:call("after-cancel")});assert.equal((await result).result?.output.toString(),'{"value":"1"}');
  }finally{f.close();}
 });
+test("deadline exhausted in transit is terminal without poisoning the channel",async()=>{
+ const f=await fixture();try{const s=f.connect();let result=receive(s);s.write({hello:f.hello});await result;
+  result=receive(s);s.write({call:{...call("expired"),deadlineUnixNanos:(BigInt(Date.now()-10)*1000000n).toString()}});assert.equal((await result).result?.error?.class,"DEADLINE_EXCEEDED");
+  result=receive(s);s.write({call:call("after-expired")});assert.equal((await result).result?.output.toString(),'{"value":"1"}');
+ }finally{f.close();}
+});
 test("wire rejects multiple envelopes and malformed length before decoding",()=>{
  for(const bytes of [Buffer.alloc(0),Buffer.from([10,1]),Buffer.from([10,0,18,0]),Buffer.from([58,0]),Buffer.from([10,128,128,128,128,128])])assert.throws(()=>validateFrameBytes(bytes));
  assert.doesNotThrow(()=>validateFrameBytes(Buffer.from([10,0])));

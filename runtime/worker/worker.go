@@ -97,11 +97,7 @@ func DefineScoped[I, O any](supervisor *Supervisor, descriptor node.Descriptor, 
 		result, err := supervisor.Call(ctx, contract.Call{CallID: id.CallID, AttemptID: id.AttemptID, IdempotencyKey: id.OperationKey, Generation: ready.Generation, Node: descriptor.Name, NodeVersion: descriptor.Version, Deadline: deadline, Input: payload, Capabilities: capabilities})
 		if err != nil {
 			if len(descriptor.Effects) > 0 {
-				failure := &node.DomainError{Class: "uncertain", Code: "worker_transport", Uncertain: true}
-				if ctx.Err() != nil {
-					failure.Err = ctx.Err()
-				}
-				return zero, failure
+				return zero, transportFailure(ctx, err)
 			}
 			return zero, err
 		}
@@ -129,6 +125,19 @@ func DefineScoped[I, O any](supervisor *Supervisor, descriptor node.Descriptor, 
 		}
 		return output, nil
 	}, opts...)
+}
+func transportFailure(ctx context.Context, err error) *node.DomainError {
+	failure := &node.DomainError{Class: "uncertain", Code: "worker_transport", Uncertain: true}
+	if errors.Is(err, context.Canceled) {
+		failure.Err = context.Canceled
+	} else if errors.Is(err, context.DeadlineExceeded) {
+		// Validation can observe the absolute deadline before the context
+		// timer is scheduled. Preserve only the known, non-sensitive cause.
+		failure.Err = context.DeadlineExceeded
+	} else if ctx.Err() != nil {
+		failure.Err = ctx.Err()
+	}
+	return failure
 }
 func nativeJSON(s schema.Schema, raw []byte) ([]byte, error) {
 	var v any
