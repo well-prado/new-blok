@@ -116,11 +116,17 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	result, err := endpoint.Handle(ctx, input)
 	if err != nil {
 		status := statusFor(err)
+		requestID := s.newRequestID()
 		if status >= 500 {
-			writeJSON(writer, status, map[string]any{"error": "internal error", "requestId": s.newRequestID()})
+			writeJSON(writer, status, map[string]any{"error": "internal error", "requestId": requestID})
 			return
 		}
-		writeJSON(writer, status, map[string]any{"error": "request failed"})
+		code := "request_failed"
+		var engineError *engine.Error
+		if errors.As(err, &engineError) && engineError.Code != "" {
+			code = engineError.Code
+		}
+		writeJSON(writer, status, map[string]any{"error": code, "requestId": requestID})
 		return
 	}
 	writeJSON(writer, http.StatusOK, result)

@@ -41,6 +41,20 @@ go build -o bin/blok ./cmd/blok
 
 The initial toolchain is Go 1.27.1. The first application milestone delivers a quote service that can be authored, tested and served entirely in Go. Follow the [roadmap](ROADMAP.md) for implementation order, issue dependencies, and exit evidence.
 
+### Run the native quote application
+
+The quote example is a Go-only executable; it does not require Node.js, Python, a container, or a foreign runtime:
+
+```sh
+go run ./examples/quote/cmd/quote
+curl -i -X POST http://localhost:8080/quotes \
+  -H 'content-type: application/json' \
+  -d '{"sku":"coffee","quantity":2}'
+# {"totalCents":3000}
+```
+
+Invalid SKU or quantity requests return a bounded client error with a `requestId` for correlation. The executable owns composition, lifecycle, and the HTTP listener; no handwritten workflow IR is required.
+
 ## An ecosystem with clear boundaries
 
 This repository owns the framework, CLI, package client, adapter contracts, and conformance suites. Studio, the hosted package registry, and BLOK Cloud will be separate products.

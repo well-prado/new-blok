@@ -1,0 +1,41 @@
+{
+  "application": "examples/quote/cmd/quote",
+  "listener": {
+    "address": "127.0.0.1:0",
+    "method": "POST",
+    "path": "/quotes"
+  },
+  "cases": [
+    {
+      "name": "valid quote",
+      "request": {"sku": "coffee", "quantity": 2},
+      "status": 200,
+      "response": {"totalCents": 3000}
+    },
+    {
+      "name": "unknown sku",
+      "request": {"sku": "tea", "quantity": 2},
+      "status": 400,
+      "error": "unknown_sku",
+      "requiresRequestId": true
+    },
+    {
+      "name": "invalid quantity",
+      "request": {"sku": "coffee", "quantity": 0},
+      "status": 400,
+      "error": "invalid request",
+      "requiresRequestId": false
+    }
+  ],
+  "validation": {
+    "toolchain": "go1.27.1",
+    "commands": [
+      "go test ./...",
+      "go vet ./...",
+      "go test -race ./...",
+      "go build ./...",
+      "go build ./examples/quote/cmd/quote"
+    ],
+    "githubActions": "not run by project instruction"
+  }
+}

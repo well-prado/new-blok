@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/well-prado/new-blok/contract"
 	"github.com/well-prado/new-blok/node"
 )
 
@@ -42,6 +43,33 @@ func TestBuildRecordsWholeValueProgramWithoutExecutingNode(t *testing.T) {
 	instruction := program.Instructions[0]
 	if instruction.Input != "$input" || instruction.Node.Name != "shop/calculate-quote" {
 		t.Fatalf("instruction=%+v", instruction)
+	}
+}
+
+func TestLowerProducesEngineProgramWithoutExecutingNode(t *testing.T) {
+	program, err := buildQuote(t).Lower()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := contract.InternalProgram{WorkflowID: "shop/quote", Version: "1.0.0", Instructions: []contract.InternalInstruction{
+		{Index: 0, ID: "calculate", Kind: "call", Node: "shop/calculate-quote"},
+		{Index: 1, ID: "output", Kind: "output", References: []contract.Reference{{Step: "calculate"}}},
+	}}
+	if !reflect.DeepEqual(program, want) {
+		t.Fatalf("program=%+v want=%+v", program, want)
+	}
+}
+
+func TestLowerRejectsNonCallInstruction(t *testing.T) {
+	definition := MustDefine(Spec{Name: "shop/quote", Version: "1.0.0"}, func(builder *Builder, input Ref[quoteInput]) Ref[quoteOutput] {
+		return If(builder, "route", Lit(true), func(arm *ArmBuilder) Ref[quoteOutput] {
+			return ArmCall(arm, "then", testQuoteNode(t), input)
+		}, func(arm *ArmBuilder) Ref[quoteOutput] {
+			return ArmCall(arm, "else", testQuoteNode(t), input)
+		})
+	})
+	if _, err := definition.Lower(); err == nil {
+		t.Fatal("Lower accepted unsupported control flow")
 	}
 }
 
