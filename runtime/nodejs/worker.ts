@@ -9,7 +9,7 @@ export interface Limits { maxFrameBytes: number; maxBlobBytes: number; maxConcur
 const identity = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
 const digest = /^sha256:[0-9a-f]{64}$/;
 function uint64(text: string): boolean { return /^(0|[1-9][0-9]*)$/.test(text) && BigInt(text) > 0n && BigInt(text) <= (1n << 64n) - 1n; }
-function capabilities(values: readonly string[]): boolean { return values.length <= 64 && new Set(values).size === values.length && values.every(c => identity.test(c) && !c.includes("orchestrate")); }
+function capabilities(values: readonly string[]): boolean { return values.length <= 128 && new Set(values).size === values.length && values.every(c => identity.test(c) && !c.includes("orchestrate")); }
 function limitsValid(l: Limits): boolean { return Object.entries(DEFAULT_LIMITS).every(([key, max]) => { const n = l[key as keyof Limits]; return Number.isInteger(n) && n > 0 && n <= max; }); }
 export interface WorkerOptions {
   nodes: readonly AnyNode[];
@@ -22,10 +22,9 @@ export interface WorkerOptions {
   protoPath?: string;
   limits?: Limits;
   replayEntries?: number;
-  maxCallDurationMs?: number;
   handshakeTimeoutMs?: number;
 }
-type Active = { controller: AbortController; terminal: boolean; timer: NodeJS.Timeout };
+type Active = { controller: AbortController; terminal: boolean; timer: NodeJS.Timeout; operationKey: string };
 export class Worker {
   readonly catalog: ReturnType<typeof discover>;
   readonly server: grpc.Server;
@@ -35,7 +34,6 @@ export class Worker {
   private readonly options: WorkerOptions;
   private readonly limits: Limits;
   private readonly replayEntries: number;
-  private readonly maxDuration: number;
   private session: { stop(code?: grpc.status): void } | undefined;
   private executing = 0;
   private readonly controllers = new Set<AbortController>();
@@ -43,9 +41,8 @@ export class Worker {
     this.options = { ...options, nodes: [...options.nodes], capabilities: Object.freeze([...options.capabilities]) };
     this.limits = { ...(options.limits ?? DEFAULT_LIMITS) };
     this.replayEntries = options.replayEntries ?? 8192;
-    this.maxDuration = options.maxCallDurationMs ?? 60000;
     if (Buffer.byteLength(options.token) < 32 || Buffer.byteLength(options.token) > 4096 || !identity.test(options.principal) || !capabilities(options.capabilities) || !digest.test(options.artifactDigest) || !uint64(options.generation) || !limitsValid(this.limits)) throw new Error("invalid_worker_configuration");
-    if (!Number.isInteger(this.replayEntries) || this.replayEntries < 2 || this.replayEntries > 1048576 || !Number.isInteger(this.maxDuration) || this.maxDuration < 1 || this.maxDuration > 300000) throw new Error("invalid_worker_bounds");
+    if (!Number.isInteger(this.replayEntries) || this.replayEntries < 2 || this.replayEntries > 1048576) throw new Error("invalid_worker_bounds");
     if (!/^127\.0\.0\.1:([1-9][0-9]{0,4})$/.test(options.address) || Number(options.address.split(":")[1]) > 65535) throw new Error("loopback_fixed_address_required");
     this.catalog = discover(options.nodes);
     if (Buffer.byteLength(JSON.stringify(this.catalog)) > 1 << 20) throw new Error("catalog_too_large");
@@ -110,7 +107,7 @@ export class Worker {
           const state = active.get(`${c.callId}\0${c.attemptId}`);
           if (state && !state.terminal) {
             state.terminal = true; clearTimeout(state.timer); state.controller.abort(new DomainError("call_canceled", "CANCELED"));
-            send({ result: { callId: c.callId, attemptId: c.attemptId, generation: c.generation, error: redactError(new DomainError("call_canceled", "CANCELED"), "") } });
+            send({ result: { callId: c.callId, attemptId: c.attemptId, generation: c.generation, error: redactError(new DomainError("call_canceled", "CANCELED"), state.operationKey) } });
           }
           return;
         }
@@ -129,7 +126,15 @@ export class Worker {
         const controller = new AbortController();
         const key = `${call.callId}\0${call.attemptId}`;
         const remaining = Number((BigInt(call.deadlineUnixNanos) - BigInt(Date.now()) * 1000000n + 999999n) / 1000000n);
-        const state: Active = { controller, terminal: false, timer: setTimeout(() => {
+        const expire = (): boolean => {
+          if (BigInt(call.deadlineUnixNanos) > BigInt(Date.now()) * 1000000n) return false;
+          if (!state.terminal && !stopped) {
+            state.terminal = true; controller.abort(new DomainError("call_deadline", "DEADLINE_EXCEEDED"));
+            send({ result: { ...this.resultIdentity(call), error: redactError(new DomainError("call_deadline", "DEADLINE_EXCEEDED"), call.idempotencyKey) } });
+          }
+          return true;
+        };
+        const state: Active = { controller, terminal: false, operationKey: call.idempotencyKey, timer: setTimeout(() => {
           if (state.terminal || stopped) return;
           state.terminal = true; controller.abort(new DomainError("call_deadline", "DEADLINE_EXCEEDED"));
           send({ result: { ...this.resultIdentity(call), error: redactError(new DomainError("call_deadline", "DEADLINE_EXCEEDED"), call.idempotencyKey) } });
@@ -139,9 +144,9 @@ export class Worker {
         void (async () => {
           try {
             const output = await node.invokeJSON(ctx, call.input.toString("utf8"));
-            if (!stopped && !state.terminal && !controller.signal.aborted) send({ result: { ...this.resultIdentity(call), output: Buffer.from(output) } });
+            if (!expire() && !stopped && !state.terminal && !controller.signal.aborted) send({ result: { ...this.resultIdentity(call), output: Buffer.from(output) } });
           } catch (e) {
-            if (!stopped && !state.terminal && !controller.signal.aborted) send({ result: { ...this.resultIdentity(call), error: redactError(e instanceof SchemaError ? new DomainError(e.code, "INVALID_INPUT") : e, call.idempotencyKey) } });
+            if (!expire() && !stopped && !state.terminal && !controller.signal.aborted) send({ result: { ...this.resultIdentity(call), error: redactError(e instanceof SchemaError ? new DomainError(e.code, "INVALID_INPUT") : e, call.idempotencyKey) } });
           } finally {
             state.terminal = true; clearTimeout(state.timer); active.delete(key); this.executing--; this.controllers.delete(controller);
           }
@@ -171,8 +176,8 @@ export class Worker {
     if (c.principal !== this.options.principal || !capabilities(c.capabilities) || c.capabilities.some(x => !h.capabilities.includes(x))) throw new DomainError("capability_denied");
     const deadline = BigInt(c.deadlineUnixNanos), now = BigInt(Date.now()) * 1000000n;
     if (deadline <= now) throw new DomainError("call_deadline","DEADLINE_EXCEEDED");
-    if (deadline - now > BigInt(this.maxDuration) * 1000000n) throw new Error("invalid_deadline");
-    if (!Buffer.isBuffer(c.input) || c.input.length > h.limits!.maxFrameBytes - 1024 || c.blobs.length > 64) throw new Error("payload_too_large");
+    if (deadline - now > 300000n * 1000000n) throw new Error("invalid_deadline");
+    if (!Buffer.isBuffer(c.input) || c.input.length === 0 || c.input.length > h.limits!.maxFrameBytes - 1024 || c.blobs.length > 128) throw new Error("payload_too_large");
     let total = 0n;
     for (const b of c.blobs) { const size = BigInt(b.size); if (!digest.test(b.digest) || size < 0n || size > BigInt(h.limits!.maxBlobBytes)) throw new Error("invalid_blob"); total += size; }
     if (total > BigInt(h.limits!.maxBlobBytes)) throw new Error("invalid_blob");
