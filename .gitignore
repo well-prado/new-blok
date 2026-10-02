@@ -1,4 +1,5 @@
 /bin/
+/blok
 /coverage.out
 /.local/
 .env

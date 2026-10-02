@@ -5,12 +5,67 @@
     "id": "PVT_kwHOAyzkKc4BlZqm",
     "url": "https://github.com/users/well-prado/projects/15"
   },
-  "milestones": {},
+  "milestones": {
+    "M0": {
+      "number": 1,
+      "url": "https://github.com/well-prado/new-blok/milestone/1",
+      "title": "M0 \u2014 Contracts and sustainable foundation"
+    },
+    "M1": {
+      "number": 2,
+      "url": "https://github.com/well-prado/new-blok/milestone/2",
+      "title": "M1 \u2014 Complete native Go application"
+    },
+    "M2": {
+      "number": 3,
+      "url": "https://github.com/well-prado/new-blok/milestone/3",
+      "title": "M2 \u2014 Durable orders and jobs"
+    },
+    "M3": {
+      "number": 4,
+      "url": "https://github.com/well-prado/new-blok/milestone/4",
+      "title": "M3 \u2014 Recovery across control flow and versions"
+    },
+    "M4": {
+      "number": 5,
+      "url": "https://github.com/well-prado/new-blok/milestone/5",
+      "title": "M4 \u2014 Node.js and persistent worker conformance"
+    },
+    "M5": {
+      "number": 6,
+      "url": "https://github.com/well-prado/new-blok/milestone/6",
+      "title": "M5 \u2014 All nine modular triggers"
+    },
+    "M6": {
+      "number": 7,
+      "url": "https://github.com/well-prado/new-blok/milestone/7",
+      "title": "M6 \u2014 Developer tooling and package ecosystem"
+    },
+    "M7": {
+      "number": 8,
+      "url": "https://github.com/well-prado/new-blok/milestone/8",
+      "title": "M7 \u2014 AI tools, Studio APIs and observability"
+    },
+    "M8": {
+      "number": 9,
+      "url": "https://github.com/well-prado/new-blok/milestone/9",
+      "title": "M8 \u2014 Distributed deployment and runtime coverage"
+    },
+    "M9": {
+      "number": 10,
+      "url": "https://github.com/well-prado/new-blok/milestone/10",
+      "title": "M9 \u2014 Production release and ecosystem handoff"
+    }
+  },
   "issues": {
     "E01": {
       "kind": "epic",
       "milestone": "M0",
-      "area": "foundation"
+      "area": "foundation",
+      "number": 1,
+      "url": "https://github.com/well-prado/new-blok/issues/1",
+      "nodeId": "I_kwDOU4AyT88AAAABUhFp6A",
+      "databaseId": 5671840232
     },
     "E01-T01": {
       "kind": "task",
@@ -19,8 +74,12 @@
       "dependencies": [],
       "priority": "P0",
       "size": "M",
-      "review": "R",
-      "area": "foundation"
+      "review": "A",
+      "area": "foundation",
+      "number": 21,
+      "url": "https://github.com/well-prado/new-blok/issues/21",
+      "nodeId": "I_kwDOU4AyT88AAAABUhGR2w",
+      "databaseId": 5671850459
     },
     "E01-T02": {
       "kind": "task",
@@ -32,7 +91,11 @@
       "priority": "P0",
       "size": "S",
       "review": "R",
-      "area": "foundation"
+      "area": "foundation",
+      "number": 22,
+      "url": "https://github.com/well-prado/new-blok/issues/22",
+      "nodeId": "I_kwDOU4AyT88AAAABUhGUOw",
+      "databaseId": 5671851067
     },
     "E01-T03": {
       "kind": "task",
@@ -44,7 +107,11 @@
       "priority": "P0",
       "size": "M",
       "review": "R",
-      "area": "foundation"
+      "area": "foundation",
+      "number": 23,
+      "url": "https://github.com/well-prado/new-blok/issues/23",
+      "nodeId": "I_kwDOU4AyT88AAAABUhGXAg",
+      "databaseId": 5671851778
     },
     "E01-T04": {
       "kind": "task",
@@ -56,12 +123,20 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "foundation"
+      "area": "foundation",
+      "number": 24,
+      "url": "https://github.com/well-prado/new-blok/issues/24",
+      "nodeId": "I_kwDOU4AyT88AAAABUhGZ5g",
+      "databaseId": 5671852518
     },
     "E02": {
       "kind": "epic",
       "milestone": "M0",
-      "area": "contract"
+      "area": "contract",
+      "number": 2,
+      "url": "https://github.com/well-prado/new-blok/issues/2",
+      "nodeId": "I_kwDOU4AyT88AAAABUhFs6A",
+      "databaseId": 5671841000
     },
     "E02-T01": {
       "kind": "task",
@@ -73,7 +148,11 @@
       "priority": "P0",
       "size": "M",
       "review": "R",
-      "area": "contract"
+      "area": "contract",
+      "number": 25,
+      "url": "https://github.com/well-prado/new-blok/issues/25",
+      "nodeId": "I_kwDOU4AyT88AAAABUhGcIQ",
+      "databaseId": 5671853089
     },
     "E02-T02": {
       "kind": "task",
@@ -85,7 +164,11 @@
       "priority": "P0",
       "size": "M",
       "review": "R",
-      "area": "contract"
+      "area": "contract",
+      "number": 26,
+      "url": "https://github.com/well-prado/new-blok/issues/26",
+      "nodeId": "I_kwDOU4AyT88AAAABUhGe5w",
+      "databaseId": 5671853799
     },
     "E02-T03": {
       "kind": "task",
@@ -97,7 +180,11 @@
       "priority": "P0",
       "size": "M",
       "review": "R",
-      "area": "contract"
+      "area": "contract",
+      "number": 27,
+      "url": "https://github.com/well-prado/new-blok/issues/27",
+      "nodeId": "I_kwDOU4AyT88AAAABUhGhaA",
+      "databaseId": 5671854440
     },
     "E02-T04": {
       "kind": "task",
@@ -110,12 +197,20 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "contract"
+      "area": "contract",
+      "number": 28,
+      "url": "https://github.com/well-prado/new-blok/issues/28",
+      "nodeId": "I_kwDOU4AyT88AAAABUhGj_g",
+      "databaseId": 5671855102
     },
     "E03": {
       "kind": "epic",
       "milestone": "M1",
-      "area": "authoring"
+      "area": "authoring",
+      "number": 3,
+      "url": "https://github.com/well-prado/new-blok/issues/3",
+      "nodeId": "I_kwDOU4AyT88AAAABUhFvAQ",
+      "databaseId": 5671841537
     },
     "E03-T01": {
       "kind": "task",
@@ -127,7 +222,11 @@
       "priority": "P0",
       "size": "M",
       "review": "A",
-      "area": "authoring"
+      "area": "authoring",
+      "number": 29,
+      "url": "https://github.com/well-prado/new-blok/issues/29",
+      "nodeId": "I_kwDOU4AyT88AAAABUhGmqQ",
+      "databaseId": 5671855785
     },
     "E03-T02": {
       "kind": "task",
@@ -139,7 +238,11 @@
       "priority": "P0",
       "size": "M",
       "review": "A",
-      "area": "authoring"
+      "area": "authoring",
+      "number": 30,
+      "url": "https://github.com/well-prado/new-blok/issues/30",
+      "nodeId": "I_kwDOU4AyT88AAAABUhGo0w",
+      "databaseId": 5671856339
     },
     "E03-T03": {
       "kind": "task",
@@ -152,7 +255,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "authoring"
+      "area": "authoring",
+      "number": 31,
+      "url": "https://github.com/well-prado/new-blok/issues/31",
+      "nodeId": "I_kwDOU4AyT88AAAABUhGruQ",
+      "databaseId": 5671857081
     },
     "E03-T04": {
       "kind": "task",
@@ -164,12 +271,20 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "authoring"
+      "area": "authoring",
+      "number": 32,
+      "url": "https://github.com/well-prado/new-blok/issues/32",
+      "nodeId": "I_kwDOU4AyT88AAAABUhGt5Q",
+      "databaseId": 5671857637
     },
     "E04": {
       "kind": "epic",
       "milestone": "M1",
-      "area": "compiler"
+      "area": "compiler",
+      "number": 4,
+      "url": "https://github.com/well-prado/new-blok/issues/4",
+      "nodeId": "I_kwDOU4AyT88AAAABUhFwiw",
+      "databaseId": 5671841931
     },
     "E04-T01": {
       "kind": "task",
@@ -181,7 +296,11 @@
       "priority": "P0",
       "size": "M",
       "review": "R",
-      "area": "compiler"
+      "area": "compiler",
+      "number": 33,
+      "url": "https://github.com/well-prado/new-blok/issues/33",
+      "nodeId": "I_kwDOU4AyT88AAAABUhGwUg",
+      "databaseId": 5671858258
     },
     "E04-T02": {
       "kind": "task",
@@ -194,7 +313,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "compiler"
+      "area": "compiler",
+      "number": 34,
+      "url": "https://github.com/well-prado/new-blok/issues/34",
+      "nodeId": "I_kwDOU4AyT88AAAABUhGysA",
+      "databaseId": 5671858864
     },
     "E04-T03": {
       "kind": "task",
@@ -207,12 +330,20 @@
       "priority": "P0",
       "size": "M",
       "review": "R",
-      "area": "compiler"
+      "area": "compiler",
+      "number": 35,
+      "url": "https://github.com/well-prado/new-blok/issues/35",
+      "nodeId": "I_kwDOU4AyT88AAAABUhG1UQ",
+      "databaseId": 5671859537
     },
     "E05": {
       "kind": "epic",
       "milestone": "M1",
-      "area": "engine"
+      "area": "engine",
+      "number": 5,
+      "url": "https://github.com/well-prado/new-blok/issues/5",
+      "nodeId": "I_kwDOU4AyT88AAAABUhFyeA",
+      "databaseId": 5671842424
     },
     "E05-T01": {
       "kind": "task",
@@ -224,7 +355,11 @@
       "priority": "P0",
       "size": "M",
       "review": "A",
-      "area": "engine"
+      "area": "engine",
+      "number": 36,
+      "url": "https://github.com/well-prado/new-blok/issues/36",
+      "nodeId": "I_kwDOU4AyT88AAAABUhG4Dg",
+      "databaseId": 5671860238
     },
     "E05-T02": {
       "kind": "task",
@@ -236,7 +371,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "engine"
+      "area": "engine",
+      "number": 37,
+      "url": "https://github.com/well-prado/new-blok/issues/37",
+      "nodeId": "I_kwDOU4AyT88AAAABUhG7Bw",
+      "databaseId": 5671860999
     },
     "E05-T03": {
       "kind": "task",
@@ -248,7 +387,11 @@
       "priority": "P0",
       "size": "M",
       "review": "R",
-      "area": "engine"
+      "area": "engine",
+      "number": 38,
+      "url": "https://github.com/well-prado/new-blok/issues/38",
+      "nodeId": "I_kwDOU4AyT88AAAABUhG95w",
+      "databaseId": 5671861735
     },
     "E05-T04": {
       "kind": "task",
@@ -260,12 +403,20 @@
       "priority": "P1",
       "size": "M",
       "review": "A",
-      "area": "engine"
+      "area": "engine",
+      "number": 39,
+      "url": "https://github.com/well-prado/new-blok/issues/39",
+      "nodeId": "I_kwDOU4AyT88AAAABUhHAjQ",
+      "databaseId": 5671862413
     },
     "E06": {
       "kind": "epic",
       "milestone": "M1",
-      "area": "app"
+      "area": "app",
+      "number": 6,
+      "url": "https://github.com/well-prado/new-blok/issues/6",
+      "nodeId": "I_kwDOU4AyT88AAAABUhF0ag",
+      "databaseId": 5671842922
     },
     "E06-T01": {
       "kind": "task",
@@ -277,7 +428,11 @@
       "priority": "P0",
       "size": "M",
       "review": "A",
-      "area": "app"
+      "area": "app",
+      "number": 40,
+      "url": "https://github.com/well-prado/new-blok/issues/40",
+      "nodeId": "I_kwDOU4AyT88AAAABUhHDMw",
+      "databaseId": 5671863091
     },
     "E06-T02": {
       "kind": "task",
@@ -289,7 +444,11 @@
       "priority": "P0",
       "size": "M",
       "review": "R",
-      "area": "app"
+      "area": "app",
+      "number": 41,
+      "url": "https://github.com/well-prado/new-blok/issues/41",
+      "nodeId": "I_kwDOU4AyT88AAAABUhHF7w",
+      "databaseId": 5671863791
     },
     "E06-T03": {
       "kind": "task",
@@ -301,12 +460,20 @@
       "priority": "P1",
       "size": "M",
       "review": "A",
-      "area": "app"
+      "area": "app",
+      "number": 42,
+      "url": "https://github.com/well-prado/new-blok/issues/42",
+      "nodeId": "I_kwDOU4AyT88AAAABUhHIZQ",
+      "databaseId": 5671864421
     },
     "E07": {
       "kind": "epic",
       "milestone": "M3",
-      "area": "durability"
+      "area": "durability",
+      "number": 7,
+      "url": "https://github.com/well-prado/new-blok/issues/7",
+      "nodeId": "I_kwDOU4AyT88AAAABUhF2ZQ",
+      "databaseId": 5671843429
     },
     "E07-T01": {
       "kind": "task",
@@ -319,7 +486,11 @@
       "priority": "P0",
       "size": "M",
       "review": "R",
-      "area": "durability"
+      "area": "durability",
+      "number": 43,
+      "url": "https://github.com/well-prado/new-blok/issues/43",
+      "nodeId": "I_kwDOU4AyT88AAAABUhHK7A",
+      "databaseId": 5671865068
     },
     "E07-T02": {
       "kind": "task",
@@ -332,7 +503,11 @@
       "priority": "P0",
       "size": "M",
       "review": "R",
-      "area": "durability"
+      "area": "durability",
+      "number": 44,
+      "url": "https://github.com/well-prado/new-blok/issues/44",
+      "nodeId": "I_kwDOU4AyT88AAAABUhHNrg",
+      "databaseId": 5671865774
     },
     "E07-T03": {
       "kind": "task",
@@ -345,7 +520,11 @@
       "priority": "P0",
       "size": "M",
       "review": "R",
-      "area": "durability"
+      "area": "durability",
+      "number": 45,
+      "url": "https://github.com/well-prado/new-blok/issues/45",
+      "nodeId": "I_kwDOU4AyT88AAAABUhHRNQ",
+      "databaseId": 5671866677
     },
     "E07-T04": {
       "kind": "task",
@@ -357,7 +536,11 @@
       "priority": "P0",
       "size": "M",
       "review": "R",
-      "area": "durability"
+      "area": "durability",
+      "number": 46,
+      "url": "https://github.com/well-prado/new-blok/issues/46",
+      "nodeId": "I_kwDOU4AyT88AAAABUhHUDg",
+      "databaseId": 5671867406
     },
     "E07-T05": {
       "kind": "task",
@@ -370,7 +553,11 @@
       "priority": "P0",
       "size": "M",
       "review": "R",
-      "area": "durability"
+      "area": "durability",
+      "number": 47,
+      "url": "https://github.com/well-prado/new-blok/issues/47",
+      "nodeId": "I_kwDOU4AyT88AAAABUhHWHQ",
+      "databaseId": 5671867933
     },
     "E07-T06": {
       "kind": "task",
@@ -383,7 +570,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "durability"
+      "area": "durability",
+      "number": 48,
+      "url": "https://github.com/well-prado/new-blok/issues/48",
+      "nodeId": "I_kwDOU4AyT88AAAABUhHYiw",
+      "databaseId": 5671868555
     },
     "E07-T07": {
       "kind": "task",
@@ -395,12 +586,20 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "durability"
+      "area": "durability",
+      "number": 49,
+      "url": "https://github.com/well-prado/new-blok/issues/49",
+      "nodeId": "I_kwDOU4AyT88AAAABUhHa7w",
+      "databaseId": 5671869167
     },
     "E08": {
       "kind": "epic",
       "milestone": "M4",
-      "area": "worker"
+      "area": "worker",
+      "number": 8,
+      "url": "https://github.com/well-prado/new-blok/issues/8",
+      "nodeId": "I_kwDOU4AyT88AAAABUhF4RA",
+      "databaseId": 5671843908
     },
     "E08-T01": {
       "kind": "task",
@@ -413,7 +612,11 @@
       "priority": "P0",
       "size": "M",
       "review": "R",
-      "area": "worker"
+      "area": "worker",
+      "number": 50,
+      "url": "https://github.com/well-prado/new-blok/issues/50",
+      "nodeId": "I_kwDOU4AyT88AAAABUhHdRw",
+      "databaseId": 5671869767
     },
     "E08-T02": {
       "kind": "task",
@@ -427,7 +630,11 @@
       "priority": "P0",
       "size": "M",
       "review": "R",
-      "area": "worker"
+      "area": "worker",
+      "number": 51,
+      "url": "https://github.com/well-prado/new-blok/issues/51",
+      "nodeId": "I_kwDOU4AyT88AAAABUhHgFw",
+      "databaseId": 5671870487
     },
     "E08-T03": {
       "kind": "task",
@@ -440,7 +647,11 @@
       "priority": "P0",
       "size": "M",
       "review": "R",
-      "area": "worker"
+      "area": "worker",
+      "number": 52,
+      "url": "https://github.com/well-prado/new-blok/issues/52",
+      "nodeId": "I_kwDOU4AyT88AAAABUhHjiw",
+      "databaseId": 5671871371
     },
     "E08-T04": {
       "kind": "task",
@@ -452,12 +663,20 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "worker"
+      "area": "worker",
+      "number": 53,
+      "url": "https://github.com/well-prado/new-blok/issues/53",
+      "nodeId": "I_kwDOU4AyT88AAAABUhHmFA",
+      "databaseId": 5671872020
     },
     "E09": {
       "kind": "epic",
       "milestone": "M5",
-      "area": "triggers"
+      "area": "triggers",
+      "number": 9,
+      "url": "https://github.com/well-prado/new-blok/issues/9",
+      "nodeId": "I_kwDOU4AyT88AAAABUhF6bA",
+      "databaseId": 5671844460
     },
     "E09-T01": {
       "kind": "task",
@@ -471,7 +690,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "triggers"
+      "area": "triggers",
+      "number": 54,
+      "url": "https://github.com/well-prado/new-blok/issues/54",
+      "nodeId": "I_kwDOU4AyT88AAAABUhHopg",
+      "databaseId": 5671872678
     },
     "E09-T02": {
       "kind": "task",
@@ -483,7 +706,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "triggers"
+      "area": "triggers",
+      "number": 55,
+      "url": "https://github.com/well-prado/new-blok/issues/55",
+      "nodeId": "I_kwDOU4AyT88AAAABUhHsFw",
+      "databaseId": 5671873559
     },
     "E09-T03": {
       "kind": "task",
@@ -496,7 +723,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "triggers"
+      "area": "triggers",
+      "number": 56,
+      "url": "https://github.com/well-prado/new-blok/issues/56",
+      "nodeId": "I_kwDOU4AyT88AAAABUhHvBQ",
+      "databaseId": 5671874309
     },
     "E09-T04": {
       "kind": "task",
@@ -509,7 +740,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "triggers"
+      "area": "triggers",
+      "number": 57,
+      "url": "https://github.com/well-prado/new-blok/issues/57",
+      "nodeId": "I_kwDOU4AyT88AAAABUhHyUw",
+      "databaseId": 5671875155
     },
     "E09-T05": {
       "kind": "task",
@@ -522,7 +757,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "triggers"
+      "area": "triggers",
+      "number": 58,
+      "url": "https://github.com/well-prado/new-blok/issues/58",
+      "nodeId": "I_kwDOU4AyT88AAAABUhH0-w",
+      "databaseId": 5671875835
     },
     "E09-T06": {
       "kind": "task",
@@ -535,7 +774,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "triggers"
+      "area": "triggers",
+      "number": 59,
+      "url": "https://github.com/well-prado/new-blok/issues/59",
+      "nodeId": "I_kwDOU4AyT88AAAABUhH4Xg",
+      "databaseId": 5671876702
     },
     "E09-T07": {
       "kind": "task",
@@ -547,7 +790,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "triggers"
+      "area": "triggers",
+      "number": 60,
+      "url": "https://github.com/well-prado/new-blok/issues/60",
+      "nodeId": "I_kwDOU4AyT88AAAABUhH8Wg",
+      "databaseId": 5671877722
     },
     "E09-T08": {
       "kind": "task",
@@ -560,12 +807,20 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "triggers"
+      "area": "triggers",
+      "number": 101,
+      "url": "https://github.com/well-prado/new-blok/issues/101",
+      "nodeId": "I_kwDOU4AyT88AAAABUhJ8tA",
+      "databaseId": 5671910580
     },
     "E10": {
       "kind": "epic",
       "milestone": "M6",
-      "area": "catalog"
+      "area": "catalog",
+      "number": 10,
+      "url": "https://github.com/well-prado/new-blok/issues/10",
+      "nodeId": "I_kwDOU4AyT88AAAABUhF8Gg",
+      "databaseId": 5671844890
     },
     "E10-T01": {
       "kind": "task",
@@ -578,7 +833,11 @@
       "priority": "P1",
       "size": "M",
       "review": "A",
-      "area": "catalog"
+      "area": "catalog",
+      "number": 61,
+      "url": "https://github.com/well-prado/new-blok/issues/61",
+      "nodeId": "I_kwDOU4AyT88AAAABUhH-ug",
+      "databaseId": 5671878330
     },
     "E10-T02": {
       "kind": "task",
@@ -592,7 +851,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "catalog"
+      "area": "catalog",
+      "number": 62,
+      "url": "https://github.com/well-prado/new-blok/issues/62",
+      "nodeId": "I_kwDOU4AyT88AAAABUhIBuw",
+      "databaseId": 5671879099
     },
     "E10-T03": {
       "kind": "task",
@@ -606,12 +869,20 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "catalog"
+      "area": "catalog",
+      "number": 63,
+      "url": "https://github.com/well-prado/new-blok/issues/63",
+      "nodeId": "I_kwDOU4AyT88AAAABUhIEaw",
+      "databaseId": 5671879787
     },
     "E11": {
       "kind": "epic",
       "milestone": "M6",
-      "area": "cli"
+      "area": "cli",
+      "number": 11,
+      "url": "https://github.com/well-prado/new-blok/issues/11",
+      "nodeId": "I_kwDOU4AyT88AAAABUhF-rQ",
+      "databaseId": 5671845549
     },
     "E11-T01": {
       "kind": "task",
@@ -624,7 +895,11 @@
       "priority": "P1",
       "size": "M",
       "review": "A",
-      "area": "cli"
+      "area": "cli",
+      "number": 64,
+      "url": "https://github.com/well-prado/new-blok/issues/64",
+      "nodeId": "I_kwDOU4AyT88AAAABUhIG9w",
+      "databaseId": 5671880439
     },
     "E11-T02": {
       "kind": "task",
@@ -637,7 +912,11 @@
       "priority": "P1",
       "size": "M",
       "review": "A",
-      "area": "cli"
+      "area": "cli",
+      "number": 65,
+      "url": "https://github.com/well-prado/new-blok/issues/65",
+      "nodeId": "I_kwDOU4AyT88AAAABUhIKUw",
+      "databaseId": 5671881299
     },
     "E11-T03": {
       "kind": "task",
@@ -651,7 +930,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "cli"
+      "area": "cli",
+      "number": 66,
+      "url": "https://github.com/well-prado/new-blok/issues/66",
+      "nodeId": "I_kwDOU4AyT88AAAABUhIMwA",
+      "databaseId": 5671881920
     },
     "E11-T04": {
       "kind": "task",
@@ -664,12 +947,20 @@
       "priority": "P1",
       "size": "M",
       "review": "A",
-      "area": "cli"
+      "area": "cli",
+      "number": 102,
+      "url": "https://github.com/well-prado/new-blok/issues/102",
+      "nodeId": "I_kwDOU4AyT88AAAABUhKACQ",
+      "databaseId": 5671911433
     },
     "E12": {
       "kind": "epic",
       "milestone": "M6",
-      "area": "layout"
+      "area": "layout",
+      "number": 12,
+      "url": "https://github.com/well-prado/new-blok/issues/12",
+      "nodeId": "I_kwDOU4AyT88AAAABUhGA4A",
+      "databaseId": 5671846112
     },
     "E12-T01": {
       "kind": "task",
@@ -682,7 +973,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "layout"
+      "area": "layout",
+      "number": 67,
+      "url": "https://github.com/well-prado/new-blok/issues/67",
+      "nodeId": "I_kwDOU4AyT88AAAABUhIQDw",
+      "databaseId": 5671882767
     },
     "E12-T02": {
       "kind": "task",
@@ -695,7 +990,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "layout"
+      "area": "layout",
+      "number": 68,
+      "url": "https://github.com/well-prado/new-blok/issues/68",
+      "nodeId": "I_kwDOU4AyT88AAAABUhITew",
+      "databaseId": 5671883643
     },
     "E12-T03": {
       "kind": "task",
@@ -708,12 +1007,20 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "layout"
+      "area": "layout",
+      "number": 69,
+      "url": "https://github.com/well-prado/new-blok/issues/69",
+      "nodeId": "I_kwDOU4AyT88AAAABUhIW9g",
+      "databaseId": 5671884534
     },
     "E13": {
       "kind": "epic",
       "milestone": "M6",
-      "area": "packages"
+      "area": "packages",
+      "number": 13,
+      "url": "https://github.com/well-prado/new-blok/issues/13",
+      "nodeId": "I_kwDOU4AyT88AAAABUhGCeg",
+      "databaseId": 5671846522
     },
     "E13-T01": {
       "kind": "task",
@@ -726,7 +1033,11 @@
       "priority": "P0",
       "size": "M",
       "review": "R",
-      "area": "packages"
+      "area": "packages",
+      "number": 70,
+      "url": "https://github.com/well-prado/new-blok/issues/70",
+      "nodeId": "I_kwDOU4AyT88AAAABUhIZvg",
+      "databaseId": 5671885246
     },
     "E13-T02": {
       "kind": "task",
@@ -738,7 +1049,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "packages"
+      "area": "packages",
+      "number": 71,
+      "url": "https://github.com/well-prado/new-blok/issues/71",
+      "nodeId": "I_kwDOU4AyT88AAAABUhIc8Q",
+      "databaseId": 5671886065
     },
     "E13-T03": {
       "kind": "task",
@@ -751,7 +1066,11 @@
       "priority": "P0",
       "size": "M",
       "review": "R",
-      "area": "packages"
+      "area": "packages",
+      "number": 72,
+      "url": "https://github.com/well-prado/new-blok/issues/72",
+      "nodeId": "I_kwDOU4AyT88AAAABUhIgAA",
+      "databaseId": 5671886848
     },
     "E13-T04": {
       "kind": "task",
@@ -764,12 +1083,20 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "packages"
+      "area": "packages",
+      "number": 73,
+      "url": "https://github.com/well-prado/new-blok/issues/73",
+      "nodeId": "I_kwDOU4AyT88AAAABUhIjAg",
+      "databaseId": 5671887618
     },
     "E14": {
       "kind": "epic",
       "milestone": "M7",
-      "area": "ai"
+      "area": "ai",
+      "number": 14,
+      "url": "https://github.com/well-prado/new-blok/issues/14",
+      "nodeId": "I_kwDOU4AyT88AAAABUhGFTg",
+      "databaseId": 5671847246
     },
     "E14-T01": {
       "kind": "task",
@@ -783,7 +1110,11 @@
       "priority": "P0",
       "size": "M",
       "review": "R",
-      "area": "ai"
+      "area": "ai",
+      "number": 74,
+      "url": "https://github.com/well-prado/new-blok/issues/74",
+      "nodeId": "I_kwDOU4AyT88AAAABUhImxw",
+      "databaseId": 5671888583
     },
     "E14-T02": {
       "kind": "task",
@@ -796,7 +1127,11 @@
       "priority": "P0",
       "size": "M",
       "review": "R",
-      "area": "ai"
+      "area": "ai",
+      "number": 75,
+      "url": "https://github.com/well-prado/new-blok/issues/75",
+      "nodeId": "I_kwDOU4AyT88AAAABUhIqHQ",
+      "databaseId": 5671889437
     },
     "E14-T03": {
       "kind": "task",
@@ -810,7 +1145,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "ai"
+      "area": "ai",
+      "number": 103,
+      "url": "https://github.com/well-prado/new-blok/issues/103",
+      "nodeId": "I_kwDOU4AyT88AAAABUhKDug",
+      "databaseId": 5671912378
     },
     "E14-T04": {
       "kind": "task",
@@ -824,12 +1163,20 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "ai"
+      "area": "ai",
+      "number": 104,
+      "url": "https://github.com/well-prado/new-blok/issues/104",
+      "nodeId": "I_kwDOU4AyT88AAAABUhKHCw",
+      "databaseId": 5671913227
     },
     "E15": {
       "kind": "epic",
       "milestone": "M7",
-      "area": "inspection"
+      "area": "inspection",
+      "number": 15,
+      "url": "https://github.com/well-prado/new-blok/issues/15",
+      "nodeId": "I_kwDOU4AyT88AAAABUhGHVA",
+      "databaseId": 5671847764
     },
     "E15-T01": {
       "kind": "task",
@@ -843,7 +1190,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "inspection"
+      "area": "inspection",
+      "number": 76,
+      "url": "https://github.com/well-prado/new-blok/issues/76",
+      "nodeId": "I_kwDOU4AyT88AAAABUhIs7A",
+      "databaseId": 5671890156
     },
     "E15-T02": {
       "kind": "task",
@@ -856,7 +1207,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "inspection"
+      "area": "inspection",
+      "number": 77,
+      "url": "https://github.com/well-prado/new-blok/issues/77",
+      "nodeId": "I_kwDOU4AyT88AAAABUhIwiw",
+      "databaseId": 5671891083
     },
     "E15-T03": {
       "kind": "task",
@@ -869,12 +1224,20 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "inspection"
+      "area": "inspection",
+      "number": 78,
+      "url": "https://github.com/well-prado/new-blok/issues/78",
+      "nodeId": "I_kwDOU4AyT88AAAABUhI0XA",
+      "databaseId": 5671892060
     },
     "E16": {
       "kind": "epic",
       "milestone": "M7",
-      "area": "observability"
+      "area": "observability",
+      "number": 16,
+      "url": "https://github.com/well-prado/new-blok/issues/16",
+      "nodeId": "I_kwDOU4AyT88AAAABUhGJYg",
+      "databaseId": 5671848290
     },
     "E16-T01": {
       "kind": "task",
@@ -887,7 +1250,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "observability"
+      "area": "observability",
+      "number": 79,
+      "url": "https://github.com/well-prado/new-blok/issues/79",
+      "nodeId": "I_kwDOU4AyT88AAAABUhI3nQ",
+      "databaseId": 5671892893
     },
     "E16-T02": {
       "kind": "task",
@@ -901,7 +1268,11 @@
       "priority": "P0",
       "size": "M",
       "review": "R",
-      "area": "observability"
+      "area": "observability",
+      "number": 80,
+      "url": "https://github.com/well-prado/new-blok/issues/80",
+      "nodeId": "I_kwDOU4AyT88AAAABUhI7ew",
+      "databaseId": 5671893883
     },
     "E16-T03": {
       "kind": "task",
@@ -914,12 +1285,20 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "observability"
+      "area": "observability",
+      "number": 105,
+      "url": "https://github.com/well-prado/new-blok/issues/105",
+      "nodeId": "I_kwDOU4AyT88AAAABUhKJ9A",
+      "databaseId": 5671913972
     },
     "E17": {
       "kind": "epic",
       "milestone": "M8",
-      "area": "deployment"
+      "area": "deployment",
+      "number": 17,
+      "url": "https://github.com/well-prado/new-blok/issues/17",
+      "nodeId": "I_kwDOU4AyT88AAAABUhGK2g",
+      "databaseId": 5671848666
     },
     "E17-T01": {
       "kind": "task",
@@ -933,7 +1312,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "deployment"
+      "area": "deployment",
+      "number": 81,
+      "url": "https://github.com/well-prado/new-blok/issues/81",
+      "nodeId": "I_kwDOU4AyT88AAAABUhI_Fg",
+      "databaseId": 5671894806
     },
     "E17-T02": {
       "kind": "task",
@@ -947,7 +1330,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "deployment"
+      "area": "deployment",
+      "number": 82,
+      "url": "https://github.com/well-prado/new-blok/issues/82",
+      "nodeId": "I_kwDOU4AyT88AAAABUhJB3g",
+      "databaseId": 5671895518
     },
     "E17-T03": {
       "kind": "task",
@@ -960,7 +1347,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "deployment"
+      "area": "deployment",
+      "number": 83,
+      "url": "https://github.com/well-prado/new-blok/issues/83",
+      "nodeId": "I_kwDOU4AyT88AAAABUhJFDA",
+      "databaseId": 5671896332
     },
     "E17-T04": {
       "kind": "task",
@@ -974,12 +1365,20 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "deployment"
+      "area": "deployment",
+      "number": 106,
+      "url": "https://github.com/well-prado/new-blok/issues/106",
+      "nodeId": "I_kwDOU4AyT88AAAABUhKMqA",
+      "databaseId": 5671914664
     },
     "E18": {
       "kind": "epic",
       "milestone": "M8",
-      "area": "distributed"
+      "area": "distributed",
+      "number": 18,
+      "url": "https://github.com/well-prado/new-blok/issues/18",
+      "nodeId": "I_kwDOU4AyT88AAAABUhGM5g",
+      "databaseId": 5671849190
     },
     "E18-T01": {
       "kind": "task",
@@ -992,7 +1391,11 @@
       "priority": "P0",
       "size": "M",
       "review": "R",
-      "area": "distributed"
+      "area": "distributed",
+      "number": 84,
+      "url": "https://github.com/well-prado/new-blok/issues/84",
+      "nodeId": "I_kwDOU4AyT88AAAABUhJITA",
+      "databaseId": 5671897164
     },
     "E18-T02": {
       "kind": "task",
@@ -1004,7 +1407,11 @@
       "priority": "P0",
       "size": "M",
       "review": "R",
-      "area": "distributed"
+      "area": "distributed",
+      "number": 85,
+      "url": "https://github.com/well-prado/new-blok/issues/85",
+      "nodeId": "I_kwDOU4AyT88AAAABUhJMHw",
+      "databaseId": 5671898143
     },
     "E18-T03": {
       "kind": "task",
@@ -1017,7 +1424,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "distributed"
+      "area": "distributed",
+      "number": 86,
+      "url": "https://github.com/well-prado/new-blok/issues/86",
+      "nodeId": "I_kwDOU4AyT88AAAABUhJOtQ",
+      "databaseId": 5671898805
     },
     "E18-T04": {
       "kind": "task",
@@ -1031,12 +1442,20 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "distributed"
+      "area": "distributed",
+      "number": 107,
+      "url": "https://github.com/well-prado/new-blok/issues/107",
+      "nodeId": "I_kwDOU4AyT88AAAABUhKPXQ",
+      "databaseId": 5671915357
     },
     "E19": {
       "kind": "epic",
       "milestone": "M8",
-      "area": "runtimes"
+      "area": "runtimes",
+      "number": 19,
+      "url": "https://github.com/well-prado/new-blok/issues/19",
+      "nodeId": "I_kwDOU4AyT88AAAABUhGOnQ",
+      "databaseId": 5671849629
     },
     "E19-T01": {
       "kind": "task",
@@ -1050,7 +1469,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "runtimes"
+      "area": "runtimes",
+      "number": 87,
+      "url": "https://github.com/well-prado/new-blok/issues/87",
+      "nodeId": "I_kwDOU4AyT88AAAABUhJSJA",
+      "databaseId": 5671899684
     },
     "E19-T02": {
       "kind": "task",
@@ -1062,7 +1485,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "runtimes"
+      "area": "runtimes",
+      "number": 88,
+      "url": "https://github.com/well-prado/new-blok/issues/88",
+      "nodeId": "I_kwDOU4AyT88AAAABUhJVng",
+      "databaseId": 5671900574
     },
     "E19-T03": {
       "kind": "task",
@@ -1074,7 +1501,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "runtimes"
+      "area": "runtimes",
+      "number": 89,
+      "url": "https://github.com/well-prado/new-blok/issues/89",
+      "nodeId": "I_kwDOU4AyT88AAAABUhJYEQ",
+      "databaseId": 5671901201
     },
     "E19-T04": {
       "kind": "task",
@@ -1086,7 +1517,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "runtimes"
+      "area": "runtimes",
+      "number": 90,
+      "url": "https://github.com/well-prado/new-blok/issues/90",
+      "nodeId": "I_kwDOU4AyT88AAAABUhJbXQ",
+      "databaseId": 5671902045
     },
     "E19-T05": {
       "kind": "task",
@@ -1098,7 +1533,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "runtimes"
+      "area": "runtimes",
+      "number": 91,
+      "url": "https://github.com/well-prado/new-blok/issues/91",
+      "nodeId": "I_kwDOU4AyT88AAAABUhJe3g",
+      "databaseId": 5671902942
     },
     "E19-T06": {
       "kind": "task",
@@ -1110,7 +1549,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "runtimes"
+      "area": "runtimes",
+      "number": 92,
+      "url": "https://github.com/well-prado/new-blok/issues/92",
+      "nodeId": "I_kwDOU4AyT88AAAABUhJiHg",
+      "databaseId": 5671903774
     },
     "E19-T07": {
       "kind": "task",
@@ -1122,7 +1565,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "runtimes"
+      "area": "runtimes",
+      "number": 93,
+      "url": "https://github.com/well-prado/new-blok/issues/93",
+      "nodeId": "I_kwDOU4AyT88AAAABUhJkiA",
+      "databaseId": 5671904392
     },
     "E19-T08": {
       "kind": "task",
@@ -1134,7 +1581,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "runtimes"
+      "area": "runtimes",
+      "number": 94,
+      "url": "https://github.com/well-prado/new-blok/issues/94",
+      "nodeId": "I_kwDOU4AyT88AAAABUhJnVg",
+      "databaseId": 5671905110
     },
     "E19-T09": {
       "kind": "task",
@@ -1146,7 +1597,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "runtimes"
+      "area": "runtimes",
+      "number": 95,
+      "url": "https://github.com/well-prado/new-blok/issues/95",
+      "nodeId": "I_kwDOU4AyT88AAAABUhJqew",
+      "databaseId": 5671905915
     },
     "E19-T10": {
       "kind": "task",
@@ -1158,7 +1613,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "runtimes"
+      "area": "runtimes",
+      "number": 96,
+      "url": "https://github.com/well-prado/new-blok/issues/96",
+      "nodeId": "I_kwDOU4AyT88AAAABUhJs1g",
+      "databaseId": 5671906518
     },
     "E19-T11": {
       "kind": "task",
@@ -1170,7 +1629,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "runtimes"
+      "area": "runtimes",
+      "number": 97,
+      "url": "https://github.com/well-prado/new-blok/issues/97",
+      "nodeId": "I_kwDOU4AyT88AAAABUhJvDQ",
+      "databaseId": 5671907085
     },
     "E19-T12": {
       "kind": "task",
@@ -1182,7 +1645,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "runtimes"
+      "area": "runtimes",
+      "number": 98,
+      "url": "https://github.com/well-prado/new-blok/issues/98",
+      "nodeId": "I_kwDOU4AyT88AAAABUhJxGQ",
+      "databaseId": 5671907609
     },
     "E19-T13": {
       "kind": "task",
@@ -1194,7 +1661,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "runtimes"
+      "area": "runtimes",
+      "number": 99,
+      "url": "https://github.com/well-prado/new-blok/issues/99",
+      "nodeId": "I_kwDOU4AyT88AAAABUhJ0Pw",
+      "databaseId": 5671908415
     },
     "E19-T14": {
       "kind": "task",
@@ -1217,12 +1688,20 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "runtimes"
+      "area": "runtimes",
+      "number": 100,
+      "url": "https://github.com/well-prado/new-blok/issues/100",
+      "nodeId": "I_kwDOU4AyT88AAAABUhJ3LQ",
+      "databaseId": 5671909165
     },
     "E20": {
       "kind": "epic",
       "milestone": "M9",
-      "area": "release"
+      "area": "release",
+      "number": 20,
+      "url": "https://github.com/well-prado/new-blok/issues/20",
+      "nodeId": "I_kwDOU4AyT88AAAABUhGQSQ",
+      "databaseId": 5671850057
     },
     "E20-T01": {
       "kind": "task",
@@ -1237,7 +1716,11 @@
       "priority": "P0",
       "size": "M",
       "review": "R",
-      "area": "release"
+      "area": "release",
+      "number": 108,
+      "url": "https://github.com/well-prado/new-blok/issues/108",
+      "nodeId": "I_kwDOU4AyT88AAAABUhKSNQ",
+      "databaseId": 5671916085
     },
     "E20-T02": {
       "kind": "task",
@@ -1252,7 +1735,11 @@
       "priority": "P1",
       "size": "M",
       "review": "R",
-      "area": "release"
+      "area": "release",
+      "number": 109,
+      "url": "https://github.com/well-prado/new-blok/issues/109",
+      "nodeId": "I_kwDOU4AyT88AAAABUhKVtw",
+      "databaseId": 5671916983
     },
     "E20-T03": {
       "kind": "task",
@@ -1267,7 +1754,11 @@
       "priority": "P0",
       "size": "M",
       "review": "R",
-      "area": "release"
+      "area": "release",
+      "number": 110,
+      "url": "https://github.com/well-prado/new-blok/issues/110",
+      "nodeId": "I_kwDOU4AyT88AAAABUhKYiQ",
+      "databaseId": 5671917705
     },
     "E20-T04": {
       "kind": "task",
@@ -1279,7 +1770,11 @@
       "priority": "P0",
       "size": "M",
       "review": "R",
-      "area": "release"
+      "area": "release",
+      "number": 111,
+      "url": "https://github.com/well-prado/new-blok/issues/111",
+      "nodeId": "I_kwDOU4AyT88AAAABUhKcLg",
+      "databaseId": 5671918638
     }
   },
   "schemaVersion": "roadmap/v1",

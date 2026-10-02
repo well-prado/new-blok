@@ -20,16 +20,16 @@ Milestones are capability gates without artificial dates. M0–M1 establish a na
 
 | Milestone | Exit evidence |
 | --- | --- |
-| M0 — Contracts and sustainable foundation | A tested Go bootstrap, reviewed architecture decisions, schema/identity contracts, synthetic fixture inventory and enforceable dependency rules. No unfinished API is advertised as released. |
-| M1 — Complete native Go application | A newcomer builds, tests and serves a typed quote application without hand-editing IR or installing a foreign runtime. Invalid types have actionable diagnostics; bounded execution and real HTTP pass race and integration tests. |
-| M2 — Durable orders and jobs | One selected embedded backend atomically admits and resumes accepted orders/jobs. Process-kill tests prove acknowledgment barriers, deduplication, uncertainty and outbox behavior. |
-| M3 — Recovery across control flow and versions | Nested branches, loops, parallel joins, waits, signals and child runs recover after every specified crash boundary. Artifact mismatch, compaction, backup and reconciliation fail safely. |
-| M4 — Node.js and persistent worker conformance | Node.js is a real persistent gRPC worker with schema/error/cancellation/capacity/generation parity, authenticated transport and fault-tested lifecycle; tiny-call overhead is measured honestly. |
-| M5 — All nine modular triggers | HTTP, webhook, worker, cron, pubsub, gRPC, SSE, WebSocket and MCP have real adapters, shared admission tests, protocol integration tests and removal/footprint evidence. |
-| M6 — Developer tooling and package ecosystem | CLI scaffold/generate/check/dev/test/inspect and node/workflow installation work in both layouts with deterministic locks, offline cache, atomic changes and trusted artifacts. Generic nodes and recipes use the same contracts. |
-| M7 — AI tools, Studio APIs and observability | Agents discover and compose nodes/workflows under enforced policy, including custom nodes. Versioned authorized notebook inspection and optional production telemetry are consumed by contract fixtures without placing Studio/Cloud UI here. |
-| M8 — Distributed deployment and runtime coverage | Self-hosted deployment contracts, multi-version routing, fenced ownership and resharding pass failures. Every target worker runs actual conformance on a published matrix. Capacity evidence includes distributed topology and overload. |
-| M9 — Production release and ecosystem handoff | Executable current-Blok parity, live-model DX evaluation, controlled native/worker/durable/fleet benchmarks, security review and signed reproducible releases pass. Publish supported limits and separate Studio/registry/Cloud handoffs. |
+| [M0 — Contracts and sustainable foundation](https://github.com/well-prado/new-blok/milestone/1) | A tested Go bootstrap, reviewed architecture decisions, schema/identity contracts, synthetic fixture inventory and enforceable dependency rules. No unfinished API is advertised as released. |
+| [M1 — Complete native Go application](https://github.com/well-prado/new-blok/milestone/2) | A newcomer builds, tests and serves a typed quote application without hand-editing IR or installing a foreign runtime. Invalid types have actionable diagnostics; bounded execution and real HTTP pass race and integration tests. |
+| [M2 — Durable orders and jobs](https://github.com/well-prado/new-blok/milestone/3) | One selected embedded backend atomically admits and resumes accepted orders/jobs. Process-kill tests prove acknowledgment barriers, deduplication, uncertainty and outbox behavior. |
+| [M3 — Recovery across control flow and versions](https://github.com/well-prado/new-blok/milestone/4) | Nested branches, loops, parallel joins, waits, signals and child runs recover after every specified crash boundary. Artifact mismatch, compaction, backup and reconciliation fail safely. |
+| [M4 — Node.js and persistent worker conformance](https://github.com/well-prado/new-blok/milestone/5) | Node.js is a real persistent gRPC worker with schema/error/cancellation/capacity/generation parity, authenticated transport and fault-tested lifecycle; tiny-call overhead is measured honestly. |
+| [M5 — All nine modular triggers](https://github.com/well-prado/new-blok/milestone/6) | HTTP, webhook, worker, cron, pubsub, gRPC, SSE, WebSocket and MCP have real adapters, shared admission tests, protocol integration tests and removal/footprint evidence. |
+| [M6 — Developer tooling and package ecosystem](https://github.com/well-prado/new-blok/milestone/7) | CLI scaffold/generate/check/dev/test/inspect and node/workflow installation work in both layouts with deterministic locks, offline cache, atomic changes and trusted artifacts. Generic nodes and recipes use the same contracts. |
+| [M7 — AI tools, Studio APIs and observability](https://github.com/well-prado/new-blok/milestone/8) | Agents discover and compose nodes/workflows under enforced policy, including custom nodes. Versioned authorized notebook inspection and optional production telemetry are consumed by contract fixtures without placing Studio/Cloud UI here. |
+| [M8 — Distributed deployment and runtime coverage](https://github.com/well-prado/new-blok/milestone/9) | Self-hosted deployment contracts, multi-version routing, fenced ownership and resharding pass failures. Every target worker runs actual conformance on a published matrix. Capacity evidence includes distributed topology and overload. |
+| [M9 — Production release and ecosystem handoff](https://github.com/well-prado/new-blok/milestone/10) | Executable current-Blok parity, live-model DX evaluation, controlled native/worker/durable/fleet benchmarks, security review and signed reproducible releases pass. Publish supported limits and separate Studio/registry/Cloud handoffs. |
 
 ## 4. Execution model and project fields
 
@@ -68,26 +68,26 @@ A milestone closes after integrated exit evidence and a requirement audit, not a
 
 | Epic | Completion milestone | Objective |
 | --- | --- | --- |
-| E01 — Open-source foundation and delivery governance | M0 | Establish a small, tested repository with truthful public documentation and evidence-based delivery controls. |
-| E02 — Canonical contracts, schemas and identities | M0 | Freeze one inspectable structural contract with precise cross-language value and identity semantics. |
-| E03 — Typed Go nodes and workflow authoring | M1 | Make ordinary Go functions composable with compile-time wiring and inspectable structural output. |
-| E04 — Compiler and portable execution program | M1 | Validate programs once and lower structural references without hidden runtime evaluation. |
-| E05 — Bounded Go execution engine and test harness | M1 | Execute compiled workflows correctly with bounded resources and application-friendly testing. |
-| E06 — Application lifecycle and HTTP vertical slice | M1 | Deliver an application-owned Go executable with real HTTP and explicit module lifecycle. |
-| E07 — Durable state, recovery and version retention | M3 | Establish precise single-host recovery before adding distributed ownership. |
-| E08 — Persistent gRPC runtime protocol and Node.js first | M4 | Connect foreign nodes without giving workers a second workflow engine or an unbounded process lifecycle. |
-| E09 — Complete modular trigger catalog | M5 | Implement every promised protocol against one admission and lifecycle contract. |
-| E10 — Generic nodes and complete application recipes | M6 | Make reusable generic nodes and custom business nodes obey the same contracts without turning the core into an ORM. |
-| E11 — Go CLI and everyday developer experience | M6 | Provide fast feedback and ordinary Go ownership without hidden registration or mandatory hosted services. |
-| E12 — Unified and classic layouts with ownership enforcement | M6 | Offer layout choice without changing identities, contracts or node independence. |
-| E13 — Node and workflow package client and registry contracts | M6 | Install reusable packages safely and reproducibly while keeping the hosted registry a separate product. |
-| E14 — Policy-enforced AI tools and composed workflow tools | M7 | Let agents assemble complete applications while execution enforces authorization, evidence and budgets. |
-| E15 — Notebook inspection APIs and Studio handoff | M7 | Expose every dev execution step through a secure versioned API consumed by a separate simple Studio. |
-| E16 — Optional production observability and reliable audit | M7 | Make production behavior measurable without unbounded overhead or debug event guarantees masquerading as audit. |
-| E17 — Self-hosting, artifacts and Cloud integration contracts | M8 | Make applications easy to deploy through reproducible binaries and operational contracts without embedding a hosting product. |
-| E18 — Distributed ownership, fencing and capacity | M8 | Scale accepted work across a fleet with tested ownership and failure semantics. |
-| E19 — Full runtime and SDK coverage | M8 | Give every promised language a real persistent worker and the same semantic/failure conformance. |
-| E20 — Production evidence, migration and open-source release | M9 | Release only what application, security, usability and capacity evidence actually proves. |
+| [E01](https://github.com/well-prado/new-blok/issues/1) — Open-source foundation and delivery governance | M0 | Establish a small, tested repository with truthful public documentation and evidence-based delivery controls. |
+| [E02](https://github.com/well-prado/new-blok/issues/2) — Canonical contracts, schemas and identities | M0 | Freeze one inspectable structural contract with precise cross-language value and identity semantics. |
+| [E03](https://github.com/well-prado/new-blok/issues/3) — Typed Go nodes and workflow authoring | M1 | Make ordinary Go functions composable with compile-time wiring and inspectable structural output. |
+| [E04](https://github.com/well-prado/new-blok/issues/4) — Compiler and portable execution program | M1 | Validate programs once and lower structural references without hidden runtime evaluation. |
+| [E05](https://github.com/well-prado/new-blok/issues/5) — Bounded Go execution engine and test harness | M1 | Execute compiled workflows correctly with bounded resources and application-friendly testing. |
+| [E06](https://github.com/well-prado/new-blok/issues/6) — Application lifecycle and HTTP vertical slice | M1 | Deliver an application-owned Go executable with real HTTP and explicit module lifecycle. |
+| [E07](https://github.com/well-prado/new-blok/issues/7) — Durable state, recovery and version retention | M3 | Establish precise single-host recovery before adding distributed ownership. |
+| [E08](https://github.com/well-prado/new-blok/issues/8) — Persistent gRPC runtime protocol and Node.js first | M4 | Connect foreign nodes without giving workers a second workflow engine or an unbounded process lifecycle. |
+| [E09](https://github.com/well-prado/new-blok/issues/9) — Complete modular trigger catalog | M5 | Implement every promised protocol against one admission and lifecycle contract. |
+| [E10](https://github.com/well-prado/new-blok/issues/10) — Generic nodes and complete application recipes | M6 | Make reusable generic nodes and custom business nodes obey the same contracts without turning the core into an ORM. |
+| [E11](https://github.com/well-prado/new-blok/issues/11) — Go CLI and everyday developer experience | M6 | Provide fast feedback and ordinary Go ownership without hidden registration or mandatory hosted services. |
+| [E12](https://github.com/well-prado/new-blok/issues/12) — Unified and classic layouts with ownership enforcement | M6 | Offer layout choice without changing identities, contracts or node independence. |
+| [E13](https://github.com/well-prado/new-blok/issues/13) — Node and workflow package client and registry contracts | M6 | Install reusable packages safely and reproducibly while keeping the hosted registry a separate product. |
+| [E14](https://github.com/well-prado/new-blok/issues/14) — Policy-enforced AI tools and composed workflow tools | M7 | Let agents assemble complete applications while execution enforces authorization, evidence and budgets. |
+| [E15](https://github.com/well-prado/new-blok/issues/15) — Notebook inspection APIs and Studio handoff | M7 | Expose every dev execution step through a secure versioned API consumed by a separate simple Studio. |
+| [E16](https://github.com/well-prado/new-blok/issues/16) — Optional production observability and reliable audit | M7 | Make production behavior measurable without unbounded overhead or debug event guarantees masquerading as audit. |
+| [E17](https://github.com/well-prado/new-blok/issues/17) — Self-hosting, artifacts and Cloud integration contracts | M8 | Make applications easy to deploy through reproducible binaries and operational contracts without embedding a hosting product. |
+| [E18](https://github.com/well-prado/new-blok/issues/18) — Distributed ownership, fencing and capacity | M8 | Scale accepted work across a fleet with tested ownership and failure semantics. |
+| [E19](https://github.com/well-prado/new-blok/issues/19) — Full runtime and SDK coverage | M8 | Give every promised language a real persistent worker and the same semantic/failure conformance. |
+| [E20](https://github.com/well-prado/new-blok/issues/20) — Production evidence, migration and open-source release | M9 | Release only what application, security, usability and capacity evidence actually proves. |
 
 ## 8. Implementation task briefs
 
@@ -99,12 +99,12 @@ Establish a small, tested repository with truthful public documentation and evid
 
 #### E01-T01 — Bootstrap the public Go repository and linked roadmap
 
-Issue: E01-T01 · Initial status: Done
+Issue: [E01-T01](https://github.com/well-prado/new-blok/issues/21) · Initial status: Done
 
 Roadmap ID: E01-T01
-Epic: E01 — Open-source foundation and delivery governance
+Epic: [E01](https://github.com/well-prado/new-blok/issues/1) — Open-source foundation and delivery governance
 Milestone: M0 — Contracts and sustainable foundation
-Priority: P0 | Size: M | Review: R
+Priority: P0 | Size: M | Review: A
 
 ## Problem and intended result
 
@@ -145,14 +145,14 @@ Nodes never import/invoke nodes; workflows compose. Builders do not execute effe
 
 ## Delivery and review
 
-One branch `codex/<issue-number>-<description>` and one PR, linked to this issue and project. Keep Status current. Review R means independent specialist review of the relevant contract/security/durability/performance evidence; record review conclusions. Completion requires every acceptance item and ROADMAP Definition of Done. Do not close a dependency/epic solely because this issue passed.
+Bootstrap is recorded in the initial repository commits because no prior base branch exists. Link the commits and CI/audit evidence. Subsequent implementation tasks use one issue branch and PR. Keep Status current. Review A means automated checks plus normal maintainer review; record review conclusions. Completion requires every acceptance item and ROADMAP Definition of Done. Do not close a dependency/epic solely because this issue passed.
 
 #### E01-T02 — Record public API boundaries and architecture decision policy
 
-Issue: E01-T02 · Initial status: Ready
+Issue: [E01-T02](https://github.com/well-prado/new-blok/issues/22) · Initial status: Ready
 
 Roadmap ID: E01-T02
-Epic: E01 — Open-source foundation and delivery governance
+Epic: [E01](https://github.com/well-prado/new-blok/issues/1) — Open-source foundation and delivery governance
 Milestone: M0 — Contracts and sustainable foundation
 Priority: P0 | Size: S | Review: R
 
@@ -185,7 +185,7 @@ Resolve public versus internal package ownership, versioning policy, supported s
 
 ## Dependencies
 
-- [ ] E01-T01 — Bootstrap the public Go repository and linked roadmap
+- [ ] [E01-T01](https://github.com/well-prado/new-blok/issues/21) — Bootstrap the public Go repository and linked roadmap
 
 ## Cross-cutting invariants
 
@@ -197,10 +197,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E01-T03 — Enforce modular imports and synthetic fixture governance
 
-Issue: E01-T03 · Initial status: Backlog
+Issue: [E01-T03](https://github.com/well-prado/new-blok/issues/23) · Initial status: Backlog
 
 Roadmap ID: E01-T03
-Epic: E01 — Open-source foundation and delivery governance
+Epic: [E01](https://github.com/well-prado/new-blok/issues/1) — Open-source foundation and delivery governance
 Milestone: M0 — Contracts and sustainable foundation
 Priority: P0 | Size: M | Review: R
 
@@ -234,7 +234,7 @@ Add Go package graph checks that prevent engine imports of adapters/stores/provi
 
 ## Dependencies
 
-- [ ] E01-T02 — Record public API boundaries and architecture decision policy
+- [ ] [E01-T02](https://github.com/well-prado/new-blok/issues/22) — Record public API boundaries and architecture decision policy
 
 ## Cross-cutting invariants
 
@@ -246,10 +246,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E01-T04 — Create release quality gates and supported toolchain matrix
 
-Issue: E01-T04 · Initial status: Backlog
+Issue: [E01-T04](https://github.com/well-prado/new-blok/issues/24) · Initial status: Backlog
 
 Roadmap ID: E01-T04
-Epic: E01 — Open-source foundation and delivery governance
+Epic: [E01](https://github.com/well-prado/new-blok/issues/1) — Open-source foundation and delivery governance
 Milestone: M0 — Contracts and sustainable foundation
 Priority: P1 | Size: M | Review: R
 
@@ -284,7 +284,7 @@ Extend CI with generated drift, race, fuzz smoke, dependency/license scanning an
 
 ## Dependencies
 
-- [ ] E01-T03 — Enforce modular imports and synthetic fixture governance
+- [ ] [E01-T03](https://github.com/well-prado/new-blok/issues/23) — Enforce modular imports and synthetic fixture governance
 
 ## Cross-cutting invariants
 
@@ -300,10 +300,10 @@ Freeze one inspectable structural contract with precise cross-language value and
 
 #### E02-T01 — Specify workflow, binding and descriptor documents
 
-Issue: E02-T01 · Initial status: Ready
+Issue: [E02-T01](https://github.com/well-prado/new-blok/issues/25) · Initial status: Backlog
 
 Roadmap ID: E02-T01
-Epic: E02 — Canonical contracts, schemas and identities
+Epic: [E02](https://github.com/well-prado/new-blok/issues/2) — Canonical contracts, schemas and identities
 Milestone: M0 — Contracts and sustainable foundation
 Priority: P0 | Size: M | Review: R
 
@@ -338,7 +338,7 @@ Reconcile lab workflow/v1 with application-first workflow/binding separation. Sp
 
 ## Dependencies
 
-- [ ] E01-T02 — Record public API boundaries and architecture decision policy
+- [ ] [E01-T02](https://github.com/well-prado/new-blok/issues/22) — Record public API boundaries and architecture decision policy
 
 ## Cross-cutting invariants
 
@@ -350,10 +350,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E02-T02 — Implement supported schema validation and normalization
 
-Issue: E02-T02 · Initial status: Backlog
+Issue: [E02-T02](https://github.com/well-prado/new-blok/issues/26) · Initial status: Backlog
 
 Roadmap ID: E02-T02
-Epic: E02 — Canonical contracts, schemas and identities
+Epic: [E02](https://github.com/well-prado/new-blok/issues/2) — Canonical contracts, schemas and identities
 Milestone: M0 — Contracts and sustainable foundation
 Priority: P0 | Size: M | Review: R
 
@@ -388,7 +388,7 @@ Define and enforce scalar ranges, optional/null, objects, collections, unions, u
 
 ## Dependencies
 
-- [ ] E02-T01 — Specify workflow, binding and descriptor documents
+- [ ] [E02-T01](https://github.com/well-prado/new-blok/issues/25) — Specify workflow, binding and descriptor documents
 
 ## Cross-cutting invariants
 
@@ -400,10 +400,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E02-T03 — Implement immutable artifact identity and deployment manifests
 
-Issue: E02-T03 · Initial status: Backlog
+Issue: [E02-T03](https://github.com/well-prado/new-blok/issues/27) · Initial status: Backlog
 
 Roadmap ID: E02-T03
-Epic: E02 — Canonical contracts, schemas and identities
+Epic: [E02](https://github.com/well-prado/new-blok/issues/2) — Canonical contracts, schemas and identities
 Milestone: M0 — Contracts and sustainable foundation
 Priority: P0 | Size: M | Review: R
 
@@ -438,7 +438,7 @@ Bind human versions to content digests for workflow, native binary, worker catal
 
 ## Dependencies
 
-- [ ] E02-T01 — Specify workflow, binding and descriptor documents
+- [ ] [E02-T01](https://github.com/well-prado/new-blok/issues/25) — Specify workflow, binding and descriptor documents
 
 ## Cross-cutting invariants
 
@@ -450,10 +450,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E02-T04 — Publish diagnostics and conformance harness contracts
 
-Issue: E02-T04 · Initial status: Backlog
+Issue: [E02-T04](https://github.com/well-prado/new-blok/issues/28) · Initial status: Backlog
 
 Roadmap ID: E02-T04
-Epic: E02 — Canonical contracts, schemas and identities
+Epic: [E02](https://github.com/well-prado/new-blok/issues/2) — Canonical contracts, schemas and identities
 Milestone: M0 — Contracts and sustainable foundation
 Priority: P1 | Size: M | Review: R
 
@@ -489,8 +489,8 @@ Define stable machine-readable diagnostics and reusable store/trigger/worker/SDK
 
 ## Dependencies
 
-- [ ] E02-T02 — Implement supported schema validation and normalization
-- [ ] E02-T03 — Implement immutable artifact identity and deployment manifests
+- [ ] [E02-T02](https://github.com/well-prado/new-blok/issues/26) — Implement supported schema validation and normalization
+- [ ] [E02-T03](https://github.com/well-prado/new-blok/issues/27) — Implement immutable artifact identity and deployment manifests
 
 ## Cross-cutting invariants
 
@@ -506,10 +506,10 @@ Make ordinary Go functions composable with compile-time wiring and inspectable s
 
 #### E03-T01 — Implement typed node definitions and explicit registration
 
-Issue: E03-T01 · Initial status: Backlog
+Issue: [E03-T01](https://github.com/well-prado/new-blok/issues/29) · Initial status: Backlog
 
 Roadmap ID: E03-T01
-Epic: E03 — Typed Go nodes and workflow authoring
+Epic: [E03](https://github.com/well-prado/new-blok/issues/3) — Typed Go nodes and workflow authoring
 Milestone: M1 — Complete native Go application
 Priority: P0 | Size: M | Review: A
 
@@ -545,7 +545,7 @@ Implement typed input/output function descriptors, constructor-injected dependen
 
 ## Dependencies
 
-- [ ] E02-T04 — Publish diagnostics and conformance harness contracts
+- [ ] [E02-T04](https://github.com/well-prado/new-blok/issues/28) — Publish diagnostics and conformance harness contracts
 
 ## Cross-cutting invariants
 
@@ -557,10 +557,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E03-T02 — Implement typed whole-value workflow references and outputs
 
-Issue: E03-T02 · Initial status: Backlog
+Issue: [E03-T02](https://github.com/well-prado/new-blok/issues/30) · Initial status: Backlog
 
 Roadmap ID: E03-T02
-Epic: E03 — Typed Go nodes and workflow authoring
+Epic: [E03](https://github.com/well-prado/new-blok/issues/3) — Typed Go nodes and workflow authoring
 Milestone: M1 — Complete native Go application
 Priority: P0 | Size: M | Review: A
 
@@ -595,7 +595,7 @@ Implement Define/MustDefine, Builder, Ref, Lit and Call for whole-value wiring. 
 
 ## Dependencies
 
-- [ ] E03-T01 — Implement typed node definitions and explicit registration
+- [ ] [E03-T01](https://github.com/well-prado/new-blok/issues/29) — Implement typed node definitions and explicit registration
 
 ## Cross-cutting invariants
 
@@ -607,10 +607,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E03-T03 — Generate typed field accessors and node input bindings
 
-Issue: E03-T03 · Initial status: Backlog
+Issue: [E03-T03](https://github.com/well-prado/new-blok/issues/31) · Initial status: Backlog
 
 Roadmap ID: E03-T03
-Epic: E03 — Typed Go nodes and workflow authoring
+Epic: [E03](https://github.com/well-prado/new-blok/issues/3) — Typed Go nodes and workflow authoring
 Milestone: M1 — Complete native Go application
 Priority: P1 | Size: M | Review: R
 
@@ -646,8 +646,8 @@ Use Go package/type analysis to generate deterministic field refs and argument s
 
 ## Dependencies
 
-- [ ] E03-T02 — Implement typed whole-value workflow references and outputs
-- [ ] E02-T02 — Implement supported schema validation and normalization
+- [ ] [E03-T02](https://github.com/well-prado/new-blok/issues/30) — Implement typed whole-value workflow references and outputs
+- [ ] [E02-T02](https://github.com/well-prado/new-blok/issues/26) — Implement supported schema validation and normalization
 
 ## Cross-cutting invariants
 
@@ -659,10 +659,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E03-T04 — Implement scoped control-flow authoring primitives
 
-Issue: E03-T04 · Initial status: Backlog
+Issue: [E03-T04](https://github.com/well-prado/new-blok/issues/32) · Initial status: Backlog
 
 Roadmap ID: E03-T04
-Epic: E03 — Typed Go nodes and workflow authoring
+Epic: [E03](https://github.com/well-prado/new-blok/issues/3) — Typed Go nodes and workflow authoring
 Milestone: M1 — Complete native Go application
 Priority: P1 | Size: M | Review: R
 
@@ -699,7 +699,7 @@ Add typed If/Choose, Each, Parallel, Try/Finally, child workflow and portable co
 
 ## Dependencies
 
-- [ ] E03-T03 — Generate typed field accessors and node input bindings
+- [ ] [E03-T03](https://github.com/well-prado/new-blok/issues/31) — Generate typed field accessors and node input bindings
 
 ## Cross-cutting invariants
 
@@ -715,10 +715,10 @@ Validate programs once and lower structural references without hidden runtime ev
 
 #### E04-T01 — Compile schema-compatible references and trigger mappings
 
-Issue: E04-T01 · Initial status: Backlog
+Issue: [E04-T01](https://github.com/well-prado/new-blok/issues/33) · Initial status: Backlog
 
 Roadmap ID: E04-T01
-Epic: E04 — Compiler and portable execution program
+Epic: [E04](https://github.com/well-prado/new-blok/issues/4) — Compiler and portable execution program
 Milestone: M1 — Complete native Go application
 Priority: P0 | Size: M | Review: R
 
@@ -754,7 +754,7 @@ Validate registered calls, output fields, reference order/scope, selected module
 
 ## Dependencies
 
-- [ ] E03-T04 — Implement scoped control-flow authoring primitives
+- [ ] [E03-T04](https://github.com/well-prado/new-blok/issues/32) — Implement scoped control-flow authoring primitives
 
 ## Cross-cutting invariants
 
@@ -766,10 +766,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E04-T02 — Lower versioned instructions with deterministic artifact checks
 
-Issue: E04-T02 · Initial status: Backlog
+Issue: [E04-T02](https://github.com/well-prado/new-blok/issues/34) · Initial status: Backlog
 
 Roadmap ID: E04-T02
-Epic: E04 — Compiler and portable execution program
+Epic: [E04](https://github.com/well-prado/new-blok/issues/4) — Compiler and portable execution program
 Milestone: M1 — Complete native Go application
 Priority: P1 | Size: M | Review: R
 
@@ -805,8 +805,8 @@ Produce immutable program instructions and indexes for calls, control flow, outp
 
 ## Dependencies
 
-- [ ] E04-T01 — Compile schema-compatible references and trigger mappings
-- [ ] E02-T03 — Implement immutable artifact identity and deployment manifests
+- [ ] [E04-T01](https://github.com/well-prado/new-blok/issues/33) — Compile schema-compatible references and trigger mappings
+- [ ] [E02-T03](https://github.com/well-prado/new-blok/issues/27) — Implement immutable artifact identity and deployment manifests
 
 ## Cross-cutting invariants
 
@@ -818,10 +818,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E04-T03 — Enforce value ownership across native and wire paths
 
-Issue: E04-T03 · Initial status: Backlog
+Issue: [E04-T03](https://github.com/well-prado/new-blok/issues/35) · Initial status: Backlog
 
 Roadmap ID: E04-T03
-Epic: E04 — Compiler and portable execution program
+Epic: [E04](https://github.com/well-prado/new-blok/issues/4) — Compiler and portable execution program
 Milestone: M1 — Complete native Go application
 Priority: P0 | Size: M | Review: R
 
@@ -857,8 +857,8 @@ Define representation and copy/borrow boundaries for pointers, slices, maps and 
 
 ## Dependencies
 
-- [ ] E04-T02 — Lower versioned instructions with deterministic artifact checks
-- [ ] E02-T02 — Implement supported schema validation and normalization
+- [ ] [E04-T02](https://github.com/well-prado/new-blok/issues/34) — Lower versioned instructions with deterministic artifact checks
+- [ ] [E02-T02](https://github.com/well-prado/new-blok/issues/26) — Implement supported schema validation and normalization
 
 ## Cross-cutting invariants
 
@@ -874,10 +874,10 @@ Execute compiled workflows correctly with bounded resources and application-frie
 
 #### E05-T01 — Execute native calls and explicit workflow outputs
 
-Issue: E05-T01 · Initial status: Backlog
+Issue: [E05-T01](https://github.com/well-prado/new-blok/issues/36) · Initial status: Backlog
 
 Roadmap ID: E05-T01
-Epic: E05 — Bounded Go execution engine and test harness
+Epic: [E05](https://github.com/well-prado/new-blok/issues/5) — Bounded Go execution engine and test harness
 Milestone: M1 — Complete native Go application
 Priority: P0 | Size: M | Review: A
 
@@ -914,7 +914,7 @@ Implement memory-mode interpreter for compiled calls with input/output validatio
 
 ## Dependencies
 
-- [ ] E04-T03 — Enforce value ownership across native and wire paths
+- [ ] [E04-T03](https://github.com/well-prado/new-blok/issues/35) — Enforce value ownership across native and wire paths
 
 ## Cross-cutting invariants
 
@@ -926,10 +926,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E05-T02 — Execute branches, loops, parallel groups and error control
 
-Issue: E05-T02 · Initial status: Backlog
+Issue: [E05-T02](https://github.com/well-prado/new-blok/issues/37) · Initial status: Backlog
 
 Roadmap ID: E05-T02
-Epic: E05 — Bounded Go execution engine and test harness
+Epic: [E05](https://github.com/well-prado/new-blok/issues/5) — Bounded Go execution engine and test harness
 Milestone: M1 — Complete native Go application
 Priority: P1 | Size: M | Review: R
 
@@ -966,7 +966,7 @@ Implement control instructions with scoped invocation/iteration identity, typed 
 
 ## Dependencies
 
-- [ ] E05-T01 — Execute native calls and explicit workflow outputs
+- [ ] [E05-T01](https://github.com/well-prado/new-blok/issues/36) — Execute native calls and explicit workflow outputs
 
 ## Cross-cutting invariants
 
@@ -978,10 +978,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E05-T03 — Implement admission budgets, fairness and cancellation
 
-Issue: E05-T03 · Initial status: Backlog
+Issue: [E05-T03](https://github.com/well-prado/new-blok/issues/38) · Initial status: Backlog
 
 Roadmap ID: E05-T03
-Epic: E05 — Bounded Go execution engine and test harness
+Epic: [E05](https://github.com/well-prado/new-blok/issues/5) — Bounded Go execution engine and test harness
 Milestone: M1 — Complete native Go application
 Priority: P0 | Size: M | Review: R
 
@@ -1017,7 +1017,7 @@ Add bounded active/runnable queues, per-binding/tenant budgets, retry/child limi
 
 ## Dependencies
 
-- [ ] E05-T02 — Execute branches, loops, parallel groups and error control
+- [ ] [E05-T02](https://github.com/well-prado/new-blok/issues/37) — Execute branches, loops, parallel groups and error control
 
 ## Cross-cutting invariants
 
@@ -1029,10 +1029,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E05-T04 — Provide typed in-process node and workflow testing
 
-Issue: E05-T04 · Initial status: Backlog
+Issue: [E05-T04](https://github.com/well-prado/new-blok/issues/39) · Initial status: Backlog
 
 Roadmap ID: E05-T04
-Epic: E05 — Bounded Go execution engine and test harness
+Epic: [E05](https://github.com/well-prado/new-blok/issues/5) — Bounded Go execution engine and test harness
 Milestone: M1 — Complete native Go application
 Priority: P1 | Size: M | Review: A
 
@@ -1068,7 +1068,7 @@ Add public testing helpers using production compiler/interpreter, identity/versi
 
 ## Dependencies
 
-- [ ] E05-T03 — Implement admission budgets, fairness and cancellation
+- [ ] [E05-T03](https://github.com/well-prado/new-blok/issues/38) — Implement admission budgets, fairness and cancellation
 
 ## Cross-cutting invariants
 
@@ -1084,10 +1084,10 @@ Deliver an application-owned Go executable with real HTTP and explicit module li
 
 #### E06-T01 — Implement application composition and graceful lifecycle
 
-Issue: E06-T01 · Initial status: Backlog
+Issue: [E06-T01](https://github.com/well-prado/new-blok/issues/40) · Initial status: Backlog
 
 Roadmap ID: E06-T01
-Epic: E06 — Application lifecycle and HTTP vertical slice
+Epic: [E06](https://github.com/well-prado/new-blok/issues/6) — Application lifecycle and HTTP vertical slice
 Milestone: M1 — Complete native Go application
 Priority: P0 | Size: M | Review: A
 
@@ -1123,7 +1123,7 @@ Add app composition for nodes/workflows/adapters/dependencies. Validate duplicat
 
 ## Dependencies
 
-- [ ] E05-T04 — Provide typed in-process node and workflow testing
+- [ ] [E05-T04](https://github.com/well-prado/new-blok/issues/39) — Provide typed in-process node and workflow testing
 
 ## Cross-cutting invariants
 
@@ -1135,10 +1135,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E06-T02 — Serve typed HTTP bindings through shared admission
 
-Issue: E06-T02 · Initial status: Backlog
+Issue: [E06-T02](https://github.com/well-prado/new-blok/issues/41) · Initial status: Backlog
 
 Roadmap ID: E06-T02
-Epic: E06 — Application lifecycle and HTTP vertical slice
+Epic: [E06](https://github.com/well-prado/new-blok/issues/6) — Application lifecycle and HTTP vertical slice
 Milestone: M1 — Complete native Go application
 Priority: P0 | Size: M | Review: R
 
@@ -1175,7 +1175,7 @@ Implement method/path/parameter/body mapping, payload limits, trusted principal 
 
 ## Dependencies
 
-- [ ] E06-T01 — Implement application composition and graceful lifecycle
+- [ ] [E06-T01](https://github.com/well-prado/new-blok/issues/40) — Implement application composition and graceful lifecycle
 
 ## Cross-cutting invariants
 
@@ -1187,10 +1187,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E06-T03 — Ship the complete native quote application and DX fixture
 
-Issue: E06-T03 · Initial status: Backlog
+Issue: [E06-T03](https://github.com/well-prado/new-blok/issues/42) · Initial status: Backlog
 
 Roadmap ID: E06-T03
-Epic: E06 — Application lifecycle and HTTP vertical slice
+Epic: [E06](https://github.com/well-prado/new-blok/issues/6) — Application lifecycle and HTTP vertical slice
 Milestone: M1 — Complete native Go application
 Priority: P1 | Size: M | Review: A
 
@@ -1226,7 +1226,7 @@ Create one conventional Go module/example with pure pricing node, typed workflow
 
 ## Dependencies
 
-- [ ] E06-T02 — Serve typed HTTP bindings through shared admission
+- [ ] [E06-T02](https://github.com/well-prado/new-blok/issues/41) — Serve typed HTTP bindings through shared admission
 
 ## Cross-cutting invariants
 
@@ -1242,10 +1242,10 @@ Establish precise single-host recovery before adding distributed ownership.
 
 #### E07-T01 — Select one embedded durable backend through an executable spike
 
-Issue: E07-T01 · Initial status: Backlog
+Issue: [E07-T01](https://github.com/well-prado/new-blok/issues/43) · Initial status: Backlog
 
 Roadmap ID: E07-T01
-Epic: E07 — Durable state, recovery and version retention
+Epic: [E07](https://github.com/well-prado/new-blok/issues/7) — Durable state, recovery and version retention
 Milestone: M2 — Durable orders and jobs
 Priority: P0 | Size: M | Review: R
 
@@ -1281,8 +1281,8 @@ Compare SQLite and the justified alternative on atomic transitions, group commit
 
 ## Dependencies
 
-- [ ] E02-T04 — Publish diagnostics and conformance harness contracts
-- [ ] E05-T03 — Implement admission budgets, fairness and cancellation
+- [ ] [E02-T04](https://github.com/well-prado/new-blok/issues/28) — Publish diagnostics and conformance harness contracts
+- [ ] [E05-T03](https://github.com/well-prado/new-blok/issues/38) — Implement admission budgets, fairness and cancellation
 
 ## Cross-cutting invariants
 
@@ -1294,16 +1294,16 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E07-T02 — Implement atomic admission, checkpoints and uncertainty state
 
-Issue: E07-T02 · Initial status: Backlog
+Issue: [E07-T02](https://github.com/well-prado/new-blok/issues/44) · Initial status: Backlog
 
 Roadmap ID: E07-T02
-Epic: E07 — Durable state, recovery and version retention
+Epic: [E07](https://github.com/well-prado/new-blok/issues/7) — Durable state, recovery and version retention
 Milestone: M2 — Durable orders and jobs
 Priority: P0 | Size: M | Review: R
 
 ## Problem and intended result
 
-Implement selected store transitions for accepted runs, effect intent, attempts, committed results and uncertain outcomes. Scope stable operation identity by workflow/invocation/iteration/attempt as defined.
+Implement selected store transitions for accepted runs, effect intent, attempts, committed results and uncertain outcomes. Scope stable operation identity by run/artifact/invocation/iteration and record attempt identity separately: transient retries reuse the same logical operation key.
 
 ## Required context and ownership
 
@@ -1318,6 +1318,8 @@ Implement selected store transitions for accepted runs, effect intent, attempts,
 - [ ] Acceptance/completion acknowledgments follow durable barriers.
 - [ ] Committed results replay without effect redispatch.
 - [ ] External success without commit becomes uncertain.
+- [ ] Retries reuse stable provider operation key while attempt IDs remain unique.
+- [ ] New replay runs have fresh operation identity and explicit lineage.
 - [ ] Stale writers/results cannot overwrite current attempt.
 - [ ] Integrity errors fail closed.
 
@@ -1326,7 +1328,7 @@ Implement selected store transitions for accepted runs, effect intent, attempts,
 - [ ] Kill process at admission/intent/dispatch/result/ack barriers.
 - [ ] Concurrent duplicate input and conflicting key tests.
 - [ ] Disk-full/write-failure/corruption fixtures.
-- [ ] Verify observable effect counts.
+- [ ] Verify observable effect counts and identical operation key across retries.
 - [ ] Add synthetic fixtures with predeclared expected output/error/effect counts. Include negative/failure cases, not just happy-path compilation.
 - [ ] Run focused package/language tests first, then `go vet ./...`, `go test -race ./...`, `go build ./...` and `git diff --check`. New SDK code also runs its native lint/type/build/test commands with exact versions recorded in the PR.
 - [ ] Run the applicable actual protocol/store/worker/crash/load suite described above. A fake, file-presence test or green unrelated suite does not satisfy integration evidence. If no Go source changes, document why each Go gate is unchanged and still run the current repository gate.
@@ -1334,8 +1336,8 @@ Implement selected store transitions for accepted runs, effect intent, attempts,
 
 ## Dependencies
 
-- [ ] E07-T01 — Select one embedded durable backend through an executable spike
-- [ ] E05-T01 — Execute native calls and explicit workflow outputs
+- [ ] [E07-T01](https://github.com/well-prado/new-blok/issues/43) — Select one embedded durable backend through an executable spike
+- [ ] [E05-T01](https://github.com/well-prado/new-blok/issues/36) — Execute native calls and explicit workflow outputs
 
 ## Cross-cutting invariants
 
@@ -1347,10 +1349,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E07-T03 — Deliver durable jobs and an outbox-backed order application
 
-Issue: E07-T03 · Initial status: Backlog
+Issue: [E07-T03](https://github.com/well-prado/new-blok/issues/45) · Initial status: Backlog
 
 Roadmap ID: E07-T03
-Epic: E07 — Durable state, recovery and version retention
+Epic: [E07](https://github.com/well-prado/new-blok/issues/7) — Durable state, recovery and version retention
 Milestone: M2 — Durable orders and jobs
 Priority: P0 | Size: M | Review: R
 
@@ -1387,8 +1389,8 @@ Add the initial local durable worker trigger and order recipe with business uniq
 
 ## Dependencies
 
-- [ ] E07-T02 — Implement atomic admission, checkpoints and uncertainty state
-- [ ] E06-T03 — Ship the complete native quote application and DX fixture
+- [ ] [E07-T02](https://github.com/well-prado/new-blok/issues/44) — Implement atomic admission, checkpoints and uncertainty state
+- [ ] [E06-T03](https://github.com/well-prado/new-blok/issues/42) — Ship the complete native quote application and DX fixture
 
 ## Cross-cutting invariants
 
@@ -1400,10 +1402,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E07-T04 — Persist waits, retry timers and authorized signals
 
-Issue: E07-T04 · Initial status: Backlog
+Issue: [E07-T04](https://github.com/well-prado/new-blok/issues/46) · Initial status: Backlog
 
 Roadmap ID: E07-T04
-Epic: E07 — Durable state, recovery and version retention
+Epic: [E07](https://github.com/well-prado/new-blok/issues/7) — Durable state, recovery and version retention
 Milestone: M3 — Recovery across control flow and versions
 Priority: P0 | Size: M | Review: R
 
@@ -1440,7 +1442,7 @@ Add durable suspension with deterministic test clock, signal identities, pre-wai
 
 ## Dependencies
 
-- [ ] E07-T03 — Deliver durable jobs and an outbox-backed order application
+- [ ] [E07-T03](https://github.com/well-prado/new-blok/issues/45) — Deliver durable jobs and an outbox-backed order application
 
 ## Cross-cutting invariants
 
@@ -1452,10 +1454,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E07-T05 — Recover nested control flow, child runs and parallel joins
 
-Issue: E07-T05 · Initial status: Backlog
+Issue: [E07-T05](https://github.com/well-prado/new-blok/issues/47) · Initial status: Backlog
 
 Roadmap ID: E07-T05
-Epic: E07 — Durable state, recovery and version retention
+Epic: [E07](https://github.com/well-prado/new-blok/issues/7) — Durable state, recovery and version retention
 Milestone: M3 — Recovery across control flow and versions
 Priority: P0 | Size: M | Review: R
 
@@ -1491,8 +1493,8 @@ Persist branch decisions, loop invocation paths, child lineage, partial results 
 
 ## Dependencies
 
-- [ ] E07-T04 — Persist waits, retry timers and authorized signals
-- [ ] E05-T02 — Execute branches, loops, parallel groups and error control
+- [ ] [E07-T04](https://github.com/well-prado/new-blok/issues/46) — Persist waits, retry timers and authorized signals
+- [ ] [E05-T02](https://github.com/well-prado/new-blok/issues/37) — Execute branches, loops, parallel groups and error control
 
 ## Cross-cutting invariants
 
@@ -1504,10 +1506,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E07-T06 — Implement reconciliation, artifact retention and safe upgrades
 
-Issue: E07-T06 · Initial status: Backlog
+Issue: [E07-T06](https://github.com/well-prado/new-blok/issues/48) · Initial status: Backlog
 
 Roadmap ID: E07-T06
-Epic: E07 — Durable state, recovery and version retention
+Epic: [E07](https://github.com/well-prado/new-blok/issues/7) — Durable state, recovery and version retention
 Milestone: M3 — Recovery across control flow and versions
 Priority: P1 | Size: M | Review: R
 
@@ -1543,8 +1545,8 @@ Expose authorized inspection/reconciliation for uncertain effects and matching-a
 
 ## Dependencies
 
-- [ ] E07-T05 — Recover nested control flow, child runs and parallel joins
-- [ ] E02-T03 — Implement immutable artifact identity and deployment manifests
+- [ ] [E07-T05](https://github.com/well-prado/new-blok/issues/47) — Recover nested control flow, child runs and parallel joins
+- [ ] [E02-T03](https://github.com/well-prado/new-blok/issues/27) — Implement immutable artifact identity and deployment manifests
 
 ## Cross-cutting invariants
 
@@ -1556,10 +1558,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E07-T07 — Implement verified retention, compaction, backup and restore
 
-Issue: E07-T07 · Initial status: Backlog
+Issue: [E07-T07](https://github.com/well-prado/new-blok/issues/49) · Initial status: Backlog
 
 Roadmap ID: E07-T07
-Epic: E07 — Durable state, recovery and version retention
+Epic: [E07](https://github.com/well-prado/new-blok/issues/7) — Durable state, recovery and version retention
 Milestone: M3 — Recovery across control flow and versions
 Priority: P1 | Size: M | Review: R
 
@@ -1595,7 +1597,7 @@ Bound history growth with verified checkpoints, retention policy, audit separati
 
 ## Dependencies
 
-- [ ] E07-T06 — Implement reconciliation, artifact retention and safe upgrades
+- [ ] [E07-T06](https://github.com/well-prado/new-blok/issues/48) — Implement reconciliation, artifact retention and safe upgrades
 
 ## Cross-cutting invariants
 
@@ -1611,10 +1613,10 @@ Connect foreign nodes without giving workers a second workflow engine or an unbo
 
 #### E08-T01 — Specify and generate the negotiated worker protocol
 
-Issue: E08-T01 · Initial status: Backlog
+Issue: [E08-T01](https://github.com/well-prado/new-blok/issues/50) · Initial status: Backlog
 
 Roadmap ID: E08-T01
-Epic: E08 — Persistent gRPC runtime protocol and Node.js first
+Epic: [E08](https://github.com/well-prado/new-blok/issues/8) — Persistent gRPC runtime protocol and Node.js first
 Milestone: M4 — Node.js and persistent worker conformance
 Priority: P0 | Size: M | Review: R
 
@@ -1651,8 +1653,8 @@ Define runtime protocol versions, frame direction, local/remote connection topol
 
 ## Dependencies
 
-- [ ] E02-T04 — Publish diagnostics and conformance harness contracts
-- [ ] E07-T02 — Implement atomic admission, checkpoints and uncertainty state
+- [ ] [E02-T04](https://github.com/well-prado/new-blok/issues/28) — Publish diagnostics and conformance harness contracts
+- [ ] [E07-T02](https://github.com/well-prado/new-blok/issues/44) — Implement atomic admission, checkpoints and uncertainty state
 
 ## Cross-cutting invariants
 
@@ -1664,10 +1666,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E08-T02 — Implement supervised Go worker client and lifecycle
 
-Issue: E08-T02 · Initial status: Backlog
+Issue: [E08-T02](https://github.com/well-prado/new-blok/issues/51) · Initial status: Backlog
 
 Roadmap ID: E08-T02
-Epic: E08 — Persistent gRPC runtime protocol and Node.js first
+Epic: [E08](https://github.com/well-prado/new-blok/issues/8) — Persistent gRPC runtime protocol and Node.js first
 Milestone: M4 — Node.js and persistent worker conformance
 Priority: P0 | Size: M | Review: R
 
@@ -1704,9 +1706,9 @@ Start persistent local workers only when selected, reuse authenticated channels,
 
 ## Dependencies
 
-- [ ] E08-T01 — Specify and generate the negotiated worker protocol
-- [ ] E06-T01 — Implement application composition and graceful lifecycle
-- [ ] E07-T06 — Implement reconciliation, artifact retention and safe upgrades
+- [ ] [E08-T01](https://github.com/well-prado/new-blok/issues/50) — Specify and generate the negotiated worker protocol
+- [ ] [E06-T01](https://github.com/well-prado/new-blok/issues/40) — Implement application composition and graceful lifecycle
+- [ ] [E07-T06](https://github.com/well-prado/new-blok/issues/48) — Implement reconciliation, artifact retention and safe upgrades
 
 ## Cross-cutting invariants
 
@@ -1718,10 +1720,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E08-T03 — Implement Node.js SDK and persistent worker
 
-Issue: E08-T03 · Initial status: Backlog
+Issue: [E08-T03](https://github.com/well-prado/new-blok/issues/52) · Initial status: Backlog
 
 Roadmap ID: E08-T03
-Epic: E08 — Persistent gRPC runtime protocol and Node.js first
+Epic: [E08](https://github.com/well-prado/new-blok/issues/8) — Persistent gRPC runtime protocol and Node.js first
 Milestone: M4 — Node.js and persistent worker conformance
 Priority: P0 | Size: M | Review: R
 
@@ -1759,8 +1761,8 @@ Implement typed JavaScript/TypeScript node descriptors and actual persistent gRP
 
 ## Dependencies
 
-- [ ] E08-T02 — Implement supervised Go worker client and lifecycle
-- [ ] E03-T01 — Implement typed node definitions and explicit registration
+- [ ] [E08-T02](https://github.com/well-prado/new-blok/issues/51) — Implement supervised Go worker client and lifecycle
+- [ ] [E03-T01](https://github.com/well-prado/new-blok/issues/29) — Implement typed node definitions and explicit registration
 
 ## Cross-cutting invariants
 
@@ -1772,10 +1774,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E08-T04 — Harden worker transport and publish equivalent workload evidence
 
-Issue: E08-T04 · Initial status: Backlog
+Issue: [E08-T04](https://github.com/well-prado/new-blok/issues/53) · Initial status: Backlog
 
 Roadmap ID: E08-T04
-Epic: E08 — Persistent gRPC runtime protocol and Node.js first
+Epic: [E08](https://github.com/well-prado/new-blok/issues/8) — Persistent gRPC runtime protocol and Node.js first
 Milestone: M4 — Node.js and persistent worker conformance
 Priority: P1 | Size: M | Review: R
 
@@ -1811,7 +1813,7 @@ Add mTLS or authenticated local transport, principal/capability scope, message/b
 
 ## Dependencies
 
-- [ ] E08-T03 — Implement Node.js SDK and persistent worker
+- [ ] [E08-T03](https://github.com/well-prado/new-blok/issues/52) — Implement Node.js SDK and persistent worker
 
 ## Cross-cutting invariants
 
@@ -1827,10 +1829,10 @@ Implement every promised protocol against one admission and lifecycle contract.
 
 #### E09-T01 — Publish shared trigger conformance and modularity checks
 
-Issue: E09-T01 · Initial status: Backlog
+Issue: [E09-T01](https://github.com/well-prado/new-blok/issues/54) · Initial status: Backlog
 
 Roadmap ID: E09-T01
-Epic: E09 — Complete modular trigger catalog
+Epic: [E09](https://github.com/well-prado/new-blok/issues/9) — Complete modular trigger catalog
 Milestone: M5 — All nine modular triggers
 Priority: P1 | Size: M | Review: R
 
@@ -1866,9 +1868,9 @@ Extend the initial HTTP/worker contracts into reusable admission, mapping, princ
 
 ## Dependencies
 
-- [ ] E06-T02 — Serve typed HTTP bindings through shared admission
-- [ ] E07-T03 — Deliver durable jobs and an outbox-backed order application
-- [ ] E02-T04 — Publish diagnostics and conformance harness contracts
+- [ ] [E06-T02](https://github.com/well-prado/new-blok/issues/41) — Serve typed HTTP bindings through shared admission
+- [ ] [E07-T03](https://github.com/well-prado/new-blok/issues/45) — Deliver durable jobs and an outbox-backed order application
+- [ ] [E02-T04](https://github.com/well-prado/new-blok/issues/28) — Publish diagnostics and conformance harness contracts
 
 ## Cross-cutting invariants
 
@@ -1880,10 +1882,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E09-T02 — Implement signed webhook admission
 
-Issue: E09-T02 · Initial status: Backlog
+Issue: [E09-T02](https://github.com/well-prado/new-blok/issues/55) · Initial status: Backlog
 
 Roadmap ID: E09-T02
-Epic: E09 — Complete modular trigger catalog
+Epic: [E09](https://github.com/well-prado/new-blok/issues/9) — Complete modular trigger catalog
 Milestone: M5 — All nine modular triggers
 Priority: P1 | Size: M | Review: R
 
@@ -1920,7 +1922,7 @@ Verify original request bytes before mapping, provider signature/key rotation, r
 
 ## Dependencies
 
-- [ ] E09-T01 — Publish shared trigger conformance and modularity checks
+- [ ] [E09-T01](https://github.com/well-prado/new-blok/issues/54) — Publish shared trigger conformance and modularity checks
 
 ## Cross-cutting invariants
 
@@ -1932,10 +1934,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E09-T03 — Implement cron schedules with durable occurrence identity
 
-Issue: E09-T03 · Initial status: Backlog
+Issue: [E09-T03](https://github.com/well-prado/new-blok/issues/56) · Initial status: Backlog
 
 Roadmap ID: E09-T03
-Epic: E09 — Complete modular trigger catalog
+Epic: [E09](https://github.com/well-prado/new-blok/issues/9) — Complete modular trigger catalog
 Milestone: M5 — All nine modular triggers
 Priority: P1 | Size: M | Review: R
 
@@ -1971,8 +1973,8 @@ Add timezone-aware cron scheduling, daylight-saving rules, overlap and missed-ti
 
 ## Dependencies
 
-- [ ] E09-T01 — Publish shared trigger conformance and modularity checks
-- [ ] E07-T04 — Persist waits, retry timers and authorized signals
+- [ ] [E09-T01](https://github.com/well-prado/new-blok/issues/54) — Publish shared trigger conformance and modularity checks
+- [ ] [E07-T04](https://github.com/well-prado/new-blok/issues/46) — Persist waits, retry timers and authorized signals
 
 ## Cross-cutting invariants
 
@@ -1984,10 +1986,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E09-T04 — Implement pubsub adapter with delivery transfer semantics
 
-Issue: E09-T04 · Initial status: Backlog
+Issue: [E09-T04](https://github.com/well-prado/new-blok/issues/57) · Initial status: Backlog
 
 Roadmap ID: E09-T04
-Epic: E09 — Complete modular trigger catalog
+Epic: [E09](https://github.com/well-prado/new-blok/issues/9) — Complete modular trigger catalog
 Milestone: M5 — All nine modular triggers
 Priority: P1 | Size: M | Review: R
 
@@ -2025,8 +2027,8 @@ Ship one selected broker integration using scoped subscription/cursor, explicit 
 
 ## Dependencies
 
-- [ ] E09-T01 — Publish shared trigger conformance and modularity checks
-- [ ] E07-T03 — Deliver durable jobs and an outbox-backed order application
+- [ ] [E09-T01](https://github.com/well-prado/new-blok/issues/54) — Publish shared trigger conformance and modularity checks
+- [ ] [E07-T03](https://github.com/well-prado/new-blok/issues/45) — Deliver durable jobs and an outbox-backed order application
 
 ## Cross-cutting invariants
 
@@ -2038,10 +2040,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E09-T05 — Implement application gRPC trigger bindings
 
-Issue: E09-T05 · Initial status: Backlog
+Issue: [E09-T05](https://github.com/well-prado/new-blok/issues/58) · Initial status: Backlog
 
 Roadmap ID: E09-T05
-Epic: E09 — Complete modular trigger catalog
+Epic: [E09](https://github.com/well-prado/new-blok/issues/9) — Complete modular trigger catalog
 Milestone: M5 — All nine modular triggers
 Priority: P1 | Size: M | Review: R
 
@@ -2078,8 +2080,8 @@ Generate service/method mapping to domain inputs and outputs with deadlines, met
 
 ## Dependencies
 
-- [ ] E09-T01 — Publish shared trigger conformance and modularity checks
-- [ ] E08-T01 — Specify and generate the negotiated worker protocol
+- [ ] [E09-T01](https://github.com/well-prado/new-blok/issues/54) — Publish shared trigger conformance and modularity checks
+- [ ] [E08-T01](https://github.com/well-prado/new-blok/issues/50) — Specify and generate the negotiated worker protocol
 
 ## Cross-cutting invariants
 
@@ -2091,10 +2093,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E09-T06 — Implement SSE streams with replay cursors and slow-client policy
 
-Issue: E09-T06 · Initial status: Backlog
+Issue: [E09-T06](https://github.com/well-prado/new-blok/issues/59) · Initial status: Backlog
 
 Roadmap ID: E09-T06
-Epic: E09 — Complete modular trigger catalog
+Epic: [E09](https://github.com/well-prado/new-blok/issues/9) — Complete modular trigger catalog
 Milestone: M5 — All nine modular triggers
 Priority: P1 | Size: M | Review: R
 
@@ -2131,8 +2133,8 @@ Add authorized subscriptions, event framing, heartbeat, bounded buffers, disconn
 
 ## Dependencies
 
-- [ ] E09-T01 — Publish shared trigger conformance and modularity checks
-- [ ] E07-T04 — Persist waits, retry timers and authorized signals
+- [ ] [E09-T01](https://github.com/well-prado/new-blok/issues/54) — Publish shared trigger conformance and modularity checks
+- [ ] [E07-T04](https://github.com/well-prado/new-blok/issues/46) — Persist waits, retry timers and authorized signals
 
 ## Cross-cutting invariants
 
@@ -2144,10 +2146,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E09-T07 — Implement WebSocket connection and message workflow bindings
 
-Issue: E09-T07 · Initial status: Backlog
+Issue: [E09-T07](https://github.com/well-prado/new-blok/issues/60) · Initial status: Backlog
 
 Roadmap ID: E09-T07
-Epic: E09 — Complete modular trigger catalog
+Epic: [E09](https://github.com/well-prado/new-blok/issues/9) — Complete modular trigger catalog
 Milestone: M5 — All nine modular triggers
 Priority: P1 | Size: M | Review: R
 
@@ -2184,7 +2186,7 @@ Add connect/message/disconnect bindings with principal, connection identity, ori
 
 ## Dependencies
 
-- [ ] E09-T01 — Publish shared trigger conformance and modularity checks
+- [ ] [E09-T01](https://github.com/well-prado/new-blok/issues/54) — Publish shared trigger conformance and modularity checks
 
 ## Cross-cutting invariants
 
@@ -2196,10 +2198,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E09-T08 — Implement MCP node and workflow exposure
 
-Issue: E09-T08 · Initial status: Backlog
+Issue: [E09-T08](https://github.com/well-prado/new-blok/issues/101) · Initial status: Backlog
 
 Roadmap ID: E09-T08
-Epic: E09 — Complete modular trigger catalog
+Epic: [E09](https://github.com/well-prado/new-blok/issues/9) — Complete modular trigger catalog
 Milestone: M5 — All nine modular triggers
 Priority: P1 | Size: M | Review: R
 
@@ -2236,8 +2238,8 @@ Expose selected nodes as typed tools and workflows as composed tools/resources u
 
 ## Dependencies
 
-- [ ] E09-T01 — Publish shared trigger conformance and modularity checks
-- [ ] E14-T02 — Enforce durable approvals, evidence and publication gates
+- [ ] [E09-T01](https://github.com/well-prado/new-blok/issues/54) — Publish shared trigger conformance and modularity checks
+- [ ] [E14-T02](https://github.com/well-prado/new-blok/issues/75) — Enforce durable approvals, evidence and publication gates
 
 ## Cross-cutting invariants
 
@@ -2253,10 +2255,10 @@ Make reusable generic nodes and custom business nodes obey the same contracts wi
 
 #### E10-T01 — Implement pure validation, mapping and formatting catalog nodes
 
-Issue: E10-T01 · Initial status: Backlog
+Issue: [E10-T01](https://github.com/well-prado/new-blok/issues/61) · Initial status: Backlog
 
 Roadmap ID: E10-T01
-Epic: E10 — Generic nodes and complete application recipes
+Epic: [E10](https://github.com/well-prado/new-blok/issues/10) — Generic nodes and complete application recipes
 Milestone: M4 — Node.js and persistent worker conformance
 Priority: P1 | Size: M | Review: A
 
@@ -2293,8 +2295,8 @@ Ship small schema-described generic validation, selection/mapping, template/defa
 
 ## Dependencies
 
-- [ ] E03-T04 — Implement scoped control-flow authoring primitives
-- [ ] E05-T04 — Provide typed in-process node and workflow testing
+- [ ] [E03-T04](https://github.com/well-prado/new-blok/issues/32) — Implement scoped control-flow authoring primitives
+- [ ] [E05-T04](https://github.com/well-prado/new-blok/issues/39) — Provide typed in-process node and workflow testing
 
 ## Cross-cutting invariants
 
@@ -2306,10 +2308,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E10-T02 — Implement effect nodes through injected provider ports
 
-Issue: E10-T02 · Initial status: Backlog
+Issue: [E10-T02](https://github.com/well-prado/new-blok/issues/62) · Initial status: Backlog
 
 Roadmap ID: E10-T02
-Epic: E10 — Generic nodes and complete application recipes
+Epic: [E10](https://github.com/well-prado/new-blok/issues/10) — Generic nodes and complete application recipes
 Milestone: M4 — Node.js and persistent worker conformance
 Priority: P1 | Size: M | Review: R
 
@@ -2347,9 +2349,9 @@ Add HTTP request, email, database operation, payment, publish, audit and structu
 
 ## Dependencies
 
-- [ ] E10-T01 — Implement pure validation, mapping and formatting catalog nodes
-- [ ] E07-T03 — Deliver durable jobs and an outbox-backed order application
-- [ ] E08-T03 — Implement Node.js SDK and persistent worker
+- [ ] [E10-T01](https://github.com/well-prado/new-blok/issues/61) — Implement pure validation, mapping and formatting catalog nodes
+- [ ] [E07-T03](https://github.com/well-prado/new-blok/issues/45) — Deliver durable jobs and an outbox-backed order application
+- [ ] [E08-T03](https://github.com/well-prado/new-blok/issues/52) — Implement Node.js SDK and persistent worker
 
 ## Cross-cutting invariants
 
@@ -2361,10 +2363,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E10-T03 — Deliver authenticated CRUD, webhook, job and streaming recipes
 
-Issue: E10-T03 · Initial status: Backlog
+Issue: [E10-T03](https://github.com/well-prado/new-blok/issues/63) · Initial status: Backlog
 
 Roadmap ID: E10-T03
-Epic: E10 — Generic nodes and complete application recipes
+Epic: [E10](https://github.com/well-prado/new-blok/issues/10) — Generic nodes and complete application recipes
 Milestone: M6 — Developer tooling and package ecosystem
 Priority: P1 | Size: M | Review: R
 
@@ -2401,9 +2403,9 @@ Create runnable application recipes using ordinary Go dependencies and selected 
 
 ## Dependencies
 
-- [ ] E10-T02 — Implement effect nodes through injected provider ports
-- [ ] E09-T02 — Implement signed webhook admission
-- [ ] E09-T06 — Implement SSE streams with replay cursors and slow-client policy
+- [ ] [E10-T02](https://github.com/well-prado/new-blok/issues/62) — Implement effect nodes through injected provider ports
+- [ ] [E09-T02](https://github.com/well-prado/new-blok/issues/55) — Implement signed webhook admission
+- [ ] [E09-T06](https://github.com/well-prado/new-blok/issues/59) — Implement SSE streams with replay cursors and slow-client policy
 
 ## Cross-cutting invariants
 
@@ -2419,10 +2421,10 @@ Provide fast feedback and ordinary Go ownership without hidden registration or m
 
 #### E11-T01 — Implement new and generate for conventional Go applications
 
-Issue: E11-T01 · Initial status: Backlog
+Issue: [E11-T01](https://github.com/well-prado/new-blok/issues/64) · Initial status: Backlog
 
 Roadmap ID: E11-T01
-Epic: E11 — Go CLI and everyday developer experience
+Epic: [E11](https://github.com/well-prado/new-blok/issues/11) — Go CLI and everyday developer experience
 Milestone: M1 — Complete native Go application
 Priority: P1 | Size: M | Review: A
 
@@ -2459,8 +2461,8 @@ Create initial Go starter and selected trigger configuration with deterministic 
 
 ## Dependencies
 
-- [ ] E06-T03 — Ship the complete native quote application and DX fixture
-- [ ] E03-T03 — Generate typed field accessors and node input bindings
+- [ ] [E06-T03](https://github.com/well-prado/new-blok/issues/42) — Ship the complete native quote application and DX fixture
+- [ ] [E03-T03](https://github.com/well-prado/new-blok/issues/31) — Generate typed field accessors and node input bindings
 
 ## Cross-cutting invariants
 
@@ -2472,10 +2474,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E11-T02 — Implement check, test and machine-readable inspection
 
-Issue: E11-T02 · Initial status: Backlog
+Issue: [E11-T02](https://github.com/well-prado/new-blok/issues/65) · Initial status: Backlog
 
 Roadmap ID: E11-T02
-Epic: E11 — Go CLI and everyday developer experience
+Epic: [E11](https://github.com/well-prado/new-blok/issues/11) — Go CLI and everyday developer experience
 Milestone: M6 — Developer tooling and package ecosystem
 Priority: P1 | Size: M | Review: A
 
@@ -2512,8 +2514,8 @@ Wrap real compiler, test harness and catalog inspection with stable JSON diagnos
 
 ## Dependencies
 
-- [ ] E11-T01 — Implement new and generate for conventional Go applications
-- [ ] E02-T04 — Publish diagnostics and conformance harness contracts
+- [ ] [E11-T01](https://github.com/well-prado/new-blok/issues/64) — Implement new and generate for conventional Go applications
+- [ ] [E02-T04](https://github.com/well-prado/new-blok/issues/28) — Publish diagnostics and conformance harness contracts
 
 ## Cross-cutting invariants
 
@@ -2525,10 +2527,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E11-T03 — Implement dev build/watch and supervised worker reload
 
-Issue: E11-T03 · Initial status: Backlog
+Issue: [E11-T03](https://github.com/well-prado/new-blok/issues/66) · Initial status: Backlog
 
 Roadmap ID: E11-T03
-Epic: E11 — Go CLI and everyday developer experience
+Epic: [E11](https://github.com/well-prado/new-blok/issues/11) — Go CLI and everyday developer experience
 Milestone: M6 — Developer tooling and package ecosystem
 Priority: P1 | Size: M | Review: R
 
@@ -2566,9 +2568,9 @@ Watch source, regenerate/build and gracefully restart application. Drain persist
 
 ## Dependencies
 
-- [ ] E11-T02 — Implement check, test and machine-readable inspection
-- [ ] E08-T04 — Harden worker transport and publish equivalent workload evidence
-- [ ] E07-T06 — Implement reconciliation, artifact retention and safe upgrades
+- [ ] [E11-T02](https://github.com/well-prado/new-blok/issues/65) — Implement check, test and machine-readable inspection
+- [ ] [E08-T04](https://github.com/well-prado/new-blok/issues/53) — Harden worker transport and publish equivalent workload evidence
+- [ ] [E07-T06](https://github.com/well-prado/new-blok/issues/48) — Implement reconciliation, artifact retention and safe upgrades
 
 ## Cross-cutting invariants
 
@@ -2580,10 +2582,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E11-T04 — Implement doctor and operationally honest CLI output
 
-Issue: E11-T04 · Initial status: Backlog
+Issue: [E11-T04](https://github.com/well-prado/new-blok/issues/102) · Initial status: Backlog
 
 Roadmap ID: E11-T04
-Epic: E11 — Go CLI and everyday developer experience
+Epic: [E11](https://github.com/well-prado/new-blok/issues/11) — Go CLI and everyday developer experience
 Milestone: M6 — Developer tooling and package ecosystem
 Priority: P1 | Size: M | Review: A
 
@@ -2620,8 +2622,8 @@ Validate configuration, dependency versions, bindings, stores, worker artifacts,
 
 ## Dependencies
 
-- [ ] E11-T03 — Implement dev build/watch and supervised worker reload
-- [ ] E17-T01 — Implement deployment validation and production runtime endpoints
+- [ ] [E11-T03](https://github.com/well-prado/new-blok/issues/66) — Implement dev build/watch and supervised worker reload
+- [ ] [E17-T01](https://github.com/well-prado/new-blok/issues/81) — Implement deployment validation and production runtime endpoints
 
 ## Cross-cutting invariants
 
@@ -2637,10 +2639,10 @@ Offer layout choice without changing identities, contracts or node independence.
 
 #### E12-T01 — Implement manifest-based discovery for both layouts
 
-Issue: E12-T01 · Initial status: Backlog
+Issue: [E12-T01](https://github.com/well-prado/new-blok/issues/67) · Initial status: Backlog
 
 Roadmap ID: E12-T01
-Epic: E12 — Unified and classic layouts with ownership enforcement
+Epic: [E12](https://github.com/well-prado/new-blok/issues/12) — Unified and classic layouts with ownership enforcement
 Milestone: M6 — Developer tooling and package ecosystem
 Priority: P1 | Size: M | Review: R
 
@@ -2675,8 +2677,8 @@ Support nodes/<runtime>/<node> and runtimes/<runtime>/nodes/<node>, explicit wor
 
 ## Dependencies
 
-- [ ] E11-T01 — Implement new and generate for conventional Go applications
-- [ ] E01-T03 — Enforce modular imports and synthetic fixture governance
+- [ ] [E11-T01](https://github.com/well-prado/new-blok/issues/64) — Implement new and generate for conventional Go applications
+- [ ] [E01-T03](https://github.com/well-prado/new-blok/issues/23) — Enforce modular imports and synthetic fixture governance
 
 ## Cross-cutting invariants
 
@@ -2688,10 +2690,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E12-T02 — Enforce node independence across all language import graphs
 
-Issue: E12-T02 · Initial status: Backlog
+Issue: [E12-T02](https://github.com/well-prado/new-blok/issues/68) · Initial status: Backlog
 
 Roadmap ID: E12-T02
-Epic: E12 — Unified and classic layouts with ownership enforcement
+Epic: [E12](https://github.com/well-prado/new-blok/issues/12) — Unified and classic layouts with ownership enforcement
 Milestone: M6 — Developer tooling and package ecosystem
 Priority: P1 | Size: M | Review: R
 
@@ -2727,8 +2729,8 @@ Extend ownership analysis for supported language import forms and package manage
 
 ## Dependencies
 
-- [ ] E12-T01 — Implement manifest-based discovery for both layouts
-- [ ] E08-T03 — Implement Node.js SDK and persistent worker
+- [ ] [E12-T01](https://github.com/well-prado/new-blok/issues/67) — Implement manifest-based discovery for both layouts
+- [ ] [E08-T03](https://github.com/well-prado/new-blok/issues/52) — Implement Node.js SDK and persistent worker
 
 ## Cross-cutting invariants
 
@@ -2740,10 +2742,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E12-T03 — Implement transactional layout migration
 
-Issue: E12-T03 · Initial status: Backlog
+Issue: [E12-T03](https://github.com/well-prado/new-blok/issues/69) · Initial status: Backlog
 
 Roadmap ID: E12-T03
-Epic: E12 — Unified and classic layouts with ownership enforcement
+Epic: [E12](https://github.com/well-prado/new-blok/issues/12) — Unified and classic layouts with ownership enforcement
 Milestone: M6 — Developer tooling and package ecosystem
 Priority: P1 | Size: M | Review: R
 
@@ -2780,8 +2782,8 @@ Plan dry-run migrations, stage moves/import rewrites, validate catalog/graph equ
 
 ## Dependencies
 
-- [ ] E12-T02 — Enforce node independence across all language import graphs
-- [ ] E11-T02 — Implement check, test and machine-readable inspection
+- [ ] [E12-T02](https://github.com/well-prado/new-blok/issues/68) — Enforce node independence across all language import graphs
+- [ ] [E11-T02](https://github.com/well-prado/new-blok/issues/65) — Implement check, test and machine-readable inspection
 
 ## Cross-cutting invariants
 
@@ -2797,10 +2799,10 @@ Install reusable packages safely and reproducibly while keeping the hosted regis
 
 #### E13-T01 — Specify package identity, compatibility and trust protocol
 
-Issue: E13-T01 · Initial status: Backlog
+Issue: [E13-T01](https://github.com/well-prado/new-blok/issues/70) · Initial status: Backlog
 
 Roadmap ID: E13-T01
-Epic: E13 — Node and workflow package client and registry contracts
+Epic: [E13](https://github.com/well-prado/new-blok/issues/13) — Node and workflow package client and registry contracts
 Milestone: M6 — Developer tooling and package ecosystem
 Priority: P0 | Size: M | Review: R
 
@@ -2835,8 +2837,8 @@ Define namespaced immutable node/workflow packages, manifests, artifacts, depend
 
 ## Dependencies
 
-- [ ] E02-T03 — Implement immutable artifact identity and deployment manifests
-- [ ] E08-T01 — Specify and generate the negotiated worker protocol
+- [ ] [E02-T03](https://github.com/well-prado/new-blok/issues/27) — Implement immutable artifact identity and deployment manifests
+- [ ] [E08-T01](https://github.com/well-prado/new-blok/issues/50) — Specify and generate the negotiated worker protocol
 
 ## Cross-cutting invariants
 
@@ -2848,10 +2850,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E13-T02 — Implement deterministic resolution, locks and offline cache
 
-Issue: E13-T02 · Initial status: Backlog
+Issue: [E13-T02](https://github.com/well-prado/new-blok/issues/71) · Initial status: Backlog
 
 Roadmap ID: E13-T02
-Epic: E13 — Node and workflow package client and registry contracts
+Epic: [E13](https://github.com/well-prado/new-blok/issues/13) — Node and workflow package client and registry contracts
 Milestone: M6 — Developer tooling and package ecosystem
 Priority: P1 | Size: M | Review: R
 
@@ -2889,7 +2891,7 @@ Resolve compatible node/workflow package graphs with exact artifact hashes and n
 
 ## Dependencies
 
-- [ ] E13-T01 — Specify package identity, compatibility and trust protocol
+- [ ] [E13-T01](https://github.com/well-prado/new-blok/issues/70) — Specify package identity, compatibility and trust protocol
 
 ## Cross-cutting invariants
 
@@ -2901,10 +2903,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E13-T03 — Implement atomic add, remove, update and verify commands
 
-Issue: E13-T03 · Initial status: Backlog
+Issue: [E13-T03](https://github.com/well-prado/new-blok/issues/72) · Initial status: Backlog
 
 Roadmap ID: E13-T03
-Epic: E13 — Node and workflow package client and registry contracts
+Epic: [E13](https://github.com/well-prado/new-blok/issues/13) — Node and workflow package client and registry contracts
 Milestone: M6 — Developer tooling and package ecosystem
 Priority: P0 | Size: M | Review: R
 
@@ -2941,8 +2943,8 @@ Stage package changes, safely extract verified artifacts, update registration/lo
 
 ## Dependencies
 
-- [ ] E13-T02 — Implement deterministic resolution, locks and offline cache
-- [ ] E12-T03 — Implement transactional layout migration
+- [ ] [E13-T02](https://github.com/well-prado/new-blok/issues/71) — Implement deterministic resolution, locks and offline cache
+- [ ] [E12-T03](https://github.com/well-prado/new-blok/issues/69) — Implement transactional layout migration
 
 ## Cross-cutting invariants
 
@@ -2954,10 +2956,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E13-T04 — Publish offline examples and hosted registry handoff
 
-Issue: E13-T04 · Initial status: Backlog
+Issue: [E13-T04](https://github.com/well-prado/new-blok/issues/73) · Initial status: Backlog
 
 Roadmap ID: E13-T04
-Epic: E13 — Node and workflow package client and registry contracts
+Epic: [E13](https://github.com/well-prado/new-blok/issues/13) — Node and workflow package client and registry contracts
 Milestone: M6 — Developer tooling and package ecosystem
 Priority: P1 | Size: M | Review: R
 
@@ -2993,8 +2995,8 @@ Ship example reusable node and workflow packages, inspect/license/trust outputs 
 
 ## Dependencies
 
-- [ ] E13-T03 — Implement atomic add, remove, update and verify commands
-- [ ] E10-T03 — Deliver authenticated CRUD, webhook, job and streaming recipes
+- [ ] [E13-T03](https://github.com/well-prado/new-blok/issues/72) — Implement atomic add, remove, update and verify commands
+- [ ] [E10-T03](https://github.com/well-prado/new-blok/issues/63) — Deliver authenticated CRUD, webhook, job and streaming recipes
 
 ## Cross-cutting invariants
 
@@ -3010,10 +3012,10 @@ Let agents assemble complete applications while execution enforces authorization
 
 #### E14-T01 — Implement filtered node/workflow tool catalogs and invocation
 
-Issue: E14-T01 · Initial status: Backlog
+Issue: [E14-T01](https://github.com/well-prado/new-blok/issues/74) · Initial status: Backlog
 
 Roadmap ID: E14-T01
-Epic: E14 — Policy-enforced AI tools and composed workflow tools
+Epic: [E14](https://github.com/well-prado/new-blok/issues/14) — Policy-enforced AI tools and composed workflow tools
 Milestone: M4 — Node.js and persistent worker conformance
 Priority: P0 | Size: M | Review: R
 
@@ -3049,9 +3051,9 @@ Expose schema-described nodes and composed workflows through versioned tool inte
 
 ## Dependencies
 
-- [ ] E10-T02 — Implement effect nodes through injected provider ports
-- [ ] E08-T04 — Harden worker transport and publish equivalent workload evidence
-- [ ] E02-T04 — Publish diagnostics and conformance harness contracts
+- [ ] [E10-T02](https://github.com/well-prado/new-blok/issues/62) — Implement effect nodes through injected provider ports
+- [ ] [E08-T04](https://github.com/well-prado/new-blok/issues/53) — Harden worker transport and publish equivalent workload evidence
+- [ ] [E02-T04](https://github.com/well-prado/new-blok/issues/28) — Publish diagnostics and conformance harness contracts
 
 ## Cross-cutting invariants
 
@@ -3063,10 +3065,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E14-T02 — Enforce durable approvals, evidence and publication gates
 
-Issue: E14-T02 · Initial status: Backlog
+Issue: [E14-T02](https://github.com/well-prado/new-blok/issues/75) · Initial status: Backlog
 
 Roadmap ID: E14-T02
-Epic: E14 — Policy-enforced AI tools and composed workflow tools
+Epic: [E14](https://github.com/well-prado/new-blok/issues/14) — Policy-enforced AI tools and composed workflow tools
 Milestone: M4 — Node.js and persistent worker conformance
 Priority: P0 | Size: M | Review: R
 
@@ -3104,8 +3106,8 @@ Bind authorized approval to action/input/workflow/artifact digest, effects, revi
 
 ## Dependencies
 
-- [ ] E14-T01 — Implement filtered node/workflow tool catalogs and invocation
-- [ ] E07-T06 — Implement reconciliation, artifact retention and safe upgrades
+- [ ] [E14-T01](https://github.com/well-prado/new-blok/issues/74) — Implement filtered node/workflow tool catalogs and invocation
+- [ ] [E07-T06](https://github.com/well-prado/new-blok/issues/48) — Implement reconciliation, artifact retention and safe upgrades
 
 ## Cross-cutting invariants
 
@@ -3117,10 +3119,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E14-T03 — Expose read-only development MCP and bounded authoring tools
 
-Issue: E14-T03 · Initial status: Backlog
+Issue: [E14-T03](https://github.com/well-prado/new-blok/issues/103) · Initial status: Backlog
 
 Roadmap ID: E14-T03
-Epic: E14 — Policy-enforced AI tools and composed workflow tools
+Epic: [E14](https://github.com/well-prado/new-blok/issues/14) — Policy-enforced AI tools and composed workflow tools
 Milestone: M7 — AI tools, Studio APIs and observability
 Priority: P1 | Size: M | Review: R
 
@@ -3158,9 +3160,9 @@ Provide inspect/catalog/check/test projections for agents with project-root conf
 
 ## Dependencies
 
-- [ ] E14-T02 — Enforce durable approvals, evidence and publication gates
-- [ ] E11-T02 — Implement check, test and machine-readable inspection
-- [ ] E15-T01 — Implement versioned run and step inspection projections
+- [ ] [E14-T02](https://github.com/well-prado/new-blok/issues/75) — Enforce durable approvals, evidence and publication gates
+- [ ] [E11-T02](https://github.com/well-prado/new-blok/issues/65) — Implement check, test and machine-readable inspection
+- [ ] [E15-T01](https://github.com/well-prado/new-blok/issues/76) — Implement versioned run and step inspection projections
 
 ## Cross-cutting invariants
 
@@ -3172,10 +3174,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E14-T04 — Generate and evaluate complete generic/custom application proposals
 
-Issue: E14-T04 · Initial status: Backlog
+Issue: [E14-T04](https://github.com/well-prado/new-blok/issues/104) · Initial status: Backlog
 
 Roadmap ID: E14-T04
-Epic: E14 — Policy-enforced AI tools and composed workflow tools
+Epic: [E14](https://github.com/well-prado/new-blok/issues/14) — Policy-enforced AI tools and composed workflow tools
 Milestone: M7 — AI tools, Studio APIs and observability
 Priority: P1 | Size: M | Review: R
 
@@ -3212,9 +3214,9 @@ Create bounded application drafts from authorized catalog and recipes, generatin
 
 ## Dependencies
 
-- [ ] E14-T03 — Expose read-only development MCP and bounded authoring tools
-- [ ] E10-T03 — Deliver authenticated CRUD, webhook, job and streaming recipes
-- [ ] E13-T04 — Publish offline examples and hosted registry handoff
+- [ ] [E14-T03](https://github.com/well-prado/new-blok/issues/103) — Expose read-only development MCP and bounded authoring tools
+- [ ] [E10-T03](https://github.com/well-prado/new-blok/issues/63) — Deliver authenticated CRUD, webhook, job and streaming recipes
+- [ ] [E13-T04](https://github.com/well-prado/new-blok/issues/73) — Publish offline examples and hosted registry handoff
 
 ## Cross-cutting invariants
 
@@ -3230,10 +3232,10 @@ Expose every dev execution step through a secure versioned API consumed by a sep
 
 #### E15-T01 — Implement versioned run and step inspection projections
 
-Issue: E15-T01 · Initial status: Backlog
+Issue: [E15-T01](https://github.com/well-prado/new-blok/issues/76) · Initial status: Backlog
 
 Roadmap ID: E15-T01
-Epic: E15 — Notebook inspection APIs and Studio handoff
+Epic: [E15](https://github.com/well-prado/new-blok/issues/15) — Notebook inspection APIs and Studio handoff
 Milestone: M7 — AI tools, Studio APIs and observability
 Priority: P1 | Size: M | Review: R
 
@@ -3271,9 +3273,9 @@ Expose run/step inputs, processing events, attempts, output/error, logs and timi
 
 ## Dependencies
 
-- [ ] E05-T04 — Provide typed in-process node and workflow testing
-- [ ] E07-T06 — Implement reconciliation, artifact retention and safe upgrades
-- [ ] E08-T04 — Harden worker transport and publish equivalent workload evidence
+- [ ] [E05-T04](https://github.com/well-prado/new-blok/issues/39) — Provide typed in-process node and workflow testing
+- [ ] [E07-T06](https://github.com/well-prado/new-blok/issues/48) — Implement reconciliation, artifact retention and safe upgrades
+- [ ] [E08-T04](https://github.com/well-prado/new-blok/issues/53) — Harden worker transport and publish equivalent workload evidence
 
 ## Cross-cutting invariants
 
@@ -3285,10 +3287,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E15-T02 — Implement bounded live dev event streaming
 
-Issue: E15-T02 · Initial status: Backlog
+Issue: [E15-T02](https://github.com/well-prado/new-blok/issues/77) · Initial status: Backlog
 
 Roadmap ID: E15-T02
-Epic: E15 — Notebook inspection APIs and Studio handoff
+Epic: [E15](https://github.com/well-prado/new-blok/issues/15) — Notebook inspection APIs and Studio handoff
 Milestone: M7 — AI tools, Studio APIs and observability
 Priority: P1 | Size: M | Review: R
 
@@ -3326,8 +3328,8 @@ Add resumable authorized stream of step transitions/logs with cursor/gap policy,
 
 ## Dependencies
 
-- [ ] E15-T01 — Implement versioned run and step inspection projections
-- [ ] E09-T06 — Implement SSE streams with replay cursors and slow-client policy
+- [ ] [E15-T01](https://github.com/well-prado/new-blok/issues/76) — Implement versioned run and step inspection projections
+- [ ] [E09-T06](https://github.com/well-prado/new-blok/issues/59) — Implement SSE streams with replay cursors and slow-client policy
 
 ## Cross-cutting invariants
 
@@ -3339,10 +3341,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E15-T03 — Publish Studio consumer contracts and notebook UX specification
 
-Issue: E15-T03 · Initial status: Backlog
+Issue: [E15-T03](https://github.com/well-prado/new-blok/issues/78) · Initial status: Backlog
 
 Roadmap ID: E15-T03
-Epic: E15 — Notebook inspection APIs and Studio handoff
+Epic: [E15](https://github.com/well-prado/new-blok/issues/15) — Notebook inspection APIs and Studio handoff
 Milestone: M7 — AI tools, Studio APIs and observability
 Priority: P1 | Size: M | Review: R
 
@@ -3378,8 +3380,8 @@ Specify separate Studio integration: restrained Vercel/shadcn-like UI, notebook 
 
 ## Dependencies
 
-- [ ] E15-T02 — Implement bounded live dev event streaming
-- [ ] E14-T02 — Enforce durable approvals, evidence and publication gates
+- [ ] [E15-T02](https://github.com/well-prado/new-blok/issues/77) — Implement bounded live dev event streaming
+- [ ] [E14-T02](https://github.com/well-prado/new-blok/issues/75) — Enforce durable approvals, evidence and publication gates
 
 ## Cross-cutting invariants
 
@@ -3395,10 +3397,10 @@ Make production behavior measurable without unbounded overhead or debug event gu
 
 #### E16-T01 — Implement optional metrics, traces and structured logs
 
-Issue: E16-T01 · Initial status: Backlog
+Issue: [E16-T01](https://github.com/well-prado/new-blok/issues/79) · Initial status: Backlog
 
 Roadmap ID: E16-T01
-Epic: E16 — Optional production observability and reliable audit
+Epic: [E16](https://github.com/well-prado/new-blok/issues/16) — Optional production observability and reliable audit
 Milestone: M7 — AI tools, Studio APIs and observability
 Priority: P1 | Size: M | Review: R
 
@@ -3436,8 +3438,8 @@ Add narrow engine observation ports and independently selected OpenTelemetry-com
 
 ## Dependencies
 
-- [ ] E15-T01 — Implement versioned run and step inspection projections
-- [ ] E08-T04 — Harden worker transport and publish equivalent workload evidence
+- [ ] [E15-T01](https://github.com/well-prado/new-blok/issues/76) — Implement versioned run and step inspection projections
+- [ ] [E08-T04](https://github.com/well-prado/new-blok/issues/53) — Harden worker transport and publish equivalent workload evidence
 
 ## Cross-cutting invariants
 
@@ -3449,10 +3451,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E16-T02 — Enforce sensitive-data access, redaction and reliable audit
 
-Issue: E16-T02 · Initial status: Backlog
+Issue: [E16-T02](https://github.com/well-prado/new-blok/issues/80) · Initial status: Backlog
 
 Roadmap ID: E16-T02
-Epic: E16 — Optional production observability and reliable audit
+Epic: [E16](https://github.com/well-prado/new-blok/issues/16) — Optional production observability and reliable audit
 Milestone: M7 — AI tools, Studio APIs and observability
 Priority: P0 | Size: M | Review: R
 
@@ -3490,9 +3492,9 @@ Define input/output/error/log redaction and audit retention/access with separate
 
 ## Dependencies
 
-- [ ] E16-T01 — Implement optional metrics, traces and structured logs
-- [ ] E14-T02 — Enforce durable approvals, evidence and publication gates
-- [ ] E07-T07 — Implement verified retention, compaction, backup and restore
+- [ ] [E16-T01](https://github.com/well-prado/new-blok/issues/79) — Implement optional metrics, traces and structured logs
+- [ ] [E14-T02](https://github.com/well-prado/new-blok/issues/75) — Enforce durable approvals, evidence and publication gates
+- [ ] [E07-T07](https://github.com/well-prado/new-blok/issues/49) — Implement verified retention, compaction, backup and restore
 
 ## Cross-cutting invariants
 
@@ -3504,10 +3506,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E16-T03 — Publish operational SLO metrics and monitoring integrations
 
-Issue: E16-T03 · Initial status: Backlog
+Issue: [E16-T03](https://github.com/well-prado/new-blok/issues/105) · Initial status: Backlog
 
 Roadmap ID: E16-T03
-Epic: E16 — Optional production observability and reliable audit
+Epic: [E16](https://github.com/well-prado/new-blok/issues/16) — Optional production observability and reliable audit
 Milestone: M7 — AI tools, Studio APIs and observability
 Priority: P1 | Size: M | Review: R
 
@@ -3543,8 +3545,8 @@ Define readiness/health, admission saturation, queue depth, latency, error, unce
 
 ## Dependencies
 
-- [ ] E16-T02 — Enforce sensitive-data access, redaction and reliable audit
-- [ ] E17-T01 — Implement deployment validation and production runtime endpoints
+- [ ] [E16-T02](https://github.com/well-prado/new-blok/issues/80) — Enforce sensitive-data access, redaction and reliable audit
+- [ ] [E17-T01](https://github.com/well-prado/new-blok/issues/81) — Implement deployment validation and production runtime endpoints
 
 ## Cross-cutting invariants
 
@@ -3560,10 +3562,10 @@ Make applications easy to deploy through reproducible binaries and operational c
 
 #### E17-T01 — Implement deployment validation and production runtime endpoints
 
-Issue: E17-T01 · Initial status: Backlog
+Issue: [E17-T01](https://github.com/well-prado/new-blok/issues/81) · Initial status: Backlog
 
 Roadmap ID: E17-T01
-Epic: E17 — Self-hosting, artifacts and Cloud integration contracts
+Epic: [E17](https://github.com/well-prado/new-blok/issues/17) — Self-hosting, artifacts and Cloud integration contracts
 Milestone: M4 — Node.js and persistent worker conformance
 Priority: P1 | Size: M | Review: R
 
@@ -3601,9 +3603,9 @@ Define app manifest/config env handling, readiness/health/metrics, durable volum
 
 ## Dependencies
 
-- [ ] E06-T01 — Implement application composition and graceful lifecycle
-- [ ] E07-T07 — Implement verified retention, compaction, backup and restore
-- [ ] E08-T04 — Harden worker transport and publish equivalent workload evidence
+- [ ] [E06-T01](https://github.com/well-prado/new-blok/issues/40) — Implement application composition and graceful lifecycle
+- [ ] [E07-T07](https://github.com/well-prado/new-blok/issues/49) — Implement verified retention, compaction, backup and restore
+- [ ] [E08-T04](https://github.com/well-prado/new-blok/issues/53) — Harden worker transport and publish equivalent workload evidence
 
 ## Cross-cutting invariants
 
@@ -3615,10 +3617,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E17-T02 — Build reproducible binaries, SDK packages and signed artifacts
 
-Issue: E17-T02 · Initial status: Backlog
+Issue: [E17-T02](https://github.com/well-prado/new-blok/issues/82) · Initial status: Backlog
 
 Roadmap ID: E17-T02
-Epic: E17 — Self-hosting, artifacts and Cloud integration contracts
+Epic: [E17](https://github.com/well-prado/new-blok/issues/17) — Self-hosting, artifacts and Cloud integration contracts
 Milestone: M8 — Distributed deployment and runtime coverage
 Priority: P1 | Size: M | Review: R
 
@@ -3655,9 +3657,9 @@ Pin build/generation tools and dependency locks; produce target-matrix artifacts
 
 ## Dependencies
 
-- [ ] E17-T01 — Implement deployment validation and production runtime endpoints
-- [ ] E13-T03 — Implement atomic add, remove, update and verify commands
-- [ ] E01-T04 — Create release quality gates and supported toolchain matrix
+- [ ] [E17-T01](https://github.com/well-prado/new-blok/issues/81) — Implement deployment validation and production runtime endpoints
+- [ ] [E13-T03](https://github.com/well-prado/new-blok/issues/72) — Implement atomic add, remove, update and verify commands
+- [ ] [E01-T04](https://github.com/well-prado/new-blok/issues/24) — Create release quality gates and supported toolchain matrix
 
 ## Cross-cutting invariants
 
@@ -3669,10 +3671,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E17-T03 — Implement multi-version deployment and artifact retention routing
 
-Issue: E17-T03 · Initial status: Backlog
+Issue: [E17-T03](https://github.com/well-prado/new-blok/issues/83) · Initial status: Backlog
 
 Roadmap ID: E17-T03
-Epic: E17 — Self-hosting, artifacts and Cloud integration contracts
+Epic: [E17](https://github.com/well-prado/new-blok/issues/17) — Self-hosting, artifacts and Cloud integration contracts
 Milestone: M8 — Distributed deployment and runtime coverage
 Priority: P1 | Size: M | Review: R
 
@@ -3710,8 +3712,8 @@ Route new runs to new artifacts while retaining old binary/worker generations fo
 
 ## Dependencies
 
-- [ ] E17-T02 — Build reproducible binaries, SDK packages and signed artifacts
-- [ ] E07-T06 — Implement reconciliation, artifact retention and safe upgrades
+- [ ] [E17-T02](https://github.com/well-prado/new-blok/issues/82) — Build reproducible binaries, SDK packages and signed artifacts
+- [ ] [E07-T06](https://github.com/well-prado/new-blok/issues/48) — Implement reconciliation, artifact retention and safe upgrades
 
 ## Cross-cutting invariants
 
@@ -3723,10 +3725,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E17-T04 — Publish Cloud contract and self-hosted deployment recipes
 
-Issue: E17-T04 · Initial status: Backlog
+Issue: [E17-T04](https://github.com/well-prado/new-blok/issues/106) · Initial status: Backlog
 
 Roadmap ID: E17-T04
-Epic: E17 — Self-hosting, artifacts and Cloud integration contracts
+Epic: [E17](https://github.com/well-prado/new-blok/issues/17) — Self-hosting, artifacts and Cloud integration contracts
 Milestone: M8 — Distributed deployment and runtime coverage
 Priority: P1 | Size: M | Review: R
 
@@ -3762,9 +3764,9 @@ Provide deployment/artifact/health/observability/control APIs and examples for s
 
 ## Dependencies
 
-- [ ] E17-T03 — Implement multi-version deployment and artifact retention routing
-- [ ] E16-T03 — Publish operational SLO metrics and monitoring integrations
-- [ ] E18-T03 — Implement online resharding, drain and rolling recovery
+- [ ] [E17-T03](https://github.com/well-prado/new-blok/issues/83) — Implement multi-version deployment and artifact retention routing
+- [ ] [E16-T03](https://github.com/well-prado/new-blok/issues/105) — Publish operational SLO metrics and monitoring integrations
+- [ ] [E18-T03](https://github.com/well-prado/new-blok/issues/86) — Implement online resharding, drain and rolling recovery
 
 ## Cross-cutting invariants
 
@@ -3780,10 +3782,10 @@ Scale accepted work across a fleet with tested ownership and failure semantics.
 
 #### E18-T01 — Specify distributed persistence and partition ownership
 
-Issue: E18-T01 · Initial status: Backlog
+Issue: [E18-T01](https://github.com/well-prado/new-blok/issues/84) · Initial status: Backlog
 
 Roadmap ID: E18-T01
-Epic: E18 — Distributed ownership, fencing and capacity
+Epic: [E18](https://github.com/well-prado/new-blok/issues/18) — Distributed ownership, fencing and capacity
 Milestone: M8 — Distributed deployment and runtime coverage
 Priority: P0 | Size: M | Review: R
 
@@ -3820,8 +3822,8 @@ Choose persistence/coordination model through failure/load spike. Define partiti
 
 ## Dependencies
 
-- [ ] E07-T07 — Implement verified retention, compaction, backup and restore
-- [ ] E17-T01 — Implement deployment validation and production runtime endpoints
+- [ ] [E07-T07](https://github.com/well-prado/new-blok/issues/49) — Implement verified retention, compaction, backup and restore
+- [ ] [E17-T01](https://github.com/well-prado/new-blok/issues/81) — Implement deployment validation and production runtime endpoints
 
 ## Cross-cutting invariants
 
@@ -3833,10 +3835,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E18-T02 — Implement fenced failover and distributed work admission
 
-Issue: E18-T02 · Initial status: Backlog
+Issue: [E18-T02](https://github.com/well-prado/new-blok/issues/85) · Initial status: Backlog
 
 Roadmap ID: E18-T02
-Epic: E18 — Distributed ownership, fencing and capacity
+Epic: [E18](https://github.com/well-prado/new-blok/issues/18) — Distributed ownership, fencing and capacity
 Milestone: M8 — Distributed deployment and runtime coverage
 Priority: P0 | Size: M | Review: R
 
@@ -3873,7 +3875,7 @@ Add partitioned routing and transactional fenced commits for runs/timers/signals
 
 ## Dependencies
 
-- [ ] E18-T01 — Specify distributed persistence and partition ownership
+- [ ] [E18-T01](https://github.com/well-prado/new-blok/issues/84) — Specify distributed persistence and partition ownership
 
 ## Cross-cutting invariants
 
@@ -3885,10 +3887,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E18-T03 — Implement online resharding, drain and rolling recovery
 
-Issue: E18-T03 · Initial status: Backlog
+Issue: [E18-T03](https://github.com/well-prado/new-blok/issues/86) · Initial status: Backlog
 
 Roadmap ID: E18-T03
-Epic: E18 — Distributed ownership, fencing and capacity
+Epic: [E18](https://github.com/well-prado/new-blok/issues/18) — Distributed ownership, fencing and capacity
 Milestone: M8 — Distributed deployment and runtime coverage
 Priority: P1 | Size: M | Review: R
 
@@ -3924,8 +3926,8 @@ Move ownership and referenced blobs/timers safely while versions run, preserving
 
 ## Dependencies
 
-- [ ] E18-T02 — Implement fenced failover and distributed work admission
-- [ ] E17-T03 — Implement multi-version deployment and artifact retention routing
+- [ ] [E18-T02](https://github.com/well-prado/new-blok/issues/85) — Implement fenced failover and distributed work admission
+- [ ] [E17-T03](https://github.com/well-prado/new-blok/issues/83) — Implement multi-version deployment and artifact retention routing
 
 ## Cross-cutting invariants
 
@@ -3937,10 +3939,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E18-T04 — Publish fleet-scale load and operational capacity envelopes
 
-Issue: E18-T04 · Initial status: Backlog
+Issue: [E18-T04](https://github.com/well-prado/new-blok/issues/107) · Initial status: Backlog
 
 Roadmap ID: E18-T04
-Epic: E18 — Distributed ownership, fencing and capacity
+Epic: [E18](https://github.com/well-prado/new-blok/issues/18) — Distributed ownership, fencing and capacity
 Milestone: M8 — Distributed deployment and runtime coverage
 Priority: P1 | Size: M | Review: R
 
@@ -3977,9 +3979,9 @@ Exercise millions-of-requests-per-second ambition using controlled distributed l
 
 ## Dependencies
 
-- [ ] E18-T03 — Implement online resharding, drain and rolling recovery
-- [ ] E16-T03 — Publish operational SLO metrics and monitoring integrations
-- [ ] E19-T14 — Certify cross-runtime application and release conformance
+- [ ] [E18-T03](https://github.com/well-prado/new-blok/issues/86) — Implement online resharding, drain and rolling recovery
+- [ ] [E16-T03](https://github.com/well-prado/new-blok/issues/105) — Publish operational SLO metrics and monitoring integrations
+- [ ] [E19-T14](https://github.com/well-prado/new-blok/issues/100) — Certify cross-runtime application and release conformance
 
 ## Cross-cutting invariants
 
@@ -3995,10 +3997,10 @@ Give every promised language a real persistent worker and the same semantic/fail
 
 #### E19-T01 — Publish SDK extension kit and supported runtime matrix
 
-Issue: E19-T01 · Initial status: Backlog
+Issue: [E19-T01](https://github.com/well-prado/new-blok/issues/87) · Initial status: Backlog
 
 Roadmap ID: E19-T01
-Epic: E19 — Full runtime and SDK coverage
+Epic: [E19](https://github.com/well-prado/new-blok/issues/19) — Full runtime and SDK coverage
 Milestone: M8 — Distributed deployment and runtime coverage
 Priority: P1 | Size: M | Review: R
 
@@ -4035,9 +4037,9 @@ Extract worker/SDK implementation guidance, generated bindings, language depende
 
 ## Dependencies
 
-- [ ] E08-T04 — Harden worker transport and publish equivalent workload evidence
-- [ ] E12-T02 — Enforce node independence across all language import graphs
-- [ ] E17-T02 — Build reproducible binaries, SDK packages and signed artifacts
+- [ ] [E08-T04](https://github.com/well-prado/new-blok/issues/53) — Harden worker transport and publish equivalent workload evidence
+- [ ] [E12-T02](https://github.com/well-prado/new-blok/issues/68) — Enforce node independence across all language import graphs
+- [ ] [E17-T02](https://github.com/well-prado/new-blok/issues/82) — Build reproducible binaries, SDK packages and signed artifacts
 
 ## Cross-cutting invariants
 
@@ -4049,10 +4051,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E19-T02 — Implement Python3 persistent worker and SDK
 
-Issue: E19-T02 · Initial status: Backlog
+Issue: [E19-T02](https://github.com/well-prado/new-blok/issues/88) · Initial status: Backlog
 
 Roadmap ID: E19-T02
-Epic: E19 — Full runtime and SDK coverage
+Epic: [E19](https://github.com/well-prado/new-blok/issues/19) — Full runtime and SDK coverage
 Milestone: M8 — Distributed deployment and runtime coverage
 Priority: P1 | Size: M | Review: R
 
@@ -4091,7 +4093,7 @@ Implement Python3 SDK/runtime adapter against the extension kit. Cover Python as
 
 ## Dependencies
 
-- [ ] E19-T01 — Publish SDK extension kit and supported runtime matrix
+- [ ] [E19-T01](https://github.com/well-prado/new-blok/issues/87) — Publish SDK extension kit and supported runtime matrix
 
 ## Cross-cutting invariants
 
@@ -4103,10 +4105,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E19-T03 — Implement Rust persistent worker and SDK
 
-Issue: E19-T03 · Initial status: Backlog
+Issue: [E19-T03](https://github.com/well-prado/new-blok/issues/89) · Initial status: Backlog
 
 Roadmap ID: E19-T03
-Epic: E19 — Full runtime and SDK coverage
+Epic: [E19](https://github.com/well-prado/new-blok/issues/19) — Full runtime and SDK coverage
 Milestone: M8 — Distributed deployment and runtime coverage
 Priority: P1 | Size: M | Review: R
 
@@ -4145,7 +4147,7 @@ Implement Rust SDK/runtime adapter against the extension kit. Cover Tokio cancel
 
 ## Dependencies
 
-- [ ] E19-T01 — Publish SDK extension kit and supported runtime matrix
+- [ ] [E19-T01](https://github.com/well-prado/new-blok/issues/87) — Publish SDK extension kit and supported runtime matrix
 
 ## Cross-cutting invariants
 
@@ -4157,10 +4159,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E19-T04 — Implement Java persistent worker and SDK
 
-Issue: E19-T04 · Initial status: Backlog
+Issue: [E19-T04](https://github.com/well-prado/new-blok/issues/90) · Initial status: Backlog
 
 Roadmap ID: E19-T04
-Epic: E19 — Full runtime and SDK coverage
+Epic: [E19](https://github.com/well-prado/new-blok/issues/19) — Full runtime and SDK coverage
 Milestone: M8 — Distributed deployment and runtime coverage
 Priority: P1 | Size: M | Review: R
 
@@ -4199,7 +4201,7 @@ Implement Java SDK/runtime adapter against the extension kit. Cover JVM process/
 
 ## Dependencies
 
-- [ ] E19-T01 — Publish SDK extension kit and supported runtime matrix
+- [ ] [E19-T01](https://github.com/well-prado/new-blok/issues/87) — Publish SDK extension kit and supported runtime matrix
 
 ## Cross-cutting invariants
 
@@ -4211,10 +4213,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E19-T05 — Implement Kotlin persistent worker and SDK
 
-Issue: E19-T05 · Initial status: Backlog
+Issue: [E19-T05](https://github.com/well-prado/new-blok/issues/91) · Initial status: Backlog
 
 Roadmap ID: E19-T05
-Epic: E19 — Full runtime and SDK coverage
+Epic: [E19](https://github.com/well-prado/new-blok/issues/19) — Full runtime and SDK coverage
 Milestone: M8 — Distributed deployment and runtime coverage
 Priority: P1 | Size: M | Review: R
 
@@ -4253,7 +4255,7 @@ Implement Kotlin SDK/runtime adapter against the extension kit. Cover Coroutine 
 
 ## Dependencies
 
-- [ ] E19-T01 — Publish SDK extension kit and supported runtime matrix
+- [ ] [E19-T01](https://github.com/well-prado/new-blok/issues/87) — Publish SDK extension kit and supported runtime matrix
 
 ## Cross-cutting invariants
 
@@ -4265,10 +4267,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E19-T06 — Implement C# persistent worker and SDK
 
-Issue: E19-T06 · Initial status: Backlog
+Issue: [E19-T06](https://github.com/well-prado/new-blok/issues/92) · Initial status: Backlog
 
 Roadmap ID: E19-T06
-Epic: E19 — Full runtime and SDK coverage
+Epic: [E19](https://github.com/well-prado/new-blok/issues/19) — Full runtime and SDK coverage
 Milestone: M8 — Distributed deployment and runtime coverage
 Priority: P1 | Size: M | Review: R
 
@@ -4307,7 +4309,7 @@ Implement C# SDK/runtime adapter against the extension kit. Cover .NET Cancellat
 
 ## Dependencies
 
-- [ ] E19-T01 — Publish SDK extension kit and supported runtime matrix
+- [ ] [E19-T01](https://github.com/well-prado/new-blok/issues/87) — Publish SDK extension kit and supported runtime matrix
 
 ## Cross-cutting invariants
 
@@ -4319,10 +4321,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E19-T07 — Implement PHP persistent worker and SDK
 
-Issue: E19-T07 · Initial status: Backlog
+Issue: [E19-T07](https://github.com/well-prado/new-blok/issues/93) · Initial status: Backlog
 
 Roadmap ID: E19-T07
-Epic: E19 — Full runtime and SDK coverage
+Epic: [E19](https://github.com/well-prado/new-blok/issues/19) — Full runtime and SDK coverage
 Milestone: M8 — Distributed deployment and runtime coverage
 Priority: P1 | Size: M | Review: R
 
@@ -4361,7 +4363,7 @@ Implement PHP SDK/runtime adapter against the extension kit. Cover Persistent gR
 
 ## Dependencies
 
-- [ ] E19-T01 — Publish SDK extension kit and supported runtime matrix
+- [ ] [E19-T01](https://github.com/well-prado/new-blok/issues/87) — Publish SDK extension kit and supported runtime matrix
 
 ## Cross-cutting invariants
 
@@ -4373,10 +4375,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E19-T08 — Implement Ruby persistent worker and SDK
 
-Issue: E19-T08 · Initial status: Backlog
+Issue: [E19-T08](https://github.com/well-prado/new-blok/issues/94) · Initial status: Backlog
 
 Roadmap ID: E19-T08
-Epic: E19 — Full runtime and SDK coverage
+Epic: [E19](https://github.com/well-prado/new-blok/issues/19) — Full runtime and SDK coverage
 Milestone: M8 — Distributed deployment and runtime coverage
 Priority: P1 | Size: M | Review: R
 
@@ -4415,7 +4417,7 @@ Implement Ruby SDK/runtime adapter against the extension kit. Cover Persistent g
 
 ## Dependencies
 
-- [ ] E19-T01 — Publish SDK extension kit and supported runtime matrix
+- [ ] [E19-T01](https://github.com/well-prado/new-blok/issues/87) — Publish SDK extension kit and supported runtime matrix
 
 ## Cross-cutting invariants
 
@@ -4427,10 +4429,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E19-T09 — Implement Swift persistent worker and SDK
 
-Issue: E19-T09 · Initial status: Backlog
+Issue: [E19-T09](https://github.com/well-prado/new-blok/issues/95) · Initial status: Backlog
 
 Roadmap ID: E19-T09
-Epic: E19 — Full runtime and SDK coverage
+Epic: [E19](https://github.com/well-prado/new-blok/issues/19) — Full runtime and SDK coverage
 Milestone: M8 — Distributed deployment and runtime coverage
 Priority: P1 | Size: M | Review: R
 
@@ -4469,7 +4471,7 @@ Implement Swift SDK/runtime adapter against the extension kit. Cover Structured 
 
 ## Dependencies
 
-- [ ] E19-T01 — Publish SDK extension kit and supported runtime matrix
+- [ ] [E19-T01](https://github.com/well-prado/new-blok/issues/87) — Publish SDK extension kit and supported runtime matrix
 
 ## Cross-cutting invariants
 
@@ -4481,10 +4483,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E19-T10 — Implement Dart persistent worker and SDK
 
-Issue: E19-T10 · Initial status: Backlog
+Issue: [E19-T10](https://github.com/well-prado/new-blok/issues/96) · Initial status: Backlog
 
 Roadmap ID: E19-T10
-Epic: E19 — Full runtime and SDK coverage
+Epic: [E19](https://github.com/well-prado/new-blok/issues/19) — Full runtime and SDK coverage
 Milestone: M8 — Distributed deployment and runtime coverage
 Priority: P1 | Size: M | Review: R
 
@@ -4523,7 +4525,7 @@ Implement Dart SDK/runtime adapter against the extension kit. Cover Async/isolat
 
 ## Dependencies
 
-- [ ] E19-T01 — Publish SDK extension kit and supported runtime matrix
+- [ ] [E19-T01](https://github.com/well-prado/new-blok/issues/87) — Publish SDK extension kit and supported runtime matrix
 
 ## Cross-cutting invariants
 
@@ -4535,10 +4537,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E19-T11 — Implement Elixir persistent worker and SDK
 
-Issue: E19-T11 · Initial status: Backlog
+Issue: [E19-T11](https://github.com/well-prado/new-blok/issues/97) · Initial status: Backlog
 
 Roadmap ID: E19-T11
-Epic: E19 — Full runtime and SDK coverage
+Epic: [E19](https://github.com/well-prado/new-blok/issues/19) — Full runtime and SDK coverage
 Milestone: M8 — Distributed deployment and runtime coverage
 Priority: P1 | Size: M | Review: R
 
@@ -4577,7 +4579,7 @@ Implement Elixir SDK/runtime adapter against the extension kit. Cover OTP superv
 
 ## Dependencies
 
-- [ ] E19-T01 — Publish SDK extension kit and supported runtime matrix
+- [ ] [E19-T01](https://github.com/well-prado/new-blok/issues/87) — Publish SDK extension kit and supported runtime matrix
 
 ## Cross-cutting invariants
 
@@ -4589,10 +4591,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E19-T12 — Implement Go remote persistent worker and SDK
 
-Issue: E19-T12 · Initial status: Backlog
+Issue: [E19-T12](https://github.com/well-prado/new-blok/issues/98) · Initial status: Backlog
 
 Roadmap ID: E19-T12
-Epic: E19 — Full runtime and SDK coverage
+Epic: [E19](https://github.com/well-prado/new-blok/issues/19) — Full runtime and SDK coverage
 Milestone: M8 — Distributed deployment and runtime coverage
 Priority: P1 | Size: M | Review: R
 
@@ -4631,7 +4633,7 @@ Implement Go remote SDK/runtime adapter against the extension kit. Cover Optiona
 
 ## Dependencies
 
-- [ ] E19-T01 — Publish SDK extension kit and supported runtime matrix
+- [ ] [E19-T01](https://github.com/well-prado/new-blok/issues/87) — Publish SDK extension kit and supported runtime matrix
 
 ## Cross-cutting invariants
 
@@ -4643,10 +4645,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E19-T13 — Implement Bun and Deno persistent worker and SDK
 
-Issue: E19-T13 · Initial status: Backlog
+Issue: [E19-T13](https://github.com/well-prado/new-blok/issues/99) · Initial status: Backlog
 
 Roadmap ID: E19-T13
-Epic: E19 — Full runtime and SDK coverage
+Epic: [E19](https://github.com/well-prado/new-blok/issues/19) — Full runtime and SDK coverage
 Milestone: M8 — Distributed deployment and runtime coverage
 Priority: P1 | Size: M | Review: R
 
@@ -4685,7 +4687,7 @@ Implement Bun and Deno SDK/runtime adapter against the extension kit. Cover Sepa
 
 ## Dependencies
 
-- [ ] E19-T01 — Publish SDK extension kit and supported runtime matrix
+- [ ] [E19-T01](https://github.com/well-prado/new-blok/issues/87) — Publish SDK extension kit and supported runtime matrix
 
 ## Cross-cutting invariants
 
@@ -4697,10 +4699,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E19-T14 — Certify cross-runtime application and release conformance
 
-Issue: E19-T14 · Initial status: Backlog
+Issue: [E19-T14](https://github.com/well-prado/new-blok/issues/100) · Initial status: Backlog
 
 Roadmap ID: E19-T14
-Epic: E19 — Full runtime and SDK coverage
+Epic: [E19](https://github.com/well-prado/new-blok/issues/19) — Full runtime and SDK coverage
 Milestone: M8 — Distributed deployment and runtime coverage
 Priority: P1 | Size: M | Review: R
 
@@ -4738,18 +4740,18 @@ Run equivalent business workflows with every worker, explicit supported matrices
 
 ## Dependencies
 
-- [ ] E19-T02 — Implement Python3 persistent worker and SDK
-- [ ] E19-T03 — Implement Rust persistent worker and SDK
-- [ ] E19-T04 — Implement Java persistent worker and SDK
-- [ ] E19-T05 — Implement Kotlin persistent worker and SDK
-- [ ] E19-T06 — Implement C# persistent worker and SDK
-- [ ] E19-T07 — Implement PHP persistent worker and SDK
-- [ ] E19-T08 — Implement Ruby persistent worker and SDK
-- [ ] E19-T09 — Implement Swift persistent worker and SDK
-- [ ] E19-T10 — Implement Dart persistent worker and SDK
-- [ ] E19-T11 — Implement Elixir persistent worker and SDK
-- [ ] E19-T12 — Implement Go remote persistent worker and SDK
-- [ ] E19-T13 — Implement Bun and Deno persistent worker and SDK
+- [ ] [E19-T02](https://github.com/well-prado/new-blok/issues/88) — Implement Python3 persistent worker and SDK
+- [ ] [E19-T03](https://github.com/well-prado/new-blok/issues/89) — Implement Rust persistent worker and SDK
+- [ ] [E19-T04](https://github.com/well-prado/new-blok/issues/90) — Implement Java persistent worker and SDK
+- [ ] [E19-T05](https://github.com/well-prado/new-blok/issues/91) — Implement Kotlin persistent worker and SDK
+- [ ] [E19-T06](https://github.com/well-prado/new-blok/issues/92) — Implement C# persistent worker and SDK
+- [ ] [E19-T07](https://github.com/well-prado/new-blok/issues/93) — Implement PHP persistent worker and SDK
+- [ ] [E19-T08](https://github.com/well-prado/new-blok/issues/94) — Implement Ruby persistent worker and SDK
+- [ ] [E19-T09](https://github.com/well-prado/new-blok/issues/95) — Implement Swift persistent worker and SDK
+- [ ] [E19-T10](https://github.com/well-prado/new-blok/issues/96) — Implement Dart persistent worker and SDK
+- [ ] [E19-T11](https://github.com/well-prado/new-blok/issues/97) — Implement Elixir persistent worker and SDK
+- [ ] [E19-T12](https://github.com/well-prado/new-blok/issues/98) — Implement Go remote persistent worker and SDK
+- [ ] [E19-T13](https://github.com/well-prado/new-blok/issues/99) — Implement Bun and Deno persistent worker and SDK
 
 ## Cross-cutting invariants
 
@@ -4765,10 +4767,10 @@ Release only what application, security, usability and capacity evidence actuall
 
 #### E20-T01 — Execute behaviorally equivalent current-Blok application comparisons
 
-Issue: E20-T01 · Initial status: Backlog
+Issue: [E20-T01](https://github.com/well-prado/new-blok/issues/108) · Initial status: Backlog
 
 Roadmap ID: E20-T01
-Epic: E20 — Production evidence, migration and open-source release
+Epic: [E20](https://github.com/well-prado/new-blok/issues/20) — Production evidence, migration and open-source release
 Milestone: M9 — Production release and ecosystem handoff
 Priority: P0 | Size: M | Review: R
 
@@ -4805,10 +4807,10 @@ Run actual old and new engines on equivalent quote/order/job/webhook/streaming c
 
 ## Dependencies
 
-- [ ] E06-T03 — Ship the complete native quote application and DX fixture
-- [ ] E07-T07 — Implement verified retention, compaction, backup and restore
-- [ ] E09-T08 — Implement MCP node and workflow exposure
-- [ ] E08-T04 — Harden worker transport and publish equivalent workload evidence
+- [ ] [E06-T03](https://github.com/well-prado/new-blok/issues/42) — Ship the complete native quote application and DX fixture
+- [ ] [E07-T07](https://github.com/well-prado/new-blok/issues/49) — Implement verified retention, compaction, backup and restore
+- [ ] [E09-T08](https://github.com/well-prado/new-blok/issues/101) — Implement MCP node and workflow exposure
+- [ ] [E08-T04](https://github.com/well-prado/new-blok/issues/53) — Harden worker transport and publish equivalent workload evidence
 
 ## Cross-cutting invariants
 
@@ -4820,10 +4822,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E20-T02 — Measure newcomer DX and live AI application success
 
-Issue: E20-T02 · Initial status: Backlog
+Issue: [E20-T02](https://github.com/well-prado/new-blok/issues/109) · Initial status: Backlog
 
 Roadmap ID: E20-T02
-Epic: E20 — Production evidence, migration and open-source release
+Epic: [E20](https://github.com/well-prado/new-blok/issues/20) — Production evidence, migration and open-source release
 Milestone: M9 — Production release and ecosystem handoff
 Priority: P1 | Size: M | Review: R
 
@@ -4860,10 +4862,10 @@ Evaluate setup, typed node/workflow composition, diagnosis/repair, package insta
 
 ## Dependencies
 
-- [ ] E14-T04 — Generate and evaluate complete generic/custom application proposals
-- [ ] E15-T03 — Publish Studio consumer contracts and notebook UX specification
-- [ ] E13-T04 — Publish offline examples and hosted registry handoff
-- [ ] E17-T04 — Publish Cloud contract and self-hosted deployment recipes
+- [ ] [E14-T04](https://github.com/well-prado/new-blok/issues/104) — Generate and evaluate complete generic/custom application proposals
+- [ ] [E15-T03](https://github.com/well-prado/new-blok/issues/78) — Publish Studio consumer contracts and notebook UX specification
+- [ ] [E13-T04](https://github.com/well-prado/new-blok/issues/73) — Publish offline examples and hosted registry handoff
+- [ ] [E17-T04](https://github.com/well-prado/new-blok/issues/106) — Publish Cloud contract and self-hosted deployment recipes
 
 ## Cross-cutting invariants
 
@@ -4875,10 +4877,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E20-T03 — Complete security, fuzz, chaos and performance release audits
 
-Issue: E20-T03 · Initial status: Backlog
+Issue: [E20-T03](https://github.com/well-prado/new-blok/issues/110) · Initial status: Backlog
 
 Roadmap ID: E20-T03
-Epic: E20 — Production evidence, migration and open-source release
+Epic: [E20](https://github.com/well-prado/new-blok/issues/20) — Production evidence, migration and open-source release
 Milestone: M9 — Production release and ecosystem handoff
 Priority: P0 | Size: M | Review: R
 
@@ -4916,10 +4918,10 @@ Audit capability/tenant isolation, parser/resource bounds, approvals/secrets, su
 
 ## Dependencies
 
-- [ ] E20-T01 — Execute behaviorally equivalent current-Blok application comparisons
-- [ ] E20-T02 — Measure newcomer DX and live AI application success
-- [ ] E18-T04 — Publish fleet-scale load and operational capacity envelopes
-- [ ] E19-T14 — Certify cross-runtime application and release conformance
+- [ ] [E20-T01](https://github.com/well-prado/new-blok/issues/108) — Execute behaviorally equivalent current-Blok application comparisons
+- [ ] [E20-T02](https://github.com/well-prado/new-blok/issues/109) — Measure newcomer DX and live AI application success
+- [ ] [E18-T04](https://github.com/well-prado/new-blok/issues/107) — Publish fleet-scale load and operational capacity envelopes
+- [ ] [E19-T14](https://github.com/well-prado/new-blok/issues/100) — Certify cross-runtime application and release conformance
 
 ## Cross-cutting invariants
 
@@ -4931,10 +4933,10 @@ One branch `codex/<issue-number>-<description>` and one PR, linked to this issue
 
 #### E20-T04 — Publish production release, supported guarantees and ecosystem handoffs
 
-Issue: E20-T04 · Initial status: Backlog
+Issue: [E20-T04](https://github.com/well-prado/new-blok/issues/111) · Initial status: Backlog
 
 Roadmap ID: E20-T04
-Epic: E20 — Production evidence, migration and open-source release
+Epic: [E20](https://github.com/well-prado/new-blok/issues/20) — Production evidence, migration and open-source release
 Milestone: M9 — Production release and ecosystem handoff
 Priority: P0 | Size: M | Review: R
 
@@ -4973,7 +4975,7 @@ Finalize stable API/brand/version compatibility after evidence review, signed ar
 
 ## Dependencies
 
-- [ ] E20-T03 — Complete security, fuzz, chaos and performance release audits
+- [ ] [E20-T03](https://github.com/well-prado/new-blok/issues/110) — Complete security, fuzz, chaos and performance release audits
 
 ## Cross-cutting invariants
 
