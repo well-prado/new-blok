@@ -19,6 +19,12 @@ jobs:
           cache: false
       - name: Formatting
         run: test -z "$(gofmt -l .)"
+      - name: Module verification
+        run: go mod verify
       - run: go vet ./...
       - run: go test -race ./...
+      - name: Bounded fuzz smoke
+        run: go test ./contract -run=^$ -fuzz=FuzzParseBounded -fuzztime=5s -parallel=1
+      - name: Import graph conformance
+        run: go test ./internal/tooling/graphcheck -run 'TestSyntheticGraphs|TestFixtureProvenance|TestDiscoveryDoesNotExecuteInit'
       - run: go build ./...
