@@ -391,3 +391,59 @@ func TestQueueMigratesPreDeferralSchema(t *testing.T) {
 		t.Fatalf("legacy job=%+v err=%v", job, err)
 	}
 }
+
+// TestPrincipalIsPersistedAndPartOfRequestIdentity: the producer's principal
+// reaches the handler after a restart of the queue, and reusing a request key
+// under another principal conflicts instead of deduplicating.
+func TestPrincipalIsPersistedAndPartOfRequestIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "worker.db")
+	database, err := (sqlite.Backend{}).Open(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	queue, err := New(context.Background(), database, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := trigger.Principal{ID: "provider:shop", Roles: []string{"orders"}}
+	accepted, err := queue.Submit(context.Background(), trigger.Submission{Key: "evt-1", Kind: "test", Payload: []byte(`{}`), Principal: owner})
+	if err != nil || !accepted {
+		t.Fatalf("accepted=%v err=%v", accepted, err)
+	}
+	if accepted, err := queue.Submit(context.Background(), trigger.Submission{Key: "evt-1", Kind: "test", Payload: []byte(`{}`), Principal: owner}); err != nil || accepted {
+		t.Fatalf("duplicate accepted=%v err=%v", accepted, err)
+	}
+	_, err = queue.Submit(context.Background(), trigger.Submission{Key: "evt-1", Kind: "test", Payload: []byte(`{}`), Principal: trigger.Principal{ID: "provider:other"}})
+	if !errors.Is(err, trigger.ErrConflict) || !errors.Is(err, ErrRequestConflict) {
+		t.Fatalf("other principal err=%v, want a conflict", err)
+	}
+	reordered := trigger.Principal{ID: "multi", Roles: []string{"b", "a"}}
+	if _, err := queue.Submit(context.Background(), trigger.Submission{Key: "evt-3", Kind: "test", Payload: []byte(`{}`), Principal: reordered}); err != nil {
+		t.Fatal(err)
+	}
+	if accepted, err := queue.Submit(context.Background(), trigger.Submission{Key: "evt-3", Kind: "test", Payload: []byte(`{}`), Principal: trigger.Principal{ID: "multi", Roles: []string{"a", "b", "a"}}}); err != nil || accepted {
+		t.Fatalf("same principal with reordered roles: accepted=%v err=%v, want a duplicate", accepted, err)
+	}
+	if _, err := queue.Submit(context.Background(), trigger.Submission{Key: "evt-2", Kind: "test", Payload: []byte(`{`)}); !errors.Is(err, trigger.ErrInvalidInput) || !errors.Is(err, ErrInvalidPayload) {
+		t.Fatalf("invalid payload err=%v", err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	database, err = (sqlite.Backend{}).Open(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	queue, err = New(context.Background(), database, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var seen trigger.Principal
+	if _, err := queue.ProcessOnce(context.Background(), func(_ context.Context, _ *sql.Tx, job Job) error { seen = job.Principal; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if seen.ID != owner.ID || len(seen.Roles) != 1 || seen.Roles[0] != "orders" {
+		t.Fatalf("handler principal=%+v, want %+v", seen, owner)
+	}
+}

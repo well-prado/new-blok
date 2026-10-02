@@ -29,7 +29,7 @@ dependency. It defines:
   | Kind | Allowed completion / disconnect |
   | --- | --- |
   | http, grpc, sse, websocket, mcp | memory / cancel, durable / detach |
-  | webhook | durable / detach |
+  | webhook | durable / redeliver, durable / detach (redeliver added by [ADR 0006](0006-durable-submission-and-webhooks.md)) |
   | worker, cron, pubsub | durable / redeliver |
 
   Memory work always cancels when its caller goes away. Durable work never
@@ -149,8 +149,8 @@ not applicable with a reason, never as passed. Failures are
 - Only HTTP (memory/cancel/caller) and worker (durable/redeliver/trusted
   producer) exist. The `detach` cases are exercised by a synthetic reference
   adapter until E09-T02 adds a real durable caller-facing adapter.
-- The worker has no producer principal; principal propagation for trusted
-  producers is not covered.
+- The worker had no producer principal; [ADR 0006](0006-durable-submission-and-webhooks.md)
+  adds one, persisted with each job.
 - Goroutine checks are process-wide; `RunTrigger` must not run in parallel with
   other tests. A goroutine started and finished during construction is not
   detected.
