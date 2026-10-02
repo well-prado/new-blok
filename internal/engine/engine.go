@@ -39,6 +39,8 @@ type Result struct {
 type StepResult struct {
 	ID       string
 	Executed bool
+	Input    any
+	Attempt  int
 	Output   any
 	Error    error
 }
@@ -92,6 +94,8 @@ func (e *Engine) Run(ctx context.Context, program contract.InternalProgram, inpu
 				result.Steps = append(result.Steps, step)
 				return result, step.Error
 			}
+			step.Input = callInput
+			step.Attempt = 1
 			if err := validateSchema(definition.Descriptor().InputSchema, callInput); err != nil {
 				step.Error = &Error{Code: "invalid_input", Class: "validation", Step: instruction.ID, Err: err}
 				result.Steps = append(result.Steps, step)
