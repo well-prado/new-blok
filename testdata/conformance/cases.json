@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "cases": [
+    {"id":"document-valid","kind":"document","expectedOutput":1,"expectedErrors":0,"expectedEffects":0},
+    {"id":"schema-invalid","kind":"schema","expectedOutput":0,"expectedErrors":1,"expectedEffects":0},
+    {"id":"artifact-conflict","kind":"artifact","expectedOutput":0,"expectedErrors":1,"expectedEffects":0},
+    {"id":"nodejs-worker","kind":"worker","unsupported":true,"expectedOutput":0,"expectedErrors":0,"expectedEffects":0}
+  ]
+}
