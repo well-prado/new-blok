@@ -33,7 +33,7 @@ func TestHTTPProviderClassifiesBusinessAndTransientFailures(t *testing.T) {
 	for _, tc := range []struct {
 		status int
 		class  ErrorClass
-	}{{400, Business}, {500, Transient}, {429, Transient}} {
+	}{{400, Business}, {500, Uncertain}, {429, Transient}, {408, Uncertain}} {
 		t.Run(http.StatusText(tc.status), func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(tc.status) }))
 			defer server.Close()
