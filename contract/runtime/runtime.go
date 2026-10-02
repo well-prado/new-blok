@@ -133,13 +133,18 @@ func (h Hello) validate() error {
 	if err := h.Limits.Validate(); err != nil {
 		return err
 	}
-	if len(h.Capabilities) > 128 { return ErrLimitExceeded }
+	if len(h.Capabilities) > 128 {
+		return ErrLimitExceeded
+	}
 	seen := map[Capability]bool{}
 	for _, capability := range h.Capabilities {
 		if !identityPattern.MatchString(string(capability)) || strings.Contains(string(capability), "orchestrate") {
 			return fmt.Errorf("%w: invalid capability", ErrCapabilityDenied)
 		}
-		if seen[capability] { return ErrCapabilityDenied }; seen[capability] = true
+		if seen[capability] {
+			return ErrCapabilityDenied
+		}
+		seen[capability] = true
 	}
 	return nil
 }
@@ -172,16 +177,16 @@ type BlobRef struct {
 }
 
 type Call struct {
-	CallID         string    `json:"callId"`
-	AttemptID      string    `json:"attemptId"`
-	Generation     uint64    `json:"generation"`
-	Node           string    `json:"node"`
-	NodeVersion    string    `json:"nodeVersion"`
-	IdempotencyKey string    `json:"idempotencyKey,omitempty"`
-	Deadline       time.Time `json:"deadline"`
-	Input          []byte    `json:"input"`
-	Blobs          []BlobRef `json:"blobs,omitempty"`
-	Principal      string    `json:"principal"`
+	CallID         string       `json:"callId"`
+	AttemptID      string       `json:"attemptId"`
+	Generation     uint64       `json:"generation"`
+	Node           string       `json:"node"`
+	NodeVersion    string       `json:"nodeVersion"`
+	IdempotencyKey string       `json:"idempotencyKey,omitempty"`
+	Deadline       time.Time    `json:"deadline"`
+	Input          []byte       `json:"input"`
+	Blobs          []BlobRef    `json:"blobs,omitempty"`
+	Principal      string       `json:"principal"`
 	Capabilities   []Capability `json:"capabilities,omitempty"`
 }
 
@@ -201,14 +206,18 @@ func (c Call) Validate(limits Limits, generation uint64) error {
 	if len(c.Input) == 0 || len(c.Input) > limits.MaxFrameBytes-1024 || len(c.IdempotencyKey) > 128 || len(c.Blobs) > 128 || len(c.Capabilities) > 128 {
 		return fmt.Errorf("%w: input", ErrLimitExceeded)
 	}
-	if c.Principal != "" && !identityPattern.MatchString(c.Principal) { return ErrCapabilityDenied }
+	if c.Principal != "" && !identityPattern.MatchString(c.Principal) {
+		return ErrCapabilityDenied
+	}
 	totalBlobBytes := 0
 	for _, blob := range c.Blobs {
 		if blob.Size < 0 || blob.Size > limits.MaxBlobBytes || !digestPattern.MatchString(blob.Digest) {
 			return fmt.Errorf("%w: blob", ErrLimitExceeded)
 		}
 		totalBlobBytes += blob.Size
-		if totalBlobBytes > limits.MaxBlobBytes { return ErrLimitExceeded }
+		if totalBlobBytes > limits.MaxBlobBytes {
+			return ErrLimitExceeded
+		}
 	}
 	return nil
 }
@@ -272,7 +281,10 @@ func CanonicalDigest(data []byte) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
-func ValidatePayload(data []byte, contract schema.Schema) error { _, err := contract.Normalize(data); return err }
+func ValidatePayload(data []byte, contract schema.Schema) error {
+	_, err := contract.Normalize(data)
+	return err
+}
 
 func SortedCapabilities(values []Capability) []Capability {
 	out := append([]Capability(nil), values...)
