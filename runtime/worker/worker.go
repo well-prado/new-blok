@@ -94,12 +94,12 @@ func DefineScoped[I, O any](supervisor *Supervisor, descriptor node.Descriptor, 
 	}
 	return node.Define(descriptor.Name, descriptor.Version, func(ctx context.Context, input I) (O, error) {
 		var zero O
+		if tool.TokenLimit(ctx) > 0 {
+			return zero, tool.ErrBudget
+		}
 		if scope, ok := tool.Scope(ctx); ok {
 			if !scope.Allows(tool.Manifest{Capabilities: required}) {
 				return zero, contract.ErrCapabilityDenied
-			}
-			if tool.TokenLimit(ctx) > 0 {
-				return zero, tool.ErrBudget
 			}
 		}
 		raw, err := json.Marshal(input)
