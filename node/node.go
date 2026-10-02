@@ -143,6 +143,38 @@ func (n Any) Invoke(ctx context.Context, input any) (any, error) {
 	return n.invoke(ctx, input)
 }
 
+func (n Any) Mock(output any, returned error) (Any, error) {
+	if returned == nil {
+		if err := validateRuntimeSchema(n.descriptor.OutputSchema, output); err != nil {
+			return Any{}, &Error{Code: "invalid_mock_output", Message: err.Error()}
+		}
+	}
+	copy := n
+	copy.invoke = func(ctx context.Context, _ any) (any, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return output, returned
+	}
+	return copy, nil
+}
+
+func validateRuntimeSchema(raw []byte, output any) error {
+	parsed, err := schema.Parse(raw)
+	if err != nil {
+		return err
+	}
+	if parsed.Type == "object" && len(parsed.Properties) == 0 && len(parsed.Required) == 0 {
+		return nil
+	}
+	data, err := json.Marshal(output)
+	if err != nil {
+		return err
+	}
+	_, err = parsed.Normalize(data)
+	return err
+}
+
 type Registry struct{ nodes map[string]Any }
 
 func NewRegistry() *Registry { return &Registry{nodes: map[string]Any{}} }
