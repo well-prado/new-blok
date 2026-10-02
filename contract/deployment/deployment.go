@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -32,8 +34,20 @@ func (c Config) Validate() error {
 	if c.ListenerAddress == "" {
 		return fmt.Errorf("%w: listener address required", ErrInvalid)
 	}
-	if _, err := net.ResolveTCPAddr("tcp", c.ListenerAddress); err != nil {
-		return fmt.Errorf("%w: listener address: %v", ErrInvalid, err)
+	host, port, err := net.SplitHostPort(c.ListenerAddress)
+	if err != nil {
+		return fmt.Errorf("%w: listener address", ErrInvalid)
+	}
+	p, err := strconv.Atoi(port)
+	if err != nil || p < 0 || p > 65535 {
+		return fmt.Errorf("%w: listener port", ErrInvalid)
+	}
+	ip := net.ParseIP(host)
+	if host != "" && ip == nil {
+		return fmt.Errorf("%w: listener must use a literal IP address", ErrInvalid)
+	}
+	if !c.External && (ip == nil || !ip.IsLoopback()) {
+		return fmt.Errorf("%w: external listener requires explicit opt-in", ErrInvalid)
 	}
 	if c.MaxAdmission <= 0 {
 		return fmt.Errorf("%w: max admission must be positive", ErrInvalid)
@@ -43,12 +57,45 @@ func (c Config) Validate() error {
 	}
 	seen := map[string]bool{}
 	for _, secret := range c.RequiredSecrets {
-		if secret == "" || seen[secret] {
+		if secret == "" || strings.ContainsAny(secret, "=\x00\n\r") || seen[secret] {
 			return fmt.Errorf("%w: duplicate secret ref", ErrInvalid)
 		}
 		seen[secret] = true
 	}
 	return nil
+}
+
+// FromEnv applies only operational settings; environment cannot select code.
+// Secret references are declared by the application, never supplied as values.
+func FromEnv(c Config, lookup func(string) (string, bool)) (Config, error) {
+	if lookup == nil {
+		return Config{}, ErrInvalid
+	}
+	if v, ok := lookup("BLOK_LISTEN"); ok {
+		c.ListenerAddress = v
+	}
+	if v, ok := lookup("BLOK_EXTERNAL"); ok {
+		parsed, err := strconv.ParseBool(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("%w: BLOK_EXTERNAL", ErrInvalid)
+		}
+		c.External = parsed
+	}
+	if v, ok := lookup("BLOK_MAX_ADMISSION"); ok {
+		parsed, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("%w: BLOK_MAX_ADMISSION", ErrInvalid)
+		}
+		c.MaxAdmission = parsed
+	}
+	if v, ok := lookup("BLOK_DRAIN_TIMEOUT"); ok {
+		parsed, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("%w: BLOK_DRAIN_TIMEOUT", ErrInvalid)
+		}
+		c.DrainTimeout = parsed
+	}
+	return c, c.Validate()
 }
 
 type Dependencies struct {

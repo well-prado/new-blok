@@ -2,6 +2,7 @@ package deployment
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -70,5 +71,27 @@ func TestValidationRejectsUnsafeConfig(t *testing.T) {
 	c.RequiredSecrets = []string{"X", "X"}
 	if err := c.Validate(); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("duplicate secret: %v", err)
+	}
+}
+
+func TestExternalOptInAndEnvironment(t *testing.T) {
+	for _, addr := range []string{":8080", "0.0.0.0:8080", "[::]:8080", "192.0.2.1:8080", "localhost:8080"} {
+		c := config()
+		c.ListenerAddress = addr
+		if c.Validate() == nil {
+			t.Fatalf("unsafe bind accepted: %s", addr)
+		}
+	}
+	c := config()
+	c.ListenerAddress = "0.0.0.0:8080"
+	c.External = true
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"BLOK_MAX_ADMISSION", "BLOK_EXTERNAL", "BLOK_DRAIN_TIMEOUT"} {
+		_, err := FromEnv(config(), func(k string) (string, bool) { return "sensitive-value", k == key })
+		if err == nil || strings.Contains(err.Error(), "sensitive-value") {
+			t.Fatalf("%s: %v", key, err)
+		}
 	}
 }
