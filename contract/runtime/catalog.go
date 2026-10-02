@@ -34,6 +34,8 @@ func CatalogDigest(descriptors []node.Descriptor) (string, error) {
 		}
 		ds[i].Effects = append([]string(nil), d.Effects...)
 		sort.Strings(ds[i].Effects)
+		ds[i].RequiredCapabilities = append([]string(nil), d.RequiredCapabilities...)
+		sort.Strings(ds[i].RequiredCapabilities)
 	}
 	raw, err := json.Marshal(ds)
 	if err != nil {

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	contract "github.com/well-prado/new-blok/contract/runtime"
 	"github.com/well-prado/new-blok/contract/schema"
+	"github.com/well-prado/new-blok/contract/tool"
 	runtime "github.com/well-prado/new-blok/internal/runtime"
 	"github.com/well-prado/new-blok/node"
 	"strings"
@@ -46,7 +47,11 @@ func WithIdentity(ctx context.Context, id Identity) context.Context {
 var sequence atomic.Uint64
 
 func Define[I, O any](supervisor *Supervisor, descriptor node.Descriptor) (node.Definition[I, O], error) {
-	return DefineScoped[I, O](supervisor, descriptor, nil)
+	caps := make([]contract.Capability, len(descriptor.RequiredCapabilities))
+	for i, c := range descriptor.RequiredCapabilities {
+		caps[i] = contract.Capability(c)
+	}
+	return DefineScoped[I, O](supervisor, descriptor, caps)
 }
 
 // DefineScoped binds narrow application-reviewed capabilities to this node's
@@ -65,7 +70,23 @@ func DefineScoped[I, O any](supervisor *Supervisor, descriptor node.Descriptor, 
 	if err != nil {
 		return node.Definition[I, O]{}, err
 	}
-	opts := []node.Option{node.Description(descriptor.Description), node.Schemas(descriptor.InputSchema, descriptor.OutputSchema)}
+	required := make([]string, len(capabilities))
+	for i, c := range capabilities {
+		required[i] = string(c)
+	}
+	for _, want := range descriptor.RequiredCapabilities {
+		found := false
+		for _, have := range required {
+			if want == have {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return node.Definition[I, O]{}, contract.ErrCapabilityDenied
+		}
+	}
+	opts := []node.Option{node.Description(descriptor.Description), node.Schemas(descriptor.InputSchema, descriptor.OutputSchema), node.RequiredCapabilities(required...), node.RemoteBoundary()}
 	if descriptor.Deterministic {
 		opts = append(opts, node.Pure())
 	} else {
@@ -73,6 +94,14 @@ func DefineScoped[I, O any](supervisor *Supervisor, descriptor node.Descriptor, 
 	}
 	return node.Define(descriptor.Name, descriptor.Version, func(ctx context.Context, input I) (O, error) {
 		var zero O
+		if scope, ok := tool.Scope(ctx); ok {
+			if !scope.Allows(tool.Manifest{Capabilities: required}) {
+				return zero, contract.ErrCapabilityDenied
+			}
+			if tool.TokenLimit(ctx) > 0 {
+				return zero, tool.ErrBudget
+			}
+		}
 		raw, err := json.Marshal(input)
 		if err != nil {
 			return zero, err

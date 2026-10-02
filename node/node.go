@@ -17,13 +17,14 @@ import (
 type Handler[I, O any] func(context.Context, I) (O, error)
 
 type Descriptor struct {
-	Name          string          `json:"name"`
-	Version       string          `json:"version"`
-	Description   string          `json:"description"`
-	InputSchema   json.RawMessage `json:"inputSchema"`
-	OutputSchema  json.RawMessage `json:"outputSchema"`
-	Effects       []string        `json:"effects,omitempty"`
-	Deterministic bool            `json:"deterministic"`
+	Name                 string          `json:"name"`
+	Version              string          `json:"version"`
+	Description          string          `json:"description"`
+	InputSchema          json.RawMessage `json:"inputSchema"`
+	OutputSchema         json.RawMessage `json:"outputSchema"`
+	Effects              []string        `json:"effects,omitempty"`
+	RequiredCapabilities []string        `json:"requiredCapabilities,omitempty"`
+	Deterministic        bool            `json:"deterministic"`
 }
 
 type Error struct{ Code, Message string }
@@ -53,6 +54,8 @@ type config struct {
 	description               string
 	inputSchema, outputSchema json.RawMessage
 	effects                   []string
+	requiredCapabilities      []string
+	remote                    bool
 	deterministic             bool
 }
 
@@ -68,6 +71,15 @@ func Effects(values ...string) Option {
 	return func(c *config) { c.effects = append([]string(nil), values...); c.deterministic = false }
 }
 
+// RequiredCapabilities records the trusted boundary's actual dispatch needs.
+func RequiredCapabilities(values ...string) Option {
+	return func(c *config) { c.requiredCapabilities = append([]string(nil), values...) }
+}
+
+// RemoteBoundary marks a foreign handler. Remote token-using agent tools fail
+// closed until an adapter can actually enforce their reserved token budget.
+func RemoteBoundary() Option { return func(c *config) { c.remote = true } }
+
 type Definition[I, O any] struct{ any Any }
 
 type Any struct {
@@ -75,16 +87,25 @@ type Any struct {
 	inputType  reflect.Type
 	outputType reflect.Type
 	invoke     func(context.Context, any) (any, error)
+	remote     bool
 }
 
-func (n Any) Descriptor() Descriptor { return n.descriptor }
+func (n Any) Descriptor() Descriptor { return cloneDescriptor(n.descriptor) }
+func (n Any) IsRemote() bool         { return n.remote }
+func cloneDescriptor(d Descriptor) Descriptor {
+	d.InputSchema = append(json.RawMessage(nil), d.InputSchema...)
+	d.OutputSchema = append(json.RawMessage(nil), d.OutputSchema...)
+	d.Effects = append([]string(nil), d.Effects...)
+	d.RequiredCapabilities = append([]string(nil), d.RequiredCapabilities...)
+	return d
+}
 
 func Define[I, O any](name, version string, handler Handler[I, O], options ...Option) (Definition[I, O], error) {
 	var c config
 	for _, option := range options {
 		option(&c)
 	}
-	d := Descriptor{Name: name, Version: version, Description: c.description, InputSchema: c.inputSchema, OutputSchema: c.outputSchema, Effects: append([]string(nil), c.effects...), Deterministic: c.deterministic}
+	d := Descriptor{Name: name, Version: version, Description: c.description, InputSchema: c.inputSchema, OutputSchema: c.outputSchema, Effects: append([]string(nil), c.effects...), RequiredCapabilities: append([]string(nil), c.requiredCapabilities...), Deterministic: c.deterministic}
 	if err := validateDescriptor(d); err != nil {
 		return Definition[I, O]{}, err
 	}
@@ -93,7 +114,7 @@ func Define[I, O any](name, version string, handler Handler[I, O], options ...Op
 	}
 	var in I
 	var out O
-	a := Any{descriptor: d, inputType: reflect.TypeOf(in), outputType: reflect.TypeOf(out)}
+	a := Any{descriptor: d, inputType: reflect.TypeOf(in), outputType: reflect.TypeOf(out), remote: c.remote}
 	a.invoke = func(ctx context.Context, value any) (result any, err error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -121,7 +142,7 @@ func MustDefine[I, O any](name, version string, handler Handler[I, O], options .
 	return definition
 }
 
-func (n Definition[I, O]) Descriptor() Descriptor { return n.any.descriptor }
+func (n Definition[I, O]) Descriptor() Descriptor { return n.any.Descriptor() }
 func (n Definition[I, O]) Any() Any               { return n.any }
 func (n Definition[I, O]) Invoke(ctx context.Context, input I) (O, error) {
 	var zero O
@@ -204,6 +225,16 @@ func (r *Registry) Lookup(name, version string) (Any, bool) {
 }
 
 func validateDescriptor(d Descriptor) error {
+	if len(d.RequiredCapabilities) > 128 {
+		return &Error{Code: "invalid_capability", Message: "too many required capabilities"}
+	}
+	seen := map[string]bool{}
+	for _, cap := range d.RequiredCapabilities {
+		if seen[cap] || !regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$`).MatchString(cap) || strings.Contains(cap, "orchestrate") {
+			return &Error{Code: "invalid_capability", Message: "invalid required capability"}
+		}
+		seen[cap] = true
+	}
 	if !regexp.MustCompile(`^[a-z][a-z0-9_/-]{0,127}$`).MatchString(d.Name) || strings.Contains(d.Name, "..") {
 		return &Error{Code: "invalid_node_identity", Message: "node name must be a stable namespace, not a path"}
 	}

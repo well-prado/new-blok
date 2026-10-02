@@ -39,6 +39,7 @@ type Listing struct {
 	Effects                          []string
 	CapabilityDigest, ArtifactDigest string
 	Metadata                         tool.Metadata
+	Resources                        tool.Resources
 }
 
 type binding struct {
@@ -86,6 +87,12 @@ func RegisterNode[I, O any](c *Catalog, definition node.Definition[I, O], m Mani
 	if r.TokenLimit < 0 || r.TokenLimit > 1<<30 {
 		return ErrBudget
 	}
+	if n.IsRemote() && r.TokenLimit > 0 {
+		return ErrNotAgentSafe
+	}
+	if !(Principal{Capabilities: m.Capabilities}).Allows(Manifest{Capabilities: d.RequiredCapabilities}) {
+		return ErrInvalidManifest
+	}
 	// Effects and determinism belong to the native registry, not agent claims.
 	if !equalSet(m.Effects, d.Effects) || m.Deterministic != d.Deterministic {
 		return ErrInvalidManifest
@@ -95,6 +102,12 @@ func RegisterNode[I, O any](c *Catalog, definition node.Definition[I, O], m Mani
 		return err
 	}
 	b.resources = r
+	b.listing.Resources = r
+	identity, _ := json.Marshal(struct {
+		Base      string
+		Resources tool.Resources
+	}{b.listing.ArtifactDigest, r})
+	b.listing.ArtifactDigest = hash(identity)
 	b.maxDepth, b.calls, b.tokens = 1, 1, r.TokenLimit
 	b.native = func(ctx context.Context, input []byte) ([]byte, error) {
 		var typed I
@@ -205,6 +218,8 @@ func RegisterWorkflow[I, O any](c *Catalog, wf flow.Definition[I, O], inputSchem
 	}
 	b.program, b.children, b.literals = &program, children, literals
 	b.maxDepth, b.calls, b.tokens = maxDepth, calls, tokens
+	b.resources = tool.Resources{TokenLimit: tokens}
+	b.listing.Resources = b.resources
 	// Include exact program and transitive child identities in the gate digest.
 	raw, _ := json.Marshal(struct {
 		Program  flow.Program
@@ -349,7 +364,7 @@ func (c *Catalog) execute(ctx context.Context, b binding, input []byte, s *execu
 	if len(normal) > s.budget.MaxInputBytes {
 		return nil, ErrBudget
 	}
-	a := tool.Admission{Name: b.listing.Name, Version: b.listing.Version, Principal: s.principal.ID, Workflow: s.workflow, WorkflowDigest: s.workflowDigest, ArtifactDigest: b.listing.ArtifactDigest, InputDigest: hash(normal), Input: append([]byte(nil), normal...), Effects: append([]string(nil), b.manifest.Effects...), Capabilities: append([]string(nil), b.manifest.Capabilities...), Budget: s.budget}
+	a := tool.Admission{Name: b.listing.Name, Version: b.listing.Version, Principal: s.principal.ID, Workflow: s.workflow, WorkflowDigest: s.workflowDigest, ArtifactDigest: b.listing.ArtifactDigest, InputDigest: hash(normal), Input: append([]byte(nil), normal...), Effects: append([]string(nil), b.manifest.Effects...), Capabilities: append([]string(nil), b.manifest.Capabilities...), Budget: s.budget, Resources: b.resources}
 	if c.gate != nil {
 		if err := c.gate.Authorize(ctx, a); err != nil {
 			return nil, err

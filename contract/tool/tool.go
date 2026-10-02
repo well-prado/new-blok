@@ -99,6 +99,7 @@ type Admission struct {
 	Effects, Capabilities                                []string
 	Input                                                []byte
 	Budget                                               Budget
+	Resources                                            Resources
 }
 
 type scopeKey struct{}
