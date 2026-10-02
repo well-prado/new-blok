@@ -34,6 +34,13 @@ func Lit[T any](value T) Ref[T] {
 	return Ref[T]{expression: expression{Kind: "literal", Source: "$literal", Value: value}}
 }
 
+func Select[I, O any](input Ref[I], path string) Ref[O] {
+	if path == "" {
+		panic("flow: field path is required")
+	}
+	return Ref[O]{expression: expression{Kind: "reference", Source: input.expression.Source + "." + path}}
+}
+
 type Instruction struct {
 	Kind    string          `json:"kind"`
 	ID      string          `json:"id"`
