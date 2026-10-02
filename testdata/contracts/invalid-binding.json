@@ -1,0 +1,1 @@
+{"version":1,"workflow":{"id":"quote","name":"shop/quote","version":"1.0.0","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","inputSchema":{},"outputSchema":{},"instructions":[]},"bindings":[{"id":"bad","kind":"http","workflow":"missing"}]}

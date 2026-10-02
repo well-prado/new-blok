@@ -1,0 +1,1 @@
+{"version":1,"workflow":{"id":"quote","name":"shop/quote","version":"1.0.0","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","inputSchema":{},"outputSchema":{},"instructions":[{"id":"same","kind":"output"},{"id":"same","kind":"output"}]}}
