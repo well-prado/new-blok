@@ -30,7 +30,9 @@ import (
 type fixture struct {
 	Name, Kind, Scenario, Error string
 	Input, Output               json.RawMessage
+	ValueSchema                 json.RawMessage
 	Requests, Effects           int
+	Published                   *int
 }
 
 func effectManifest(capability string) provider.Manifest {
@@ -57,13 +59,19 @@ func TestEffectEndpointFixtures(t *testing.T) {
 				runEndpoint(t, f, "email:send", catalog.Email)
 			case "payment":
 				runEndpoint(t, f, "payment:charge", catalog.Payment)
+			case "database":
+				runEndpoint(t, f, "database:write-outbox", catalog.Database)
 			case "publish":
 				runEndpoint(t, f, "message:publish", catalog.Publish)
 			case "audit":
 				runEndpoint(t, f, "audit:append", catalog.Audit)
 			case "generate":
 				runEndpoint(t, f, "model:generate", func(p provider.Port[provider.GenerateInput, provider.GenerateOutput], m provider.Manifest) (catalog.EffectNode[provider.GenerateInput, provider.GenerateOutput], error) {
-					return catalog.Generate(p, m, generationSchema)
+					valueSchema := f.ValueSchema
+					if len(valueSchema) == 0 {
+						valueSchema = generationSchema
+					}
+					return catalog.Generate(p, m, valueSchema)
 				})
 			default:
 				t.Fatal("unknown fixture kind")
@@ -186,6 +194,15 @@ func runEndpoint[I provider.Keyed, O any](t *testing.T, f fixture, capability st
 	}
 	for i := 0; i < count; i++ {
 		run, err := runner.Run(ctx, program, input)
+		if f.Published != nil {
+			published := 0
+			if run.Output != nil {
+				published = 1
+			}
+			if published != *f.Published {
+				t.Fatalf("published=%d want=%d", published, *f.Published)
+			}
+		}
 		if f.Error == "" {
 			if err != nil {
 				t.Fatal(err)

@@ -53,6 +53,16 @@ func effect[I provider.Keyed, O any](name, capability string, p provider.Port[I,
 	if err != nil {
 		return EffectNode[I, O]{}, err
 	}
+	// JSON adapters must validate the actual response before typed decoding;
+	// marshaling an already-decoded struct cannot recover missing/null fields.
+	if endpoint, ok := p.(interface {
+		WithOutputSchema([]byte) (provider.Port[I, O], error)
+	}); ok {
+		p, err = endpoint.WithOutputSchema(output)
+		if err != nil {
+			return EffectNode[I, O]{}, err
+		}
+	}
 	definition, err := node.Define(name, "1.0.0", func(ctx context.Context, in I) (result O, returned error) {
 		var zero O
 		key := in.EffectKey()
