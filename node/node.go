@@ -77,6 +77,8 @@ type Any struct {
 	invoke     func(context.Context, any) (any, error)
 }
 
+func (n Any) Descriptor() Descriptor { return n.descriptor }
+
 func Define[I, O any](name, version string, handler Handler[I, O], options ...Option) (Definition[I, O], error) {
 	var c config
 	for _, option := range options {
@@ -132,6 +134,13 @@ func (n Definition[I, O]) Invoke(ctx context.Context, input I) (O, error) {
 		return zero, &Error{Code: "output_type_mismatch", Message: fmt.Sprintf("handler returned %T, descriptor requires %T", value, zero)}
 	}
 	return output, nil
+}
+
+func (n Any) Invoke(ctx context.Context, input any) (any, error) {
+	if n.invoke == nil {
+		return nil, &Error{Code: "invalid_node", Message: "node has no invocation boundary"}
+	}
+	return n.invoke(ctx, input)
 }
 
 type Registry struct{ nodes map[string]Any }
