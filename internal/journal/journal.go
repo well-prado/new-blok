@@ -213,6 +213,46 @@ var schemaStatements = []string{
 		PRIMARY KEY (run_id, signal_id)
 	)`,
 	`CREATE INDEX IF NOT EXISTS journal_waits_due ON journal_waits(state, due_at)`,
+	`CREATE TABLE IF NOT EXISTS journal_checkpoints (
+		run_id TEXT PRIMARY KEY,
+		artifact_digest TEXT NOT NULL,
+		checkpoint_digest TEXT NOT NULL,
+		status TEXT NOT NULL,
+		state_json BLOB NOT NULL,
+		updated_at INTEGER NOT NULL,
+		FOREIGN KEY (run_id) REFERENCES journal_runs(run_id)
+	)`,
+	`CREATE TABLE IF NOT EXISTS journal_scopes (
+		run_id TEXT NOT NULL,
+		path TEXT NOT NULL,
+		kind TEXT NOT NULL,
+		parent_path TEXT NOT NULL DEFAULT '',
+		state TEXT NOT NULL,
+		output_json BLOB,
+		error_text TEXT NOT NULL DEFAULT '',
+		updated_at INTEGER NOT NULL,
+		PRIMARY KEY (run_id, path),
+		FOREIGN KEY (run_id) REFERENCES journal_runs(run_id)
+	)`,
+	`CREATE TABLE IF NOT EXISTS journal_children (
+		run_id TEXT NOT NULL,
+		path TEXT NOT NULL,
+		child_run_id TEXT NOT NULL,
+		state TEXT NOT NULL,
+		result_json BLOB,
+		PRIMARY KEY (run_id, path),
+		FOREIGN KEY (run_id) REFERENCES journal_runs(run_id)
+	)`,
+	`CREATE TABLE IF NOT EXISTS journal_joins (
+		run_id TEXT NOT NULL,
+		path TEXT NOT NULL,
+		expected INTEGER NOT NULL,
+		completed INTEGER NOT NULL,
+		results_json BLOB NOT NULL,
+		state TEXT NOT NULL,
+		PRIMARY KEY (run_id, path),
+		FOREIGN KEY (run_id) REFERENCES journal_runs(run_id)
+	)`,
 }
 
 func (j *Journal) Admit(ctx context.Context, request AdmissionRequest) (Admission, error) {
