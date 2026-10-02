@@ -1,0 +1,94 @@
+syntax = "proto3";
+
+package blok.runtime.v1;
+
+// This file is the canonical wire description. Generated bindings must be
+// produced by the pinned toolchain in the owning runtime adapter; the Go
+// contract package remains transport-independent and is the semantic oracle.
+option go_package = "github.com/well-prado/new-blok/contract/runtime/wire;wire";
+
+message Limits {
+  uint32 max_frame_bytes = 1;
+  uint32 max_blob_bytes = 2;
+  uint32 max_concurrent_calls = 3;
+}
+
+message Hello {
+  string protocol = 1;
+  uint32 major = 2;
+  uint32 minor = 3;
+  string artifact_digest = 4;
+  string catalog_digest = 5;
+  uint64 generation = 6;
+  repeated string capabilities = 7;
+  Limits limits = 8;
+}
+
+message Ready {
+  Hello contract = 1;
+}
+
+message BlobRef {
+  string digest = 1;
+  uint64 size = 2;
+}
+
+message Call {
+  string call_id = 1;
+  string attempt_id = 2;
+  uint64 generation = 3;
+  string node = 4;
+  string node_version = 5;
+  string idempotency_key = 6;
+  int64 deadline_unix_nanos = 7;
+  bytes input = 8;
+  repeated BlobRef blobs = 9;
+  string principal = 10;
+  repeated string capabilities = 11;
+}
+
+message Cancel { string call_id = 1; string attempt_id = 2; uint64 generation = 3; }
+message Drain { uint32 reason = 1; }
+
+enum ErrorClass {
+  ERROR_CLASS_UNSPECIFIED = 0;
+  INVALID_INPUT = 1;
+  NODE_ERROR = 2;
+  TRANSIENT = 3;
+  UNCERTAIN = 4;
+  CANCELED = 5;
+  DEADLINE_EXCEEDED = 6;
+}
+
+message RemoteError {
+  ErrorClass class = 1;
+  string code = 2;
+  string message = 3;
+  bool retryable = 4;
+  string idempotency_key = 5;
+}
+
+message Result {
+  string call_id = 1;
+  string attempt_id = 2;
+  uint64 generation = 3;
+  bytes output = 4;
+  RemoteError error = 5;
+}
+
+service Worker {
+  rpc Connect(stream Frame) returns (stream Frame);
+  // Spike-only unary comparison. Production clients use Connect.
+  rpc Invoke(Call) returns (Result);
+}
+
+message Frame {
+  oneof body {
+    Hello hello = 1;
+    Ready ready = 2;
+    Call call = 3;
+    Result result = 4;
+    Cancel cancel = 5;
+    Drain drain = 6;
+  }
+}
