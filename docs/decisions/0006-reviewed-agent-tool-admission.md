@@ -11,6 +11,10 @@ captures the actual registered handler and descriptor; a caller's definition
 cannot replace code or reclassify effects. Capabilities and manifests are
 composition-owned, not accepted from invocation JSON. Schema-described native
 and worker-backed nodes use the same admission/normalization/publication path.
+Worker descriptors bind their actual required dispatch capabilities into the
+canonical catalog digest. Registration rejects a manifest omitting any configured
+worker grant; dispatch also checks the trusted narrowed scope before sending.
+Changing worker requirements therefore requires a new catalog negotiation.
 Catalog listings copy metadata/schema collections and filter against a verified
 caller principal. Opaque secret references never appear in model-visible listings.
 
@@ -28,6 +32,12 @@ budget and deadline; calls at most 10000; at most 64 active top-level invocation
 without an unbounded waiting queue. A node's worst-case provider token limit is
 reserved before dispatch and passed through trusted context; the injected
 provider must enforce it. Recursive invocations cannot reset ledger, principal,
+Positive token reservations on remote nodes fail closed at registration and at
+the worker adapter. No verified remote token-budget adapter exists in this
+slice, so token-using remote agent tools are explicitly unsupported; reserving
+Go context values does not establish enforcement in Node. Zero-token native and
+remote tools remain supported. Resources enter node/transitive workflow digests
+and admission records, including resource-only policy changes.
 deadline or depth. Approval/evidence adapters run before each dispatch and
 publication when injected. Durable review and provenance are owned by #75.
 
@@ -44,4 +54,7 @@ publication and concurrent access under race. The explicit
 native read → Node quote through the real engine, verifies all three admission
 records and normalized int64 output, then denies a caller lacking read scope
 without a second effect. Go-only tests skip this foreign-runtime gate explicitly.
+`TestActualNodeEffectScopeCannotWidenOrBypassTokenBudget` starts an effectful Node
+and real HTTP provider; weaker manifests/callers and unsupported reservations
+dispatch zero effects, while the reviewed grant executes exactly one charge.
 No live AI performance, native-code sandbox or production release claim.

@@ -30,7 +30,15 @@ safe to retry.
 ## Bounds and value semantics
 
 The maximum frame is 1 MiB, aggregate blob references per call are 8 MiB,
-and concurrent calls are 64. Input reserves 1024 bytes for bounded call metadata.
+and concurrent calls are 64. Calls and negotiation permit at most 128
+capabilities; calls permit at most 128 blob references. A call deadline is at
+most five minutes from validation, shared by Go and Node (not an unadvertised
+worker-only duration setting). Input reserves 1024 bytes for bounded call metadata.
+The complete encoded call envelope is also checked against the negotiated
+frame ceiling before queueing: the 1024-byte input reserve alone does not bound
+128 capabilities or blob-reference metadata. An unset principal reserves the
+maximum authenticated adapter identity. Catalog hashing applies the native
+`node.ValidateDescriptor` declaration rules, not merely nonempty metadata.
 Both peers negotiate the minimum of their limits, and values are rejected
 before dispatch when they exceed it. Payload schemas use the existing bounded
 schema contract: null/presence is explicit and portable integers use the
@@ -64,3 +72,11 @@ catalog/artifact identity. Unsupported protocol majors fail before dispatch.
 Workers expose no orchestration RPC. #51 owns process/client lifecycle, #52
 owns Node schema/server conformance, and #53 owns authenticated workload and
 blob authorization evidence.
+
+#53 review hardening tightens pre-alpha call validation to the shared five-minute
+deadline bound. Earlier clients requesting longer deadlines must split the work
+or use durable workflow waiting, then rebuild their application. Node rechecks
+absolute expiry before publishing either output or an error: a blocked event
+loop is not allowed to turn an expired call into successful output. Explicit
+cancellation retains the logical operation key. Neither deadline nor cancel
+claims to undo an external effect already dispatched by trusted code.

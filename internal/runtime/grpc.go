@@ -29,6 +29,7 @@ type outcome struct {
 type queuedFrame struct {
 	frame *wire.Frame
 	ack   chan error
+	ctx   context.Context
 }
 type grpcConnection struct {
 	client    *grpc.ClientConn
@@ -152,6 +153,19 @@ func (c *grpcConnection) writeLoop() {
 	for {
 		select {
 		case q := <-c.send:
+			// Cancellation while queued must not dispatch a node effect. Control
+			// frames have no call context and still need to reach the worker.
+			if q.ctx != nil && q.ctx.Err() != nil {
+				if q.ack != nil {
+					q.ack <- q.ctx.Err()
+				}
+				continue
+			}
+			select {
+			case <-c.done:
+				return
+			default:
+			}
 			err := c.stream.Send(q.frame)
 			if q.ack != nil {
 				q.ack <- err
@@ -192,6 +206,11 @@ func (c *grpcConnection) readLoop() {
 	}
 }
 func (c *grpcConnection) Call(ctx context.Context, call contract.Call) (contract.Result, error) {
+	callCtx, cancel := context.WithDeadline(ctx, call.Deadline)
+	defer cancel()
+	if err := callCtx.Err(); err != nil {
+		return contract.Result{}, err
+	}
 	if err := call.Validate(c.ready.Limits, c.ready.Generation); err != nil {
 		return contract.Result{}, err
 	}
@@ -204,6 +223,10 @@ func (c *grpcConnection) Call(ctx context.Context, call contract.Call) (contract
 	call.Principal = c.principal
 	ch := make(chan outcome, 1)
 	c.mu.Lock()
+	if err := callCtx.Err(); err != nil {
+		c.mu.Unlock()
+		return contract.Result{}, err
+	}
 	if len(c.pending) >= c.ready.Limits.MaxConcurrentCalls {
 		c.mu.Unlock()
 		return contract.Result{}, ErrCapacity
@@ -215,10 +238,11 @@ func (c *grpcConnection) Call(ctx context.Context, call contract.Call) (contract
 	c.pending[call.CallID] = ch
 	c.mu.Unlock()
 	defer func() { c.mu.Lock(); delete(c.pending, call.CallID); c.mu.Unlock() }()
-	callCtx, cancel := context.WithDeadline(ctx, call.Deadline)
-	defer cancel()
 	ack := make(chan error, 1)
-	q := queuedFrame{frame: &wire.Frame{Body: &wire.Frame_Call{Call: contract.CallWire(call)}}, ack: ack}
+	q := queuedFrame{frame: &wire.Frame{Body: &wire.Frame_Call{Call: contract.CallWire(call)}}, ack: ack, ctx: callCtx}
+	if err := callCtx.Err(); err != nil {
+		return contract.Result{}, err
+	}
 	select {
 	case c.send <- q:
 	case <-c.done:
@@ -229,6 +253,9 @@ func (c *grpcConnection) Call(ctx context.Context, call contract.Call) (contract
 	select {
 	case err := <-ack:
 		if err != nil {
+			if callCtx.Err() != nil {
+				return contract.Result{}, callCtx.Err()
+			}
 			return contract.Result{}, contract.ErrUncertain
 		}
 	case <-c.done:
@@ -265,6 +292,10 @@ func (c *grpcConnection) sendCancel(call contract.Call) {
 	}
 }
 func (c *grpcConnection) Close(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		c.fail()
+		return err
+	}
 	ack := make(chan error, 1)
 	select {
 	case <-c.done:

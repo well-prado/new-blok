@@ -182,7 +182,7 @@ func NativeNodes(providerURL string) map[string]node.Any {
 			return Paid{}, err
 		}
 		return out, nil
-	}, node.Description("Charge the HTTP mock provider"), node.Schemas(PricedSchema, PaidSchema), node.Effects("http:orders"))
+	}, node.Description("Charge the HTTP mock provider"), node.Schemas(PricedSchema, PaidSchema), node.Effects("http:orders"), node.RequiredCapabilities("http:orders"))
 	receipt := node.MustDefine("bench/receipt", "1.0.0", func(ctx context.Context, in Paid) (Receipt, error) {
 		if err := ctx.Err(); err != nil {
 			return Receipt{}, err
