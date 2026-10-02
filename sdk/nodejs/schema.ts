@@ -85,12 +85,13 @@ function formatValid(value: string, format: string | undefined): boolean {
 }
 function normalizeAt(s: Schema, v: unknown, path: string, depth: number): unknown {
   if (depth > 64) return fail("depth_exceeded", path);
-  if (v === null) return s.nullable || s.type === "null" ? null : fail("null_not_allowed", path);
+  if (v === null && s.nullable) return null;
   if (s.anyOf?.length) {
     const matches: unknown[] = [];
     for (const candidate of s.anyOf) { try { matches.push(normalizeAt(candidate, v, path, depth + 1)); } catch (e) { if (!(e instanceof SchemaError)) throw e; } }
     return matches.length === 1 ? matches[0] : fail("compatibility_unproven", path);
   }
+  if (v === null) return s.type === "null" ? null : fail("null_not_allowed", path);
   switch (s.type) {
     case "object": {
       if (!object(v)) return fail("type_mismatch", path);
@@ -121,8 +122,7 @@ function normalizeAt(s: Schema, v: unknown, path: string, depth: number): unknow
       if (!(v instanceof JSONNumber) && typeof v !== "number") return fail("type_mismatch", path);
       return Number.isFinite(Number(v instanceof JSONNumber ? v.text : v)) ? v : fail("number_invalid", path);
     }
-    // Go's current subset normalizes non-null values under a null schema to null.
-    case "null": return null;
+    case "null": return fail("type_mismatch", path);
     default: return fail("unsupported_schema", path);
   }
 }
