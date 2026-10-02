@@ -140,6 +140,9 @@ func (h Hello) validate() error {
 	return nil
 }
 
+// Validate checks a hello before it is sent to a peer.
+func (h Hello) Validate() error { return h.validate() }
+
 func containsAll(have, want []Capability) bool {
 	set := make(map[Capability]struct{}, len(have))
 	for _, value := range have {
