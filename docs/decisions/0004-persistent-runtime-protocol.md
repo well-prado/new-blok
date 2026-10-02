@@ -34,6 +34,11 @@ and concurrent calls are 64. Calls and negotiation permit at most 128
 capabilities; calls permit at most 128 blob references. A call deadline is at
 most five minutes from validation, shared by Go and Node (not an unadvertised
 worker-only duration setting). Input reserves 1024 bytes for bounded call metadata.
+The complete encoded call envelope is also checked against the negotiated
+frame ceiling before queueing: the 1024-byte input reserve alone does not bound
+128 capabilities or blob-reference metadata. An unset principal reserves the
+maximum authenticated adapter identity. Catalog hashing applies the native
+`node.ValidateDescriptor` declaration rules, not merely nonempty metadata.
 Both peers negotiate the minimum of their limits, and values are rejected
 before dispatch when they exceed it. Payload schemas use the existing bounded
 schema contract: null/presence is explicit and portable integers use the

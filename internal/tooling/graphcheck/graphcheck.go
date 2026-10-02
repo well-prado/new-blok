@@ -5,6 +5,7 @@ package graphcheck
 import (
 	"bufio"
 	"fmt"
+	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
@@ -26,6 +27,14 @@ type Package struct {
 	ImportPath string
 	Dir        string
 	Imports    []string
+	// Source reports whether the directory has non-test Go files.
+	Source bool
+	// Declaration reports a top-level variable named Declaration of type
+	// <module>/trigger.Declaration.
+	Declaration bool
+	// RunsTriggerConformance reports whether a test file calls
+	// contract/conformance.RunTrigger.
+	RunsTriggerConformance bool
 }
 
 type Graph struct {
@@ -44,12 +53,14 @@ func Analyze(root string) (Graph, error) {
 			return walkErr
 		}
 		if info.IsDir() {
-			if path != root && (info.Name() == "vendor" || strings.HasPrefix(info.Name(), ".")) {
+			// testdata is ignored by the go tool; fixture modules inside it
+			// are analyzed only when passed as the root.
+			if path != root && (info.Name() == "vendor" || info.Name() == "testdata" || strings.HasPrefix(info.Name(), ".")) {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		if filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
+		if filepath.Ext(path) != ".go" {
 			return nil
 		}
 		file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
@@ -66,9 +77,16 @@ func Analyze(root string) (Graph, error) {
 		}
 		p := g.Packages[pkgPath]
 		p.ImportPath, p.Dir = pkgPath, filepath.Dir(path)
+		if strings.HasSuffix(path, "_test.go") {
+			p.RunsTriggerConformance = p.RunsTriggerConformance || callsRunTrigger(file, module+"/contract/conformance")
+			g.Packages[pkgPath] = p
+			return nil
+		}
+		p.Source = true
 		for _, spec := range file.Imports {
 			p.Imports = append(p.Imports, strings.Trim(spec.Path.Value, `"`))
 		}
+		p.Declaration = p.Declaration || declaresContract(file, module+"/trigger")
 		g.Packages[pkgPath] = p
 		return nil
 	})
@@ -97,6 +115,23 @@ func Check(root string) ([]Diagnostic, error) {
 				if reachesForbidden(g, imported, map[string]bool{}) {
 					diagnostics = append(diagnostics, Diagnostic{Code: "engine_transitive_import_forbidden", Package: path, Import: imported, Message: "engine dependency transitively reaches a forbidden package"})
 				}
+			}
+		}
+		if isTrigger(g.Module, path) {
+			for _, imported := range p.Imports {
+				if forbiddenTriggerImport(g.Module, imported) {
+					diagnostics = append(diagnostics, Diagnostic{Code: "trigger_import_forbidden", Package: path, Import: imported, Message: "trigger adapter imports the interpreter, compiler or journal; adapters dispatch through an injected handler"})
+				} else if reachesForbiddenTrigger(g, imported, map[string]bool{}) {
+					diagnostics = append(diagnostics, Diagnostic{Code: "trigger_transitive_import_forbidden", Package: path, Import: imported, Message: "trigger adapter dependency transitively reaches the interpreter, compiler or journal"})
+				}
+			}
+		}
+		if p.Source && isTriggerAdapter(g.Module, path) {
+			if !p.Declaration {
+				diagnostics = append(diagnostics, Diagnostic{Code: "trigger_declaration_missing", Package: path, Message: "trigger adapter must publish var Declaration of type trigger.Declaration stating its completion and disconnect behavior"})
+			}
+			if !p.RunsTriggerConformance {
+				diagnostics = append(diagnostics, Diagnostic{Code: "trigger_conformance_missing", Package: path, Message: "trigger adapter tests must run contract/conformance.RunTrigger"})
 			}
 		}
 		if nodeRoot := nodeOwnerRoot(p.Dir); nodeRoot != "" {
@@ -171,6 +206,132 @@ func reachesForbidden(g Graph, path string, seen map[string]bool) bool {
 		}
 	}
 	return false
+}
+
+func isTrigger(module, path string) bool {
+	rel := strings.TrimPrefix(path, module+"/")
+	return rel != path && (rel == "trigger" || strings.HasPrefix(rel, "trigger/"))
+}
+
+// isTriggerAdapter matches every package under trigger/ except the contract
+// package itself and internal helpers: each one is an adapter and must
+// declare its behavior and run conformance.
+func isTriggerAdapter(module, path string) bool {
+	rel := strings.TrimPrefix(path, module+"/")
+	if rel == path || !strings.HasPrefix(rel, "trigger/") {
+		return false
+	}
+	for _, part := range strings.Split(rel, "/") {
+		if part == "internal" {
+			return false
+		}
+	}
+	return true
+}
+
+// importName returns the name file uses for importPath: its alias, "." for a
+// dot import, the default last element, or "" when it is not imported.
+func importName(file *ast.File, importPath string) string {
+	for _, spec := range file.Imports {
+		if strings.Trim(spec.Path.Value, `"`) != importPath {
+			continue
+		}
+		if spec.Name != nil {
+			return spec.Name.Name
+		}
+		return importPath[strings.LastIndex(importPath, "/")+1:]
+	}
+	return ""
+}
+
+// refers reports whether expr names symbol from the package imported as name.
+func refers(expr ast.Expr, name, symbol string) bool {
+	switch e := expr.(type) {
+	case *ast.SelectorExpr:
+		ident, ok := e.X.(*ast.Ident)
+		return ok && ident.Name == name && e.Sel.Name == symbol
+	case *ast.Ident:
+		return name == "." && e.Name == symbol
+	}
+	return false
+}
+
+// declaresContract reports a top-level `var Declaration` whose declared type
+// or composite literal is the trigger package's Declaration.
+func declaresContract(file *ast.File, triggerPath string) bool {
+	name := importName(file, triggerPath)
+	if name == "" {
+		return false
+	}
+	for _, decl := range file.Decls {
+		general, ok := decl.(*ast.GenDecl)
+		if !ok || general.Tok != token.VAR {
+			continue
+		}
+		for _, spec := range general.Specs {
+			value := spec.(*ast.ValueSpec)
+			for index, ident := range value.Names {
+				if ident.Name != "Declaration" {
+					continue
+				}
+				if value.Type != nil && refers(value.Type, name, "Declaration") {
+					return true
+				}
+				if index < len(value.Values) {
+					if literal, ok := value.Values[index].(*ast.CompositeLit); ok && refers(literal.Type, name, "Declaration") {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+func forbiddenTriggerImport(module, path string) bool {
+	for _, owned := range []string{"/internal/engine", "/internal/compile", "/internal/program", "/internal/journal", "/flowtest"} {
+		if path == module+owned || strings.HasPrefix(path, module+owned+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+func reachesForbiddenTrigger(g Graph, path string, seen map[string]bool) bool {
+	if forbiddenTriggerImport(g.Module, path) {
+		return true
+	}
+	if seen[path] {
+		return false
+	}
+	seen[path] = true
+	p, ok := g.Packages[path]
+	if !ok {
+		return false
+	}
+	for _, imported := range p.Imports {
+		if reachesForbiddenTrigger(g, imported, seen) {
+			return true
+		}
+	}
+	return false
+}
+
+// callsRunTrigger reports whether file imports conformancePath and calls its
+// RunTrigger function. Merely referring to the function does not count.
+func callsRunTrigger(file *ast.File, conformancePath string) bool {
+	name := importName(file, conformancePath)
+	if name == "" {
+		return false
+	}
+	found := false
+	ast.Inspect(file, func(n ast.Node) bool {
+		if call, ok := n.(*ast.CallExpr); ok && refers(call.Fun, name, "RunTrigger") {
+			found = true
+		}
+		return !found
+	})
+	return found
 }
 
 func nodeOwnerRoot(dir string) string {

@@ -6,5 +6,14 @@
   {"name":"integer-overflow","schema":{"type":"integer","wire":"int64-string"},"value":"9223372036854775808","error":"integer_range"},
   {"name":"decimal-wire","schema":{"type":"number","wire":"decimal-string"},"value":"12.50","normalized":"12.50"},
   {"name":"timestamp","schema":{"type":"string","format":"date-time"},"value":"2026-10-02T12:00:00Z","normalized":"2026-10-02T12:00:00Z"},
-  {"name":"blob-reference","schema":{"type":"string","format":"blob-ref"},"value":"blob://sha256/abc","normalized":"blob://sha256/abc"}
+  {"name":"blob-reference","schema":{"type":"string","format":"blob-ref"},"value":"blob://sha256/abc","normalized":"blob://sha256/abc"},
+  {"name":"null-only","schema":{"type":"null"},"value":null,"normalized":null},
+  {"name":"null-rejects-object","schema":{"type":"null"},"value":{},"error":"type_mismatch"},
+  {"name":"null-rejects-string","schema":{"type":"null"},"value":"blok","error":"type_mismatch"},
+  {"name":"union-null","schema":{"anyOf":[{"type":"string"},{"type":"null"}]},"value":null,"normalized":null},
+  {"name":"union-string","schema":{"anyOf":[{"type":"string"},{"type":"null"}]},"value":"blok","normalized":"blok"},
+  {"name":"union-object","schema":{"anyOf":[{"type":"object","additionalProperties":true},{"type":"null"}]},"value":{"name":"blok"},"normalized":{"name":"blok"}},
+  {"name":"union-no-match","schema":{"anyOf":[{"type":"string"},{"type":"null"}]},"value":true,"error":"compatibility_unproven"},
+  {"name":"union-ambiguous-null","schema":{"anyOf":[{"type":"null"},{"type":"null"}]},"value":null,"error":"compatibility_unproven"},
+  {"name":"union-ambiguous-number","schema":{"anyOf":[{"type":"integer"},{"type":"number"}]},"value":1,"error":"compatibility_unproven"}
 ]

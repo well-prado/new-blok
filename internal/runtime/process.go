@@ -78,17 +78,28 @@ func (f ProcessFactory) Connect(ctx context.Context, h contract.Hello) (Connecti
 	}
 }
 func (p *processConnection) Close(ctx context.Context) error {
-	err := p.Connection.Close(ctx)
+	cleanup, cancel := context.WithTimeout(ctx, cleanupTimeout)
+	defer cancel()
+	// Transport drain must not prevent reaching process termination. A stuck
+	// adapter cannot hold the child alive past the cleanup budget.
+	closed := make(chan error, 1)
+	go func() { closed <- p.Connection.Close(cleanup) }()
+	var err error
+	select {
+	case err = <-closed:
+	case <-cleanup.Done():
+		err = cleanup.Err()
+		if c, ok := p.Connection.(*grpcConnection); ok {
+			c.fail()
+		}
+	}
 	p.once.Do(func() { _ = p.cmd.Process.Signal(syscall.SIGTERM) })
 	select {
 	case <-p.exited:
-	case <-ctx.Done():
+	case <-cleanup.Done():
 		_ = p.cmd.Process.Kill()
 		<-p.exited
-		return ctx.Err()
-	case <-time.After(time.Second):
-		_ = p.cmd.Process.Kill()
-		<-p.exited
+		return cleanup.Err()
 	}
 	return err
 }
