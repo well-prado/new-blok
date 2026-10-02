@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "roadmap": "E09-T01",
+  "workflow": {
+    "name": "selection/quote",
+    "inputSchema": {"type":"object","properties":{"sku":{"type":"string"},"quantity":{"type":"integer","minimum":1,"maximum":100}},"required":["sku","quantity"]}
+  },
+  "bindings": [
+    {"id":"http-public","kind":"http","workflow":"selection/quote","path":"/quotes","authenticated":false,
+     "protocolSchema":{"type":"object","properties":{"sku":{"type":"string"},"quantity":{"type":"integer","minimum":1,"maximum":100}},"required":["sku","quantity"]},
+     "mapping":[],
+     "inputSchema":{"type":"object","properties":{"sku":{"type":"string"},"quantity":{"type":"integer","minimum":1,"maximum":100}},"required":["sku","quantity"]}},
+    {"id":"http-partner","kind":"http","workflow":"selection/quote","path":"/partners/quotes","authenticated":true,
+     "protocolSchema":{"type":"object","properties":{"sku":{"type":"string"},"quantity":{"type":"integer","minimum":1,"maximum":100},"partnerRef":{"type":"string"}},"required":["sku","quantity"]},
+     "mapping":["drop:partnerRef"],
+     "inputSchema":{"type":"object","properties":{"sku":{"type":"string"},"quantity":{"type":"integer","minimum":1,"maximum":100}},"required":["sku","quantity"]}},
+    {"id":"worker-quote","kind":"worker","workflow":"selection/quote","authenticated":false,
+     "protocolSchema":{"type":"object","properties":{"sku":{"type":"string"},"quantity":{"type":"integer","minimum":1,"maximum":100}},"required":["sku","quantity"]},
+     "mapping":[],
+     "inputSchema":{"type":"object","properties":{"sku":{"type":"string"},"quantity":{"type":"integer","minimum":1,"maximum":100}},"required":["sku","quantity"]}}
+  ],
+  "rejectedBindings": [
+    {"name":"protocol field passed through unmapped","code":"incompatible_binding",
+     "binding":{"id":"http-unmapped","kind":"http","workflow":"selection/quote","inputSchema":{"type":"object","properties":{"sku":{"type":"string"},"quantity":{"type":"integer","minimum":1,"maximum":100},"partnerRef":{"type":"string"}},"required":["sku","quantity"]}}},
+    {"name":"wider integer bounds","code":"incompatible_binding",
+     "binding":{"id":"http-wide","kind":"http","workflow":"selection/quote","inputSchema":{"type":"object","properties":{"sku":{"type":"string"},"quantity":{"type":"integer","minimum":1,"maximum":100000}},"required":["sku","quantity"]}}},
+    {"name":"missing workflow field","code":"incompatible_binding",
+     "binding":{"id":"http-legacy","kind":"http","workflow":"selection/quote","inputSchema":{"type":"object","properties":{"sku":{"type":"string"}},"required":["sku"]}}},
+    {"name":"workflow-required field made optional","code":"incompatible_binding",
+     "binding":{"id":"http-optional","kind":"http","workflow":"selection/quote","inputSchema":{"type":"object","properties":{"sku":{"type":"string"},"quantity":{"type":"integer","minimum":1,"maximum":100}},"required":["sku"]}}},
+    {"name":"changed field type","code":"incompatible_binding",
+     "binding":{"id":"http-string","kind":"http","workflow":"selection/quote","inputSchema":{"type":"string"}}},
+    {"name":"different workflow","code":"invalid_binding",
+     "binding":{"id":"http-other","kind":"http","workflow":"shop/other","inputSchema":{"type":"object","properties":{"sku":{"type":"string"},"quantity":{"type":"integer"}},"required":["sku","quantity"]}}},
+    {"name":"unknown trigger kind","code":"invalid_binding",
+     "binding":{"id":"pigeon","kind":"carrier-pigeon","workflow":"selection/quote","inputSchema":{"type":"object","properties":{"sku":{"type":"string"},"quantity":{"type":"integer"}},"required":["sku","quantity"]}}},
+    {"name":"duplicate binding id","code":"duplicate_binding",
+     "binding":{"id":"http-public","kind":"http","workflow":"selection/quote","inputSchema":{"type":"object","properties":{"sku":{"type":"string"},"quantity":{"type":"integer"}},"required":["sku","quantity"]}}}
+  ],
+  "deliveries": [
+    {"binding":"http-public","payload":{"sku":"coffee","quantity":2},"expect":"completed"},
+    {"binding":"http-partner","payload":{"sku":"coffee","quantity":2,"partnerRef":"p-1"},"credential":"partner-token","expect":"completed","principal":"partner-1"},
+    {"binding":"http-partner","payload":{"sku":"coffee","quantity":2,"partnerRef":"p-1"},"expect":"rejected","code":"unauthorized"},
+    {"binding":"http-public","payload":{"sku":"coffee","quantity":2,"partnerRef":"p-1"},"expect":"rejected","code":"invalid_input"},
+    {"binding":"worker-quote","payload":{"sku":"coffee","quantity":2},"expect":"completed"}
+  ],
+  "expected": {"output": 3, "errors": 2, "effects": 3, "totalCents": 3000},
+  "limits": [
+    "Bindings share one workflow and one node registry; each binding owns its protocol schema, mapping and authentication.",
+    "inputSchema is the value a binding hands the workflow after mapping; trigger.CheckBindings proves at startup that every such value is accepted by the workflow schema and rejects what it cannot prove.",
+    "Every mapped value is also validated against the workflow schema at run time in this test, so an unmapped protocol field fails instead of being dropped by a lenient decoder."
+  ]
+}
