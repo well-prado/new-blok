@@ -1,0 +1,10 @@
+[
+ {"id":"read-cannot-dispatch-hidden-write","outputs":0,"errors":1,"effects":0},
+ {"id":"invalid-input-before-effects","outputs":0,"errors":1,"effects":0},
+ {"id":"forged-authority-json","outputs":0,"errors":1,"effects":0},
+ {"id":"tokens-reserved-before-effects","outputs":0,"errors":1,"effects":0},
+ {"id":"calls-reserved-before-effects","outputs":0,"errors":1,"effects":0},
+ {"id":"depth-enforced-before-effects","outputs":0,"errors":1,"effects":0},
+ {"id":"expired-before-effects","outputs":0,"errors":1,"effects":0},
+ {"id":"native-worker-seam-chaining-defaults","outputs":1,"errors":0,"effects":2}
+]
