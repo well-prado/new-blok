@@ -1,0 +1,22 @@
+{
+  "cases": [
+    {
+      "name": "quote-success",
+      "expectedOutputCount": 1,
+      "expectedErrorCount": 0,
+      "expectedEffectCount": 0
+    },
+    {
+      "name": "panic-no-publication",
+      "expectedOutputCount": 0,
+      "expectedErrorCount": 1,
+      "expectedEffectCount": 0
+    },
+    {
+      "name": "canceled-no-publication",
+      "expectedOutputCount": 0,
+      "expectedErrorCount": 1,
+      "expectedEffectCount": 0
+    }
+  ]
+}
