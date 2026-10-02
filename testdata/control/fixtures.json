@@ -1,0 +1,22 @@
+{
+  "cases": [
+    {
+      "name": "ordered-each-and-selected-branch",
+      "expectedOutputCount": 1,
+      "expectedErrorCount": 0,
+      "expectedEffectCount": 0
+    },
+    {
+      "name": "parallel-failure-cancels-sibling",
+      "expectedOutputCount": 0,
+      "expectedErrorCount": 1,
+      "expectedEffectCount": 0
+    },
+    {
+      "name": "business-catch-finally",
+      "expectedOutputCount": 1,
+      "expectedErrorCount": 0,
+      "expectedEffectCount": 0
+    }
+  ]
+}
