@@ -6,3 +6,5 @@
 .env.*
 !.env.example
 .DS_Store
+runtime/nodejs/node_modules/
+runtime/nodejs/dist/
