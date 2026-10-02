@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "roadmap": "E10-T01",
+  "fixtures": [
+    {"id":"validation-field-error","kind":"rejected","expected":{"outputRecords":0,"errorRecords":1,"effectRecords":0,"errorCode":"type_mismatch","path":"$.name"}},
+    {"id":"template-overflow","kind":"rejected","expected":{"outputRecords":0,"errorRecords":1,"effectRecords":0,"errorCode":"template_limit"}},
+    {"id":"integer-overflow","kind":"rejected","expected":{"outputRecords":0,"errorRecords":1,"effectRecords":0,"errorCode":"integer_overflow"}},
+    {"id":"order-total","kind":"accepted","expected":{"outputRecords":1,"errorRecords":0,"effectRecords":0,"value":3000}}
+  ]
+}
