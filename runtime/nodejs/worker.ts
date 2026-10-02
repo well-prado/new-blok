@@ -146,7 +146,18 @@ export class Worker {
             state.terminal = true; clearTimeout(state.timer); active.delete(key); this.executing--; this.controllers.delete(controller);
           }
         })();
-      } catch (e) { stop(e instanceof DomainError && e.code === "capability_denied" ? grpc.status.PERMISSION_DENIED : grpc.status.FAILED_PRECONDITION); }
+      } catch (e) {
+        // Network/scheduler delay may exhaust a valid deadline before dispatch.
+        // Return a terminal call error, not a connection-wide uncertain failure.
+        if(e instanceof DomainError && e.classification==="DEADLINE_EXCEEDED" && frame.call){
+          const c=frame.call,callKey=`c:${c.callId}`,attemptKey=`a:${c.attemptId}`;
+          if(this.replay.has(callKey)||this.replay.has(attemptKey)){stop(grpc.status.ALREADY_EXISTS);return;}
+          if(this.replay.size+2>this.replayEntries){stop(grpc.status.RESOURCE_EXHAUSTED);return;}
+          this.replay.set(callKey,1);this.replay.set(attemptKey,1);
+          send({result:{...this.resultIdentity(c),error:redactError(e,c.idempotencyKey)}});return;
+        }
+        stop(e instanceof DomainError && e.code === "capability_denied" ? grpc.status.PERMISSION_DENIED : grpc.status.FAILED_PRECONDITION);
+      }
     });
   }
   private resultIdentity(c: Call): { callId: string; attemptId: string; generation: string } { return { callId: c.callId, attemptId: c.attemptId, generation: c.generation }; }
@@ -159,7 +170,8 @@ export class Worker {
     if (![c.callId, c.attemptId, c.node, c.nodeVersion].every(x => identity.test(x)) || c.generation !== this.options.generation || Buffer.byteLength(c.idempotencyKey) > 128 || (c.idempotencyKey !== "" && !identity.test(c.idempotencyKey))) throw new Error("invalid_call_identity");
     if (c.principal !== this.options.principal || !capabilities(c.capabilities) || c.capabilities.some(x => !h.capabilities.includes(x))) throw new DomainError("capability_denied");
     const deadline = BigInt(c.deadlineUnixNanos), now = BigInt(Date.now()) * 1000000n;
-    if (deadline <= now || deadline - now > BigInt(this.maxDuration) * 1000000n) throw new Error("invalid_deadline");
+    if (deadline <= now) throw new DomainError("call_deadline","DEADLINE_EXCEEDED");
+    if (deadline - now > BigInt(this.maxDuration) * 1000000n) throw new Error("invalid_deadline");
     if (!Buffer.isBuffer(c.input) || c.input.length > h.limits!.maxFrameBytes - 1024 || c.blobs.length > 64) throw new Error("payload_too_large");
     let total = 0n;
     for (const b of c.blobs) { const size = BigInt(b.size); if (!digest.test(b.digest) || size < 0n || size > BigInt(h.limits!.maxBlobBytes)) throw new Error("invalid_blob"); total += size; }
