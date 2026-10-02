@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "roadmap": "E01-T02",
+  "purpose": "Synthetic planning fixtures; they are contracts for future executable tests, not implementation evidence.",
+  "fixtures": [
+    {
+      "id": "valid-nested-document",
+      "kind": "accepted",
+      "owner": "E02-T01",
+      "input": "synthetic workflow with one binding, one call and one output",
+      "expected": {"outputRecords": 1, "errorRecords": 0, "effectRecords": 0}
+    },
+    {
+      "id": "duplicate-id-rejected",
+      "kind": "rejected",
+      "owner": "E02-T01",
+      "input": "synthetic workflow with two instructions using the same id",
+      "expected": {"outputRecords": 0, "errorRecords": 1, "effectRecords": 0, "errorCode": "duplicate_id"}
+    },
+    {
+      "id": "unsupported-schema-rejected",
+      "kind": "rejected",
+      "owner": "E02-T02",
+      "input": "synthetic schema using an unsupported recursive or unbounded construct",
+      "expected": {"outputRecords": 0, "errorRecords": 1, "effectRecords": 0, "errorCode": "unsupported_schema"}
+    },
+    {
+      "id": "same-version-conflict-rejected",
+      "kind": "rejected",
+      "owner": "E02-T03",
+      "input": "synthetic artifact registration reusing a version with different content",
+      "expected": {"outputRecords": 0, "errorRecords": 1, "effectRecords": 0, "errorCode": "artifact_version_conflict"}
+    },
+    {
+      "id": "equal-step-is-not-parity",
+      "kind": "insufficient-evidence",
+      "owner": "E20-T01",
+      "input": "two source fixtures with equal step counts and no-op work",
+      "expected": {"outputRecords": 0, "errorRecords": 1, "effectRecords": 0, "errorCode": "parity_evidence_insufficient"}
+    },
+    {
+      "id": "deterministic-model-is-not-live-ai",
+      "kind": "insufficient-evidence",
+      "owner": "E20-T02",
+      "input": "fixed deterministic model responses for three authoring goals",
+      "expected": {"outputRecords": 0, "errorRecords": 1, "effectRecords": 0, "errorCode": "live_ai_evidence_insufficient"}
+    }
+  ]
+}

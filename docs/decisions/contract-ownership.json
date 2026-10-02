@@ -1,0 +1,86 @@
+{
+  "schemaVersion": 1,
+  "roadmap": "E01-T02",
+  "contracts": [
+    {
+      "id": "workflow-document",
+      "question": "What is the canonical workflow, binding and descriptor document?",
+      "owner": "E02-T01",
+      "status": "planned",
+      "decision": "Separate domain workflow input/output from trigger bindings and use one versioned structural document.",
+      "evidence": ["valid-nested-document", "duplicate-id-rejected", "future-version-rejected"]
+    },
+    {
+      "id": "schema-semantics",
+      "question": "Which values, presence rules and normalization operations are portable?",
+      "owner": "E02-T02",
+      "status": "planned",
+      "decision": "Use a bounded JSON-compatible subset with explicit missing/null/default/unknown-field semantics and limits.",
+      "evidence": ["missing-versus-null", "default-annotation-versus-normalization", "unsupported-schema-rejected"]
+    },
+    {
+      "id": "artifact-identity",
+      "question": "How are versioned executable artifacts made immutable and locatable?",
+      "owner": "E02-T03",
+      "status": "planned",
+      "decision": "Bind execution-relevant content to deterministic digests; reject same-version content conflicts.",
+      "evidence": ["digest-formatting-stable", "binary-change-changes-digest", "same-version-conflict-rejected"]
+    },
+    {
+      "id": "diagnostic-and-conformance-contract",
+      "question": "How do tools and adapters consume stable diagnostics and conformance cases?",
+      "owner": "E02-T04",
+      "status": "planned",
+      "decision": "Publish versioned diagnostic/conformance records with actionable location, expected/actual and remediation fields.",
+      "evidence": ["unknown-instruction-diagnostic", "malformed-binding-diagnostic"]
+    },
+    {
+      "id": "go-authoring-api",
+      "question": "Which typed Go authoring forms and ownership rules are supported?",
+      "owner": "E03-T01",
+      "status": "planned",
+      "decision": "Applications author typed nodes and structural workflows; nodes do not import or invoke other nodes.",
+      "evidence": ["typed-node-registration", "node-import-boundary", "builder-records-without-effects"]
+    },
+    {
+      "id": "embedded-durability-backend",
+      "question": "Which embedded backend provides the first durable execution implementation?",
+      "owner": "E07-T01",
+      "status": "open",
+      "decision": "Select one backend through a measured executable spike; keep the store port replaceable.",
+      "evidence": ["restart-recovery", "atomic-admission", "crash-boundary-results"]
+    },
+    {
+      "id": "worker-protocol",
+      "question": "What persistent external-runtime protocol and topology are supported first?",
+      "owner": "E08-T01",
+      "status": "planned",
+      "decision": "Node.js is first over authenticated persistent gRPC with negotiated schemas, identities, bounds and cancellation.",
+      "evidence": ["handshake-rejection", "cancellation", "reconnect-generation"]
+    },
+    {
+      "id": "registry-trust",
+      "question": "How are packages resolved, verified, locked and installed offline?",
+      "owner": "E13-T01",
+      "status": "planned",
+      "decision": "Use immutable identities, verified artifacts, deterministic locks, offline cache and atomic changes; do not replace language package managers.",
+      "evidence": ["digest-mismatch-rejected", "offline-lock-resolution", "atomic-install-failure"]
+    },
+    {
+      "id": "distributed-ownership",
+      "question": "How are durable partitions fenced and work ownership transferred?",
+      "owner": "E18-T01",
+      "status": "open",
+      "decision": "Specify fencing and persistence semantics before implementing distributed admission or claiming fleet capacity.",
+      "evidence": ["stale-owner-rejected", "failover-recovery", "overload-envelope"]
+    },
+    {
+      "id": "release-capacity-evidence",
+      "question": "What evidence supports production release and fleet-scale capacity claims?",
+      "owner": "E20-T03",
+      "status": "open",
+      "decision": "Require behaviorally equivalent application workloads, security/fuzz/chaos evidence and controlled repeated measurements.",
+      "evidence": ["current-blok-parity", "live-ai-evaluation", "fleet-load-with-failures"]
+    }
+  ]
+}

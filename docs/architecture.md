@@ -152,7 +152,7 @@ The roadmap therefore includes executable current-Blok parity workloads, live-pr
 
 ## 12. Decisions and technical references
 
-Open decisions have explicit owners: canonical schema/IR (E02), Go API ergonomics (E03), embedded backend (E07), worker topology/codec (E08), registry trust/distribution (E13), distributed persistence/ownership (E18), and release capacity envelope (E20). Resolve each through a decision record and executable evidence before dependent behavior is frozen.
+Open decisions have explicit owners: canonical schema/IR (E02), Go API ergonomics (E03), embedded backend (E07), worker topology/codec (E08), registry trust/distribution (E13), distributed persistence/ownership (E18), and release capacity envelope (E20). Resolve each through a decision record and executable evidence before dependent behavior is frozen. The public-surface inventory, compatibility process and synthetic evidence policy are recorded in [ADR 0001](decisions/0001-public-api-boundaries.md), with machine-readable ownership and evidence fixtures alongside it. These fixtures are planning contracts until their owning implementation issues add executable validation.
 
 - [Go module/package layout](https://go.dev/doc/modules/layout)
 - [Go release history](https://go.dev/doc/devel/release)

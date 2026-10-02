@@ -32,3 +32,20 @@ Read `ROADMAP.md`, `docs/architecture.md`, and the assigned issue before editing
 ## Current state
 
 The repository contains a tested CLI bootstrap and a delivery roadmap. Application APIs in `docs/architecture.md` are proposals until their implementation issues pass. Do not present planned commands as available.
+
+## Public surface and decision records
+
+Public package responsibilities, compatibility requirements, separate-product
+boundaries and evidence limits are recorded in
+`docs/decisions/0001-public-api-boundaries.md`. Its JSON fixtures are the
+machine-readable inventory for ambiguous contract ownership and synthetic
+accepted/rejected evidence cases. They are planning contracts until the owning
+implementation issues add executable validation.
+
+Changes to a public or cross-boundary contract require an issue-linked decision
+record, compatibility classification, migration evidence where applicable,
+valid and invalid fixtures, and the owning issue's focused and required gates.
+Equal-step source comparisons and deterministic-model evaluations never count
+as current-Blok parity or live-AI evidence. Studio, the hosted registry and
+BLOK Cloud remain separate products; this repository contains only their
+framework contracts and consumer fixtures.
