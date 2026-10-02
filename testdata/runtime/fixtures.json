@@ -1,0 +1,9 @@
+[
+ {"id":"matching-contract","expectedOutput":1,"expectedErrors":0,"expectedEffects":0},
+ {"id":"unsupported-version","expectedOutput":0,"expectedErrors":1,"expectedEffects":0},
+ {"id":"wrong-catalog","expectedOutput":0,"expectedErrors":1,"expectedEffects":0},
+ {"id":"wrong-artifact","expectedOutput":0,"expectedErrors":1,"expectedEffects":0},
+ {"id":"stale-generation","expectedOutput":0,"expectedErrors":1,"expectedEffects":0},
+ {"id":"widened-capability","expectedOutput":0,"expectedErrors":1,"expectedEffects":0},
+ {"id":"int64-boundaries-presence-null","expectedOutput":2,"expectedErrors":0,"expectedEffects":0}
+]
