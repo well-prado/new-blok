@@ -1,0 +1,22 @@
+{
+  "cases": [
+    {
+      "name": "deterministic-program",
+      "expectedOutputCount": 1,
+      "expectedErrorCount": 0,
+      "expectedEffectCount": 0
+    },
+    {
+      "name": "unknown-opcode",
+      "expectedOutputCount": 0,
+      "expectedErrorCount": 1,
+      "expectedEffectCount": 0
+    },
+    {
+      "name": "cycle-or-future-reference",
+      "expectedOutputCount": 0,
+      "expectedErrorCount": 1,
+      "expectedEffectCount": 0
+    }
+  ]
+}
