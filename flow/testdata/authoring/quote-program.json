@@ -1,0 +1,24 @@
+{
+  "spec": {
+    "Name": "shop/quote",
+    "Version": "1.0.0",
+    "Durability": "memory"
+  },
+  "instructions": [
+    {
+      "kind": "call",
+      "id": "calculate",
+      "node": {
+        "name": "shop/calculate-quote",
+        "version": "1.0.0",
+        "description": "calculates a quote",
+        "inputSchema": {"type":"object"},
+        "outputSchema": {"type":"object"},
+        "deterministic": true
+      },
+      "input": "$input",
+      "output": "$step.calculate"
+    }
+  ],
+  "output": "$step.calculate"
+}

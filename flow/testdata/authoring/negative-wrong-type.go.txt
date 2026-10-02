@@ -1,0 +1,2 @@
+// This fixture must fail to compile: Call expects Ref[quoteInput], not Ref[string].
+// Call(builder, "calculate", quoteNode, Lit("coffee"))
