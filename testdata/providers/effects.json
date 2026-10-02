@@ -1,0 +1,24 @@
+{
+ "schemaVersion":"provider-effects/v1",
+ "synthetic":true,
+ "cases":[
+  {"name":"http","kind":"http","scenario":"success","input":{"key":"http-1","body":"hello"},"output":{"status":200,"body":"hello"},"requests":1,"effects":1},
+  {"name":"email-repeat","kind":"email","scenario":"repeat","input":{"key":"email-1","to":"synthetic@example.invalid","subject":"receipt","text":"paid"},"output":{"id":"mail-1"},"requests":2,"effects":1},
+  {"name":"payment-repeat","kind":"payment","scenario":"repeat","input":{"key":"pay-1","account":"synthetic","amountCents":3000,"currency":"USD"},"output":{"id":"charge-1"},"requests":2,"effects":1},
+  {"name":"publish","kind":"publish","scenario":"success","input":{"key":"event-1","topic":"orders","payload":"created"},"output":{"id":"event-1"},"requests":1,"effects":1},
+  {"name":"audit","kind":"audit","scenario":"success","input":{"key":"audit-1","action":"order.created","subject":"order-1"},"output":{"id":"audit-1"},"requests":1,"effects":1},
+  {"name":"generate","kind":"generate","scenario":"success","input":{"key":"gen-1","prompt":"synthetic"},"output":{"value":{"answer":42}},"requests":1,"effects":1},
+  {"name":"generate-invalid","kind":"generate","scenario":"success","input":{"key":"gen-2","prompt":"synthetic"},"output":{"value":{"answer":"wrong"}},"error":"uncertain","requests":1,"effects":1},
+  {"name":"payment-lost-response","kind":"payment","scenario":"drop-after","input":{"key":"pay-lost","account":"synthetic","amountCents":3000,"currency":"USD"},"output":{"id":"charge-lost"},"error":"uncertain","requests":1,"effects":1},
+  {"name":"email-timeout-after","kind":"email","scenario":"timeout-after","input":{"key":"email-slow","to":"synthetic@example.invalid","subject":"receipt","text":"paid"},"output":{"id":"mail-slow"},"error":"uncertain","requests":1,"effects":1},
+  {"name":"payment-timeout-before","kind":"payment","scenario":"cancel-before","input":{"key":"pay-before","account":"synthetic","amountCents":3000,"currency":"USD"},"output":{"id":"unused"},"error":"cancellation","requests":0,"effects":0},
+  {"name":"payment-rejected","kind":"payment","scenario":"business","input":{"key":"pay-bad","account":"synthetic","amountCents":3000,"currency":"USD"},"output":{},"error":"business","requests":1,"effects":0},
+  {"name":"email-rate-limit","kind":"email","scenario":"transient","input":{"key":"mail-busy","to":"synthetic@example.invalid","subject":"receipt","text":"paid"},"output":{},"error":"transient","requests":1,"effects":0},
+  {"name":"payment-server-error-after","kind":"payment","scenario":"server-unknown","input":{"key":"pay-server","account":"synthetic","amountCents":3000,"currency":"USD"},"output":{},"error":"uncertain","requests":1,"effects":1},
+  {"name":"payment-invalid","kind":"payment","scenario":"success","input":{"key":"pay-zero","account":"synthetic","amountCents":0,"currency":"USD"},"output":{},"error":"validation","requests":0,"effects":0},
+  {"name":"email-empty-receipt","kind":"email","scenario":"success","input":{"key":"email-empty","to":"synthetic@example.invalid","subject":"receipt","text":"paid"},"output":{"id":""},"error":"uncertain","requests":1,"effects":1},
+  {"name":"email-extra-output","kind":"email","scenario":"success","input":{"key":"email-extra","to":"synthetic@example.invalid","subject":"receipt","text":"paid"},"output":{"id":"mail","credential":"synthetic-secret"},"error":"uncertain","requests":1,"effects":1}
+ ],
+ "database":{"rollback":{"records":0,"outbox":0},"duplicate":{"records":1,"outbox":1},"conflict":{"error":"business","records":1,"outbox":1}},
+ "orderOutbox":{"failedDispatch":{"pending":1,"effects":1},"recoveredDispatch":{"sent":1,"effects":1,"requests":2}}
+}
