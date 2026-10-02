@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/well-prado/new-blok/app"
 	contract "github.com/well-prado/new-blok/contract/runtime"
 	"github.com/well-prado/new-blok/contract/runtime/wire"
 	"google.golang.org/grpc"
@@ -14,6 +15,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -35,6 +38,13 @@ func (testWorker) Connect(stream wire.Worker_ConnectServer) error {
 		return status.Error(codes.InvalidArgument, "invalid hello")
 	}
 	peer := hello()
+	if text := os.Getenv("WORKER_TEST_GENERATION"); text != "" {
+		generation, err := strconv.ParseUint(text, 10, 64)
+		if err != nil {
+			return status.Error(codes.InvalidArgument, "invalid generation")
+		}
+		peer.Generation = generation
+	}
 	ready, err := contract.Negotiate(h, peer)
 	if err != nil {
 		return status.Error(codes.FailedPrecondition, "identity mismatch")
@@ -105,6 +115,77 @@ func (testWorker) Connect(stream wire.Worker_ConnectServer) error {
 		default:
 			return status.Error(codes.InvalidArgument, "wrong direction")
 		}
+	}
+}
+func TestSelectedWorkerApplicationLifecycleReapsEveryGeneration(t *testing.T) {
+	baseline := goruntime.NumGoroutine()
+	pids := map[int]bool{}
+	for cycle := 0; cycle < 4; cycle++ {
+		f := factory(t, freeAddress(t))
+		generation := uint64(cycle + 1)
+		f.Env = append(f.Env, "WORKER_TEST_GENERATION="+strconv.FormatUint(generation, 10))
+		h := hello()
+		h.Generation = generation
+		supervisor, err := New(Config{Hello: h, Factory: f, Capacity: 2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		application, err := app.New(app.Config{Dependencies: []app.Dependency{{Name: "selected-node-worker", Start: supervisor.Start, Close: supervisor.Shutdown}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if application.Ready() {
+			t.Fatal("ready before negotiated startup")
+		}
+		if err := application.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		process := supervisor.conn.(*processConnection)
+		if pids[process.PID()] {
+			t.Fatal("expected distinct process for explicit lifecycle")
+		}
+		pids[process.PID()] = true
+		for i := 0; i < 3; i++ {
+			c := call(fmt.Sprintf("lifecycle-%d-%d", cycle, i))
+			c.Generation = generation
+			if _, err := supervisor.Call(context.Background(), c); err != nil {
+				t.Fatal(err)
+			}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		err = application.Shutdown(ctx)
+		cancel()
+		if err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-process.exited:
+		default:
+			t.Fatal("application shutdown left child process unreaped")
+		}
+		if application.Ready() {
+			t.Fatal("ready after drain")
+		}
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for goruntime.NumGoroutine() > baseline+4 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if after := goruntime.NumGoroutine(); after > baseline+4 {
+		t.Fatalf("lifecycle goroutines grew: %d -> %d", baseline, after)
+	}
+}
+func TestMissingSelectedRuntimePreventsApplicationReadiness(t *testing.T) {
+	supervisor, err := New(Config{Hello: hello(), Factory: ProcessFactory{Command: "/nonexistent/synthetic-node-runtime"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	application, err := app.New(app.Config{Dependencies: []app.Dependency{{Name: "worker", Start: supervisor.Start, Close: supervisor.Shutdown}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := application.Start(context.Background()); err == nil || application.Ready() {
+		t.Fatal("missing selected runtime accepted traffic")
 	}
 }
 func TestWorkerSubprocess(t *testing.T) {
