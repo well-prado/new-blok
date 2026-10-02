@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	contract "github.com/well-prado/new-blok/contract/runtime"
 )
@@ -25,6 +26,15 @@ var (
 type Connection interface {
 	Call(context.Context, contract.Call) (contract.Result, error)
 	Close(context.Context) error
+}
+
+// Cleanup has a finite budget even when the lifecycle caller has no deadline.
+const cleanupTimeout = time.Second
+
+func closeConnection(ctx context.Context, conn Connection) error {
+	cleanup, cancel := context.WithTimeout(ctx, cleanupTimeout)
+	defer cancel()
+	return conn.Close(cleanup)
 }
 
 type Factory interface {
@@ -94,7 +104,7 @@ func (s *Supervisor) Start(ctx context.Context) error {
 		return errors.New("worker supervisor: factory returned nil connection")
 	}
 	if ready.Generation != s.config.Hello.Generation || ready.ArtifactDigest != s.config.Hello.ArtifactDigest || ready.CatalogDigest != s.config.Hello.CatalogDigest {
-		_ = conn.Close(context.Background())
+		_ = closeConnection(ctx, conn)
 		s.finish()
 		return contract.ErrGenerationMismatch
 	}
@@ -102,7 +112,7 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	peer.Protocol, peer.Major, peer.Minor = ready.Protocol, ready.Major, ready.Minor
 	peer.Capabilities, peer.Limits = ready.Capabilities, ready.Limits
 	if _, err := contract.Negotiate(s.config.Hello, peer); err != nil {
-		_ = conn.Close(context.Background())
+		_ = closeConnection(ctx, conn)
 		s.finish()
 		return err
 	}
@@ -113,7 +123,14 @@ func (s *Supervisor) Start(ctx context.Context) error {
 }
 
 func (s *Supervisor) Call(ctx context.Context, call contract.Call) (contract.Result, error) {
+	if err := ctx.Err(); err != nil {
+		return contract.Result{}, err
+	}
 	s.mu.Lock()
+	if err := ctx.Err(); err != nil {
+		s.mu.Unlock()
+		return contract.Result{}, err
+	}
 	if s.state != stateReady {
 		err := s.lifecycleError()
 		s.mu.Unlock()
@@ -179,11 +196,11 @@ func (s *Supervisor) Shutdown(ctx context.Context) error {
 	select {
 	case <-done:
 	case <-ctx.Done():
-		_ = conn.Close(context.Background())
+		_ = closeConnection(ctx, conn)
 		s.finish()
 		return ctx.Err()
 	}
-	if err := conn.Close(ctx); err != nil {
+	if err := closeConnection(ctx, conn); err != nil {
 		s.finish()
 		return err
 	}
