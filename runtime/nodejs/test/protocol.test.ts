@@ -9,12 +9,12 @@ import { defineNode, type AnyNode } from "../../../sdk/nodejs/index.js";
 
 const token="synthetic-test-token-0000000000001";
 const artifact=`sha256:${"a".repeat(64)}`;
-async function fixture(generation="1", replayEntries=8192,extra:readonly AnyNode[]=[]){
+async function fixture(generation="1", replayEntries=8192,extra:readonly AnyNode[]=[],caps:readonly string[]=["http:synthetic"]){
  const listener=createServer();await new Promise<void>(resolve=>listener.listen(0,"127.0.0.1",resolve));const address=listener.address();if(!address||typeof address==="string")throw new Error("test listener");await new Promise<void>(resolve=>listener.close(()=>resolve()));
  const endpoint=`127.0.0.1:${address.port}`;
- const worker=new Worker({nodes:[...nodes,...extra],token,principal:"app-1",capabilities:["http:synthetic"],artifactDigest:artifact,generation,address:endpoint,replayEntries});await worker.listen();
+ const worker=new Worker({nodes:[...nodes,...extra],token,principal:"app-1",capabilities:caps,artifactDigest:artifact,generation,address:endpoint,replayEntries});await worker.listen();
  const client=new (loadProtocol().blok.runtime.v1.Worker)(endpoint,grpc.credentials.createInsecure());
- const hello={protocol:"blok.runtime",major:1,minor:0,artifactDigest:artifact,catalogDigest:worker.catalog.catalogDigest,generation,capabilities:["http:synthetic"],limits:DEFAULT_LIMITS};
+ const hello={protocol:"blok.runtime",major:1,minor:0,artifactDigest:artifact,catalogDigest:worker.catalog.catalogDigest,generation,capabilities:[...caps],limits:DEFAULT_LIMITS};
  const connect=(auth=token,principal="app-1")=>{const metadata=new grpc.Metadata();metadata.set("authorization",`Bearer ${auth}`);metadata.set("x-blok-principal",principal);const stream=client.Connect(metadata);stream.on("error",()=>{});return stream;};
  return {worker,client,hello,connect,close(){client.close();worker.close();}};
 }
@@ -30,8 +30,23 @@ test("worker independently rejects replay and bounded identity saturation",async
 });
 test("actual deadline and Cancel terminate cooperative nodes without publishing output",async()=>{
  const f=await fixture();try{const s=f.connect();let result=receive(s);s.write({hello:f.hello});await result;
-  for(const mode of ["deadline","cancel"]){const c={...call(mode),node:"fixture/slow",input:Buffer.from('{"milliseconds":500}'),deadlineUnixNanos:(BigInt(Date.now()+(mode==="deadline"?30:1000))*1000000n).toString()};result=receive(s);s.write({call:c});if(mode==="cancel")s.write({cancel:{callId:c.callId,attemptId:c.attemptId,generation:"1"}});const response=(await result).result;assert.equal(response?.error?.class,mode==="deadline"?"DEADLINE_EXCEEDED":"CANCELED");assert.equal(response?.output.length,0);}
+  for(const mode of ["deadline","cancel"]){const c={...call(mode),node:"fixture/slow",input:Buffer.from('{"milliseconds":500}'),deadlineUnixNanos:(BigInt(Date.now()+(mode==="deadline"?30:1000))*1000000n).toString()};result=receive(s);s.write({call:c});if(mode==="cancel")s.write({cancel:{callId:c.callId,attemptId:c.attemptId,generation:"1"}});const response=(await result).result;assert.equal(response?.error?.class,mode==="deadline"?"DEADLINE_EXCEEDED":"CANCELED");assert.equal(response?.error?.idempotencyKey,"operation");assert.equal(response?.output.length,0);}
   result=receive(s);s.write({call:call("after-cancel")});assert.equal((await result).result?.output.toString(),'{"value":"1"}');
+ }finally{f.close();}
+});
+test("CPU-bound node cannot publish successful output beyond absolute deadline",async()=>{
+ let executions=0;
+ const blocked=defineNode<Record<string,never>,{done:boolean},null>({name:"fixture/blocked",version:"1.0.0",description:"Synthetic blocked event loop",input:{type:"object"},output:{type:"object",properties:{done:{type:"boolean"}},required:["done"]},deterministic:true,dependencies:null,execute(){executions++;const until=Date.now()+100;while(Date.now()<until){/* deliberately blocks timer */}return {done:true};}});
+ const f=await fixture("1",8192,[blocked]);try{const s=f.connect();let result=receive(s);s.write({hello:f.hello});await result;
+  result=receive(s);s.write({call:{...call("blocked"),node:"fixture/blocked",input:Buffer.from("{}"),deadlineUnixNanos:(BigInt(Date.now()+30)*1000000n).toString()}});
+  const response=(await result).result;assert.equal(executions,1);assert.equal(response?.error?.class,"DEADLINE_EXCEEDED");assert.equal(response?.output.length,0);assert.equal(response?.error?.idempotencyKey,"operation");
+  result=receive(s);s.write({call:call("after-blocked")});assert.equal((await result).result?.output.toString(),'{"value":"1"}');
+ }finally{f.close();}
+});
+test("shared Go bounds accept 128 capabilities, blob references and a long valid deadline",async()=>{
+ const caps=Array.from({length:128},(_,i)=>`synthetic:${i}`),f=await fixture("1",8192,[],caps);try{const s=f.connect();let result=receive(s);s.write({hello:f.hello});await result;
+  result=receive(s);s.write({call:{...call("shared-bounds"),capabilities:caps,blobs:Array.from({length:128},()=>({digest:artifact,size:"0"})),deadlineUnixNanos:(BigInt(Date.now()+90000)*1000000n).toString()}});
+  assert.equal((await result).result?.output.toString(),'{"value":"1"}');
  }finally{f.close();}
 });
 test("deadline exhausted in transit is terminal without poisoning the channel",async()=>{

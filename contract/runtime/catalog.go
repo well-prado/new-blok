@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	artifactcontract "github.com/well-prado/new-blok/contract/artifact"
-	"github.com/well-prado/new-blok/contract/schema"
 	"github.com/well-prado/new-blok/node"
 	"sort"
 )
@@ -20,17 +19,11 @@ func CatalogDigest(descriptors []node.Descriptor) (string, error) {
 	ds := append([]node.Descriptor(nil), descriptors...)
 	sort.Slice(ds, func(i, j int) bool { return ds[i].Name+"@"+ds[i].Version < ds[j].Name+"@"+ds[j].Version })
 	for i, d := range ds {
-		if !identityPattern.MatchString(d.Name) || d.Version == "" || d.Description == "" {
-			return "", errors.New("invalid catalog descriptor")
+		if err := node.ValidateDescriptor(d); err != nil {
+			return "", err
 		}
 		if i > 0 && ds[i-1].Name == d.Name && ds[i-1].Version == d.Version {
 			return "", errors.New("duplicate catalog identity")
-		}
-		if _, err := schema.Parse(d.InputSchema); err != nil {
-			return "", err
-		}
-		if _, err := schema.Parse(d.OutputSchema); err != nil {
-			return "", err
 		}
 		ds[i].Effects = append([]string(nil), d.Effects...)
 		sort.Strings(ds[i].Effects)

@@ -181,6 +181,14 @@ func nativeValue(s schema.Schema, v any) any {
 	if v == nil {
 		return nil
 	}
+	if len(s.AnyOf) > 0 {
+		for _, candidate := range s.AnyOf {
+			if _, err := candidate.NormalizeValue(v); err == nil {
+				return nativeValue(candidate, v)
+			}
+		}
+		return v // Normalize has already required exactly one matching branch.
+	}
 	if s.Type == "integer" && s.Wire == "int64-string" {
 		if str, ok := v.(string); ok {
 			return json.Number(str)

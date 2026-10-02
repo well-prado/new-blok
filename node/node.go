@@ -224,6 +224,10 @@ func (r *Registry) Lookup(name, version string) (Any, bool) {
 	return value, ok
 }
 
+// ValidateDescriptor applies the same declaration rules at registry and foreign
+// catalog boundaries. Canonical hashing alone is not descriptor validation.
+func ValidateDescriptor(d Descriptor) error { return validateDescriptor(d) }
+
 func validateDescriptor(d Descriptor) error {
 	if len(d.RequiredCapabilities) > 128 {
 		return &Error{Code: "invalid_capability", Message: "too many required capabilities"}

@@ -204,11 +204,21 @@ func (c Call) Validate(limits Limits, generation uint64) error {
 	if c.Deadline.IsZero() || !c.Deadline.After(time.Now()) {
 		return context.DeadlineExceeded
 	}
+	if time.Until(c.Deadline) > 5*time.Minute {
+		return fmt.Errorf("%w: deadline exceeds five minutes", ErrLimitExceeded)
+	}
 	if len(c.Input) == 0 || len(c.Input) > limits.MaxFrameBytes-1024 || len(c.IdempotencyKey) > 128 || len(c.Blobs) > 128 || len(c.Capabilities) > 128 {
 		return fmt.Errorf("%w: input", ErrLimitExceeded)
 	}
 	if c.Principal != "" && !identityPattern.MatchString(c.Principal) {
 		return ErrCapabilityDenied
+	}
+	seen := map[Capability]bool{}
+	for _, cap := range c.Capabilities {
+		if seen[cap] || !identityPattern.MatchString(string(cap)) || strings.Contains(string(cap), "orchestrate") {
+			return ErrCapabilityDenied
+		}
+		seen[cap] = true
 	}
 	totalBlobBytes := 0
 	for _, blob := range c.Blobs {
@@ -219,6 +229,9 @@ func (c Call) Validate(limits Limits, generation uint64) error {
 		if totalBlobBytes > limits.MaxBlobBytes {
 			return ErrLimitExceeded
 		}
+	}
+	if EncodedCallBytes(c) > limits.MaxFrameBytes {
+		return fmt.Errorf("%w: complete frame", ErrLimitExceeded)
 	}
 	return nil
 }
