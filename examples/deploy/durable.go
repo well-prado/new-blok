@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -99,6 +100,11 @@ func NewDurable(c deployment.Config, path string) (*app.Deployment, error) {
 		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
 		dec.DisallowUnknownFields()
 		if err := dec.Decode(&input); err != nil || input.RequestKey == "" || len(input.RequestKey) > 128 || input.SKU != "coffee" || input.Quantity < 1 || input.Quantity > 100 {
+			http.Error(w, "invalid order", 400)
+			return
+		}
+		var trailing any
+		if dec.Decode(&trailing) != io.EOF {
 			http.Error(w, "invalid order", 400)
 			return
 		}

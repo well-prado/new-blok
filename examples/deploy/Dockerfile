@@ -4,7 +4,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 ARG COMMAND=native
-RUN CGO_ENABLED=0 go build -trimpath -o /app ./examples/deploy/cmd/${COMMAND}
+RUN --mount=type=cache,id=new-blok-m4-gocache,target=/root/.cache/go-build CGO_ENABLED=0 go build -trimpath -o /app ./examples/deploy/cmd/${COMMAND}
 
 FROM scratch
 COPY --from=build /app /app

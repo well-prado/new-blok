@@ -1,0 +1,35 @@
+FROM golang:1.27.1 AS go-build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN --mount=type=cache,id=new-blok-m4-gocache,target=/root/.cache/go-build CGO_ENABLED=0 go build -trimpath -o /app ./examples/deploy/cmd/node
+
+FROM node:22.18.0-bookworm-slim AS node-build
+WORKDIR /src
+COPY runtime/nodejs/package*.json runtime/nodejs/
+RUN cd runtime/nodejs && npm ci
+COPY runtime/nodejs runtime/nodejs
+COPY sdk/nodejs sdk/nodejs
+COPY testdata/worker/nodejs testdata/worker/nodejs
+RUN cd runtime/nodejs && npm run build
+
+FROM go-build AS validation
+COPY --from=node-build /usr/local/bin/node /usr/local/bin/node
+COPY --from=node-build /src/runtime/nodejs/dist runtime/nodejs/dist
+COPY --from=node-build /src/runtime/nodejs/node_modules runtime/nodejs/node_modules
+ENV BLOK_NODE_INTEGRATION_ROOT=/src
+
+FROM node:22.18.0-bookworm-slim
+WORKDIR /src
+COPY --from=go-build /app /app
+COPY --from=node-build /src/runtime/nodejs/dist runtime/nodejs/dist
+COPY --from=node-build /src/runtime/nodejs/node_modules runtime/nodejs/node_modules
+COPY runtime/nodejs/package*.json runtime/nodejs/
+COPY contract/runtime/runtime.proto contract/runtime/runtime.proto
+COPY runtime/nodejs/generated/proto.sha256 runtime/nodejs/generated/proto.sha256
+COPY examples/deploy/nodes.mjs examples/deploy/node-catalog.json examples/deploy/
+USER node
+ENV BLOK_LISTEN=0.0.0.0:8080 BLOK_EXTERNAL=true
+EXPOSE 8080
+ENTRYPOINT ["/app"]
