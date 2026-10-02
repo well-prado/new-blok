@@ -81,6 +81,14 @@
       "status": "open",
       "decision": "Require behaviorally equivalent application workloads, security/fuzz/chaos evidence and controlled repeated measurements.",
       "evidence": ["current-blok-parity", "live-ai-evaluation", "fleet-load-with-failures"]
+    },
+    {
+      "id": "trigger-adapter-contract",
+      "question": "What must every trigger adapter declare and prove, and how does an extension author check it?",
+      "owner": "E09-T01",
+      "status": "implemented",
+      "decision": "Adapters publish a validated completion/disconnect/authentication Declaration, dispatch through an injected handler without interpreting or retrying, and pass contract/conformance.RunTrigger plus import-graph checks (ADR 0005).",
+      "evidence": ["trigger-corpus-v1", "broken-adapter-negative-suite", "selection-binaries", "multi-binding-fixture", "extension-module-conformance"]
     }
   ]
 }
