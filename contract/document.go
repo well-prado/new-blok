@@ -137,6 +137,7 @@ type InternalInstruction struct {
 	Node       string         `json:"node,omitempty"`
 	References []Reference    `json:"references,omitempty"`
 	Output     OptionalString `json:"output,omitempty"`
+	Source     *SourceSpan    `json:"source,omitempty"`
 }
 
 var semver = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
@@ -248,7 +249,7 @@ func (d Document) Compile() (InternalProgram, error) {
 	}
 	p := InternalProgram{WorkflowID: d.Workflow.ID, Version: d.Workflow.Version, Digest: d.Workflow.Digest, Bindings: append([]Binding(nil), d.Bindings...)}
 	for i, in := range d.Workflow.Instructions {
-		p.Instructions = append(p.Instructions, InternalInstruction{Index: i, ID: in.ID, Kind: in.Kind, Node: in.Node, References: append([]Reference(nil), in.References...), Output: in.Output})
+		p.Instructions = append(p.Instructions, InternalInstruction{Index: i, ID: in.ID, Kind: in.Kind, Node: in.Node, References: append([]Reference(nil), in.References...), Output: in.Output, Source: in.Source})
 	}
 	sort.SliceStable(p.Bindings, func(i, j int) bool { return p.Bindings[i].ID < p.Bindings[j].ID })
 	return p, nil
