@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -134,3 +135,73 @@ func (c *connection) Integrity(ctx context.Context) error {
 }
 
 func (c *connection) Close() error { return c.database.Close() }
+
+// Restore copies an integrity-checked SQLite backup into a new destination.
+// The destination is never overwritten; an interrupted copy leaves only its
+// temporary file and cannot replace a usable database.
+func (Backend) Restore(ctx context.Context, source, destination string) error {
+	if source == "" || destination == "" || source == ":memory:" || destination == ":memory:" || source == destination {
+		return errors.New("sqlite: distinct source and destination paths are required")
+	}
+	if _, err := os.Stat(source); err != nil {
+		return fmt.Errorf("sqlite: inspect source: %w", err)
+	}
+	if _, err := os.Stat(destination); err == nil {
+		return fmt.Errorf("sqlite: restore destination already exists: %s", destination)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("sqlite: inspect destination: %w", err)
+	}
+	sourceDB, err := (Backend{}).Open(ctx, source)
+	if err != nil {
+		return fmt.Errorf("sqlite: open source: %w", err)
+	}
+	if err := sourceDB.Integrity(ctx); err != nil {
+		_ = sourceDB.Close()
+		return fmt.Errorf("sqlite: source integrity: %w", err)
+	}
+	if err := sourceDB.Close(); err != nil {
+		return fmt.Errorf("sqlite: close source: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
+		return fmt.Errorf("sqlite: create destination parent: %w", err)
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(destination), ".restore-*")
+	if err != nil {
+		return fmt.Errorf("sqlite: create restore temporary: %w", err)
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	input, err := os.Open(source)
+	if err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("sqlite: reopen source: %w", err)
+	}
+	if _, err := io.Copy(temporary, input); err != nil {
+		_ = input.Close()
+		_ = temporary.Close()
+		return fmt.Errorf("sqlite: copy backup: %w", err)
+	}
+	if err := input.Close(); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("sqlite: close backup: %w", err)
+	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("sqlite: sync restore: %w", err)
+	}
+	if err := temporary.Close(); err != nil {
+		return fmt.Errorf("sqlite: close restore: %w", err)
+	}
+	if err := os.Rename(temporaryPath, destination); err != nil {
+		return fmt.Errorf("sqlite: install restore: %w", err)
+	}
+	restored, err := (Backend{}).Open(ctx, destination)
+	if err != nil {
+		return fmt.Errorf("sqlite: open restored database: %w", err)
+	}
+	defer restored.Close()
+	if err := restored.Integrity(ctx); err != nil {
+		return fmt.Errorf("sqlite: restored integrity: %w", err)
+	}
+	return nil
+}
