@@ -20,6 +20,8 @@ type Catalog interface {
 	PriceCents(context.Context, string) (int64, error)
 }
 
+var quoteOutputSchema = []byte(`{"type":"object","properties":{"sku":{"type":"string"},"quantity":{"type":"integer"},"totalCents":{"type":"integer"},"currency":{"type":"string"}},"required":["sku","quantity","totalCents","currency"]}`)
+
 func NewNode(catalog Catalog) (node.Definition[Input, Output], error) {
 	return node.Define("shop/calculate-quote", "1.0.0", func(ctx context.Context, input Input) (Output, error) {
 		if input.Quantity < 1 || input.Quantity > 100 {
@@ -30,5 +32,5 @@ func NewNode(catalog Catalog) (node.Definition[Input, Output], error) {
 			return Output{}, err
 		}
 		return Output{SKU: input.SKU, Quantity: input.Quantity, TotalCents: price * int64(input.Quantity), Currency: "USD"}, nil
-	}, node.Description("Calculates a quote using an injected catalog"), node.Schemas([]byte(`{"type":"object"}`), []byte(`{"type":"object"}`)))
+	}, node.Description("Calculates a quote using an injected catalog"), node.Schemas([]byte(`{"type":"object"}`), quoteOutputSchema))
 }
