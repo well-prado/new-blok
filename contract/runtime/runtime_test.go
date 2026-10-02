@@ -1,10 +1,59 @@
 package runtime
 
 import (
+	"encoding/json"
 	"errors"
+	"os"
 	"testing"
 	"time"
 )
+
+func TestDeclaredNegotiationFixtures(t *testing.T) {
+	data, err := os.ReadFile("../../testdata/runtime/fixtures.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cases []struct {
+		ID      string `json:"id"`
+		Outputs int    `json:"expectedOutput"`
+		Errors  int    `json:"expectedErrors"`
+		Effects int    `json:"expectedEffects"`
+	}
+	if err := json.Unmarshal(data, &cases); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range cases {
+		t.Run(tc.ID, func(t *testing.T) {
+			c, w := hello(), hello()
+			switch tc.ID {
+			case "matching-contract":
+			case "unsupported-version":
+				c.Major++
+			case "wrong-catalog":
+				w.CatalogDigest = artifact
+			case "wrong-artifact":
+				w.ArtifactDigest = catalog
+			case "stale-generation":
+				w.Generation++
+			case "widened-capability":
+				c.Capabilities = append(c.Capabilities, "db:write")
+			case "int64-boundaries-presence-null":
+				TestWirePreservesMissingNullAndExactInt64(t)
+				return
+			default:
+				t.Fatal("unknown fixture")
+			}
+			_, err := Negotiate(c, w)
+			outputs, errs := 1, 0
+			if err != nil {
+				outputs, errs = 0, 1
+			}
+			if outputs != tc.Outputs || errs != tc.Errors || tc.Effects != 0 {
+				t.Fatalf("fixture %s: outputs=%d errors=%d effects=0", tc.ID, outputs, errs)
+			}
+		})
+	}
+}
 
 const (
 	artifact = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
