@@ -9,6 +9,7 @@
 package trigger
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"regexp"
@@ -75,7 +76,7 @@ type semantics struct {
 // Memory work always cancels on disconnect; durable work never does.
 var allowed = map[Kind][]semantics{
 	HTTP:      {{Memory, CancelWork}, {Durable, StopWaiting}},
-	Webhook:   {{Durable, StopWaiting}},
+	Webhook:   {{Durable, Redeliver}, {Durable, StopWaiting}},
 	Worker:    {{Durable, Redeliver}},
 	Cron:      {{Durable, Redeliver}},
 	PubSub:    {{Durable, Redeliver}},
@@ -166,6 +167,31 @@ type Principal struct {
 // ErrSaturated is returned by an admission handler that has no capacity.
 // Adapters translate it into protocol backpressure without retrying.
 var ErrSaturated = errors.New("admission_saturated")
+
+// ErrConflict reports a submission whose key was already accepted with a
+// different payload or principal. It is never silently deduplicated.
+var ErrConflict = errors.New("submission_conflict")
+
+// ErrInvalidInput reports a submission rejected before durable acceptance.
+var ErrInvalidInput = errors.New("submission_invalid")
+
+// Submission is verified, validated work an adapter hands to durable
+// admission. Key is the stable delivery identity used for deduplication; the
+// principal was established by the adapter, never by Payload.
+type Submission struct {
+	Key       string
+	Kind      string
+	Payload   []byte
+	Principal Principal
+}
+
+// Submitter is the shared durable admission port. Submit returns only after
+// the submission is committed: accepted reports a new submission, false a
+// duplicate of one already committed under the same key. An adapter
+// acknowledges its source only after Submit returns without error.
+type Submitter interface {
+	Submit(context.Context, Submission) (accepted bool, err error)
+}
 
 // Classified is implemented by errors that carry a stable public code and
 // class. Adapters map these without importing engine packages.

@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
+	"sort"
 	"sync"
 	"time"
 
@@ -27,10 +29,10 @@ import (
 var Declaration = trigger.Declaration{Kind: trigger.Worker, Adapter: "trigger/worker", Completion: trigger.Durable, Disconnect: trigger.Redeliver, Authentication: trigger.TrustedProducer}
 
 var (
-	ErrRequestConflict = errors.New("worker: request key conflicts with existing payload")
+	ErrRequestConflict = fmt.Errorf("worker: request key conflicts with existing payload or principal: %w", trigger.ErrConflict)
 	ErrNotFound        = errors.New("worker: job not found")
 	// ErrInvalidPayload rejects a job before durable acceptance.
-	ErrInvalidPayload = errors.New("worker: payload is invalid for its kind")
+	ErrInvalidPayload = fmt.Errorf("worker: payload is invalid for its kind: %w", trigger.ErrInvalidInput)
 )
 
 const (
@@ -50,6 +52,8 @@ type Job struct {
 	// Deferrals counts redeliveries caused by saturation or a lost consumer.
 	// They do not consume attempts but have their own bounded budget.
 	Deferrals int
+	// Principal was established by the trusted producer at enqueue time.
+	Principal trigger.Principal
 	State     string
 	Error     string
 }
@@ -78,6 +82,10 @@ type EnqueueRequest struct {
 	Kind        string
 	Payload     json.RawMessage
 	MaxAttempts int
+	// Principal is persisted with the job and handed to the handler. It is
+	// part of the request identity: the same key with another principal
+	// conflicts.
+	Principal trigger.Principal
 }
 
 type EnqueueResult struct {
@@ -113,7 +121,10 @@ func New(ctx context.Context, database store.Database, clock func() time.Time) (
 		if err := createJobs(ctx, tx); err != nil {
 			return err
 		}
-		return migrateDeferrals(ctx, tx)
+		if err := ensureColumn(ctx, tx, "deferrals", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return err
+		}
+		return ensureColumn(ctx, tx, "principal_json", "TEXT NOT NULL DEFAULT ''")
 	}); err != nil {
 		return nil, fmt.Errorf("worker: schema: %w", err)
 	}
@@ -129,6 +140,7 @@ func createJobs(ctx context.Context, tx *sql.Tx) error {
 		payload_digest TEXT NOT NULL,
 		attempt INTEGER NOT NULL DEFAULT 0,
 		deferrals INTEGER NOT NULL DEFAULT 0,
+		principal_json TEXT NOT NULL DEFAULT '',
 		max_attempts INTEGER NOT NULL,
 		state TEXT NOT NULL,
 		available_at INTEGER NOT NULL,
@@ -140,9 +152,9 @@ func createJobs(ctx context.Context, tx *sql.Tx) error {
 	return err
 }
 
-// migrateDeferrals adds the deferral counter to queues created before it
-// existed. Existing jobs start with no deferrals.
-func migrateDeferrals(ctx context.Context, tx *sql.Tx) error {
+// ensureColumn adds a column to queues created before it existed. Existing
+// jobs take the column default.
+func ensureColumn(ctx context.Context, tx *sql.Tx, column, definition string) error {
 	rows, err := tx.QueryContext(ctx, `PRAGMA table_info(worker_jobs)`)
 	if err != nil {
 		return err
@@ -156,7 +168,7 @@ func migrateDeferrals(ctx context.Context, tx *sql.Tx) error {
 			rows.Close()
 			return err
 		}
-		present = present || name == "deferrals"
+		present = present || name == column
 	}
 	if err := rows.Close(); err != nil {
 		return err
@@ -167,7 +179,7 @@ func migrateDeferrals(ctx context.Context, tx *sql.Tx) error {
 	if present {
 		return nil
 	}
-	_, err = tx.ExecContext(ctx, `ALTER TABLE worker_jobs ADD COLUMN deferrals INTEGER NOT NULL DEFAULT 0`)
+	_, err = tx.ExecContext(ctx, `ALTER TABLE worker_jobs ADD COLUMN `+column+` `+definition)
 	return err
 }
 
@@ -210,15 +222,19 @@ func (q *Queue) Enqueue(ctx context.Context, request EnqueueRequest) (EnqueueRes
 		request.MaxAttempts = 3
 	}
 	payloadDigest := digest(request.Payload)
+	principal, err := encodePrincipal(request.Principal)
+	if err != nil {
+		return EnqueueResult{}, err
+	}
 	// The request key is unique, so it alone identifies the job. Deriving the
 	// ID from the clock let equal payloads collide under a coarse clock.
 	jobID := "job:" + digest([]byte(request.RequestKey))[:32]
 	var result EnqueueResult
-	err := q.withTx(ctx, func(tx *sql.Tx) error {
+	err = q.withTx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `INSERT INTO worker_jobs
-			(job_id, request_key, kind, payload_json, payload_digest, max_attempts, state, available_at, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(request_key) DO NOTHING`,
-			jobID, request.RequestKey, request.Kind, []byte(request.Payload), payloadDigest, request.MaxAttempts, StatePending, q.now(), q.now(), q.now())
+			(job_id, request_key, kind, payload_json, payload_digest, max_attempts, principal_json, state, available_at, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(request_key) DO NOTHING`,
+			jobID, request.RequestKey, request.Kind, []byte(request.Payload), payloadDigest, request.MaxAttempts, principal, StatePending, q.now(), q.now(), q.now())
 		if err != nil {
 			return err
 		}
@@ -227,21 +243,21 @@ func (q *Queue) Enqueue(ctx context.Context, request EnqueueRequest) (EnqueueRes
 			return err
 		}
 		if count == 0 {
-			job, err := scanJob(tx.QueryRowContext(ctx, `SELECT job_id, request_key, kind, payload_json, attempt, max_attempts, deferrals, state, error_text FROM worker_jobs WHERE request_key = ?`, request.RequestKey))
+			job, err := scanJob(tx.QueryRowContext(ctx, `SELECT job_id, request_key, kind, payload_json, attempt, max_attempts, deferrals, principal_json, state, error_text FROM worker_jobs WHERE request_key = ?`, request.RequestKey))
 			if err != nil {
 				return err
 			}
-			var existingDigest string
-			if err := tx.QueryRowContext(ctx, `SELECT payload_digest FROM worker_jobs WHERE request_key = ?`, request.RequestKey).Scan(&existingDigest); err != nil {
+			var existingDigest, existingPrincipal string
+			if err := tx.QueryRowContext(ctx, `SELECT payload_digest, principal_json FROM worker_jobs WHERE request_key = ?`, request.RequestKey).Scan(&existingDigest, &existingPrincipal); err != nil {
 				return err
 			}
-			if job.Kind != request.Kind || existingDigest != payloadDigest {
+			if job.Kind != request.Kind || existingDigest != payloadDigest || existingPrincipal != principal {
 				return ErrRequestConflict
 			}
 			result = EnqueueResult{Job: job, Accepted: false}
 			return nil
 		}
-		result = EnqueueResult{Job: Job{ID: jobID, RequestKey: request.RequestKey, Kind: request.Kind, Payload: append([]byte(nil), request.Payload...), MaxAttempts: request.MaxAttempts, State: StatePending}, Accepted: true}
+		result = EnqueueResult{Job: Job{ID: jobID, RequestKey: request.RequestKey, Kind: request.Kind, Payload: append([]byte(nil), request.Payload...), MaxAttempts: request.MaxAttempts, Principal: request.Principal, State: StatePending}, Accepted: true}
 		return nil
 	})
 	if err != nil {
@@ -351,11 +367,40 @@ func (q *Queue) deferLost(ctx context.Context, job Job) error {
 	})
 }
 
+// Submit implements trigger.Submitter on the durable queue: the submission
+// is committed (or found already committed) before Submit returns.
+func (q *Queue) Submit(ctx context.Context, submission trigger.Submission) (bool, error) {
+	result, err := q.Enqueue(ctx, EnqueueRequest{RequestKey: submission.Key, Kind: submission.Kind, Payload: submission.Payload, Principal: submission.Principal})
+	if err != nil {
+		return false, err
+	}
+	return result.Accepted, nil
+}
+
+var _ trigger.Submitter = (*Queue)(nil)
+
+// encodePrincipal stores an empty principal as "" so jobs from producers that
+// establish none compare equal, and sorts roles so the same principal always
+// encodes the same way.
+func encodePrincipal(principal trigger.Principal) (string, error) {
+	if principal.ID == "" && len(principal.Roles) == 0 {
+		return "", nil
+	}
+	roles := append([]string(nil), principal.Roles...)
+	sort.Strings(roles)
+	principal.Roles = slices.Compact(roles)
+	data, err := json.Marshal(principal)
+	if err != nil {
+		return "", fmt.Errorf("worker: principal: %w", err)
+	}
+	return string(data), nil
+}
+
 func (q *Queue) Get(ctx context.Context, requestKey string) (Job, error) {
 	var job Job
 	err := q.withTx(ctx, func(tx *sql.Tx) error {
 		var err error
-		job, err = scanJob(tx.QueryRowContext(ctx, `SELECT job_id, request_key, kind, payload_json, attempt, max_attempts, deferrals, state, error_text FROM worker_jobs WHERE request_key = ?`, requestKey))
+		job, err = scanJob(tx.QueryRowContext(ctx, `SELECT job_id, request_key, kind, payload_json, attempt, max_attempts, deferrals, principal_json, state, error_text FROM worker_jobs WHERE request_key = ?`, requestKey))
 		return err
 	})
 	if errors.Is(err, sql.ErrNoRows) {
@@ -366,7 +411,7 @@ func (q *Queue) Get(ctx context.Context, requestKey string) (Job, error) {
 
 func (q *Queue) claim(ctx context.Context, tx *sql.Tx) (Job, error) {
 	var job Job
-	row := tx.QueryRowContext(ctx, `SELECT job_id, request_key, kind, payload_json, attempt, max_attempts, deferrals, state, error_text FROM worker_jobs
+	row := tx.QueryRowContext(ctx, `SELECT job_id, request_key, kind, payload_json, attempt, max_attempts, deferrals, principal_json, state, error_text FROM worker_jobs
 		WHERE (state = ? OR (state = ? AND lease_until <= ?)) AND available_at <= ? ORDER BY created_at, job_id LIMIT 1`, StatePending, StateProcessing, q.now(), q.now())
 	if scanned, err := scanJob(row); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -392,8 +437,14 @@ func (q *Queue) claim(ctx context.Context, tx *sql.Tx) (Job, error) {
 func scanJob(row interface{ Scan(...any) error }) (Job, error) {
 	var job Job
 	var payload []byte
-	if err := row.Scan(&job.ID, &job.RequestKey, &job.Kind, &payload, &job.Attempt, &job.MaxAttempts, &job.Deferrals, &job.State, &job.Error); err != nil {
+	var principal string
+	if err := row.Scan(&job.ID, &job.RequestKey, &job.Kind, &payload, &job.Attempt, &job.MaxAttempts, &job.Deferrals, &principal, &job.State, &job.Error); err != nil {
 		return Job{}, err
+	}
+	if principal != "" {
+		if err := json.Unmarshal([]byte(principal), &job.Principal); err != nil {
+			return Job{}, fmt.Errorf("worker: stored principal: %w", err)
+		}
 	}
 	job.Payload = append([]byte(nil), payload...)
 	return job, nil
