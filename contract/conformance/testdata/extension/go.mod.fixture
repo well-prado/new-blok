@@ -1,0 +1,7 @@
+module example.test/extension
+
+go 1.27.0
+
+require github.com/well-prado/new-blok v0.0.0
+
+replace github.com/well-prado/new-blok => REPOSITORY_ROOT
