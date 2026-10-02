@@ -5,6 +5,7 @@
 package runtime
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -132,13 +133,18 @@ func (h Hello) validate() error {
 	if err := h.Limits.Validate(); err != nil {
 		return err
 	}
+	if len(h.Capabilities) > 128 { return ErrLimitExceeded }
+	seen := map[Capability]bool{}
 	for _, capability := range h.Capabilities {
 		if !identityPattern.MatchString(string(capability)) || strings.Contains(string(capability), "orchestrate") {
 			return fmt.Errorf("%w: invalid capability", ErrCapabilityDenied)
 		}
+		if seen[capability] { return ErrCapabilityDenied }; seen[capability] = true
 	}
 	return nil
 }
+
+func (h Hello) Validate() error { return h.validate() }
 
 func containsAll(have, want []Capability) bool {
 	set := make(map[Capability]struct{}, len(have))
@@ -175,6 +181,8 @@ type Call struct {
 	Deadline       time.Time `json:"deadline"`
 	Input          []byte    `json:"input"`
 	Blobs          []BlobRef `json:"blobs,omitempty"`
+	Principal      string    `json:"principal"`
+	Capabilities   []Capability `json:"capabilities,omitempty"`
 }
 
 func (c Call) Validate(limits Limits, generation uint64) error {
@@ -188,15 +196,19 @@ func (c Call) Validate(limits Limits, generation uint64) error {
 		return ErrGenerationMismatch
 	}
 	if c.Deadline.IsZero() || !c.Deadline.After(time.Now()) {
-		return contextDeadlineError{}
+		return context.DeadlineExceeded
 	}
-	if len(c.Input) > limits.MaxFrameBytes {
+	if len(c.Input) == 0 || len(c.Input) > limits.MaxFrameBytes-1024 || len(c.IdempotencyKey) > 128 || len(c.Blobs) > 128 || len(c.Capabilities) > 128 {
 		return fmt.Errorf("%w: input", ErrLimitExceeded)
 	}
+	if c.Principal != "" && !identityPattern.MatchString(c.Principal) { return ErrCapabilityDenied }
+	totalBlobBytes := 0
 	for _, blob := range c.Blobs {
 		if blob.Size < 0 || blob.Size > limits.MaxBlobBytes || !digestPattern.MatchString(blob.Digest) {
 			return fmt.Errorf("%w: blob", ErrLimitExceeded)
 		}
+		totalBlobBytes += blob.Size
+		if totalBlobBytes > limits.MaxBlobBytes { return ErrLimitExceeded }
 	}
 	return nil
 }
@@ -231,7 +243,7 @@ type RemoteError struct {
 	IdempotencyKey string     `json:"idempotencyKey,omitempty"`
 }
 
-func (e RemoteError) SafeToRetry() bool { return e.Retryable && e.Class != ErrorUncertain }
+func (e RemoteError) SafeToRetry() bool { return e.Retryable && e.Class == ErrorTransient }
 
 type FrameKind string
 
@@ -260,7 +272,7 @@ func CanonicalDigest(data []byte) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
-func ValidatePayload(data []byte, contract schema.Schema) error { return contract.ValidateValue(data) }
+func ValidatePayload(data []byte, contract schema.Schema) error { _, err := contract.Normalize(data); return err }
 
 func SortedCapabilities(values []Capability) []Capability {
 	out := append([]Capability(nil), values...)
