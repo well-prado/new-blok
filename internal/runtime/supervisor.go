@@ -38,20 +38,23 @@ type Config struct {
 }
 
 type Supervisor struct {
-	config Config
-	mu     sync.Mutex
-	conn   Connection
-	ready  contract.Ready
-	state  state
-	active map[string]struct{}
-	sem    chan struct{}
-	done   chan struct{}
+	config   Config
+	mu       sync.Mutex
+	conn     Connection
+	ready    contract.Ready
+	state    state
+	active   map[string]struct{}
+	seen     map[string]struct{}
+	attempts map[string]struct{}
+	sem      chan struct{}
+	done     chan struct{}
 }
 
 type state uint8
 
 const (
 	stateNew state = iota
+	stateStarting
 	stateReady
 	stateDraining
 	stateStopped
@@ -70,7 +73,7 @@ func New(config Config) (*Supervisor, error) {
 	if config.Capacity <= 0 || config.Capacity > config.Hello.Limits.MaxConcurrentCalls {
 		return nil, fmt.Errorf("%w: %d", ErrCapacity, config.Capacity)
 	}
-	return &Supervisor{config: config, state: stateNew, active: map[string]struct{}{}, sem: make(chan struct{}, config.Capacity), done: make(chan struct{})}, nil
+	return &Supervisor{config: config, state: stateNew, active: map[string]struct{}{}, seen: map[string]struct{}{}, attempts: map[string]struct{}{}, sem: make(chan struct{}, config.Capacity), done: make(chan struct{})}, nil
 }
 
 func (s *Supervisor) Start(ctx context.Context) error {
@@ -79,17 +82,29 @@ func (s *Supervisor) Start(ctx context.Context) error {
 		s.mu.Unlock()
 		return errors.New("worker supervisor: invalid lifecycle state")
 	}
+	s.state = stateStarting
 	s.mu.Unlock()
 	conn, ready, err := s.config.Factory.Connect(ctx, s.config.Hello)
 	if err != nil {
+		s.finish()
 		return fmt.Errorf("worker supervisor: startup failed: %w", err)
 	}
 	if conn == nil {
+		s.finish()
 		return errors.New("worker supervisor: factory returned nil connection")
 	}
 	if ready.Generation != s.config.Hello.Generation || ready.ArtifactDigest != s.config.Hello.ArtifactDigest || ready.CatalogDigest != s.config.Hello.CatalogDigest {
 		_ = conn.Close(context.Background())
+		s.finish()
 		return contract.ErrGenerationMismatch
+	}
+	peer := s.config.Hello
+	peer.Protocol, peer.Major, peer.Minor = ready.Protocol, ready.Major, ready.Minor
+	peer.Capabilities, peer.Limits = ready.Capabilities, ready.Limits
+	if _, err := contract.Negotiate(s.config.Hello, peer); err != nil {
+		_ = conn.Close(context.Background())
+		s.finish()
+		return err
 	}
 	s.mu.Lock()
 	s.conn, s.ready, s.state = conn, ready, stateReady
@@ -100,13 +115,20 @@ func (s *Supervisor) Start(ctx context.Context) error {
 func (s *Supervisor) Call(ctx context.Context, call contract.Call) (contract.Result, error) {
 	s.mu.Lock()
 	if s.state != stateReady {
+		err := s.lifecycleError()
 		s.mu.Unlock()
-		return contract.Result{}, s.lifecycleError()
+		return contract.Result{}, err
 	}
 	conn, generation := s.conn, s.ready.Generation
-	if _, exists := s.active[call.CallID]; exists {
+	_, seenCall := s.seen[call.CallID]
+	_, seenAttempt := s.attempts[call.AttemptID]
+	if seenCall || seenAttempt {
 		s.mu.Unlock()
 		return contract.Result{}, ErrCallActive
+	}
+	if len(s.seen) >= 100000 {
+		s.mu.Unlock()
+		return contract.Result{}, ErrCapacity
 	}
 	if err := call.Validate(s.ready.Limits, generation); err != nil {
 		s.mu.Unlock()
@@ -119,10 +141,15 @@ func (s *Supervisor) Call(ctx context.Context, call contract.Call) (contract.Res
 		return contract.Result{}, ErrCapacity
 	}
 	s.active[call.CallID] = struct{}{}
+	s.seen[call.CallID] = struct{}{}
+	s.attempts[call.AttemptID] = struct{}{}
 	s.mu.Unlock()
 	defer func() { <-s.sem; s.mu.Lock(); delete(s.active, call.CallID); s.signalDone(); s.mu.Unlock() }()
 	result, err := conn.Call(ctx, call)
 	if err != nil {
+		return contract.Result{}, err
+	}
+	if err := ctx.Err(); err != nil {
 		return contract.Result{}, err
 	}
 	if result.CallID != call.CallID || result.AttemptID != call.AttemptID || result.Generation != generation {
