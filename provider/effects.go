@@ -5,11 +5,12 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"io"
 	"net/http"
 	"net/url"
 	"reflect"
 	"strings"
+
+	"github.com/well-prado/new-blok/contract/schema"
 )
 
 // Keys are business identities, stable across retries; callers must not use attempt IDs.
@@ -92,9 +93,10 @@ type GenerateOutput struct {
 // Endpoint is the synthetic/reference JSON protocol adapter for typed ports.
 // Endpoint URL and credential headers belong to composition, never workflow input.
 type Endpoint[I Keyed, O any] struct {
-	transport HTTP
-	url       string
-	headers   http.Header
+	transport    HTTP
+	url          string
+	headers      http.Header
+	outputSchema *schema.Schema
 }
 
 func NewEndpoint[I Keyed, O any](endpoint string, headers http.Header, transport HTTP) (*Endpoint[I, O], error) {
@@ -107,8 +109,24 @@ func NewEndpoint[I Keyed, O any](endpoint string, headers http.Header, transport
 	}
 	return &Endpoint[I, O]{transport: transport, url: endpoint, headers: headers.Clone()}, nil
 }
+
+// WithOutputSchema returns a bound copy; catalog constructors supply their exact
+// output contract. Standalone callers must bind a schema before Execute.
+func (p *Endpoint[I, O]) WithOutputSchema(raw []byte) (Port[I, O], error) {
+	output, err := schema.Parse(raw)
+	if err != nil {
+		return nil, &Error{Class: Invalid, Code: "invalid_output"}
+	}
+	bound := *p
+	bound.outputSchema = &output
+	return &bound, nil
+}
+
 func (p *Endpoint[I, O]) Execute(ctx context.Context, input I) (O, error) {
 	var output O
+	if p.outputSchema == nil {
+		return output, &Error{Class: Invalid, Code: "invalid_output", IdempotencyKey: input.EffectKey()}
+	}
 	body, err := json.Marshal(input)
 	if err != nil {
 		return output, &Error{Class: Invalid, Code: "invalid_input"}
@@ -130,14 +148,16 @@ func (p *Endpoint[I, O]) Execute(ctx context.Context, input I) (O, error) {
 			}
 		}
 	}
-	dec := json.NewDecoder(bytes.NewReader(response.Body))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&output); err != nil {
-		return output, &Error{Class: Uncertain, Code: "invalid_output"}
+	// Check original presence, nullability and unknown fields before Go decoding
+	// can replace missing/null fields with valid-looking zero values. The schema
+	// owns additionalProperties policy, including nested generated values.
+	normalized, err := p.outputSchema.Normalize(response.Body)
+	if err != nil {
+		return output, &Error{Class: Uncertain, Code: "invalid_output", IdempotencyKey: input.EffectKey()}
 	}
-	var extra any
-	if err := dec.Decode(&extra); err != io.EOF {
-		return output, &Error{Class: Uncertain, Code: "invalid_output"}
+	if err := json.Unmarshal(normalized, &output); err != nil {
+		var zero O
+		return zero, &Error{Class: Uncertain, Code: "invalid_output", IdempotencyKey: input.EffectKey()}
 	}
 	return output, nil
 }
