@@ -16,13 +16,14 @@ import (
 
 	"github.com/well-prado/new-blok/app"
 	"github.com/well-prado/new-blok/contract/schema"
-	"github.com/well-prado/new-blok/internal/engine"
+	"github.com/well-prado/new-blok/trigger"
 )
 
-type Principal struct {
-	ID    string
-	Roles []string
-}
+// Declaration is the HTTP adapter's conformance contract: the response carries
+// the completed result, and a disconnected caller cancels the in-flight work.
+var Declaration = trigger.Declaration{Kind: trigger.HTTP, Adapter: "trigger/http", Completion: trigger.Memory, Disconnect: trigger.CancelWork, Authentication: trigger.Caller}
+
+type Principal = trigger.Principal
 
 type Input struct {
 	Body      []byte
@@ -44,6 +45,7 @@ type Endpoint struct {
 type Server struct {
 	application *app.Application
 	endpoints   []Endpoint
+	schemas     []*schema.Schema
 	requestID   atomic.Uint64
 }
 
@@ -52,7 +54,8 @@ func New(application *app.Application, endpoints []Endpoint) (*Server, error) {
 		return nil, errors.New("nil_application")
 	}
 	seen := map[string]string{}
-	for _, endpoint := range endpoints {
+	schemas := make([]*schema.Schema, len(endpoints))
+	for index, endpoint := range endpoints {
 		if endpoint.Method == "" || endpoint.Path == "" || endpoint.Handle == nil {
 			return nil, fmt.Errorf("invalid_endpoint: %s %s", endpoint.Method, endpoint.Path)
 		}
@@ -61,12 +64,19 @@ func New(application *app.Application, endpoints []Endpoint) (*Server, error) {
 			return nil, fmt.Errorf("duplicate_route: %s conflicts with %s", key, previous)
 		}
 		seen[key] = endpoint.Path
+		if len(endpoint.InputSchema) > 0 {
+			parsed, err := schema.Parse(endpoint.InputSchema)
+			if err != nil {
+				return nil, fmt.Errorf("invalid_endpoint_schema: %s: %w", key, err)
+			}
+			schemas[index] = &parsed
+		}
 	}
-	return &Server{application: application, endpoints: append([]Endpoint(nil), endpoints...)}, nil
+	return &Server{application: application, endpoints: append([]Endpoint(nil), endpoints...), schemas: schemas}, nil
 }
 
 func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
-	endpoint, params, ok := s.match(request.Method, request.URL.Path)
+	endpoint, inputSchema, params, ok := s.match(request.Method, request.URL.Path)
 	if !ok {
 		writeJSON(writer, http.StatusNotFound, map[string]any{"error": "not found"})
 		return
@@ -95,13 +105,14 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		writeJSON(writer, http.StatusRequestEntityTooLarge, map[string]any{"error": "request body too large"})
 		return
 	}
-	if len(endpoint.InputSchema) > 0 && len(strings.TrimSpace(string(body))) > 0 {
-		parsed, parseErr := schema.Parse(endpoint.InputSchema)
-		if parseErr != nil {
-			writeJSON(writer, http.StatusInternalServerError, map[string]any{"error": "invalid endpoint schema"})
-			return
+	if inputSchema != nil {
+		// An empty body is validated as null so required fields cannot be
+		// bypassed by omitting the body.
+		candidate := body
+		if len(strings.TrimSpace(string(body))) == 0 {
+			candidate = []byte("null")
 		}
-		if _, validateErr := parsed.Normalize(body); validateErr != nil {
+		if _, validateErr := inputSchema.Normalize(candidate); validateErr != nil {
 			writeJSON(writer, http.StatusBadRequest, map[string]any{"error": "invalid request"})
 			return
 		}
@@ -117,14 +128,18 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	if err != nil {
 		status := statusFor(err)
 		requestID := s.newRequestID()
+		if status == http.StatusServiceUnavailable {
+			writer.Header().Set("Retry-After", "1")
+			writeJSON(writer, status, map[string]any{"error": "saturated", "requestId": requestID})
+			return
+		}
 		if status >= 500 {
 			writeJSON(writer, status, map[string]any{"error": "internal error", "requestId": requestID})
 			return
 		}
 		code := "request_failed"
-		var engineError *engine.Error
-		if errors.As(err, &engineError) && engineError.Code != "" {
-			code = engineError.Code
+		if classified, _, ok := trigger.Classify(err); ok && classified != "" {
+			code = classified
 		}
 		writeJSON(writer, status, map[string]any{"error": code, "requestId": requestID})
 		return
@@ -132,15 +147,15 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	writeJSON(writer, http.StatusOK, result)
 }
 
-func (s *Server) match(method, path string) (Endpoint, map[string]string, bool) {
-	for _, endpoint := range s.endpoints {
+func (s *Server) match(method, path string) (Endpoint, *schema.Schema, map[string]string, bool) {
+	for index, endpoint := range s.endpoints {
 		if strings.EqualFold(endpoint.Method, method) {
 			if params, ok := matchPath(endpoint.Path, path); ok {
-				return endpoint, params, true
+				return endpoint, s.schemas[index], params, true
 			}
 		}
 	}
-	return Endpoint{}, nil, false
+	return Endpoint{}, nil, nil, false
 }
 
 func matchPath(pattern, path string) (map[string]string, bool) {
@@ -181,9 +196,11 @@ func normalizePath(path string) string {
 }
 
 func statusFor(err error) int {
-	var engineError *engine.Error
-	if errors.As(err, &engineError) {
-		switch engineError.Class {
+	if errors.Is(err, trigger.ErrSaturated) {
+		return http.StatusServiceUnavailable
+	}
+	if _, class, ok := trigger.Classify(err); ok {
+		switch class {
 		case "validation":
 			return http.StatusBadRequest
 		case "cancellation":

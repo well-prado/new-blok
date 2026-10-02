@@ -1,0 +1,17 @@
+[
+  {"id":"object-default","schema":{"type":"object","properties":{"name":{"type":"string"},"count":{"type":"integer","default":2}},"required":["name"],"additionalProperties":false},"value":{"name":"blok"},"expected":{"count":2,"name":"blok"},"outputs":1,"errors":0,"effects":0},
+  {"id":"string","schema":{"type":"string"},"value":"blok","expected":"blok","outputs":1,"errors":0,"effects":0},
+  {"id":"boolean","schema":{"type":"boolean"},"value":true,"expected":true,"outputs":1,"errors":0,"effects":0},
+  {"id":"decimal","schema":{"type":"number"},"value":12.5,"expected":12.5,"outputs":1,"errors":0,"effects":0},
+  {"id":"int64-max","schema":{"type":"integer"},"value":9223372036854775807,"expected":9223372036854775807,"outputs":1,"errors":0,"effects":0},
+  {"id":"int64-min","schema":{"type":"integer"},"value":-9223372036854775808,"expected":-9223372036854775808,"outputs":1,"errors":0,"effects":0},
+  {"id":"int64-wire","schema":{"type":"integer","wire":"int64-string"},"value":"9223372036854775807","expected":"9223372036854775807","outputs":1,"errors":0,"effects":0},
+  {"id":"null","schema":{"type":"null"},"value":null,"expected":null,"outputs":1,"errors":0,"effects":0},
+  {"id":"string-array","schema":{"type":"array","items":{"type":"string"}},"value":["a","b"],"expected":["a","b"],"outputs":1,"errors":0,"effects":0},
+  {"id":"empty-array","schema":{"type":"array","items":{"type":"string"}},"value":[],"expected":[],"outputs":1,"errors":0,"effects":0},
+  {"id":"field-error","schema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]},"value":{"name":7},"error":"type_mismatch at $.name","outputs":0,"errors":1,"effects":0},
+  {"id":"int64-overflow","schema":{"type":"integer"},"value":9223372036854775808,"error":"integer_range","outputs":0,"errors":1,"effects":0},
+  {"id":"null-type-mismatch","schema":{"type":"null"},"value":"not-null","error":"type_mismatch","outputs":0,"errors":1,"effects":0},
+  {"id":"ambiguous-union","schema":{"anyOf":[{"type":"integer"},{"type":"number"}]},"value":1,"error":"compatibility_unproven","outputs":0,"errors":1,"effects":0},
+  {"id":"unsupported-array","schema":{"type":"array","items":{"type":"integer"}},"value":[1],"error":"compatibility_unproven","outputs":0,"errors":1,"effects":0}
+]
