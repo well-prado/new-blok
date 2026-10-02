@@ -4,6 +4,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -136,6 +137,10 @@ func (e *Engine) Run(ctx context.Context, program contract.InternalProgram, inpu
 }
 
 func classify(step string, err error) error {
+	var existing *Error
+	if errors.As(err, &existing) {
+		return existing
+	}
 	if err == context.Canceled || err == context.DeadlineExceeded {
 		return &Error{Code: "canceled", Class: "cancellation", Step: step, Err: err}
 	}
