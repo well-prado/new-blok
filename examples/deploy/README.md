@@ -71,4 +71,4 @@ tests; integrating it with actual restored/retained inventories is pending
 #49/PR #152 (unmerged), with #48's retention behavior. #81 is not complete from
 these tests. Broader #51 shutdown and #53 publication fixes and independent
 review also remain with their owners. See
-[ADR 0005](../../docs/decisions/0005-deployment-readiness.md).
+[ADR 0009](../../docs/decisions/0009-deployment-readiness.md).

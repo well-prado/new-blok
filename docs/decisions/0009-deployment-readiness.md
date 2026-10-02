@@ -1,4 +1,4 @@
-# ADR 0005: Deployment readiness composition
+# ADR 0009: Deployment readiness composition
 
 - Issue: E17-T01 (#81)
 - Status: implemented slice; retained journal checkpoint integration pending #49
