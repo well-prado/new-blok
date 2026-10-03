@@ -56,6 +56,7 @@ type Journal struct {
 
 type AdmissionRequest struct {
 	RequestKey     string
+	Principal      string
 	Workflow       string
 	ArtifactDigest string
 	Input          json.RawMessage
@@ -71,6 +72,7 @@ type Admission struct {
 
 type Run struct {
 	RunID          string
+	Principal      string
 	RequestKey     string
 	Workflow       string
 	ArtifactDigest string
@@ -139,6 +141,31 @@ func New(ctx context.Context, database store.Database, config Config) (*Journal,
 				return fmt.Errorf("schema: %w", err)
 			}
 		}
+		rows, err := tx.QueryContext(ctx, `PRAGMA table_info(journal_runs)`)
+		if err != nil {
+			return err
+		}
+		hasPrincipal := false
+		for rows.Next() {
+			var cid, notnull, pk int
+			var name, typ string
+			var def any
+			if err := rows.Scan(&cid, &name, &typ, &notnull, &def, &pk); err != nil {
+				rows.Close()
+				return err
+			}
+			if name == "principal" {
+				hasPrincipal = true
+			}
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if !hasPrincipal {
+			if _, err := tx.ExecContext(ctx, `ALTER TABLE journal_runs ADD COLUMN principal TEXT NOT NULL DEFAULT ''`); err != nil {
+				return err
+			}
+		}
 		return nil
 	}); err != nil {
 		return nil, err
@@ -158,7 +185,8 @@ var schemaStatements = []string{
 		replay_of TEXT NOT NULL DEFAULT '',
 		output_json BLOB,
 		created_at INTEGER NOT NULL,
-		completed_at INTEGER
+		completed_at INTEGER,
+		principal TEXT NOT NULL DEFAULT ''
 	)`,
 	`CREATE TABLE IF NOT EXISTS journal_operations (
 		operation_key TEXT PRIMARY KEY,
@@ -291,9 +319,9 @@ func (j *Journal) Admit(ctx context.Context, request AdmissionRequest) (Admissio
 	admission := Admission{RunID: runID, RequestKey: request.RequestKey}
 	err = j.withTx(ctx, "admission", func(tx *sql.Tx) error {
 		result, err := tx.ExecContext(ctx, `INSERT INTO journal_runs
-			(run_id, request_key, workflow, artifact_digest, input_json, input_digest, state, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(request_key) DO NOTHING`,
-			runID, request.RequestKey, request.Workflow, request.ArtifactDigest, []byte(request.Input), digest, runAccepted, j.now())
+			(run_id, request_key, workflow, artifact_digest, input_json, input_digest, state, created_at, principal)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(request_key) DO NOTHING`,
+			runID, request.RequestKey, request.Workflow, request.ArtifactDigest, []byte(request.Input), digest, runAccepted, j.now(), request.Principal)
 		if err != nil {
 			return err
 		}
@@ -303,11 +331,11 @@ func (j *Journal) Admit(ctx context.Context, request AdmissionRequest) (Admissio
 		}
 		var existing Run
 		if inserted == 0 {
-			existing, err = scanRun(tx.QueryRowContext(ctx, `SELECT run_id, request_key, workflow, artifact_digest, input_json, input_digest, state, replay_of, output_json FROM journal_runs WHERE request_key = ?`, request.RequestKey))
+			existing, err = scanRun(tx.QueryRowContext(ctx, `SELECT run_id, request_key, workflow, artifact_digest, input_json, input_digest, state, replay_of, output_json, principal FROM journal_runs WHERE request_key = ?`, request.RequestKey))
 			if err != nil {
 				return err
 			}
-			if existing.Workflow != request.Workflow || existing.ArtifactDigest != request.ArtifactDigest || existing.InputDigest != digest {
+			if existing.Principal != request.Principal || existing.Workflow != request.Workflow || existing.ArtifactDigest != request.ArtifactDigest || existing.InputDigest != digest {
 				return ErrRequestConflict
 			}
 			admission.RunID = existing.RunID
@@ -336,14 +364,14 @@ func (j *Journal) Replay(ctx context.Context, sourceRunID, requestKey string) (A
 	}
 	var admission Admission
 	err = j.withTx(ctx, "replay", func(tx *sql.Tx) error {
-		source, err := scanRun(tx.QueryRowContext(ctx, `SELECT run_id, request_key, workflow, artifact_digest, input_json, input_digest, state, replay_of, output_json FROM journal_runs WHERE run_id = ?`, sourceRunID))
+		source, err := scanRun(tx.QueryRowContext(ctx, `SELECT run_id, request_key, workflow, artifact_digest, input_json, input_digest, state, replay_of, output_json, principal FROM journal_runs WHERE run_id = ?`, sourceRunID))
 		if err != nil {
 			return err
 		}
 		result, err := tx.ExecContext(ctx, `INSERT INTO journal_runs
-			(run_id, request_key, workflow, artifact_digest, input_json, input_digest, state, replay_of, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(request_key) DO NOTHING`,
-			runID, requestKey, source.Workflow, source.ArtifactDigest, []byte(source.Input), source.InputDigest, runAccepted, source.RunID, j.now())
+			(run_id, request_key, workflow, artifact_digest, input_json, input_digest, state, replay_of, created_at, principal)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(request_key) DO NOTHING`,
+			runID, requestKey, source.Workflow, source.ArtifactDigest, []byte(source.Input), source.InputDigest, runAccepted, source.RunID, j.now(), source.Principal)
 		if err != nil {
 			return err
 		}
@@ -563,7 +591,7 @@ func (j *Journal) Run(ctx context.Context, runID string) (Run, error) {
 	var run Run
 	err := j.withRead(ctx, func(tx *sql.Tx) error {
 		var err error
-		run, err = scanRun(tx.QueryRowContext(ctx, `SELECT run_id, request_key, workflow, artifact_digest, input_json, input_digest, state, replay_of, output_json FROM journal_runs WHERE run_id = ?`, runID))
+		run, err = scanRun(tx.QueryRowContext(ctx, `SELECT run_id, request_key, workflow, artifact_digest, input_json, input_digest, state, replay_of, output_json, principal FROM journal_runs WHERE run_id = ?`, runID))
 		return err
 	})
 	if err != nil {
@@ -648,7 +676,7 @@ type scanner interface{ Scan(...any) error }
 func scanRun(row scanner) (Run, error) {
 	var run Run
 	var input, output []byte
-	if err := row.Scan(&run.RunID, &run.RequestKey, &run.Workflow, &run.ArtifactDigest, &input, &run.InputDigest, &run.State, &run.ReplayOf, &output); err != nil {
+	if err := row.Scan(&run.RunID, &run.RequestKey, &run.Workflow, &run.ArtifactDigest, &input, &run.InputDigest, &run.State, &run.ReplayOf, &output, &run.Principal); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Run{}, ErrNotFound
 		}

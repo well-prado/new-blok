@@ -151,8 +151,8 @@
       "question": "How are native run and step observations versioned, authorized, redacted, bounded and paginated?",
       "owner": "E15-T01",
       "status": "implemented",
-      "decision": "inspection/v1 projects immutable process-local Go engine events. The caller supplies trusted principal metadata; the recorder authorizes by owner, applies field allowlists and secret-key redaction, bounds payloads and pages, and rejects unsupported versions. Durable history and Node worker workflows remain outside this evidence (ADR 0015).",
-      "evidence": ["inspection-real-go-engine", "inspection-two-principal-isolation", "inspection-redaction-bounds-pagination", "inspection-version-rejection", "inspection-immutable-projection"]
+      "decision": "inspection/v1 exposes immutable app-composed Go and Node outcomes, a bounded process-local recorder, and a principal-authorized SQL journal read port for actual waits, attempts, uncertain effects and child lineage; payloads and blobs are separately bounded and redacted/authorized (ADR 0016).",
+      "evidence": ["inspection-actual-go-engine-golden", "inspection-actual-node-success-failure-cancellation-uncertain", "inspection-two-principal-isolation", "inspection-redaction-bounds-pagination", "inspection-recorder-saturation", "inspection-journal-wait-resume-uncertain-lineage", "inspection-authenticated-bounded-blob", "inspection-version-rejection", "inspection-immutable-projection"]
     }
   ]
 }

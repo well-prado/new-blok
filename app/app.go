@@ -8,6 +8,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/well-prado/new-blok/contract/inspection"
 )
 
 var (
@@ -35,6 +37,7 @@ type Config struct {
 	Routes       []Route
 	Workflows    []Workflow
 	DrainTimeout time.Duration
+	Inspection   inspection.Observer
 }
 
 type State string
@@ -122,6 +125,15 @@ func (a *Application) Start(ctx context.Context) error {
 
 func (a *Application) State() State { a.mu.Lock(); defer a.mu.Unlock(); return a.state }
 func (a *Application) Ready() bool  { return a.State() == ReadyState }
+
+// InspectionObserver exposes the configured read-only observer to the public
+// execution composition package; adapters still provide trusted per-run identity.
+func (a *Application) InspectionObserver() inspection.Observer {
+	if a == nil {
+		return nil
+	}
+	return a.config.Inspection
+}
 
 type Lease struct {
 	app  *Application
