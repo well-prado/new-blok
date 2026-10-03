@@ -165,15 +165,25 @@ func newFixtureWithListener(t *testing.T, config sse.HubConfig, configure func(*
 	f.http = httptest.NewUnstartedServer(f.server)
 	if listener != nil {
 		unusedListener := f.http.Listener
-		unusedAddress := unusedListener.Addr().String()
+		tcpListener, ok := unusedListener.(*net.TCPListener)
+		if !ok {
+			t.Fatalf("httptest default listener has type %T, want *net.TCPListener", unusedListener)
+		}
+		if err := tcpListener.SetDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+			t.Fatalf("set deadline on unused httptest listener: %v", err)
+		}
 		if err := unusedListener.Close(); err != nil {
 			t.Fatalf("close unused httptest listener: %v", err)
 		}
-		probe, err := net.DialTimeout("tcp", unusedAddress, 100*time.Millisecond)
-		if err == nil {
-			_ = probe.Close()
+		conn, err := unusedListener.Accept()
+		if conn != nil {
+			_ = conn.Close()
 			closeErr := unusedListener.Close()
-			t.Fatalf("unused httptest listener still accepts connections; cleanup close: %v", closeErr)
+			t.Fatalf("closed httptest listener accepted a connection (accept error %v); cleanup close: %v", err, closeErr)
+		}
+		if !errors.Is(err, net.ErrClosed) {
+			closeErr := unusedListener.Close()
+			t.Fatalf("accept on closed httptest listener returned %v, want %v; cleanup close: %v", err, net.ErrClosed, closeErr)
 		}
 		f.http.Listener = listener
 	}
