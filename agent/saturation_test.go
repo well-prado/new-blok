@@ -18,7 +18,8 @@ import (
 // TestWorkflowToolHidesSaturationAfterAChildEffect: a catalog workflow tool
 // whose first child charges and whose second finds the store busy. The
 // charge happened, so the caller must not be told to retry: the error does
-// not read as saturation, and names the step that committed (#190).
+// not read as saturation, nor as a busy store a caller may retry, and names
+// the step that committed (#190).
 func TestWorkflowToolHidesSaturationAfterAChildEffect(t *testing.T) {
 	registry := node.NewRegistry()
 	var charges atomic.Int32
@@ -48,7 +49,7 @@ func TestWorkflowToolHidesSaturationAfterAChildEffect(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := catalog.Invoke(context.Background(), principal("charge", "record"), "workflow/pay", "1.0.0", []byte(`{"value":1}`), budget())
-	if err == nil || errors.Is(err, capacity.ErrSaturated) || charges.Load() != 1 || !strings.Contains(err.Error(), `after step "charge" committed its effects`) {
+	if err == nil || errors.Is(err, capacity.ErrSaturated) || errors.Is(err, store.ErrBusy) || charges.Load() != 1 || !strings.Contains(err.Error(), `after step "charge" committed its effects`) {
 		t.Fatalf("err=%v charges=%d saturated=%v; want a failure after the charge that is not saturation", err, charges.Load(), errors.Is(err, capacity.ErrSaturated))
 	}
 }

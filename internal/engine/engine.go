@@ -186,8 +186,9 @@ func afterEffect(failure error, effected string) error {
 }
 
 // effectCommitted is a step failure that follows a committed effect. It
-// matches whatever the failure matches except saturation; it has no Unwrap,
-// which would expose saturation further down the chain.
+// matches whatever the failure matches except saturation and any error that
+// is itself saturation, such as store.ErrBusy; it has no Unwrap, which
+// would expose them further down the chain.
 type effectCommitted struct {
 	err  error
 	step string
@@ -198,7 +199,10 @@ func (e effectCommitted) Error() string {
 }
 
 func (e effectCommitted) Is(target error) bool {
-	return target != capacity.ErrSaturated && errors.Is(e.err, target)
+	if errors.Is(target, capacity.ErrSaturated) {
+		return false
+	}
+	return errors.Is(e.err, target)
 }
 
 func (e effectCommitted) As(target any) bool { return errors.As(e.err, target) }

@@ -53,7 +53,8 @@ committed nothing. Three things narrow it:
   completed: retrying the workflow would repeat that effect, so the
   trigger answers the step's own failure instead (its classified code,
   `node_error` unless a domain error names one). The failure still matches
-  whatever else it carries, such as a deadline, and its text names the
+  whatever else it carries, such as a deadline, except anything that is
+  itself saturation (`store.ErrBusy` included), and its text names the
   step that committed. An agent catalog workflow tool's dispatch steps
   declare their child's effects, so the same holds for them.
 - Past an agent action's dispatch barrier, a busy store leaves the effect
