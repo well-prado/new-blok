@@ -32,10 +32,12 @@ was not available before the busy timeout or the submit deadline, is
 reported as `trigger.ErrSaturated` (#184), and nothing is committed: webhook
 and SSE answer 503 `saturated` with `Retry-After`, pubsub naks with a delay
 without spending its delivery budget, and cron keeps the occurrence for its
-next attempt. A busy store seen from inside a worker handler is not
-saturation: the handler's own claim holds the write lock (it wrote outside
-`tx`, for example by submitting to the same store), so it fails rather than
-deferring into the same deadlock.
+next attempt. A worker handler that returns a busy store or a spent submit
+deadline fails rather than deferring: the usual cause is the handler's own
+claim, which holds the write lock it waited for (it wrote outside `tx`, for
+example by submitting to the same store), and deferring would repeat the
+deadlock. This also treats a busy *other* store as a failure; telling the
+two apart is tracked separately.
 
 `worker.Queue` implements the port. It persists the principal established by the
 trusted producer (`EnqueueRequest.Principal`, `Job.Principal`) and makes it part

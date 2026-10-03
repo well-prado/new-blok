@@ -261,7 +261,10 @@ func (q *Queue) Enqueue(ctx context.Context, request EnqueueRequest) (EnqueueRes
 		return nil
 	})
 	if err != nil {
-		if errors.Is(err, store.ErrBusy) || errors.Is(err, context.DeadlineExceeded) {
+		// A WithTx error means nothing was committed (the driver rolls back
+		// any failed COMMIT). The deadline is also read from ctx: if it ran
+		// out just before COMMIT, database/sql may report ErrTxDone instead.
+		if errors.Is(err, store.ErrBusy) || errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			// A store too busy to take the submission before the lock wait
 			// or the caller's deadline runs out is saturation: nothing was
 			// committed (database/sql checks the deadline before COMMIT),

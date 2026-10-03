@@ -52,6 +52,12 @@ func TestBusyStoreStartAnswersSaturated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		stop, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = server.Shutdown(stop)
+		_ = application.Shutdown(stop)
+	})
 	listener := httptest.NewServer(server)
 	defer listener.Close()
 	holding, release, held := make(chan struct{}), make(chan struct{}), make(chan error, 1)
@@ -91,8 +97,4 @@ func TestBusyStoreStartAnswersSaturated(t *testing.T) {
 	if settled, err := queue.Settled(ctx, sse.SubmissionKey("orders", trigger.Principal{ID: "alice"}, "busy")); err != nil || !settled {
 		t.Fatalf("a saturated start left work behind: settled=%v err=%v", settled, err)
 	}
-	stop, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	_ = server.Shutdown(stop)
-	_ = application.Shutdown(stop)
 }
