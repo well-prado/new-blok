@@ -114,7 +114,7 @@ An external success followed by a crash before result commit creates an uncertai
 
 Deployment manifests bind workflow document, native binary, worker artifacts, schemas, module locks, runtime versions, compiler and checkpoint formats. Immutable versions cannot be overwritten. Initial upgrades drain/retain compatible executables or refuse startup with actionable diagnostics. A later multi-version manager retains old workers for old runs. Replay creates a new run with lineage; partial reruns require separate tested effect semantics.
 
-Retention, compaction, backup, corruption checks and restore must preserve verified checkpoints and audit obligations. Business tables remain application-owned; the journal is not an ORM or a substitute for domain persistence.
+Retention, compaction, backup, corruption checks and restore must preserve verified checkpoints and audit obligations. The current SQLite backup contract uses `VACUUM INTO` to create a new, transaction-consistent snapshot; it never overwrites an existing destination. Restore first runs `PRAGMA integrity_check`, copies into a temporary file, syncs it, and renames it into a new destination before checking the restored database again. These guarantees cover one local filesystem only: they do not provide disk-loss survival, replication, or multi-host failover. Business tables remain application-owned; the journal is not an ORM or a substitute for domain persistence.
 
 ## 8. Workers and runtime coverage
 
