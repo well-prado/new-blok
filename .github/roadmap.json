@@ -953,6 +953,25 @@
       "nodeId": "I_kwDOU4AyT88AAAABUhKACQ",
       "databaseId": 5671911433
     },
+    "E11-T05": {
+      "kind": "task",
+      "epic": "E11",
+      "milestone": "M6",
+      "dependencies": [
+        "E11-T01",
+        "E11-T02",
+        "E11-T03",
+        "E11-T04"
+      ],
+      "priority": "P0",
+      "size": "M",
+      "review": "R",
+      "area": "cli",
+      "number": 157,
+      "url": "https://github.com/well-prado/new-blok/issues/157",
+      "nodeId": "I_kwDOU4AyT88AAAABUwhJgA",
+      "databaseId": 5688019328
+    },
     "E12": {
       "kind": "epic",
       "milestone": "M6",
@@ -1371,6 +1390,27 @@
       "nodeId": "I_kwDOU4AyT88AAAABUhKMqA",
       "databaseId": 5671914664
     },
+    "E17-T05": {
+      "kind": "task",
+      "epic": "E17",
+      "milestone": "M4",
+      "dependencies": [
+        "E06-T01",
+        "E07-T07",
+        "E08-T02",
+        "E08-T03",
+        "E08-T04",
+        "E17-T01"
+      ],
+      "priority": "P0",
+      "size": "M",
+      "review": "R",
+      "area": "deployment",
+      "number": 156,
+      "url": "https://github.com/well-prado/new-blok/issues/156",
+      "nodeId": "I_kwDOU4AyT88AAAABUwhJHg",
+      "databaseId": 5688019230
+    },
     "E18": {
       "kind": "epic",
       "milestone": "M8",
@@ -1765,7 +1805,9 @@
       "epic": "E20",
       "milestone": "M9",
       "dependencies": [
-        "E20-T03"
+        "E20-T03",
+        "E17-T05",
+        "E11-T05"
       ],
       "priority": "P0",
       "size": "M",
@@ -1782,6 +1824,6 @@
   "plannedCounts": {
     "milestones": 10,
     "epics": 20,
-    "tasks": 91
+    "tasks": 93
   }
 }

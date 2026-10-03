@@ -22,6 +22,7 @@ The delivery plan covers:
 - **Every entry point:** HTTP, webhook, cron, worker, pub/sub, gRPC, SSE, WebSocket, and MCP through one admission contract.
 - **Your preferred language:** Go in process; Node.js first over persistent gRPC, then Python, Rust, Java, Kotlin, C#, PHP, Ruby, Swift, Dart and Elixir. Bun and Deno receive their own tested worker adapters.
 - **Developer tooling:** a Go CLI, unified or classic node layouts, clear diagnostics, and reproducible node/workflow package installation.
+- **Native Windows:** first-class Windows execution and easy PowerShell installation alongside macOS/Linux, without requiring WSL, Bash or containers. This is a roadmap requirement; native Windows validation is still pending in [#156](https://github.com/well-prado/new-blok/issues/156) and [#157](https://github.com/well-prado/new-blok/issues/157).
 - **AI composition:** schema-described nodes as tools and workflows as composed tools, with discoverable capabilities, bounded execution, and enforced authorization.
 - **Production insight:** optional telemetry exporters, bounded observability, redaction, and reliable audit paths.
 
