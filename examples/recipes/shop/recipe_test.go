@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/well-prado/new-blok/store/sqlite"
-	"github.com/well-prado/new-blok/trigger"
 	"github.com/well-prado/new-blok/trigger/sse"
 	"github.com/well-prado/new-blok/trigger/webhook"
 	"github.com/well-prado/new-blok/trigger/worker"
@@ -674,42 +673,6 @@ func TestConcurrentTwoPrincipalWritesUnderStorageLoad(t *testing.T) {
 	records, outbox := recipeCounts(t, application)
 	if records != expected.ExpectedRecords || outbox != expected.ExpectedOutbox {
 		t.Fatalf("concurrent storage records=%d outbox=%d", records, outbox)
-	}
-}
-
-func TestWorkerConsumerCancellationRollsBackNonCancelableSQL(t *testing.T) {
-	application, closeDatabase := openRecipe(t, filepath.Join(t.TempDir(), "cancel-worker.db"))
-	defer closeDatabase()
-	expected := fixture(t, "worker-cancellation")
-	job, err := application.Queue.Enqueue(context.Background(), worker.EnqueueRequest{
-		RequestKey: "cancel-write", Kind: JobKind,
-		Payload:   []byte(`{"requestKey":"cancel-write","recordId":"cancel-record","value":"rolled-back"}`),
-		Principal: trigger.Principal{ID: "alice"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	processed, err := application.Queue.ProcessOnce(ctx, func(ctx context.Context, tx *sql.Tx, _ worker.Job) error {
-		_, err := tx.ExecContext(workerTransactionSQLContext(ctx), `INSERT INTO shop_records(record_id, owner_id, value, created_at, updated_at) VALUES('cancel-record', 'alice', 'rolled-back', 1, 1)`)
-		cancel()
-		return err
-	})
-	if err == nil || processed {
-		t.Fatalf("canceled worker processed=%v err=%v", processed, err)
-	}
-	var records int
-	if err := application.Database.WithTx(context.Background(), func(tx *sql.Tx) error {
-		return tx.QueryRow(`SELECT COUNT(*) FROM shop_records WHERE record_id = 'cancel-record'`).Scan(&records)
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if records != expected.ExpectedEffects {
-		t.Fatalf("canceled worker committed %d business rows", records)
-	}
-	stored, err := application.Queue.Get(context.Background(), job.Job.RequestKey)
-	if err != nil || stored.State != expected.ExpectedJobState {
-		t.Fatalf("canceled job state=%q err=%v, want redeliverable pending", stored.State, err)
 	}
 }
 

@@ -467,12 +467,8 @@ func (a *Application) ProcessOne(ctx context.Context) (bool, error) {
 			return runErr
 		}
 		record = event.Record
-		// The worker's consumer context is canceled when a worker disappears.
-		// Complete bounded SQL on the transaction's non-cancelable lifetime so
-		// ProcessOnce can observe cancellation and roll back the whole claim.
-		sqlCtx := workerTransactionSQLContext(ctx)
 		now := time.Now().UTC().UnixNano()
-		inserted, err := tx.ExecContext(sqlCtx, `INSERT INTO shop_records(record_id, owner_id, value, created_at, updated_at) VALUES(?, ?, ?, ?, ?) ON CONFLICT(record_id) DO NOTHING`, record.ID, record.Owner, record.Value, now, now)
+		inserted, err := tx.ExecContext(ctx, `INSERT INTO shop_records(record_id, owner_id, value, created_at, updated_at) VALUES(?, ?, ?, ?, ?) ON CONFLICT(record_id) DO NOTHING`, record.ID, record.Owner, record.Value, now, now)
 		if err != nil {
 			return err
 		}
@@ -482,7 +478,7 @@ func (a *Application) ProcessOne(ctx context.Context) (bool, error) {
 		}
 		if count == 0 {
 			var owner, value string
-			if err := tx.QueryRowContext(sqlCtx, `SELECT owner_id, value FROM shop_records WHERE record_id = ?`, record.ID).Scan(&owner, &value); err != nil {
+			if err := tx.QueryRowContext(ctx, `SELECT owner_id, value FROM shop_records WHERE record_id = ?`, record.ID).Scan(&owner, &value); err != nil {
 				return err
 			}
 			if owner != record.Owner || value != record.Value {
@@ -493,7 +489,7 @@ func (a *Application) ProcessOne(ctx context.Context) (bool, error) {
 		if err != nil {
 			return err
 		}
-		_, err = tx.ExecContext(sqlCtx, `INSERT INTO shop_outbox(event_id, record_id, payload_json, state, created_at) VALUES(?, ?, ?, 'pending', ?) ON CONFLICT(event_id) DO NOTHING`, event.EventID, record.ID, payload, now)
+		_, err = tx.ExecContext(ctx, `INSERT INTO shop_outbox(event_id, record_id, payload_json, state, created_at) VALUES(?, ?, ?, 'pending', ?) ON CONFLICT(event_id) DO NOTHING`, event.EventID, record.ID, payload, now)
 		return err
 	})
 	if err != nil || !processed {
@@ -515,10 +511,6 @@ func (a *Application) ProcessOne(ctx context.Context) (bool, error) {
 		_, _ = a.Hub.Finish(streamID, sse.Failure(handlerErr))
 	}
 	return true, nil
-}
-
-func workerTransactionSQLContext(consumerCtx context.Context) context.Context {
-	return context.WithoutCancel(consumerCtx)
 }
 
 func (a *Application) prepareRecordEvent(ctx context.Context, record Record, eventID string) (RecordEvent, error) {

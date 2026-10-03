@@ -116,14 +116,13 @@ SQLite file and any unrelated application tables in place.
 The fixture [shop/fixtures.json](shop/fixtures.json) predeclares outcomes for
 owner CRUD and idempotent update, cross-principal denial, signed duplicate
 delivery, atomic competing outbox claims, accepted-then-error reconciliation
-after process restart, worker cancellation rollback, external-module
-composition, and slow subscriber bounds. Tests run real HTTP handlers, SQLite
-transactions, the durable queue, webhook verification, and an SSE HTTP
-connection. The two-node typed workflow validates the record command and
-builds a stable `shop.record.changed` event consumed by transactional app
-handlers; it does not claim every persistence operation is an engine node. The
-synthetic receiver durably deduplicates event IDs and rejects changed payloads
-under a reused ID.
+after process restart, external-module composition, and slow subscriber
+bounds. Tests run real HTTP handlers, SQLite transactions, the durable queue,
+webhook verification, and an SSE HTTP connection. The two-node typed workflow
+validates the record command and builds a stable `shop.record.changed` event
+consumed by transactional app handlers; it does not claim every persistence
+operation is an engine node. The synthetic receiver durably deduplicates event
+IDs and rejects changed payloads under a reused ID.
 
 - Composition, migrations, CRUD, job handler, and bounded outbox claims: `shop/recipe.go`
 - Durable deduplicating local receiver: `shop/sink.go`
@@ -133,15 +132,35 @@ under a reused ID.
 - Independent consumer module and executable: `external/shopapp/`
 - Expected synthetic outcomes: `shop/fixtures.json`
 
-The worker adapter cancellation issue tracked by #180 is not changed here and
-remains an upstream dependency. This recipe passes a cancellation-independent
-context to its bounded worker-transaction SQL and includes a focused rollback
-scenario; that scoped defense is not a substitute for the adapter fix. Re-run
-the scenario against the independently reviewed upstream change before
-claiming the root behavior is resolved.
+The worker adapter transaction-ownership issue tracked by #180 is not changed
+here and remains an upstream dependency. In particular, this recipe does not
+replace the handler's cancelable context for transaction SQL or claim that
+SQLite busy timeouts bound statement execution. Worker cancellation/transaction
+ownership acceptance therefore remains pending the independently reviewed
+upstream fix and its integration evidence.
+
+The typed workflow here validates the command and prepares the stable event;
+the application handlers own the record and outbox SQL transaction. This is a
+deliberate example boundary, not a claim that persistence is an engine node.
+Architecture sections 3 and 9 describe nodes as typed functions and workflows
+as composed typed tools, with the application composition root registering
+nodes, workflows, and adapters. The recipe currently exercises that boundary
+for validation/event preparation. Issue #62 delivers effect nodes through
+injected provider ports and tests real synthetic provider endpoints; this
+recipe's `OutboxPublisher` is instead called by the app-owned outbox loop,
+outside the workflow. Its durable synthetic receiver and restart tests
+demonstrate the external-delivery boundary and uncertain-outcome reconciliation,
+not an effect node in the two-step workflow. A workflow that composes business
+persistence and provider effects as nodes would need to demonstrate those nodes
+and their transactional/durable acknowledgment boundary explicitly. That is
+not inferred from this recipe's current composition, and worker transaction
+ownership also remains gated on #180.
 
 Run root-module evidence with `go test ./examples/recipes/...`, and the
-external-consumer evidence with `cd examples/recipes/external/shopapp && go test ./...`.
+external-consumer evidence separately from `examples/recipes/external/shopapp`
+with `go test -race -p 3 ./...` plus `go vet -p 3 ./...`. Root `./...` does not
+include this nested Go module.
+
 Delivery remains at least once across lease expiry, so a receiver
 must durably deduplicate stable event IDs. The synthetic receiver implements
 and tests that contract, including accept-then-error followed by app restart.
