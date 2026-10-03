@@ -41,10 +41,24 @@ that waits longer than 5 seconds, behind one slow handler or several queued
 ones, still fails with `SQLITE_BUSY`; handlers must stay short. Such a
 failure is saturation, not a fault: every transaction error caused by
 `SQLITE_BUSY` matches `store.ErrBusy` (#184), so callers can retry it.
-`store.ErrBusy` also matches `trigger.ErrSaturated` (#190): an error that
-carries it, through the engine or not, gets every trigger's saturation
-response, including the in-band ones (HTTP 503 with `Retry-After`, gRPC
-`ResourceExhausted`, WebSocket and MCP `saturated`). A worker
+`store.ErrBusy` also matches `capacity.ErrSaturated`, which is
+`trigger.ErrSaturated` (#190): an in-band trigger that receives it answers
+with its saturation response (HTTP 503 with `Retry-After`, gRPC
+`ResourceExhausted`, WebSocket and MCP `saturated`). The sentinel lives in
+the leaf package `contract/capacity`, so the store does not depend on the
+triggers. Saturation promises only that the *failing* transaction
+committed nothing. Three things narrow it:
+
+- The engine hides it once an earlier step that declared effects has
+  completed: retrying the workflow would repeat that effect, so the
+  trigger answers the step's failure (`node_error`) instead.
+- Past an agent action's dispatch barrier, a busy store leaves the effect
+  uncertain, and the policy reports `ErrExecution`, never saturation.
+- A worker handler's busy store is a failure, not a deferral (ADR 0006).
+
+A node that commits more than one transaction itself, or a step whose
+writes are not declared as effects, is not covered: retrying such a
+workflow is safe only if its writes are idempotent. A worker
 whose consumer is canceled while it waits reports `ErrConsumerLost`, after
 up to the busy timeout, because the driver does not interrupt a busy wait.
 

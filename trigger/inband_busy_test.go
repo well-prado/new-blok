@@ -52,14 +52,15 @@ type saved struct {
 var noteSchema = []byte(`{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}`)
 var savedSchema = []byte(`{"type":"object","properties":{"saved":{"type":"boolean"}},"required":["saved"]}`)
 
-// saveRunner runs a one-node workflow, through the production engine, whose
-// node writes the note to the store.
+// saveRunner runs a workflow, through the production engine, whose node
+// writes the note to the store. With a ledger, an earlier node first
+// records the note there, committing its own effect.
 type saveRunner struct {
 	engine  *engine.Engine
 	program contract.InternalProgram
 }
 
-func newSaveRunner(t *testing.T, database store.Database) *saveRunner {
+func newSaveRunner(t *testing.T, database, ledger store.Database) *saveRunner {
 	t.Helper()
 	save, err := node.Define("busy/save-note", "1.0.0", func(ctx context.Context, in note) (saved, error) {
 		err := database.WithTx(ctx, func(tx *sql.Tx) error {
@@ -71,7 +72,19 @@ func newSaveRunner(t *testing.T, database store.Database) *saveRunner {
 	if err != nil {
 		t.Fatal(err)
 	}
+	record, err := node.Define("busy/record-note", "1.0.0", func(ctx context.Context, in note) (note, error) {
+		return in, ledger.WithTx(ctx, func(tx *sql.Tx) error {
+			_, err := tx.ExecContext(ctx, `INSERT INTO notes (text) VALUES (?)`, in.Text)
+			return err
+		})
+	}, node.Description("Records a note"), node.Schemas(noteSchema, noteSchema), node.Effects("database:write"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	workflow, err := flow.Define(flow.Spec{Name: "busy/save", Version: "1.0.0"}, func(b *flow.Builder, in flow.Ref[note]) flow.Ref[saved] {
+		if ledger != nil {
+			in = flow.Call(b, "record", record, in)
+		}
 		return flow.Call(b, "save", save, in)
 	})
 	if err != nil {
@@ -81,7 +94,7 @@ func newSaveRunner(t *testing.T, database store.Database) *saveRunner {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &saveRunner{engine: engine.New(map[string]node.Any{"busy/save-note": save.Any()}), program: program}
+	return &saveRunner{engine: engine.New(map[string]node.Any{"busy/save-note": save.Any(), "busy/record-note": record.Any()}), program: program}
 }
 
 func (r *saveRunner) run(ctx context.Context, input []byte) (json.RawMessage, error) {
@@ -134,21 +147,87 @@ func (b bearerRT) RoundTrip(request *http.Request) (*http.Response, error) {
 // TestInBandTriggersAnswerSaturatedOnBusyStore: a workflow whose node writes
 // to a store that stays write-locked past its busy timeout, run through the
 // production engine behind HTTP, gRPC, WebSocket and MCP. Each trigger
-// answers with its saturation response, never an internal error (#190).
+// answers with its saturation response, never an internal error, and
+// nothing is committed (#190).
 func TestInBandTriggersAnswerSaturatedOnBusyStore(t *testing.T) {
+	answers, notes, _ := busyAnswers(t, false)
+	want := map[string]string{
+		"http":      "Service Unavailable saturated 1",
+		"grpc":      codes.ResourceExhausted.String() + " saturated",
+		"websocket": "saturated",
+		"mcp":       `{"code":"saturated"}`,
+	}
+	for via, expected := range want {
+		if answers[via] != expected {
+			t.Errorf("%s answered %q; want %q", via, answers[via], expected)
+		}
+	}
+	if notes != 1 {
+		t.Errorf("notes=%d; want only the holder's", notes)
+	}
+}
+
+// TestInBandTriggersDoNotAskForARetryAfterAnEffect: the same busy store, but
+// an earlier step has already committed its effect to another store. A
+// retry would repeat that effect, so no trigger answers saturated; each
+// answers its failure response, without inviting a retry (#190).
+func TestInBandTriggersDoNotAskForARetryAfterAnEffect(t *testing.T) {
+	answers, notes, recorded := busyAnswers(t, true)
+	want := map[string]string{
+		"http":      "Internal Server Error internal error",
+		"grpc":      codes.FailedPrecondition.String() + " node_error",
+		"websocket": "node_error",
+		"mcp":       `{"code":"node_error"}`,
+	}
+	for via, expected := range want {
+		if answers[via] != expected {
+			t.Errorf("%s answered %q; want %q", via, answers[via], expected)
+		}
+	}
+	if notes != 1 || recorded != 4 {
+		t.Errorf("notes=%d recorded=%d; want only the holder's note and one record per trigger", notes, recorded)
+	}
+}
+
+func openNotes(t *testing.T, name string) store.Database {
+	t.Helper()
 	ctx := context.Background()
-	database, err := (sqlite.Backend{}).Open(ctx, filepath.Join(t.TempDir(), "notes.db"))
+	database, err := (sqlite.Backend{}).Open(ctx, filepath.Join(t.TempDir(), name))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer database.Close()
+	t.Cleanup(func() { database.Close() })
 	if err := database.WithTx(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `CREATE TABLE notes (text TEXT)`)
 		return err
 	}); err != nil {
 		t.Fatal(err)
 	}
-	runner := newSaveRunner(t, database)
+	return database
+}
+
+func countNotes(t *testing.T, database store.Database) int {
+	t.Helper()
+	count := 0
+	if err := database.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return tx.QueryRow(`SELECT COUNT(*) FROM notes`).Scan(&count)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+
+// busyAnswers calls the workflow once through each trigger while its store
+// is write-locked past the busy timeout, and returns each trigger's answer
+// and, once the lock is released, the rows the store and the ledger hold.
+func busyAnswers(t *testing.T, recordFirst bool) (map[string]string, int, int) {
+	ctx := context.Background()
+	database := openNotes(t, "notes.db")
+	var ledger store.Database
+	if recordFirst {
+		ledger = openNotes(t, "ledger.db")
+	}
+	runner := newSaveRunner(t, database, ledger)
 	application, err := app.New(app.Config{})
 	if err != nil {
 		t.Fatal(err)
@@ -311,17 +390,11 @@ func TestInBandTriggersAnswerSaturatedOnBusyStore(t *testing.T) {
 	if err := <-held; err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]string{
-		"http":      "Service Unavailable saturated 1",
-		"grpc":      codes.ResourceExhausted.String() + " saturated",
-		"websocket": "saturated",
-		"mcp":       `{"code":"saturated"}`,
+	recorded := 0
+	if ledger != nil {
+		recorded = countNotes(t, ledger)
 	}
-	for via, expected := range want {
-		if answers[via] != expected {
-			t.Errorf("%s answered %q; want %q", via, answers[via], expected)
-		}
-	}
+	return answers, countNotes(t, database), recorded
 }
 
 func anyString(value any) string {

@@ -4,18 +4,23 @@ package store
 import (
 	"context"
 	"database/sql"
-	"fmt"
 
-	"github.com/well-prado/new-blok/trigger"
+	"github.com/well-prado/new-blok/contract/capacity"
 )
 
 // ErrBusy reports that a transaction could not get, or keep, the store's
 // write lock: it waited out the busy timeout, or another writer committed
-// after it read. The store is contended, nothing was committed, and the same
-// work may succeed when retried later. It is saturation: it matches
-// trigger.ErrSaturated, so every trigger a busy store's error reaches,
-// through the engine or not, answers with its saturation response (#190).
-var ErrBusy = fmt.Errorf("store: busy: %w", trigger.ErrSaturated)
+// after it read. The store is contended, that transaction committed
+// nothing, and it may succeed when retried later. It is saturation: it
+// matches capacity.ErrSaturated (and so trigger.ErrSaturated), so a trigger
+// it reaches answers with its saturation response (#190).
+var ErrBusy error = busyError{}
+
+type busyError struct{}
+
+func (busyError) Error() string { return "store: busy" }
+
+func (busyError) Is(target error) bool { return target == capacity.ErrSaturated }
 
 // Backend opens a durable database without exposing its implementation to the
 // engine or journal callers.
