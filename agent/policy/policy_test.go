@@ -5,13 +5,16 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/well-prado/new-blok/contract/approval"
+	"github.com/well-prado/new-blok/contract/tool"
 	"github.com/well-prado/new-blok/internal/journal"
 	"github.com/well-prado/new-blok/store"
 	"github.com/well-prado/new-blok/store/sqlite"
@@ -111,6 +114,46 @@ func (r *rig) trace(t *testing.T) (attempts, committed int) {
 		t.Fatal(err)
 	}
 	return
+}
+
+func TestCatalogScopeCannotWidenOnPolicyReentry(t *testing.T) {
+	r := setup(t, filepath.Join(t.TempDir(), "journal.db"))
+	r.approve(t, true)
+	ctx := context.WithValue(context.Background(), scopeKey{}, []string{"payment:read", "payment:write"})
+	ctx = tool.WithScope(ctx, tool.Principal{ID: "child", Capabilities: []string{"payment:read"}, MaxDepth: 3})
+	if out, err := r.p.Invoke(ctx, r.target, r.call); out != nil || !errors.Is(err, approval.ErrDenied) {
+		t.Fatalf("child widened inherited scope: %s %v", out, err)
+	}
+	if attempts, committed := r.trace(t); attempts != 0 || committed != 0 || r.effects.Load() != 0 {
+		t.Fatalf("scope denial dispatched: %d %d %d", attempts, committed, r.effects.Load())
+	}
+}
+
+type failingCleanupJournal struct {
+	Journal
+	err error
+}
+
+func (j failingCleanupJournal) MarkUncertain(context.Context, string, string, string) error {
+	return j.err
+}
+
+func TestUncertaintyCleanupErrorIsRedacted(t *testing.T) {
+	r := setup(t, filepath.Join(t.TempDir(), "journal.db"))
+	r.approve(t, true)
+	secret := fmt.Errorf("synthetic-secret-cleanup: %w", context.DeadlineExceeded)
+	r.p.cfg.Journal = failingCleanupJournal{Journal: r.j, err: secret}
+	r.target.Execute = func(context.Context, []byte) ([]byte, error) {
+		r.effects.Add(1)
+		return nil, errors.New("synthetic-executor-secret")
+	}
+	out, err := r.p.Invoke(context.Background(), r.target, r.call)
+	if out != nil || !errors.Is(err, ErrExecution) || !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, secret) || strings.Contains(fmt.Sprint(err), "synthetic-") {
+		t.Fatalf("cleanup error escaped redaction: %s %v", out, err)
+	}
+	if attempts, committed := r.trace(t); attempts != 1 || committed != 0 || r.effects.Load() != 1 {
+		t.Fatalf("failed cleanup published: %d %d %d", attempts, committed, r.effects.Load())
+	}
 }
 
 func TestAdversarialFixturesDenyBeforeDispatchAndGatePublication(t *testing.T) {

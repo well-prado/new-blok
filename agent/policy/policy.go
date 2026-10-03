@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/well-prado/new-blok/contract/approval"
+	"github.com/well-prado/new-blok/contract/tool"
 	"github.com/well-prado/new-blok/internal/journal"
 )
 
@@ -127,6 +128,9 @@ func (p *Policy) Prepare(ctx context.Context, target Target, call Invocation) (a
 	if inherited, ok := ctx.Value(scopeKey{}).([]string); ok && !approval.Subset(target.Scope, inherited) {
 		return approval.Proposal{}, approval.ErrDenied
 	}
+	if inherited, ok := tool.Scope(ctx); ok && !approval.Subset(target.Scope, inherited.Capabilities) {
+		return approval.Proposal{}, approval.ErrDenied
+	}
 	proposal := approval.Proposal{
 		Action: target.Action, Workflow: target.Workflow, ArtifactDigest: target.ArtifactDigest,
 		ToolDigest:  target.ToolDigest,
@@ -176,6 +180,9 @@ func (p *Policy) Invoke(ctx context.Context, target Target, call Invocation) ([]
 		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 		err := p.cfg.Journal.MarkUncertain(cleanup, op.Key, attempt.ID, "policy result withheld; reconciliation required")
+		if err != nil {
+			err = externalError(err, ErrExecution)
+		}
 		return nil, errors.Join(cause, err)
 	}
 	// Recheck lifetime/cancellation after the durable dispatch barrier and before
