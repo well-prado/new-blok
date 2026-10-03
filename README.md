@@ -55,6 +55,8 @@ curl -i -X POST http://localhost:8080/quotes \
 
 Invalid SKU or quantity requests return a bounded client error with a `requestId` for correlation. The executable owns composition, lifecycle, and the HTTP listener; no handwritten workflow IR is required.
 
+The pre-alpha [durable tool policy](docs/decisions/0008-durable-tool-policy.md) connects the registered agent catalog to SQLite approval/audit and deterministic publication gates. Its tests exercise real HTTP providers, persistent Node workers and process-kill recovery. Exact executable retention and authorized reconciliation remain dependencies; these tests do not establish production or live-model reliability.
+
 ## An ecosystem with clear boundaries
 
 This repository owns the framework, CLI, package client, adapter contracts, and conformance suites. Studio, the hosted package registry, and BLOK Cloud will be separate products.
