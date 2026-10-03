@@ -557,6 +557,7 @@ func TestClaimPredicateAndOrder(t *testing.T) {
 		{"future", "job:f", StatePending, at(time.Hour), nil, 1},
 		{"live-lease", "job:l", StateProcessing, at(-time.Minute), at(10 * time.Second), 2},
 		{"expired-lease", "job:0", StateProcessing, at(-time.Minute), at(-time.Second), 10},
+		{"lease-ends-now", "job:9", StateProcessing, at(-time.Minute), at(0), 11},
 		{"tie-second", "job:b", StatePending, at(0), nil, 5},
 		{"tie-first", "job:a", StatePending, at(-time.Second), nil, 5},
 		{"completed", "job:c", StateCompleted, at(-time.Minute), nil, 0},
@@ -586,7 +587,7 @@ func TestClaimPredicateAndOrder(t *testing.T) {
 			break
 		}
 	}
-	if want := []string{"tie-first", "tie-second", "expired-lease"}; fmt.Sprint(claimed) != fmt.Sprint(want) {
+	if want := []string{"tie-first", "tie-second", "expired-lease", "lease-ends-now"}; fmt.Sprint(claimed) != fmt.Sprint(want) {
 		t.Fatalf("claimed %v, want %v", claimed, want)
 	}
 }

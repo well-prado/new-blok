@@ -42,11 +42,12 @@ ones, still fails with `SQLITE_BUSY`; handlers must stay short. A worker
 whose consumer is canceled while it waits reports `ErrConsumerLost`, after
 up to the busy timeout, because the driver does not interrupt a busy wait.
 
-Measured with 4 workers draining 200 instant jobs, 5 samples each
+Measured with 4 workers draining 200 instant jobs, 5 samples per run
 (`NEWBLOK_MEASURE_CLAIM=1 go test -run TestMeasureClaimContention -v
-./trigger/worker/`, `golang:1.27.1`, linux/arm64): read-first claim
-2,720–7,516 busy errors in 161–368 ms; write-first claim 0 errors in
-148–344 ms.
+./trigger/worker/`, `golang:1.27.1`, linux/arm64). The write-first claim:
+0 busy errors in 148–195 ms. The same harness with the read-first claim of
+`996f184` restored: 2,720–7,516 busy errors in 161–368 ms in one run, and
+5,851–8,866 in 322–485 ms in an independent reviewer's run.
 
 ## Alternatives considered
 
