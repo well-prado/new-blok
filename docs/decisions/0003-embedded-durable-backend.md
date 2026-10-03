@@ -22,13 +22,31 @@ device honoring flushes; it is not disk-loss survival or multi-host failover.
 
 Transactions start deferred, so reads stay concurrent with a writer under WAL.
 The busy timeout only helps a transaction that has not read yet: one that
-reads and then writes fails at once with `SQLITE_BUSY` if another writer
-committed after its read began, because waiting cannot make that read
-current. A transaction that may write under contention therefore writes
-first: the worker's job claim is one `UPDATE … RETURNING` (#176), and cron
-inserts its cursor before reading it (#169). With 4 workers and 200 jobs,
-the claim went from 2,720–7,516 busy errors per run to none, at comparable
-elapsed time (161–368 ms before, 190–344 ms after; 5 samples each).
+reads and then writes fails at once with `SQLITE_BUSY` if another writer holds
+the write lock or has committed since its read began, because SQLite does not
+invoke the busy handler when it upgrades a transaction that has already read.
+A transaction that may write under contention therefore writes first. Today
+that holds for the worker's job claim, one `UPDATE … RETURNING` (#176), and
+cron's cursor, inserted before it is read (#169); the journal and provider
+paths that still read first are tracked in #179. Starting every transaction
+with `BEGIN IMMEDIATE` was rejected: `WithTx` is also the read path
+(`Get`, `Settled`, journal reads), so every read would wait behind the
+long write transaction a worker handler holds.
+
+Write-first removes the immediate failure, not the single writer. A worker's
+handler runs inside its claim's write transaction, so concurrent workers run
+handlers one at a time, and every other writer (submissions, cron, the
+journal) waits for them under one busy-timeout budget per statement. A writer
+that waits longer than 5 seconds, behind one slow handler or several queued
+ones, still fails with `SQLITE_BUSY`; handlers must stay short. A worker
+whose consumer is canceled while it waits reports `ErrConsumerLost`, after
+up to the busy timeout, because the driver does not interrupt a busy wait.
+
+Measured with 4 workers draining 200 instant jobs, 5 samples each
+(`NEWBLOK_MEASURE_CLAIM=1 go test -run TestMeasureClaimContention -v
+./trigger/worker/`, `golang:1.27.1`, linux/arm64): read-first claim
+2,720–7,516 busy errors in 161–368 ms; write-first claim 0 errors in
+148–344 ms.
 
 ## Alternatives considered
 

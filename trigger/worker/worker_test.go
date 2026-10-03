@@ -452,7 +452,9 @@ func TestPrincipalIsPersistedAndPartOfRequestIdentity(t *testing.T) {
 // TestConcurrentWorkersNeverFailBusy: several workers and concurrent
 // submitters on one store. Every job runs exactly once and no worker sees
 // SQLITE_BUSY: a claim writes first, so a contending worker waits under the
-// busy timeout instead of failing on a stale read (#176).
+// busy timeout instead of failing on a stale read (#176). The handlers are
+// deliberately instant: handlers run one at a time under the write lock, so
+// slow ones can still exhaust the busy timeout (ADR 0003).
 func TestConcurrentWorkersNeverFailBusy(t *testing.T) {
 	ctx := context.Background()
 	database, err := (sqlite.Backend{}).Open(ctx, filepath.Join(t.TempDir(), "busy.db"))
@@ -524,5 +526,180 @@ func TestConcurrentWorkersNeverFailBusy(t *testing.T) {
 		if n != 1 {
 			t.Fatalf("job %s ran %d times", key, n)
 		}
+	}
+}
+
+// TestClaimPredicateAndOrder seeds jobs in every claimable and unclaimable
+// shape: the claim takes pending jobs that are due and processing jobs whose
+// lease expired, oldest first with ties broken by job id, and nothing else.
+func TestClaimPredicateAndOrder(t *testing.T) {
+	ctx := context.Background()
+	database, err := (sqlite.Backend{}).Open(ctx, filepath.Join(t.TempDir(), "predicate.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	now := time.Unix(1_000, 0)
+	queue, err := New(ctx, database, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.RegisterKind("shape", []byte(`{"type":"object"}`)); err != nil {
+		t.Fatal(err)
+	}
+	at := func(offset time.Duration) int64 { return now.Add(offset).UnixNano() }
+	shapes := []struct {
+		key, id, state string
+		available      int64
+		lease          any
+		created        int64
+	}{
+		{"future", "job:f", StatePending, at(time.Hour), nil, 1},
+		{"live-lease", "job:l", StateProcessing, at(-time.Minute), at(10 * time.Second), 2},
+		{"expired-lease", "job:0", StateProcessing, at(-time.Minute), at(-time.Second), 10},
+		{"tie-second", "job:b", StatePending, at(0), nil, 5},
+		{"tie-first", "job:a", StatePending, at(-time.Second), nil, 5},
+		{"completed", "job:c", StateCompleted, at(-time.Minute), nil, 0},
+		{"dead", "job:d", StateDead, at(-time.Minute), nil, 0},
+	}
+	for _, s := range shapes {
+		if _, err := queue.Enqueue(ctx, EnqueueRequest{RequestKey: s.key, Kind: "shape", Payload: []byte(`{}`)}); err != nil {
+			t.Fatal(err)
+		}
+		if err := database.WithTx(ctx, func(tx *sql.Tx) error {
+			_, err := tx.ExecContext(ctx, `UPDATE worker_jobs SET job_id = ?, state = ?, available_at = ?, lease_until = ?, created_at = ? WHERE request_key = ?`, s.id, s.state, s.available, s.lease, s.created, s.key)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var claimed []string
+	for {
+		processed, err := queue.ProcessOnce(ctx, func(_ context.Context, _ *sql.Tx, job Job) error {
+			claimed = append(claimed, job.RequestKey)
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !processed {
+			break
+		}
+	}
+	if want := []string{"tie-first", "tie-second", "expired-lease"}; fmt.Sprint(claimed) != fmt.Sprint(want) {
+		t.Fatalf("claimed %v, want %v", claimed, want)
+	}
+}
+
+// TestCanceledClaimWaitReportsConsumerLost: a worker waiting for the write
+// lock held by another worker's handler, whose consumer is canceled
+// meanwhile, reports ErrConsumerLost (not SQLITE_BUSY) within the busy
+// timeout, and leaves the job untouched. The SQLite driver does not
+// interrupt a busy wait, so it cannot return sooner.
+func TestCanceledClaimWaitReportsConsumerLost(t *testing.T) {
+	ctx := context.Background()
+	database, err := (sqlite.Backend{}).Open(ctx, filepath.Join(t.TempDir(), "cancel.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	queue, err := New(ctx, database, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.RegisterKind("slow", []byte(`{"type":"object"}`)); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"held", "waiting"} {
+		if _, err := queue.Enqueue(ctx, EnqueueRequest{RequestKey: key, Kind: "slow", Payload: []byte(`{}`)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	holding, release := make(chan struct{}), make(chan struct{})
+	first := make(chan error, 1)
+	go func() {
+		_, err := queue.ProcessOnce(ctx, func(context.Context, *sql.Tx, Job) error {
+			close(holding)
+			<-release
+			return nil
+		})
+		first <- err
+	}()
+	<-holding
+	consumer, cancel := context.WithCancel(ctx)
+	time.AfterFunc(100*time.Millisecond, cancel)
+	begin := time.Now()
+	_, err = queue.ProcessOnce(consumer, func(context.Context, *sql.Tx, Job) error { return nil })
+	elapsed := time.Since(begin)
+	close(release)
+	if !errors.Is(err, ErrConsumerLost) || elapsed > 7*time.Second {
+		t.Fatalf("a canceled worker waited %v for the lock and returned %v", elapsed, err)
+	}
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	if job, err := queue.Get(ctx, "waiting"); err != nil || job.State != StatePending || job.Attempt != 0 {
+		t.Fatalf("the canceled claim left %+v %v", job, err)
+	}
+}
+
+// TestMeasureClaimContention reproduces ADR 0003's numbers: 4 workers drain
+// 200 instant jobs, 5 samples. It runs only when NEWBLOK_MEASURE_CLAIM=1:
+//
+//	NEWBLOK_MEASURE_CLAIM=1 go test -run TestMeasureClaimContention -v ./trigger/worker/
+func TestMeasureClaimContention(t *testing.T) {
+	if os.Getenv("NEWBLOK_MEASURE_CLAIM") != "1" {
+		t.Skip("set NEWBLOK_MEASURE_CLAIM=1 to measure claim contention")
+	}
+	for sample := range 5 {
+		ctx := context.Background()
+		database, err := (sqlite.Backend{}).Open(ctx, filepath.Join(t.TempDir(), fmt.Sprintf("measure-%d.db", sample)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		queue, err := New(ctx, database, time.Now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := queue.RegisterKind("m", []byte(`{"type":"object"}`)); err != nil {
+			t.Fatal(err)
+		}
+		for i := range 200 {
+			if _, err := queue.Submit(ctx, trigger.Submission{Key: fmt.Sprintf("m-%d", i), Kind: "m", Payload: []byte(`{}`)}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var mu sync.Mutex
+		runs, busy := 0, 0
+		begin := time.Now()
+		var group sync.WaitGroup
+		for range 4 {
+			group.Add(1)
+			go func() {
+				defer group.Done()
+				for {
+					mu.Lock()
+					done := runs >= 200 || time.Since(begin) > 30*time.Second
+					mu.Unlock()
+					if done {
+						return
+					}
+					_, err := queue.ProcessOnce(ctx, func(context.Context, *sql.Tx, Job) error {
+						mu.Lock()
+						runs++
+						mu.Unlock()
+						return nil
+					})
+					if err != nil {
+						mu.Lock()
+						busy++
+						mu.Unlock()
+					}
+				}
+			}()
+		}
+		group.Wait()
+		t.Logf("sample=%d jobs=%d busy_errors=%d elapsed=%s", sample, runs, busy, time.Since(begin).Round(time.Millisecond))
+		_ = database.Close()
 	}
 }

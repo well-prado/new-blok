@@ -276,10 +276,20 @@ var ErrConsumerLost = errors.New("worker: consumer lost before acknowledgment")
 // the delivery acknowledgment. A handler must not perform unknown external
 // effects without an idempotency key or reconciliation path.
 //
-// Only the handler observes ctx. The transaction runs on a context ctx cannot
-// cancel, so losing the consumer rolls the claim back synchronously before
-// ProcessOnce returns instead of leaving database/sql to abort it in the
-// background while the write lock is still held.
+// Only the claim statement and the handler observe ctx. The claim holds
+// nothing while it waits for the store's write lock, so a consumer canceled
+// meanwhile is reported as ErrConsumerLost; the SQLite driver does not
+// interrupt a busy wait, so that report can take up to the busy timeout.
+// Everything after the claim runs on a context ctx cannot cancel, so losing
+// the consumer rolls the claim back synchronously before ProcessOnce returns
+// instead of leaving database/sql to abort it in the background while the
+// write lock is still held.
+//
+// The handler runs inside the claim's write transaction, which holds the
+// store's single write lock until it commits: handlers of concurrent workers
+// run one at a time, and every other writer waits for them under the busy
+// timeout. Keep handlers short; a writer that waits longer than the busy
+// timeout still fails with SQLITE_BUSY (ADR 0003).
 func (q *Queue) ProcessOnce(ctx context.Context, handler Handler) (bool, error) {
 	if handler == nil {
 		return false, errors.New("worker: handler is required")
@@ -291,9 +301,12 @@ func (q *Queue) ProcessOnce(ctx context.Context, handler Handler) (bool, error) 
 	processed := false
 	var lost Job
 	err := q.withTx(txCtx, func(tx *sql.Tx) error {
-		job, err := q.claim(txCtx, tx)
+		job, err := q.claim(ctx, tx)
 		if errors.Is(err, ErrNotFound) {
 			return nil
+		}
+		if err != nil && ctx.Err() != nil {
+			return fmt.Errorf("%w: %w", ErrConsumerLost, ctx.Err())
 		}
 		if err != nil {
 			return err
