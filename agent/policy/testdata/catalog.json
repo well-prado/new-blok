@@ -1,0 +1,14 @@
+[
+  {"name":"accepted","error":"","reads":1,"effects":1,"attempts":1,"published":1},
+  {"name":"normalized-equivalent","error":"","reads":1,"effects":1,"attempts":1,"published":1},
+  {"name":"missing","error":"stale","reads":0,"effects":0,"attempts":0,"published":0},
+  {"name":"rejected","error":"stale","reads":0,"effects":0,"attempts":0,"published":0},
+  {"name":"expired","error":"stale","reads":0,"effects":0,"attempts":0,"published":0},
+  {"name":"changed-input","error":"stale","reads":0,"effects":0,"attempts":0,"published":0},
+  {"name":"changed-tool","error":"stale","reads":0,"effects":0,"attempts":0,"published":0},
+  {"name":"narrow-principal","error":"denied","reads":0,"effects":0,"attempts":0,"published":0},
+  {"name":"unbound-child","error":"denied","reads":0,"effects":0,"attempts":1,"published":0},
+  {"name":"child-evidence-failed","error":"evidence","reads":1,"effects":0,"attempts":1,"published":0},
+  {"name":"root-evidence-failed","error":"evidence","reads":1,"effects":1,"attempts":1,"published":0},
+  {"name":"forged-provenance","error":"evidence","reads":1,"effects":0,"attempts":1,"published":0}
+]

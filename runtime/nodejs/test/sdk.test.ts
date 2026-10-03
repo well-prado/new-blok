@@ -41,6 +41,15 @@ test("catalog order is irrelevant and duplicate nodes are rejected", () => {
  assert.equal(discover([quote,echo]).catalogDigest,discover([echo,quote]).catalogDigest);
  assert.throws(()=>discover([quote,quote]));
 });
+test("required worker authority changes the canonical discovery identity",()=>{
+ const make=(capabilities:readonly string[])=>defineNode<Record<string,never>,Record<string,never>,null>({name:"fixture/authority",version:"1.0.0",description:"Synthetic authority identity",input:{type:"object"},output:{type:"object"},effects:["http:synthetic"],requiredCapabilities:capabilities,dependencies:null,execute:()=>({})});
+ const a=make(["http:read"]),b=make(["http:write"]);
+ assert.notEqual(discover([a]).catalogDigest,discover([b]).catalogDigest);
+ assert.deepEqual(a.descriptor.requiredCapabilities,["http:read"]);
+ assert.throws(()=>{(a.descriptor.requiredCapabilities as string[]).push("http:write");});
+ assert.equal(discover([make(["http:read","db:read"])]).catalogDigest,discover([make(["db:read","http:read"])]).catalogDigest);
+ assert.throws(()=>make(Array.from({length:129},(_,i)=>`synthetic:${i}`)));
+});
 test("nodes cannot call other nodes or run after cancellation", async () => {
  const n = defineNode<Record<string,never>,{totalCents:string},null>({name:"fixture/nested",version:"1.0.0",description:"forbidden nested call",input:{type:"object"},output:quote.descriptor.outputSchema,dependencies:null,execute:async(c)=>quote.invoke(c,{sku:"coffee",quantity:2})});
  await assert.rejects(n.invoke(ctx(),{}),/Node operation failed/);
