@@ -3,6 +3,7 @@ module github.com/well-prado/new-blok
 go 1.27.0
 
 require (
+	github.com/coder/websocket v1.8.15
 	github.com/nats-io/nats.go v1.54.0
 	go.etcd.io/bbolt v1.5.0
 	google.golang.org/protobuf v1.36.10
