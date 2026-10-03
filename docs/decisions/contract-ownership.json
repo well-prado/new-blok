@@ -105,6 +105,14 @@
       "status": "implemented",
       "decision": "The consumer acknowledges the broker only after durable submission commits under a stable message key; execution retries belong to the queue, poison messages are dead-lettered before termination, and broker flow control bounds in-flight work (ADR 0007).",
       "evidence": ["pubsub-transfer-fixtures", "nats-crash-boundaries", "nats-rebalance", "nats-connection-loss", "nats-slow-consumer-bound", "nats-trigger-conformance"]
+    },
+    {
+      "id": "websocket-bindings",
+      "question": "What happens to identity, ordering and slow or lost peers on a WebSocket connection?",
+      "owner": "E09-T07",
+      "status": "implemented",
+      "decision": "The server assigns connection identity; each connection runs one message at a time with a bounded queue; floods, slow readers and missed pongs close the connection with declared codes; OnDisconnect runs exactly once (ADR 0008).",
+      "evidence": ["websocket-frame-fixtures", "websocket-handshake-origin-auth-ping", "websocket-isolation-spoofing", "websocket-slow-clients", "websocket-disconnect-races", "websocket-shutdown-bounds", "websocket-trigger-conformance"]
     }
   ]
 }

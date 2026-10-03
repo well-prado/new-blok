@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "roadmap": "E09-T07",
+  "inputSchema": {"type":"object","properties":{"sku":{"type":"string"},"quantity":{"type":"integer","minimum":1,"maximum":100},"connectionId":{"type":"string"}},"required":["sku","quantity"]},
+  "maxMessageBytes": 1024,
+  "frames": [
+    {"name":"valid message","frame":"{\"id\":\"r1\",\"input\":{\"sku\":\"coffee\",\"quantity\":2}}","reply":"output","id":"r1","effects":1},
+    {"name":"message without request id","frame":"{\"input\":{\"sku\":\"coffee\",\"quantity\":1}}","reply":"output","id":"","effects":1},
+    {"name":"connection id named in the input","frame":"{\"id\":\"r3\",\"input\":{\"sku\":\"coffee\",\"quantity\":1,\"connectionId\":\"ws-spoofed\"}}","reply":"output","id":"r3","effects":1,"spoof":"ws-spoofed"},
+    {"name":"connection id in the envelope","frame":"{\"id\":\"r4\",\"connectionId\":\"ws-spoofed\",\"input\":{\"sku\":\"coffee\",\"quantity\":1}}","reply":"error","code":"invalid_frame","id":"r4","effects":0},
+    {"name":"malformed JSON","frame":"{\"id\":\"r5\",\"input\":","reply":"error","code":"invalid_frame","id":"","effects":0},
+    {"name":"two JSON values in one frame","frame":"{\"id\":\"r6\",\"input\":{\"sku\":\"coffee\",\"quantity\":1}} {}","reply":"error","code":"invalid_frame","id":"r6","effects":0},
+    {"name":"request id beyond the bound","frame":"{\"id\":\"LONGID\",\"input\":{\"sku\":\"coffee\",\"quantity\":1}}","reply":"error","code":"invalid_frame","id":"","effects":0},
+    {"name":"wrong-typed field","frame":"{\"id\":\"r8\",\"input\":{\"sku\":\"coffee\",\"quantity\":\"two\"}}","reply":"error","code":"invalid_input","id":"r8","effects":0},
+    {"name":"missing input","frame":"{\"id\":\"r9\"}","reply":"error","code":"invalid_input","id":"r9","effects":0},
+    {"name":"domain failure","frame":"{\"id\":\"r10\",\"input\":{\"sku\":\"out-of-stock\",\"quantity\":1}}","reply":"error","code":"out_of_stock","id":"r10","effects":0},
+    {"name":"internal failure","frame":"{\"id\":\"r11\",\"input\":{\"sku\":\"explode\",\"quantity\":1}}","reply":"error","code":"internal","id":"r11","effects":0},
+    {"name":"saturated","frame":"{\"id\":\"r12\",\"input\":{\"sku\":\"busy\",\"quantity\":1}}","reply":"error","code":"saturated","id":"r12","effects":0}
+  ],
+  "closing": [
+    {"name":"binary frame","kind":"binary","status":1003,"reason":"unsupported_data"},
+    {"name":"frame larger than the bound","kind":"oversized","status":1009,"reason":"too_large"}
+  ],
+  "expected": {"output": 3, "errors": 9, "effects": 3, "closed": 2},
+  "limits": [
+    "A malformed text frame is answered with an error and the connection continues; binary and oversized frames close it.",
+    "The envelope admits only id and input; a connection id cannot be supplied by the client."
+  ]
+}
