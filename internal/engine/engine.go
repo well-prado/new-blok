@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/well-prado/new-blok/contract"
+	"github.com/well-prado/new-blok/contract/inspection"
 	"github.com/well-prado/new-blok/contract/schema"
 	"github.com/well-prado/new-blok/internal/value"
 	"github.com/well-prado/new-blok/node"
@@ -42,17 +44,20 @@ type Result struct {
 }
 
 type StepResult struct {
-	ID       string
-	Executed bool
-	Input    any
-	Attempt  int
-	Output   any
-	Error    error
+	ID         string
+	Executed   bool
+	Input      any
+	Attempt    int
+	Output     any
+	Error      error
+	StartedAt  time.Time
+	FinishedAt time.Time
 }
 
 type Engine struct {
 	nodes    map[string]node.Any
 	maxSteps int
+	observer inspection.Observer
 }
 
 func New(nodes map[string]node.Any) *Engine {
@@ -71,15 +76,76 @@ func (e *Engine) WithMaxSteps(max int) *Engine {
 	return &copy
 }
 
+func (e *Engine) WithObserver(observer inspection.Observer) *Engine {
+	copy := *e
+	copy.observer = observer
+	return &copy
+}
+
 func (e *Engine) Run(ctx context.Context, program contract.InternalProgram, input any) (Result, error) {
+	return e.RunObserved(ctx, program, input, inspection.Invocation{})
+}
+
+// RunObserved executes the same production interpreter as Run and emits
+// read-only events tied to trusted invocation metadata.
+func (e *Engine) RunObserved(ctx context.Context, program contract.InternalProgram, input any, invocation inspection.Invocation) (result Result, runErr error) {
 	if e == nil {
 		return Result{}, &Error{Code: "nil_engine", Class: "configuration"}
 	}
 	if len(program.Instructions) > e.maxSteps {
 		return Result{}, &Error{Code: "step_budget_exceeded", Class: "admission"}
 	}
+	emit := func(event inspection.Event) {
+		if e.observer == nil || invocation.RunID == "" {
+			return
+		}
+		event.RunID, event.Principal, event.Workflow = invocation.RunID, invocation.Principal, program.WorkflowID
+		event.ParentRun, event.ParentStep = invocation.ParentRun, invocation.ParentStep
+		event.At = time.Now().UTC()
+		e.observer.Observe(event)
+	}
+	inputJSON, _ := json.Marshal(input)
+	emit(inspection.Event{Kind: inspection.RunStarted, Input: inputJSON})
+	defer func() {
+		terminal := inspection.Event{Kind: inspection.RunCompleted}
+		if runErr != nil {
+			terminal.Kind = inspection.RunFailed
+			var classified *Error
+			if errors.As(runErr, &classified) {
+				terminal.ErrorCode, terminal.ErrorClass = classified.Code, classified.Class
+				if strings.EqualFold(classified.Class, string(inspection.StatusUncertain)) {
+					terminal.Kind = inspection.RunUncertain
+				}
+			}
+			if errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) {
+				terminal.Kind = inspection.RunCanceled
+			}
+		} else {
+			terminal.Output, _ = json.Marshal(result.Output)
+		}
+		emit(terminal)
+	}()
 	state := make(map[string]any)
-	result := Result{State: state}
+	result = Result{State: state}
+	appendStep := func(step StepResult) {
+		result.Steps = append(result.Steps, step)
+		event := inspection.Event{Kind: inspection.StepCompleted, StepID: step.ID, Attempt: step.Attempt, Input: marshalObservation(step.Input), Output: marshalObservation(step.Output)}
+		if step.Error != nil {
+			event.Kind = inspection.StepFailed
+			var classified *Error
+			if errors.As(step.Error, &classified) {
+				event.ErrorCode, event.ErrorClass = classified.Code, classified.Class
+				if strings.EqualFold(classified.Class, string(inspection.StatusUncertain)) {
+					event.Kind = inspection.StepUncertain
+				}
+			}
+			if errors.Is(step.Error, context.Canceled) || errors.Is(step.Error, context.DeadlineExceeded) {
+				event.Kind = inspection.StepCanceled
+			}
+		}
+		event.At = step.FinishedAt
+		emit(event)
+	}
 	for _, instruction := range program.Instructions {
 		if err := ctx.Err(); err != nil {
 			return result, &Error{Code: "canceled", Class: "cancellation", Step: instruction.ID, Err: err}
@@ -90,59 +156,81 @@ func (e *Engine) Run(ctx context.Context, program contract.InternalProgram, inpu
 			definition, ok := e.nodes[instruction.Node]
 			if !ok {
 				step.Error = &Error{Code: "unknown_node", Class: "configuration", Step: instruction.ID}
-				result.Steps = append(result.Steps, step)
+				step.FinishedAt = time.Now().UTC()
+				appendStep(step)
 				return result, step.Error
 			}
 			callInput, err := resolveCallInput(state, instruction, input)
 			if err != nil {
 				step.Error = &Error{Code: "invalid_input_reference", Class: "validation", Step: instruction.ID, Err: err}
-				result.Steps = append(result.Steps, step)
+				step.FinishedAt = time.Now().UTC()
+				appendStep(step)
 				return result, step.Error
 			}
 			step.Input = callInput
 			step.Attempt = 1
+			step.StartedAt = time.Now().UTC()
+			emit(inspection.Event{Kind: inspection.StepProcessing, StepID: step.ID, Attempt: step.Attempt, Input: marshalObservation(step.Input)})
 			if err := validateSchema(definition.Descriptor().InputSchema, callInput); err != nil {
 				step.Error = &Error{Code: "invalid_input", Class: "validation", Step: instruction.ID, Err: err}
-				result.Steps = append(result.Steps, step)
+				step.FinishedAt = time.Now().UTC()
+				appendStep(step)
 				return result, step.Error
 			}
 			output, err := definition.Invoke(ctx, callInput)
 			step.Executed = true
 			if err != nil {
 				step.Error = classify(instruction.ID, err)
-				result.Steps = append(result.Steps, step)
+				step.FinishedAt = time.Now().UTC()
+				appendStep(step)
 				return result, step.Error
 			}
 			if err := validateSchema(definition.Descriptor().OutputSchema, output); err != nil {
 				step.Error = &Error{Code: "invalid_output", Class: "validation", Step: instruction.ID, Err: err}
-				result.Steps = append(result.Steps, step)
+				step.FinishedAt = time.Now().UTC()
+				appendStep(step)
 				return result, step.Error
 			}
 			committed, err := value.Clone(output)
 			if err != nil {
 				step.Error = &Error{Code: "output_ownership", Class: "validation", Step: instruction.ID, Err: err}
-				result.Steps = append(result.Steps, step)
+				step.FinishedAt = time.Now().UTC()
+				appendStep(step)
 				return result, step.Error
 			}
 			state[instruction.ID] = committed
 			step.Output = committed
 		case "output":
+			step.StartedAt = time.Now().UTC()
+			step.Attempt = 1
+			emit(inspection.Event{Kind: inspection.StepProcessing, StepID: step.ID, Attempt: step.Attempt})
 			output, err := resolveOutput(state, instruction.References)
 			if err != nil {
 				step.Error = &Error{Code: "invalid_output_reference", Class: "validation", Step: instruction.ID, Err: err}
-				result.Steps = append(result.Steps, step)
+				step.FinishedAt = time.Now().UTC()
+				appendStep(step)
 				return result, step.Error
 			}
 			result.Output = output
 			step.Output = output
 		default:
 			step.Error = &Error{Code: "unsupported_instruction", Class: "configuration", Step: instruction.ID}
-			result.Steps = append(result.Steps, step)
+			step.FinishedAt = time.Now().UTC()
+			appendStep(step)
 			return result, step.Error
 		}
-		result.Steps = append(result.Steps, step)
+		step.FinishedAt = time.Now().UTC()
+		appendStep(step)
 	}
 	return result, nil
+}
+
+func marshalObservation(value any) json.RawMessage {
+	if value == nil {
+		return nil
+	}
+	data, _ := json.Marshal(value)
+	return data
 }
 
 func classify(step string, err error) error {
