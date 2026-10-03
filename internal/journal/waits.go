@@ -15,6 +15,7 @@ const (
 	waitResumed  = "resumed"
 	waitCanceled = "canceled"
 	signalStored = "stored"
+	signalPending = "pending"
 	signalLate   = "late"
 )
 
@@ -66,6 +67,24 @@ func (j *Journal) ScheduleWait(ctx context.Context, request WaitRequest) (WaitRe
 			return ErrWaitExists
 		}
 		record = WaitRecord{WaitID: request.WaitID, RunID: request.RunID, Name: request.Name, DueAt: request.DueAt.UTC(), State: waitWaiting}
+		var signalID string
+		var payload []byte
+		err = tx.QueryRowContext(ctx, `SELECT signal_id, payload_json FROM journal_signals WHERE run_id = ? AND name = ? AND state = ? ORDER BY created_at, signal_id LIMIT 1`, request.RunID, request.Name, signalPending).Scan(&signalID, &payload)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE journal_signals SET state = ? WHERE run_id = ? AND signal_id = ? AND state = ?`, signalStored, request.RunID, signalID, signalPending); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE journal_waits SET state = ?, signal_id = ?, payload_json = ?, updated_at = ? WHERE wait_id = ? AND state = ?`, waitResumed, signalID, payload, j.now(), request.WaitID, waitWaiting); err != nil {
+			return err
+		}
+		record.State = waitResumed
+		record.SignalID = signalID
+		record.Payload = append([]byte(nil), payload...)
 		return nil
 	})
 	return record, err
@@ -83,7 +102,7 @@ func (j *Journal) Signal(ctx context.Context, envelope signal.Envelope, authoriz
 		var existing string
 		err := tx.QueryRowContext(ctx, `SELECT state FROM journal_signals WHERE run_id = ? AND signal_id = ?`, envelope.RunID, envelope.SignalID).Scan(&existing)
 		if err == nil {
-			result = SignalResult{Duplicate: true, Accepted: existing == signalStored, Resumed: existing == signalStored}
+			result = SignalResult{Duplicate: true, Accepted: existing == signalStored || existing == signalPending, Resumed: existing == signalStored}
 			return nil
 		}
 		if !errors.Is(err, sql.ErrNoRows) {
@@ -92,8 +111,8 @@ func (j *Journal) Signal(ctx context.Context, envelope signal.Envelope, authoriz
 		var waitID, state string
 		err = tx.QueryRowContext(ctx, `SELECT wait_id, state FROM journal_waits WHERE run_id = ? AND name = ?`, envelope.RunID, envelope.Name).Scan(&waitID, &state)
 		if errors.Is(err, sql.ErrNoRows) {
-			_, err = tx.ExecContext(ctx, `INSERT INTO journal_signals (run_id, signal_id, name, principal, payload_json, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, envelope.RunID, envelope.SignalID, envelope.Name, envelope.Principal, []byte(envelope.Payload), signalLate, j.now())
-			result = SignalResult{Late: true}
+			_, err = tx.ExecContext(ctx, `INSERT INTO journal_signals (run_id, signal_id, name, principal, payload_json, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, envelope.RunID, envelope.SignalID, envelope.Name, envelope.Principal, []byte(envelope.Payload), signalPending, j.now())
+			result = SignalResult{Accepted: true}
 			return err
 		}
 		if err != nil {
