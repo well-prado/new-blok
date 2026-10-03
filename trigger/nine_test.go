@@ -365,14 +365,25 @@ func TestNineTriggersDrainTogether(t *testing.T) {
 // TestNineTriggersUnderMixedLoad sends concurrent traffic through every
 // trigger at once over the one store and a pool of workers: every request
 // succeeds, every durable submission runs exactly once, and no worker sees
-// an error.
+// an error. Clients keep at most clientConcurrency requests in flight, as
+// real clients do: an unbounded burst of durable writes queues on SQLite's
+// single writer past its busy timeout, which is the saturation case, not
+// this one.
 func TestNineTriggersUnderMixedLoad(t *testing.T) {
 	baseline := goroutineSet()
-	const inBandLoad, durableLoad = 8, 40
+	const inBandLoad, durableLoad, clientConcurrency = 8, 40, 16
 	n := newNine(t, 4)
 	close(n.begin)
 	ctx := context.Background()
+	slots := make(chan struct{}, clientConcurrency)
 	var group sync.WaitGroup
+	// limited runs one client request within the concurrency bound.
+	limited := func(request func()) {
+		defer group.Done()
+		slots <- struct{}{}
+		defer func() { <-slots }()
+		request()
+	}
 	failures := make(chan string, 4*inBandLoad+4*durableLoad)
 	fail := func(format string, args ...any) { failures <- fmt.Sprintf(format, args...) }
 	var keys []string
@@ -385,20 +396,17 @@ func TestNineTriggersUnderMixedLoad(t *testing.T) {
 	for i := range inBandLoad {
 		user := fmt.Sprintf("user-%d", i)
 		group.Add(4)
-		go func() {
-			defer group.Done()
+		go limited(func() {
 			if status, _, body := n.post("/quotes", auth(user), order); status != http.StatusOK {
 				fail("http %s: %d %s", user, status, body)
 			}
-		}()
-		go func() {
-			defer group.Done()
+		})
+		go limited(func() {
 			if reply, err := n.callGRPC(ctx, user); err != nil || n.grpcCents(reply) != wantCents {
 				fail("grpc %s: %v", user, err)
 			}
-		}()
-		go func() {
-			defer group.Done()
+		})
+		go limited(func() {
 			socket, _, err := n.dialWS(ctx, user)
 			if err != nil {
 				fail("websocket %s: %v", user, err)
@@ -408,9 +416,8 @@ func TestNineTriggersUnderMixedLoad(t *testing.T) {
 			if _, err := wsQuote(ctx, socket, "load"); err != nil {
 				fail("websocket %s: %v", user, err)
 			}
-		}()
-		go func() {
-			defer group.Done()
+		})
+		go limited(func() {
 			session, err := n.mcpSession(ctx, user)
 			if err != nil {
 				fail("mcp %s: %v", user, err)
@@ -420,43 +427,39 @@ func TestNineTriggersUnderMixedLoad(t *testing.T) {
 			if _, err := mcpQuote(ctx, session); err != nil {
 				fail("mcp %s: %v", user, err)
 			}
-		}()
+		})
 	}
 	for i := range durableLoad {
 		user := fmt.Sprintf("user-%d", i)
 		group.Add(4)
-		go func() {
-			defer group.Done()
+		go limited(func() {
 			id := fmt.Sprintf("evt-%d", i)
 			if status, _, body := n.post("/webhooks/shop", n.signed(id), order); status != http.StatusAccepted {
 				fail("webhook %s: %d %s", id, status, body)
 				return
 			}
 			key(webhook.SubmissionKey("shop", id))
-		}()
-		go func() {
-			defer group.Done()
+		})
+		go limited(func() {
 			if status, _, body := n.sseStart(user, "load"); status != http.StatusAccepted {
 				fail("sse %s: %d %s", user, status, body)
 				return
 			}
 			key(sse.SubmissionKey("orders", trigger.Principal{ID: user}, "load"))
-		}()
-		go func() {
-			defer group.Done()
+		})
+		go limited(func() {
 			id := fmt.Sprintf("m-%d", i)
 			n.broker.publish(t, id, []byte(order))
 			key(pubsub.SubmissionKey("orders", n.broker.messageID(id)))
-		}()
-		go func() {
-			defer group.Done()
+		})
+		go limited(func() {
 			requestKey := fmt.Sprintf("worker:load-%d", i)
 			if enqueued, err := n.queue.Enqueue(ctx, worker.EnqueueRequest{RequestKey: requestKey, Kind: "quote.worker", Payload: []byte(order), MaxAttempts: 3}); err != nil || !enqueued.Accepted {
 				fail("worker %s: %+v %v", requestKey, enqueued, err)
 				return
 			}
 			key(requestKey)
-		}()
+		})
 	}
 	group.Wait()
 	close(failures)
