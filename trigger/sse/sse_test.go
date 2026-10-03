@@ -36,11 +36,16 @@ type memorySubmitter struct {
 	count    int
 	hold     chan struct{}
 	holdFor  string
+	// entered, when set, is signaled as a held submission starts waiting.
+	entered  chan struct{}
 	canceled atomic.Bool
 }
 
 func (m *memorySubmitter) Submit(ctx context.Context, s trigger.Submission) (bool, error) {
 	if m.hold != nil && (m.holdFor == "" || strings.Contains(string(s.Payload), m.holdFor)) {
+		if m.entered != nil {
+			m.entered <- struct{}{}
+		}
 		<-m.hold
 		// Give the caller's disconnect time to reach the context, if it
 		// is going to.
@@ -122,6 +127,7 @@ func (c *closed) wait(t *testing.T, reason string) {
 }
 
 type fixture struct {
+	app    *app.Application
 	hub    *sse.Hub
 	server *sse.Server
 	http   *httptest.Server
@@ -143,7 +149,7 @@ func newFixture(t *testing.T, config sse.HubConfig, configure func(*sse.Endpoint
 	if err := application.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	f := &fixture{hub: hub, submit: &memorySubmitter{payloads: map[string]string{}, settled: map[string]bool{}}, closed: &closed{}}
+	f := &fixture{app: application, hub: hub, submit: &memorySubmitter{payloads: map[string]string{}, settled: map[string]bool{}}, closed: &closed{}}
 	endpoint := sse.Endpoint{Name: "orders", Path: "/orders", Kind: "order.build", Submit: f.submit, Tracker: f.submit, Authenticate: authenticate, InputSchema: []byte(orderSchema), OnClose: f.closed.record}
 	if configure != nil {
 		configure(&endpoint)
@@ -1236,5 +1242,93 @@ func TestLeftSubscriberDoesNotPinStream(t *testing.T) {
 	clock.add(2 * time.Minute)
 	if status, body := f.start(t, "alice", "k2", `{"item":"book"}`); status != http.StatusAccepted {
 		t.Fatalf("a stream its subscriber left kept the hub full: %d %v", status, body)
+	}
+}
+
+// TestStartHoldsTheApplicationUntilSubmitted: the application cannot stop
+// while a start's durable submission is in flight; a start that arrives
+// while it drains is refused without submitting, and an open subscription
+// does not hold the application open.
+func TestStartHoldsTheApplicationUntilSubmitted(t *testing.T) {
+	f := newFixture(t, sse.HubConfig{}, nil)
+	stream := f.started(t, "alice", "first")
+	follow, err := http.NewRequest(http.MethodGet, f.url(stream), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	follow.Header.Set("Authorization", "Bearer alice")
+	subscription, err := f.client.Do(follow)
+	if err != nil || subscription.StatusCode != http.StatusOK {
+		t.Fatalf("subscription: %v %v", subscription, err)
+	}
+	defer subscription.Body.Close()
+	f.submit.hold, f.submit.entered = make(chan struct{}), make(chan struct{}, 1)
+	f.submit.holdFor = "pen"
+	var release sync.Once
+	// Cleanups run last-in first-out: this one frees a held submission
+	// before the fixture shuts down, so a failure cannot hang the test.
+	t.Cleanup(func() { release.Do(func() { close(f.submit.hold) }) })
+	type reply struct {
+		status int
+		body   map[string]any
+	}
+	replies := make(chan reply, 1)
+	go func() {
+		status, body := f.start(t, "alice", "held", `{"item":"pen"}`)
+		replies <- reply{status, body}
+	}()
+	select {
+	case <-f.submit.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the held start never reached its submission")
+	}
+	drained := make(chan error, 1)
+	go func() { drained <- f.app.Shutdown(context.Background()) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for f.app.State() == app.ReadyState {
+		if time.Now().After(deadline) {
+			t.Fatal("the application never began draining")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	before := f.submit.submissions()
+	late, err := http.NewRequest(http.MethodPost, f.http.URL+"/orders", strings.NewReader(`{"item":"book"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	late.Header.Set("Authorization", "Bearer alice")
+	late.Header.Set("Idempotency-Key", "late")
+	refused, err := f.client.Do(late)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var refusal map[string]any
+	_ = json.NewDecoder(refused.Body).Decode(&refusal)
+	refused.Body.Close()
+	if refused.StatusCode != http.StatusServiceUnavailable || refused.Header.Get("Retry-After") != "1" || refusal["error"] != "unavailable" {
+		t.Fatalf("a start while draining: %d Retry-After=%q %v", refused.StatusCode, refused.Header.Get("Retry-After"), refusal)
+	}
+	if got := f.submit.submissions(); got != before {
+		t.Fatalf("a refused start submitted (%d submissions, was %d)", got, before)
+	}
+	if state := f.app.State(); state != app.DrainingState {
+		t.Fatalf("the application is %s with a submission in flight; want draining", state)
+	}
+	release.Do(func() { close(f.submit.hold) })
+	select {
+	case r := <-replies:
+		if r.status != http.StatusAccepted {
+			t.Fatalf("the held start answered %d %v", r.status, r.body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the held start never answered")
+	}
+	select {
+	case err := <-drained:
+		if err != nil {
+			t.Fatalf("drain: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("an open subscription kept the application from stopping")
 	}
 }
