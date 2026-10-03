@@ -129,8 +129,11 @@ type Server struct {
 	mu          sync.Mutex
 	views       map[string]*view
 	order       []string
-	calls       sync.WaitGroup
-	closing     bool
+	// retired are evicted views whose sessions may still be open; Shutdown
+	// closes them too.
+	retired []*view
+	calls   sync.WaitGroup
+	closing bool
 	// inflight holds the calls in flight by session id, so a session its
 	// owner ends cancels its calls.
 	inflight map[string]*sessionCalls
@@ -233,7 +236,14 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		http.Error(writer, "unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	defer lease.Release()
+	// A GET is the session's standing stream and lasts as long as the
+	// session, so it is admitted but does not hold the application open;
+	// calls arrive as POSTs and do.
+	if request.Method == http.MethodGet {
+		lease.Release()
+	} else {
+		defer lease.Release()
+	}
 	s.mu.Lock()
 	closing := s.closing
 	s.mu.Unlock()
@@ -339,13 +349,28 @@ func (s *Server) serverFor(request *http.Request) *sdk.Server {
 		return existing.server
 	}
 	if len(s.order) >= s.config.MaxPrincipals {
-		// The oldest view goes; its open sessions keep their server.
+		// The oldest view goes; its open sessions keep their server until
+		// they end or Shutdown closes them.
+		live := s.retired[:0]
+		for _, old := range s.retired {
+			if hasSessions(old.server) {
+				live = append(live, old)
+			}
+		}
+		s.retired = append(live, s.views[s.order[0]])
 		delete(s.views, s.order[0])
 		s.order = s.order[1:]
 	}
 	s.views[key] = v
 	s.order = append(s.order, key)
 	return v.server
+}
+
+func hasSessions(server *sdk.Server) bool {
+	for range server.Sessions() {
+		return true
+	}
+	return false
 }
 
 func viewKey(principal tool.Principal) string {
@@ -392,7 +417,9 @@ func (s *Server) build(ctx context.Context, principal tool.Principal) (*view, er
 		if output != nil && output.Type == "object" {
 			descriptor.OutputSchema = json.RawMessage(t.OutputSchema)
 		}
-		server.AddTool(descriptor, s.handler(principal, t, input, output))
+		if !addTool(server, descriptor, s.handler(principal, t, input, output)) {
+			continue
+		}
 		resource, err := json.Marshal(map[string]any{"name": t.Name, "version": t.Version, "description": t.Description, "inputSchema": t.InputSchema, "outputSchema": t.OutputSchema, "effects": t.Effects})
 		if err != nil {
 			continue
@@ -403,6 +430,18 @@ func (s *Server) build(ctx context.Context, principal tool.Principal) (*view, er
 		})
 	}
 	return &view{server: server, principal: principal}, nil
+}
+
+// addTool registers a tool, skipping one the SDK refuses: AddTool panics on
+// a descriptor it cannot announce.
+func addTool(server *sdk.Server, descriptor *sdk.Tool, handler sdk.ToolHandler) (added bool) {
+	defer func() {
+		if recover() != nil {
+			added = false
+		}
+	}()
+	server.AddTool(descriptor, handler)
+	return true
 }
 
 // failure is a tool error result: the error is the model's to see, and
@@ -417,13 +456,23 @@ func invalidParams(code string) error {
 	return &jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: code}
 }
 
-func (s *Server) handler(principal tool.Principal, t Tool, input schema.Schema, output *schema.Schema) sdk.ToolHandler {
+// handler serves one tool of a view. The view is the session's, but each
+// call runs as the principal the call's own request authenticated, so
+// capabilities revoked since the session opened no longer apply.
+func (s *Server) handler(owner tool.Principal, t Tool, input schema.Schema, output *schema.Schema) sdk.ToolHandler {
 	return func(ctx context.Context, request *sdk.CallToolRequest) (result *sdk.CallToolResult, err error) {
 		defer func() {
 			if recover() != nil {
 				result, err = failure("internal"), nil
 			}
 		}()
+		var principal tool.Principal
+		if request.Extra != nil && request.Extra.TokenInfo != nil {
+			principal, _ = request.Extra.TokenInfo.Extra["principal"].(tool.Principal)
+		}
+		if principal.ID == "" || principal.ID != owner.ID {
+			return failure("unauthorized"), nil
+		}
 		s.mu.Lock()
 		if s.closing {
 			s.mu.Unlock()
@@ -513,7 +562,7 @@ func codeFor(ctx context.Context, err error) string {
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.mu.Lock()
 	s.closing = true
-	views := make([]*view, 0, len(s.views))
+	views := append(make([]*view, 0, len(s.views)+len(s.retired)), s.retired...)
 	for _, v := range s.views {
 		views = append(views, v)
 	}

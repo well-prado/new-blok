@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "roadmap": "E09-T08",
+  "purpose": "Synthetic MCP tool exposure cases with predeclared outcomes, catalog invocation counts and effect counts. Every value is synthetic.",
+  "expose": ["demo/echo@1.0.0", "demo/write@1.0.0", "demo/list@1.0.0", "demo/panic@1.0.0", "demo/secret@1.0.0", "demo/badout@1.0.0", "demo/classified@1.0.0", "demo/config@1.0.0", "demo/budget@1.0.0", "demo/meta@1.0.0"],
+  "discovery": [
+    {"token": "alice", "tools": ["demo.badout_v1.0.0", "demo.budget_v1.0.0", "demo.classified_v1.0.0", "demo.config_v1.0.0", "demo.echo_v1.0.0", "demo.meta_v1.0.0", "demo.panic_v1.0.0", "demo.secret_v1.0.0", "demo.write_v1.0.0"]},
+    {"token": "bob", "tools": ["demo.badout_v1.0.0", "demo.budget_v1.0.0", "demo.classified_v1.0.0", "demo.config_v1.0.0", "demo.echo_v1.0.0", "demo.meta_v1.0.0", "demo.panic_v1.0.0", "demo.secret_v1.0.0"]},
+    {"token": "nobody", "tools": []}
+  ],
+  "calls": [
+    {"name": "valid input reaches the tool once", "token": "bob", "tool": "demo.echo_v1.0.0", "arguments": {"text": "hi"}, "expect": {"kind": "result", "output": {"echo": "hi"}, "invocations": 1, "effects": 0}},
+    {"name": "input of the wrong type is refused before dispatch", "token": "bob", "tool": "demo.echo_v1.0.0", "arguments": {"text": 5}, "expect": {"kind": "protocol", "rpcCode": -32602, "message": "invalid_input", "invocations": 0, "effects": 0}},
+    {"name": "missing required input is refused before dispatch", "token": "bob", "tool": "demo.echo_v1.0.0", "arguments": {}, "expect": {"kind": "protocol", "rpcCode": -32602, "message": "invalid_input", "invocations": 0, "effects": 0}},
+    {"name": "unknown input field is refused before dispatch", "token": "bob", "tool": "demo.echo_v1.0.0", "arguments": {"text": "hi", "admin": true}, "expect": {"kind": "protocol", "rpcCode": -32602, "message": "invalid_input", "invocations": 0, "effects": 0}},
+    {"name": "unknown tool is a protocol error", "token": "alice", "tool": "demo.nope_v1.0.0", "arguments": {}, "expect": {"kind": "protocol", "rpcCode": -32602, "invocations": 0, "effects": 0}},
+    {"name": "unknown version is a protocol error", "token": "alice", "tool": "demo.echo_v2.0.0", "arguments": {"text": "hi"}, "expect": {"kind": "protocol", "rpcCode": -32602, "invocations": 0, "effects": 0}},
+    {"name": "a listed tool that is not exposed is invisible", "token": "alice", "tool": "demo.hidden_v1.0.0", "arguments": {}, "expect": {"kind": "protocol", "rpcCode": -32602, "invocations": 0, "effects": 0}},
+    {"name": "an exposed tool without an object input schema is invisible", "token": "alice", "tool": "demo.list_v1.0.0", "arguments": {}, "expect": {"kind": "protocol", "rpcCode": -32602, "invocations": 0, "effects": 0}},
+    {"name": "a tool beyond the caller's capabilities is invisible", "token": "bob", "tool": "demo.write_v1.0.0", "arguments": {"amount": 1}, "expect": {"kind": "protocol", "rpcCode": -32602, "invocations": 0, "effects": 0}},
+    {"name": "an effect within the caller's capabilities runs once", "token": "alice", "tool": "demo.write_v1.0.0", "arguments": {"amount": 1}, "expect": {"kind": "result", "output": {"ok": true}, "invocations": 1, "effects": 1}},
+    {"name": "a tool panic is an internal tool error", "token": "bob", "tool": "demo.panic_v1.0.0", "arguments": {}, "expect": {"kind": "toolError", "code": "internal", "invocations": 1, "effects": 0}},
+    {"name": "an error carrying a secret is an internal tool error", "token": "bob", "tool": "demo.secret_v1.0.0", "arguments": {}, "expect": {"kind": "toolError", "code": "internal", "invocations": 1, "effects": 0}},
+    {"name": "output outside its schema is never returned", "token": "bob", "tool": "demo.badout_v1.0.0", "arguments": {}, "expect": {"kind": "toolError", "code": "invalid_output", "invocations": 1, "effects": 0}},
+    {"name": "a classified domain error keeps its stable code", "token": "bob", "tool": "demo.classified_v1.0.0", "arguments": {}, "expect": {"kind": "toolError", "code": "out_of_stock", "invocations": 1, "effects": 0}},
+    {"name": "a configuration error is internal", "token": "bob", "tool": "demo.config_v1.0.0", "arguments": {}, "expect": {"kind": "toolError", "code": "internal", "invocations": 1, "effects": 0}},
+    {"name": "a budget error keeps its stable code", "token": "bob", "tool": "demo.budget_v1.0.0", "arguments": {}, "expect": {"kind": "toolError", "code": "budget_exceeded", "invocations": 1, "effects": 0}},
+    {"name": "a named approval reaches the catalog as a name only", "token": "bob", "tool": "demo.meta_v1.0.0", "arguments": {}, "approval": "review-7", "expect": {"kind": "result", "output": {"approval": "review-7"}, "invocations": 1, "effects": 0}},
+    {"name": "an approval that is not a string is refused", "token": "bob", "tool": "demo.meta_v1.0.0", "arguments": {}, "approval": 7, "expect": {"kind": "protocol", "rpcCode": -32602, "message": "invalid_approval", "invocations": 0, "effects": 0}},
+    {"name": "an approval with spaces is refused", "token": "bob", "tool": "demo.meta_v1.0.0", "arguments": {}, "approval": "review 7", "expect": {"kind": "protocol", "rpcCode": -32602, "message": "invalid_approval", "invocations": 0, "effects": 0}}
+  ]
+}
