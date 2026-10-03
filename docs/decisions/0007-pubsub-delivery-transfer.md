@@ -39,7 +39,9 @@ shutdown does not cancel.
 - **Execution retries belong to the durable queue**, not to the broker.
 - **Saturation** is backpressure: the message is valid, so it is nak'ed with
   exponential backoff (1 s doubling to 1 minute) and never dead-lettered for
-  it, however many deliveries that takes.
+  it, however many deliveries that takes. A store too busy to take the
+  submission in time (`store.ErrBusy`, or the submit deadline running out
+  while waiting for it) is saturation too (#184).
 - **An unavailable store** naks with the same backoff until the delivery
   budget (`MaxDeliver`, 5 by default, at most 100) is spent, then
   dead-letters with `delivery_budget_exhausted`. The budget is checked only
