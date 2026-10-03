@@ -9,7 +9,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/well-prado/new-blok/app"
+	appdeploy "github.com/well-prado/new-blok/app/deploy"
 	"github.com/well-prado/new-blok/contract/deployment"
 	"github.com/well-prado/new-blok/examples/quote"
 )
@@ -24,7 +24,7 @@ func run() error {
 		return err
 	}
 	// NewApplication lowers and validates the native workflow before returning.
-	d, err := app.NewDeployment(a, c, app.DeploymentChecks{Artifact: func(context.Context) error { return nil }}, handler)
+	d, err := appdeploy.NewDeployment(a, c, appdeploy.DeploymentChecks{Artifact: func(context.Context) error { return nil }}, handler)
 	if err != nil {
 		return err
 	}

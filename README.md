@@ -57,6 +57,13 @@ Invalid SKU or quantity requests return a bounded client error with a `requestId
 
 ## An ecosystem with clear boundaries
 
+Application-owned [deployment examples](examples/deploy/README.md) exercise
+native Go and persistent Go/Node containers, readiness, bounded admission and
+signal drain. The SQLite order example checks actual retained journal artifact
+and checkpoint compatibility, refusing incompatible cold starts. Local evidence
+and remaining limits are recorded alongside the examples; native Windows
+deployment evidence remains pending #156.
+
 This repository owns the framework, CLI, package client, adapter contracts, and conformance suites. Studio, the hosted package registry, and BLOK Cloud will be separate products.
 
 Studio will offer a simple notebook-like development experience: input → processing → output, with attempts, logs, errors and timing visible for each step. Its UI will consume a versioned inspection API. Cloud will consume deployment and operational contracts; applications will remain self-hostable.

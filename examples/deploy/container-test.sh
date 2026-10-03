@@ -52,5 +52,49 @@ docker rm "$durable" >/dev/null
 start_durable
 [[ $(curl -fsS "$durable_url/orders/fixture-81" -H 'Authorization: Bearer synthetic-fixture-token') == "$record" ]]
 [[ $(curl -fsS -X POST "$durable_url/process" -H 'Authorization: Bearer synthetic-fixture-token') == '{"processed":false}' ]]
-echo "PASS native bind/endpoints/quote/SIGTERM; durable auth/committed-admission/restart/retained-order/no-repeat"
+# Run the SQLite fault driver in Linux alongside the application. Host-side
+# mmap/WAL coherence is not guaranteed by macOS bind-mounted container volumes.
+# Python/sqlite3 is already in the pinned Go build image, not the scratch app.
+volume_sql() {
+  docker run --rm -v "$test_dir:/data" golang:1.27.1 python3 -c '
+import os, sqlite3, sys
+with sqlite3.connect("/data/" + sys.argv[1]) as db:
+    if sys.argv[2] == "backup":
+        with sqlite3.connect("/data/" + sys.argv[3]) as target:
+            db.backup(target)
+        os.chmod("/data/" + sys.argv[3], 0o666)
+    else:
+        for row in db.execute(sys.argv[2]):
+            print("|".join(str(value) for value in row))
+' "$@"
+}
+[[ $(volume_sql orders.db 'SELECT COUNT(*) FROM journal_runs') == 1 ]]
+[[ $(volume_sql orders.db 'SELECT COUNT(*) FROM journal_checkpoints') == 1 ]]
+volume_sql orders.db backup pristine.db
+counts() { volume_sql "$1" 'SELECT (SELECT COUNT(*) FROM journal_runs), (SELECT COUNT(*) FROM journal_checkpoints), (SELECT COUNT(*) FROM worker_jobs), (SELECT COUNT(*) FROM orders);'; }
+before=$(counts orders.db)
+volume_sql orders.db "UPDATE journal_checkpoints SET checkpoint_digest='unsupported-v2';"
+[[ $(curl -s -o /dev/null -w '%{http_code}' "$durable_url/healthz") == 200 ]]
+[[ $(curl -s -o /dev/null -w '%{http_code}' "$durable_url/readyz") == 503 ]]
+[[ $(curl -fsS "$durable_url/metrics") == *'blok_ready 0'* ]]
+[[ $(curl -s -o /dev/null -w '%{http_code}' -X POST "$durable_url/orders" -H 'Authorization: Bearer synthetic-fixture-token' -H 'Content-Type: application/json' -d '{"requestKey":"denied-81","sku":"coffee","quantity":2}') == 503 ]]
+[[ $(counts orders.db) == "$before" ]]
+docker kill --signal=TERM "$durable" >/dev/null
+[[ $(docker wait "$durable") == 0 ]]
+docker rm "$durable" >/dev/null
+for fault in missing-artifact incompatible-codec incompatible-manifest; do
+  fault_db="$fault.db"
+  volume_sql pristine.db backup "$fault_db"
+  case "$fault" in
+    missing-artifact) volume_sql "$fault_db" 'DELETE FROM journal_artifacts;' ;;
+    incompatible-codec) volume_sql "$fault_db" "UPDATE journal_checkpoints SET checkpoint_digest='unsupported-v2';" ;;
+    incompatible-manifest) volume_sql "$fault_db" "UPDATE journal_artifacts SET manifest_json=json_set(manifest_json,'$.checkpointFormat','unsupported-v2');" ;;
+  esac
+  before=$(counts "$fault_db")
+  if fault_output=$(docker run --rm -v "$test_dir:/data" -e BLOK_VOLUME="/data/$fault_db" -e BLOK_DEPLOY_TOKEN=synthetic-fixture-token new-blok-81-durable 2>&1); then echo "$fault accepted on cold startup"; exit 1; fi
+  [[ "$fault_output" == *'retained journal incompatible'* ]]
+  echo "$fault: $fault_output"
+  [[ $(counts "$fault_db") == "$before" ]]
+done
+echo "PASS native bind/endpoints/quote/SIGTERM; durable auth/journal-checkpoint/restart/retained-order/no-repeat; live readiness/zero admission and cold retained-artifact/codec faults"
 echo "Synthetic volume retained at $test_dir"

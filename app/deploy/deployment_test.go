@@ -1,8 +1,9 @@
-package app
+package deploy
 
 import (
 	"context"
 	"errors"
+	"github.com/well-prado/new-blok/app"
 	"io"
 	"net"
 	"net/http"
@@ -23,7 +24,7 @@ func TestDeploymentSignalHelper(t *testing.T) {
 	if os.Getenv("BLOK_TEST_CHILD") != "1" {
 		return
 	}
-	a, _ := New(Config{Dependencies: []Dependency{{Name: "resource", Start: func(context.Context) error { return nil }, Close: func(context.Context) error { _, _ = os.Stdout.WriteString("closed\n"); return nil }}}})
+	a, _ := app.New(app.Config{Dependencies: []app.Dependency{{Name: "resource", Start: func(context.Context) error { return nil }, Close: func(context.Context) error { _, _ = os.Stdout.WriteString("closed\n"); return nil }}}})
 	c := deployment.Config{ListenerAddress: os.Getenv("BLOK_TEST_ADDR"), MaxAdmission: 1, DrainTimeout: time.Second}
 	if os.Getenv("BLOK_TEST_TIMEOUT") == "1" {
 		c.DrainTimeout = 100 * time.Millisecond
@@ -44,7 +45,7 @@ func TestDeploymentSignalHelper(t *testing.T) {
 	signal.Notify(signals, syscall.SIGTERM)
 	err = d.Run(context.Background(), signals)
 	if os.Getenv("BLOK_TEST_TIMEOUT") == "1" {
-		if !errors.Is(err, ErrDrainTimeout) {
+		if !errors.Is(err, app.ErrDrainTimeout) {
 			os.Exit(4)
 		}
 	} else if err != nil {
@@ -121,7 +122,7 @@ func TestDeploymentSIGTERMDrain(t *testing.T) {
 }
 
 func TestDeploymentLiveAdmissionAndProbes(t *testing.T) {
-	a, _ := New(Config{})
+	a, _ := app.New(app.Config{})
 	if err := a.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +185,7 @@ func TestDeploymentLiveAdmissionAndProbes(t *testing.T) {
 func TestDeploymentSelectedChecksFailClosed(t *testing.T) {
 	for _, missing := range []string{"artifact", "store", "worker", "secret"} {
 		t.Run(missing, func(t *testing.T) {
-			a, _ := New(Config{})
+			a, _ := app.New(app.Config{})
 			a.Start(context.Background())
 			defer a.Shutdown(context.Background())
 			check := func(name string) func(context.Context) error {
@@ -214,7 +215,7 @@ func TestDeploymentSelectedChecksFailClosed(t *testing.T) {
 }
 
 func TestDeploymentUnselectedChecksNeverRun(t *testing.T) {
-	a, _ := New(Config{})
+	a, _ := app.New(app.Config{})
 	a.Start(context.Background())
 	defer a.Shutdown(context.Background())
 	unselected := func(context.Context) error { t.Error("unselected dependency probed"); return errors.New("missing") }

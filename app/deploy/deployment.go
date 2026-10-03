@@ -1,10 +1,12 @@
-package app
+// Package deploy provides optional HTTP deployment endpoints and signal drain.
+package deploy
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/well-prado/new-blok/app"
 	"net"
 	"net/http"
 	"os"
@@ -27,7 +29,7 @@ type DeploymentChecks struct {
 }
 
 type Deployment struct {
-	application *Application
+	application *app.Application
 	config      deployment.Config
 	checks      DeploymentChecks
 	limiter     *deployment.Limiter
@@ -35,7 +37,7 @@ type Deployment struct {
 	rejected    atomic.Uint64
 }
 
-func NewDeployment(a *Application, c deployment.Config, checks DeploymentChecks, handler http.Handler) (*Deployment, error) {
+func NewDeployment(a *app.Application, c deployment.Config, checks DeploymentChecks, handler http.Handler) (*Deployment, error) {
 	if a == nil || handler == nil || checks.Artifact == nil {
 		return nil, deployment.ErrInvalid
 	}
@@ -54,11 +56,14 @@ func (d *Deployment) status(ctx context.Context) deployment.Status {
 	ctx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
 	deps := deployment.Dependencies{Secrets: make(map[string]bool)}
-	deps.Artifact = d.application.Ready() && d.checks.Artifact(ctx) == nil
-	if d.config.StoreRequired && d.checks.Store != nil {
+	// Dependency handles are published when Start transitions to Ready. Avoid
+	// probing partially initialized resources while startup is still running.
+	initialized := d.application.Ready()
+	deps.Artifact = initialized && d.checks.Artifact(ctx) == nil
+	if initialized && d.config.StoreRequired && d.checks.Store != nil {
 		deps.Store = d.checks.Store(ctx) == nil
 	}
-	if d.config.WorkerRequired && d.checks.Worker != nil {
+	if initialized && d.config.WorkerRequired && d.checks.Worker != nil {
 		deps.Worker = d.checks.Worker(ctx) == nil
 	}
 	for _, ref := range d.config.RequiredSecrets {
@@ -166,7 +171,7 @@ func (d *Deployment) Run(ctx context.Context, signals <-chan os.Signal) error {
 		return errors.New("deployment: listener failed")
 	}
 	if shutdownErr != nil {
-		return ErrDrainTimeout
+		return app.ErrDrainTimeout
 	}
 	return closeErr
 }

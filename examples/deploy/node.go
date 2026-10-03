@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/well-prado/new-blok/app"
+	appdeploy "github.com/well-prado/new-blok/app/deploy"
 	"github.com/well-prado/new-blok/contract/deployment"
 	runtime "github.com/well-prado/new-blok/contract/runtime"
 	"github.com/well-prado/new-blok/flow"
@@ -73,7 +74,7 @@ func nodeArtifact(root string) (string, error) {
 
 // NewNodeDeployment selects one persistent child worker on authenticated
 // loopback. Neither a broker nor a store is selected by this memory workflow.
-func NewNodeDeployment(c deployment.Config, root string) (*app.Deployment, error) {
+func NewNodeDeployment(c deployment.Config, root string) (*appdeploy.Deployment, error) {
 	c.WorkerRequired = true
 	c.RequiredSecrets = append(c.RequiredSecrets, "BLOK_WORKER_TOKEN")
 	if c.MaxAdmission > 32 {
@@ -151,7 +152,7 @@ func NewNodeDeployment(c deployment.Config, root string) (*app.Deployment, error
 	if err != nil {
 		return nil, err
 	}
-	return app.NewDeployment(a, c, app.DeploymentChecks{Artifact: func(ctx context.Context) error {
+	return appdeploy.NewDeployment(a, c, appdeploy.DeploymentChecks{Artifact: func(ctx context.Context) error {
 		actual, err := nodeArtifact(root)
 		if err != nil {
 			return err

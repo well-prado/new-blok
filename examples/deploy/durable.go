@@ -14,15 +14,18 @@ import (
 	"time"
 
 	"github.com/well-prado/new-blok/app"
+	appdeploy "github.com/well-prado/new-blok/app/deploy"
 	"github.com/well-prado/new-blok/contract/deployment"
+	"github.com/well-prado/new-blok/contract/schema"
 	"github.com/well-prado/new-blok/examples/order"
+	"github.com/well-prado/new-blok/internal/journal"
 	"github.com/well-prado/new-blok/store"
 	"github.com/well-prado/new-blok/store/sqlite"
 )
 
-// NewDurable demonstrates committed order admission and business persistence.
-// It does not claim journal checkpoint/retained executable recovery (#49).
-func NewDurable(c deployment.Config, path string) (*app.Deployment, error) {
+// NewDurable demonstrates committed order admission and business persistence,
+// with readiness bound to the selected executable and real retained journal.
+func NewDurable(c deployment.Config, path string) (*appdeploy.Deployment, error) {
 	if !filepath.IsAbs(path) {
 		return nil, errors.New("deployment: absolute durable volume path required")
 	}
@@ -30,6 +33,26 @@ func NewDurable(c deployment.Config, path string) (*app.Deployment, error) {
 	c.RequiredSecrets = []string{"BLOK_DEPLOY_TOKEN"}
 	var database store.Database
 	var service *order.Service
+	var retained *journal.Journal
+	inputSchema, err := schema.Parse([]byte(durableInputSchema))
+	if err != nil {
+		return nil, err
+	}
+	manifest, codec, err := durableArtifact()
+	if err != nil {
+		return nil, err
+	}
+	probe, err := app.RetainedArtifactProbe(manifest, codec, func(ctx context.Context, visit func(app.RetainedArtifact) error) error {
+		if retained == nil {
+			return errors.New("deployment: journal unavailable")
+		}
+		return retained.RetainedArtifacts(ctx, func(item journal.RetainedArtifact) error {
+			return visit(app.RetainedArtifact{ArtifactDigest: item.ArtifactDigest, ManifestJSON: item.ManifestJSON, CheckpointArtifact: item.CheckpointArtifact, CheckpointDigest: item.CheckpointDigest, CheckpointPresent: item.CheckpointPresent})
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
 	const format = "deploy-order-v1"
 	storeCheck := func(ctx context.Context) error {
 		if database == nil {
@@ -77,6 +100,19 @@ func NewDurable(c deployment.Config, path string) (*app.Deployment, error) {
 			if err := storeCheck(ctx); err != nil {
 				return errors.New("deployment: incompatible store")
 			}
+			retained, err = journal.New(ctx, database, journal.Config{})
+			if err != nil {
+				return errors.New("deployment: journal unavailable")
+			}
+			// Check before registering: never repair a missing retained artifact.
+			if err := probe(ctx); err != nil {
+				return errors.New("deployment: retained journal incompatible")
+			}
+			identity, _ := manifest.Digest()
+			canonical, _ := manifest.Canonical()
+			if err := retained.RegisterArtifact(ctx, journal.ArtifactRecord{Digest: identity, Version: manifest.Version, ManifestJSON: canonical}); err != nil {
+				return err
+			}
 			service, err = order.New(ctx, database, map[string]int64{"coffee": 1500}, time.Now)
 			if err != nil {
 				return errors.New("deployment: order schema unavailable")
@@ -99,7 +135,7 @@ func NewDurable(c deployment.Config, path string) (*app.Deployment, error) {
 		var input order.Request
 		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
 		dec.DisallowUnknownFields()
-		if err := dec.Decode(&input); err != nil || input.RequestKey == "" || len(input.RequestKey) > 128 || input.SKU != "coffee" || input.Quantity < 1 || input.Quantity > 100 {
+		if err := dec.Decode(&input); err != nil || input.RequestKey == "" || len(input.RequestKey) > 128 || input.SKU != "coffee" {
 			http.Error(w, "invalid order", 400)
 			return
 		}
@@ -108,8 +144,35 @@ func NewDurable(c deployment.Config, path string) (*app.Deployment, error) {
 			http.Error(w, "invalid order", 400)
 			return
 		}
+		// Bind admission to the executable before acknowledging the queue handoff.
+		// Partial commits before 202 are retried with the same request key; queue
+		// deduplication still owns business processing and outbox atomicity.
+		payload, err := json.Marshal(input)
+		if err != nil {
+			http.Error(w, "admission failed", 503)
+			return
+		}
+		if err := inputSchema.ValidateValue(payload); err != nil {
+			http.Error(w, "invalid order", 400)
+			return
+		}
+		identity, _ := manifest.Digest()
+		run, err := retained.Admit(r.Context(), journal.AdmissionRequest{RequestKey: input.RequestKey, Workflow: manifest.Name, ArtifactDigest: identity, Input: payload})
+		if err != nil {
+			http.Error(w, "admission failed", 503)
+			return
+		}
 		result, err := service.Enqueue(r.Context(), input)
 		if err != nil {
+			http.Error(w, "admission failed", 503)
+			return
+		}
+		state, _ := json.Marshal(struct {
+			Format  string        `json:"format"`
+			Request order.Request `json:"request"`
+			Queued  bool          `json:"queued"`
+		}{durableCheckpointFormat, input, true})
+		if err := retained.SaveCheckpoint(r.Context(), journal.Checkpoint{RunID: run.RunID, ArtifactDigest: identity, CheckpointDigest: codec, State: state}); err != nil {
 			http.Error(w, "admission failed", 503)
 			return
 		}
@@ -149,10 +212,11 @@ func NewDurable(c deployment.Config, path string) (*app.Deployment, error) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(value)
 	})
-	return app.NewDeployment(a, c, app.DeploymentChecks{Artifact: func(context.Context) error {
-		if service == nil {
-			return errors.New("order composition unavailable")
+	return appdeploy.NewDeployment(a, c, appdeploy.DeploymentChecks{Artifact: func(ctx context.Context) error {
+		if err := probe(ctx); err != nil {
+			return err
 		}
-		return nil
+		identity, _ := manifest.Digest()
+		return retained.RequireArtifact(ctx, identity)
 	}, Store: storeCheck}, mux)
 }

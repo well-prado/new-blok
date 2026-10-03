@@ -16,6 +16,10 @@ The worker catalog is embedded into Go and shared with the Node module; changing
 the catalog produces a failed startup negotiation. Worker death withdraws
 readiness while `/healthz` remains available. Restarting the container creates a
 fresh worker. Memory workflows do not resume after process death.
+The native/durable test driver uses Python's SQLite library already present in
+the pinned Go build image to inject faults into its synthetic mounted volume.
+It runs beside the application in Linux for coherent SQLite WAL access; the
+deployed Go-only scratch image selects no foreign runtime.
 
 Build/run manually:
 
@@ -63,12 +67,33 @@ broker or hosted service. The Node image pins Node 22.18.0 and its dependency
 lock; SDK checks also run on host Node 24.21.0. Reproducible signed releases,
 SBOMs, and platform certification belong to their own roadmap issues.
 
-## Evidence limits
+## Retained journal readiness and limits
 
-The SQLite format marker and integrity check do **not** prove compatibility
-with retained journal checkpoints. `app.ArtifactProbe` has synthetic contract
-tests; integrating it with actual restored/retained inventories is pending
-#49/PR #152 (unmerged), with #48's retention behavior. #81 is not complete from
-these tests. Broader #51 shutdown and #53 publication fixes and independent
-review also remain with their owners. See
-[ADR 0009](../../docs/decisions/0009-deployment-readiness.md).
+The durable composition now uses the real SQLite journal inventory from runs,
+checkpoints and registered artifact manifests. Every new 202 order response
+follows journal admission, queue admission and checkpoint commits. Readiness
+checks retained identities against the executable's actual bytes, composition,
+schemas, embedded Go build/dependency information and supported checkpoint
+codec. It checks admitted runs before their first checkpoint too. Missing
+artifacts or incompatible identities/codecs reject cold startup before binding;
+live faults return readiness/admission 503 with no additional journal, queue
+or business records. Startup does not regenerate missing retained artifacts.
+
+The application supports one executable identity. A rebuilt/different binary
+is refused while incompatible journal records remain; retain the original
+binary and volume for restart. Manifest registration alone cannot provide an
+older executable. Queue processing and outbox atomicity remain unchanged.
+Unacknowledged partial admission can be retried using the same request key;
+the three commits do not constitute one atomic journal/queue transaction.
+Handoff checkpoints remain retained after processing. Automatic engine replay,
+multi-version execution, compaction policy and production capacity are outside
+this example. Old queue-only volumes have no journal compatibility evidence
+for their pre-existing jobs. Build identities are not signed provenance.
+
+The focused suite covers actual SQLite cold restart and backup/restore plus
+manifest, executable and checkpoint faults. The container suite also corrupts
+the mounted journal and proves live zero admission and cold startup rejection.
+Independent review remains required. Native Windows evidence is pending #156;
+these Linux container/SIGTERM runs make no Windows support claim. See
+[ADR 0009](../../docs/decisions/0009-deployment-readiness.md) and
+[local evidence](EVIDENCE.md).
