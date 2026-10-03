@@ -1,18 +1,16 @@
 package trigger_test
 
 import (
-	"bufio"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net"
+	"maps"
 	"net/http"
+	"os"
 	"os/exec"
-	"path/filepath"
-	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -20,211 +18,199 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/reflect/protodesc"
-	"google.golang.org/protobuf/reflect/protoreflect"
-	"google.golang.org/protobuf/types/descriptorpb"
-	"google.golang.org/protobuf/types/dynamicpb"
 
 	"github.com/well-prado/new-blok/app"
-	"github.com/well-prado/new-blok/contract/tool"
 	"github.com/well-prado/new-blok/store/sqlite"
 	"github.com/well-prado/new-blok/trigger"
 	"github.com/well-prado/new-blok/trigger/cron"
-	bgrpc "github.com/well-prado/new-blok/trigger/grpc"
-	blokhttp "github.com/well-prado/new-blok/trigger/http"
-	tmcp "github.com/well-prado/new-blok/trigger/mcp"
 	"github.com/well-prado/new-blok/trigger/pubsub"
 	"github.com/well-prado/new-blok/trigger/sse"
 	"github.com/well-prado/new-blok/trigger/testdata/selection/quote"
 	"github.com/well-prado/new-blok/trigger/webhook"
-	bws "github.com/well-prado/new-blok/trigger/websocket"
 	"github.com/well-prado/new-blok/trigger/worker"
 )
 
-// The one request every trigger carries, and the output the quote workflow
-// computes for it.
-const (
-	order       = `{"sku":"coffee","quantity":2}`
-	wantCents   = 3000
-	bearerToken = "alice-token"
-)
-
-var principal = trigger.Principal{ID: "alice"}
-
-// quoteOutput is the workflow's output schema, bounded so the gRPC binding
-// can prove it fits its 32-bit response field.
-var quoteOutput = []byte(`{"type":"object","properties":{"totalCents":{"type":"integer","minimum":0,"maximum":2147483647}},"required":["totalCents"]}`)
-
-// workflow runs the one shared quote workflow and counts its runs by the
-// trigger that caused them.
-type workflow struct {
-	runner *quote.Runner
-	mu     sync.Mutex
-	runs   map[string]int
-}
-
-func (w *workflow) run(ctx context.Context, via string, input []byte) (json.RawMessage, error) {
-	var in quote.Input
-	if err := json.Unmarshal(input, &in); err != nil {
-		return nil, err
-	}
-	out, err := w.runner.Run(ctx, in)
-	if err != nil {
-		return nil, err
-	}
-	w.mu.Lock()
-	w.runs[via]++
-	w.mu.Unlock()
-	return json.Marshal(out)
-}
-
-func (w *workflow) counts() map[string]int {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	counts := map[string]int{}
-	for via, n := range w.runs {
-		counts[via] = n
-	}
-	return counts
-}
-
-func cents(t *testing.T, via string, output []byte) {
-	t.Helper()
-	var result struct {
-		TotalCents int64 `json:"totalCents"`
-	}
-	if err := json.Unmarshal(output, &result); err != nil || result.TotalCents != wantCents {
-		t.Fatalf("%s returned %s (err %v), want totalCents %d", via, output, err, wantCents)
-	}
-}
-
-func bearer(request *http.Request) (trigger.Principal, error) {
-	if request.Header.Get("Authorization") != "Bearer "+bearerToken {
-		return trigger.Principal{}, errors.New("unauthenticated")
-	}
-	return principal, nil
-}
-
-// memMessage and memSource are a minimal broker for the pubsub adapter: the
-// NATS JetStream driver is proven against a real broker in its own suite.
-type memMessage struct {
-	data  []byte
-	acked chan struct{}
-	once  sync.Once
-}
-
-func (m *memMessage) ID() string                               { return "m-1" }
-func (m *memMessage) Data() []byte                             { return m.data }
-func (m *memMessage) Attempt() int                             { return 1 }
-func (m *memMessage) Cursor() string                           { return "1" }
-func (m *memMessage) Ack(context.Context) error                { m.once.Do(func() { close(m.acked) }); return nil }
-func (m *memMessage) Nak(context.Context, time.Duration) error { return errors.New("unexpected nak") }
-func (m *memMessage) Term(context.Context, string) error       { return errors.New("unexpected term") }
-
-type memSource struct {
-	mu      sync.Mutex
-	pending []pubsub.Message
-}
-
-func (s *memSource) Fetch(ctx context.Context, max int, wait time.Duration) ([]pubsub.Message, error) {
-	s.mu.Lock()
-	if len(s.pending) > 0 {
-		batch := s.pending[:min(max, len(s.pending))]
-		s.pending = s.pending[len(batch):]
-		s.mu.Unlock()
-		return batch, nil
-	}
-	s.mu.Unlock()
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-time.After(wait):
-		return nil, nil
-	}
-}
-
-func (s *memSource) DeadLetter(context.Context, pubsub.Message, string) error {
-	return errors.New("unexpected dead letter")
-}
-
-// cronClock is the scheduler's clock, moved by the test.
-type cronClock struct {
-	mu  sync.Mutex
-	now time.Time
-}
-
-func (c *cronClock) Now() time.Time                         { c.mu.Lock(); defer c.mu.Unlock(); return c.now }
-func (c *cronClock) After(d time.Duration) <-chan time.Time { return time.After(d) }
-func (c *cronClock) set(now time.Time)                      { c.mu.Lock(); c.now = now; c.mu.Unlock() }
-
-// quoteMethod is a unary gRPC method built at run time: no generated code.
-// The adapter maps fields by their proto names (ADR 0013), so the reply
-// field carries the workflow output's property name.
-func quoteMethod(t *testing.T) protoreflect.MethodDescriptor {
-	t.Helper()
-	optional := descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum()
-	file, err := protodesc.NewFile(&descriptorpb.FileDescriptorProto{
-		Name:    proto.String("nine/quotes.proto"),
-		Package: proto.String("nine"),
-		Syntax:  proto.String("proto3"),
-		MessageType: []*descriptorpb.DescriptorProto{
-			{Name: proto.String("QuoteRequest"), Field: []*descriptorpb.FieldDescriptorProto{
-				{Name: proto.String("sku"), JsonName: proto.String("sku"), Number: proto.Int32(1), Label: optional, Type: descriptorpb.FieldDescriptorProto_TYPE_STRING.Enum()},
-				{Name: proto.String("quantity"), JsonName: proto.String("quantity"), Number: proto.Int32(2), Label: optional, Type: descriptorpb.FieldDescriptorProto_TYPE_INT32.Enum()},
-			}},
-			{Name: proto.String("QuoteReply"), Field: []*descriptorpb.FieldDescriptorProto{
-				{Name: proto.String("totalCents"), JsonName: proto.String("totalCents"), Number: proto.Int32(1), Label: optional, Type: descriptorpb.FieldDescriptorProto_TYPE_INT32.Enum()},
-			}},
-		},
-		Service: []*descriptorpb.ServiceDescriptorProto{{Name: proto.String("Quotes"), Method: []*descriptorpb.MethodDescriptorProto{
-			{Name: proto.String("Quote"), InputType: proto.String(".nine.QuoteRequest"), OutputType: proto.String(".nine.QuoteReply")},
-		}}},
-	}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return file.Services().ByName("Quotes").Methods().ByName("Quote")
-}
-
-// mcpCatalog exposes the quote workflow as one MCP tool.
-type mcpCatalog struct{ workflow *workflow }
-
-func (mcpCatalog) List(context.Context, tool.Principal) ([]tmcp.Tool, error) {
-	return []tmcp.Tool{{Name: "selection/quote", Version: "1.0.0", Description: "Prices a synthetic quote", InputSchema: quote.InputSchema, OutputSchema: quoteOutput}}, nil
-}
-
-func (c mcpCatalog) Invoke(ctx context.Context, _ tool.Principal, call tmcp.Call) (json.RawMessage, error) {
-	return c.workflow.run(ctx, "mcp", call.Input)
-}
-
-// TestNineTriggersShareOneApplication wires all nine triggers into one
-// application over one durable store and one workflow, drives one real
-// request through each protocol, then stops the application and requires
-// every application-gated trigger to refuse, every adapter to shut down and
-// the goroutines to return to their baseline.
+// TestNineTriggersShareOneApplication drives one real request through each
+// of the nine triggers in one application, follows the SSE result live,
+// offers every durable source a duplicate, stops the application, requires
+// every trigger to refuse or stop with it, restarts over the same store and
+// requires no goroutine to outlive it.
 func TestNineTriggersShareOneApplication(t *testing.T) {
-	baseline := runtime.NumGoroutine()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	runner, err := quote.New()
-	if err != nil {
-		t.Fatal(err)
-	}
-	flow := &workflow{runner: runner, runs: map[string]int{}}
+	baseline := goroutineSet()
+	n := newNine(t, 1)
+	t.Logf("pubsub broker: %s", n.broker.name())
+	ctx := context.Background()
 
-	// One application, one store, one durable admission port.
-	application, err := app.New(app.Config{DrainTimeout: 5 * time.Second})
+	// In-band triggers answer with the workflow's output.
+	code, _, body := n.post("/quotes", auth("alice"), order)
+	if code != http.StatusOK {
+		t.Fatalf("http: %d %s", code, body)
+	}
+	cents(t, "http", body)
+	reply, err := n.callGRPC(ctx, "alice")
+	if err != nil || n.grpcCents(reply) != wantCents {
+		t.Fatalf("grpc: %v %v", reply, err)
+	}
+	socket, _, err := n.dialWS(ctx, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
-	database, err := (sqlite.Backend{}).Open(ctx, filepath.Join(t.TempDir(), "nine.db"))
+	output, err := wsQuote(ctx, socket, "q-1")
+	if err != nil {
+		t.Fatalf("websocket: %v", err)
+	}
+	cents(t, "websocket", output)
+	_ = socket.Close(websocket.StatusNormalClosure, "")
+	session, err := n.mcpSession(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output, err = mcpQuote(ctx, session); err != nil {
+		t.Fatalf("mcp: %v", err)
+	}
+	cents(t, "mcp", output)
+	_ = session.Close()
+
+	// Durable triggers commit a submission; the worker pool is held until
+	// the SSE stream is followed, so its result arrives live.
+	if status, _, body := n.post("/webhooks/shop", n.signed("evt-1"), order); status != http.StatusAccepted {
+		t.Fatalf("webhook: %d %s", status, body)
+	}
+	code, _, body = n.sseStart("alice", "order-1")
+	var started struct {
+		Stream string `json:"stream"`
+	}
+	if err := json.Unmarshal(body, &started); err != nil || code != http.StatusAccepted {
+		t.Fatalf("sse start: %d %s", code, body)
+	}
+	live := n.subscribe(ctx, "alice", started.Stream)
+	n.clock.set(occurrence)
+	select {
+	case results := <-n.cronRuns:
+		if len(results) != 1 || len(results[0].Submitted) != 1 {
+			t.Fatalf("cron: %+v", results)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("cron never fired its occurrence")
+	}
+	n.broker.publish(t, "m-1", []byte(order))
+	n.broker.settled(t)
+	if enqueued, err := n.queue.Enqueue(ctx, worker.EnqueueRequest{RequestKey: "worker:quote-1", Kind: "quote.worker", Payload: []byte(order), MaxAttempts: 3}); err != nil || !enqueued.Accepted {
+		t.Fatalf("worker: %+v %v", enqueued, err)
+	}
+	keys := map[string]string{
+		"webhook": webhook.SubmissionKey("shop", "evt-1"),
+		"sse":     sse.SubmissionKey("orders", trigger.Principal{ID: "alice"}, "order-1"),
+		"cron":    cron.SubmissionKey("nightly-quote", occurrence),
+		"pubsub":  pubsub.SubmissionKey("orders", n.broker.messageID("m-1")),
+		"worker":  "worker:quote-1",
+	}
+	close(n.begin)
+	n.waitSettled(slices.Collect(maps.Values(keys))...)
+	for via, key := range keys {
+		cents(t, via, n.output(key))
+	}
+	select {
+	case data := <-live:
+		cents(t, "sse stream", data)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the SSE result never reached the live subscriber")
+	}
+
+	// Every durable source deduplicates a repeat at the shared port.
+	if status, _, body := n.post("/webhooks/shop", n.signed("evt-1"), order); status != http.StatusOK {
+		t.Fatalf("webhook duplicate: %d %s", status, body)
+	}
+	code, _, body = n.sseStart("alice", "order-1")
+	if code != http.StatusOK || !strings.Contains(string(body), `"duplicate":true`) {
+		t.Fatalf("sse duplicate: %d %s", code, body)
+	}
+	n.broker.publish(t, "m-1", []byte(order))
+	n.broker.settled(t)
+	// A repeated occurrence reaches the port as the very submission cron
+	// committed: same key, normalized payload and principal.
+	committed, err := n.queue.Get(ctx, keys["cron"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accepted, err := n.queue.Submit(ctx, trigger.Submission{Key: keys["cron"], Kind: "quote.cron", Payload: committed.Payload, Principal: committed.Principal}); err != nil || accepted {
+		t.Fatalf("cron duplicate: accepted=%v err=%v", accepted, err)
+	}
+	if enqueued, err := n.queue.Enqueue(ctx, worker.EnqueueRequest{RequestKey: "worker:quote-1", Kind: "quote.worker", Payload: []byte(order), MaxAttempts: 3}); err != nil || enqueued.Accepted {
+		t.Fatalf("worker duplicate: %+v %v", enqueued, err)
+	}
+	once := map[string]int{"http": 1, "grpc": 1, "websocket": 1, "mcp": 1, "webhook": 1, "sse": 1, "cron": 1, "pubsub": 1, "worker": 1}
+	if got := n.flow.counts(); !maps.Equal(got, once) {
+		t.Fatalf("workflow runs by trigger %v, want %v", got, once)
+	}
+	if errs := n.workerErrs.Load(); errs != 0 {
+		t.Fatalf("the worker pool saw %d errors; first %v", errs, n.firstErr.Load())
+	}
+
+	// Stop the application. Every application-gated trigger refuses, and
+	// cron, pubsub and the worker pool stop with it.
+	if err := n.app.Shutdown(ctx); err != nil {
+		t.Fatalf("application shutdown: %v", err)
+	}
+	fetches := n.broker.fetches()
+	refusals := map[string][2]string{}
+	record := func(via string, code int, retry string) { refusals[via] = [2]string{fmt.Sprint(code), retry} }
+	code, retry, _ := n.post("/quotes", auth("alice"), order)
+	record("http", code, retry)
+	code, retry, _ = n.post("/webhooks/shop", n.signed("evt-2"), order)
+	record("webhook", code, retry)
+	code, retry, _ = n.sseStart("alice", "order-2")
+	record("sse", code, retry)
+	initialize := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"late","version":"1"}}}`
+	headers := auth("alice")
+	headers["Accept"] = "application/json, text/event-stream"
+	code, retry, _ = n.post("/mcp", headers, initialize)
+	record("mcp", code, retry)
+	if _, response, err := n.dialWS(ctx, "alice"); err == nil {
+		t.Fatal("websocket: a stopped application accepted a connection")
+	} else if response != nil {
+		record("websocket", response.StatusCode, response.Header.Get("Retry-After"))
+	}
+	for _, via := range []string{"http", "webhook", "sse", "mcp", "websocket"} {
+		got, ok := refusals[via]
+		if !ok || got[0] != "503" {
+			t.Errorf("%s: a stopped application answered %v, want 503", via, got)
+		}
+		if via != "http" && got[1] != "1" {
+			t.Errorf("%s: refusal without Retry-After: %v", via, got)
+		}
+	}
+	if _, err := n.callGRPC(ctx, "alice"); status.Code(err) != codes.Unavailable || status.Convert(err).Message() != "unavailable" {
+		t.Errorf("grpc: a stopped application answered %v, want Unavailable from the adapter", err)
+	}
+	n.broker.publish(t, "m-late", []byte(order))
+	n.clock.set(time.Date(2028, 1, 1, 0, 0, 0, 0, time.UTC))
+	if enqueued, err := n.queue.Enqueue(ctx, worker.EnqueueRequest{RequestKey: "worker:after-stop", Kind: "quote.worker", Payload: []byte(order), MaxAttempts: 3}); err != nil || !enqueued.Accepted {
+		t.Fatalf("enqueue after stop: %+v %v", enqueued, err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if _, err := n.queue.Get(ctx, pubsub.SubmissionKey("orders", n.broker.messageID("m-late"))); !errors.Is(err, worker.ErrNotFound) {
+		t.Errorf("pubsub consumed after the application stopped: %v", err)
+	}
+	if fetches >= 0 && n.broker.fetches() != fetches {
+		t.Errorf("pubsub fetched after the application stopped (%d → %d)", fetches, n.broker.fetches())
+	}
+	if _, err := n.queue.Get(ctx, cron.SubmissionKey("nightly-quote", time.Date(2028, 1, 1, 0, 0, 0, 0, time.UTC))); !errors.Is(err, worker.ErrNotFound) {
+		t.Errorf("cron submitted after the application stopped: %v", err)
+	}
+	if job, err := n.queue.Get(ctx, "worker:after-stop"); err != nil || job.State != worker.StatePending {
+		t.Errorf("the worker pool ran after the application stopped: %+v %v", job, err)
+	}
+	if got := n.flow.counts(); !maps.Equal(got, once) {
+		t.Errorf("the workflow ran after the stop: %v", got)
+	}
+	n.stop()
+
+	// Restart over the same store: committed work stays settled, repeats
+	// stay duplicates, and the job left pending runs.
+	database, err := (sqlite.Backend{}).Open(ctx, n.path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,444 +218,361 @@ func TestNineTriggersShareOneApplication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	durable := []string{"webhook", "cron", "pubsub", "sse", "worker"}
-	for _, via := range durable {
-		if err := queue.RegisterKind("quote."+via, quote.InputSchema); err != nil {
-			t.Fatal(err)
+	for via, key := range keys {
+		if job, err := queue.Get(ctx, key); err != nil || job.State != worker.StateCompleted {
+			t.Errorf("%s after restart: %+v %v", via, job, err)
 		}
 	}
+	if err := queue.RegisterKind("quote.worker", quote.InputSchema); err != nil {
+		t.Fatal(err)
+	}
+	if enqueued, err := queue.Enqueue(ctx, worker.EnqueueRequest{RequestKey: "worker:quote-1", Kind: "quote.worker", Payload: []byte(order), MaxAttempts: 3}); err != nil || enqueued.Accepted {
+		t.Errorf("a repeat after restart was accepted: %+v %v", enqueued, err)
+	}
+	ran := ""
+	if processed, err := queue.ProcessOnce(ctx, func(_ context.Context, _ *sql.Tx, job worker.Job) error { ran = job.RequestKey; return nil }); err != nil || !processed || ran != "worker:after-stop" {
+		t.Errorf("the pending job after restart: processed=%v ran=%q err=%v", processed, ran, err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	noLeaks(t, baseline)
+}
 
-	// HTTP, webhook, SSE, WebSocket and MCP share one listener.
-	httpServer, err := blokhttp.New(application, []blokhttp.Endpoint{{Method: "POST", Path: "/quotes", InputSchema: quote.InputSchema, Authenticate: bearer, Handle: func(ctx context.Context, in blokhttp.Input) (any, error) {
-		return flow.run(ctx, "http", in.Body)
-	}}})
+// TestNineTriggersDrainTogether holds work in flight on six triggers at
+// once: an HTTP request, a gRPC call, a WebSocket message, an MCP call, a
+// webhook submission and an SSE submission. The application must keep
+// draining while they run, refuse new work on every trigger meanwhile, let
+// every held request complete, and commit the durable ones.
+func TestNineTriggersDrainTogether(t *testing.T) {
+	baseline := goroutineSet()
+	n := newNine(t, 1)
+	ctx := context.Background()
+	session, err := n.mcpSession(ctx, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
-	secret, err := webhook.NewSecret([]byte("synthetic-webhook-secret-0123456789"))
+	defer session.Close()
+	socket, _, err := n.dialWS(ctx, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
-	webhooks, err := webhook.New(application, time.Now, []webhook.Endpoint{{Path: "/webhooks/shop", Provider: "shop", Principal: principal, Kind: "quote.webhook", Verifier: webhook.StandardWebhooks{Keys: []webhook.Key{{ID: "k1", Secret: secret}}}, Submit: queue, InputSchema: quote.InputSchema}})
-	if err != nil {
-		t.Fatal(err)
+	defer socket.CloseNow()
+	n.gate.holding("http", "grpc", "websocket", "mcp", "submit:webhook", "submit:sse")
+	type outcome struct {
+		via string
+		err error
 	}
-	hub, err := sse.NewHub(sse.HubConfig{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	streams, err := sse.New(application, hub, []sse.Endpoint{{Name: "orders", Path: "/orders", Kind: "quote.sse", Submit: queue, Tracker: queue, Authenticate: bearer, InputSchema: quote.InputSchema}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	sockets, err := bws.New(application, bws.Endpoint{Path: "/ws", Authenticate: bearer, InputSchema: quote.InputSchema, OnMessage: func(ctx context.Context, m bws.Message) (json.RawMessage, error) {
-		return flow.run(ctx, "websocket", m.Input)
-	}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	budget := tool.Budget{MaxDepth: 4, MaxInputBytes: 1 << 10, MaxOutputBytes: 1 << 10, MaxTokens: 1, MaxCalls: 1, Deadline: time.Now().Add(time.Hour)}
-	tools, err := tmcp.New(application, tmcp.Config{Name: "nine", Version: "1.0.0", Catalog: mcpCatalog{workflow: flow}, Authenticate: func(_ context.Context, token string, _ *http.Request) (tool.Principal, error) {
-		if token != bearerToken {
-			return tool.Principal{}, errors.New("unauthenticated")
+	outcomes := make(chan outcome, 6)
+	expect := func(via string, err error) { outcomes <- outcome{via, err} }
+	go func() {
+		status, _, body := n.post("/quotes", auth("alice"), order)
+		if status != http.StatusOK {
+			expect("http", fmt.Errorf("%d %s", status, body))
+			return
 		}
-		return tool.Principal{ID: principal.ID, MaxDepth: 4}, nil
-	}, Expose: []string{"selection/quote@1.0.0"}, Budget: budget})
-	if err != nil {
-		t.Fatal(err)
-	}
-	mux := http.NewServeMux()
-	mux.Handle("/quotes", httpServer)
-	mux.Handle("/webhooks/", webhooks)
-	mux.Handle("/orders", streams)
-	mux.Handle("/orders/", streams)
-	mux.Handle("/ws", sockets)
-	mux.Handle("/mcp", tools)
-
-	// gRPC on its own listener.
-	method := quoteMethod(t)
-	methods, err := bgrpc.New(application, func(ctx context.Context) (trigger.Principal, error) {
-		md, _ := metadata.FromIncomingContext(ctx)
-		if values := md.Get("authorization"); len(values) != 1 || values[0] != "Bearer "+bearerToken {
-			return trigger.Principal{}, errors.New("unauthenticated")
+		expect("http", nil)
+	}()
+	go func() {
+		reply, err := n.callGRPC(ctx, "alice")
+		if err == nil && n.grpcCents(reply) != wantCents {
+			err = fmt.Errorf("totalCents %d", n.grpcCents(reply))
 		}
-		return principal, nil
-	}, []bgrpc.Binding{{Method: method, Workflow: "selection/quote", WorkflowInput: quote.InputSchema, InputSchema: quote.InputSchema, OutputSchema: quoteOutput, Authorize: bgrpc.AllowAuthenticated, Handle: func(ctx context.Context, call bgrpc.Call) (json.RawMessage, error) {
-		return flow.run(ctx, "grpc", call.Input)
-	}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	grpcServer := grpc.NewServer(methods.ServerOptions()...)
-	if err := methods.Register(grpcServer); err != nil {
-		t.Fatal(err)
-	}
-
-	// Cron and pubsub are driven by their own loops.
-	clock := &cronClock{now: time.Date(2026, 12, 31, 23, 59, 0, 0, time.UTC)}
-	scheduler, err := cron.New(ctx, database, queue, queue, clock)
-	if err != nil {
-		t.Fatal(err)
-	}
-	message := &memMessage{data: []byte(order), acked: make(chan struct{})}
-	consumer, err := pubsub.New(&memSource{pending: []pubsub.Message{message}}, pubsub.Subscription{Name: "orders", Principal: principal, Kind: "quote.pubsub", Submit: queue, InputSchema: quote.InputSchema, FetchWait: 20 * time.Millisecond})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err := application.Start(ctx); err != nil {
-		t.Fatal(err)
-	}
-	httpListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	grpcListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-	served := make(chan error, 1)
-	go func() { served <- server.Serve(httpListener) }()
-	grpcServed := make(chan error, 1)
-	go func() { grpcServed <- grpcServer.Serve(grpcListener) }()
-	consumerCtx, stopConsumer := context.WithCancel(ctx)
-	consumed := make(chan error, 1)
-	go func() { consumed <- consumer.Run(consumerCtx) }()
-	base := "http://" + httpListener.Addr().String()
-	transport := &http.Transport{}
-	client := &http.Client{Transport: transport, Timeout: 10 * time.Second}
-	post := func(path string, headers map[string]string, body string) (int, []byte) {
-		t.Helper()
-		request, err := http.NewRequest(http.MethodPost, base+path, strings.NewReader(body))
-		if err != nil {
-			t.Fatal(err)
+		expect("grpc", err)
+	}()
+	go func() { _, err := wsQuote(ctx, socket, "held"); expect("websocket", err) }()
+	go func() { _, err := mcpQuote(ctx, session); expect("mcp", err) }()
+	go func() {
+		status, _, body := n.post("/webhooks/shop", n.signed("evt-held"), order)
+		if status != http.StatusAccepted {
+			expect("webhook", fmt.Errorf("%d %s", status, body))
+			return
 		}
-		request.Header.Set("Content-Type", "application/json")
-		for name, value := range headers {
-			request.Header.Set(name, value)
+		expect("webhook", nil)
+	}()
+	go func() {
+		status, _, body := n.sseStart("alice", "held")
+		if status != http.StatusAccepted {
+			expect("sse", fmt.Errorf("%d %s", status, body))
+			return
 		}
-		response, err := client.Do(request)
-		if err != nil {
-			t.Fatal(err)
+		expect("sse", nil)
+	}()
+	held := map[string]bool{}
+	for len(held) < 6 {
+		select {
+		case via := <-n.gate.entered:
+			held[via] = true
+		case <-time.After(10 * time.Second):
+			t.Fatalf("only %v reached their hold", held)
 		}
-		defer response.Body.Close()
-		data, _ := io.ReadAll(response.Body)
-		return response.StatusCode, data
 	}
-	signed := func(id string) map[string]string {
-		now := time.Now()
-		return map[string]string{"webhook-id": id, "webhook-timestamp": fmt.Sprint(now.Unix()), "webhook-signature": webhook.SignStandard(secret, id, now, []byte(order))}
+	drained := make(chan error, 1)
+	go func() { drained <- n.app.Shutdown(context.Background()) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for n.app.State() == app.ReadyState {
+		if time.Now().After(deadline) {
+			t.Fatal("the application never began draining")
+		}
+		time.Sleep(time.Millisecond)
 	}
-
-	// 1. HTTP: in band.
-	statusCode, body := post("/quotes", map[string]string{"Authorization": "Bearer " + bearerToken}, order)
-	if statusCode != http.StatusOK {
-		t.Fatalf("http: status=%d body=%s", statusCode, body)
+	if status, _, _ := n.post("/quotes", auth("bob"), order); status != http.StatusServiceUnavailable {
+		t.Errorf("http while draining: %d", status)
 	}
-	cents(t, "http", body)
-
-	// 2. gRPC: in band, with a dynamic message.
-	conn, err := grpc.NewClient(grpcListener.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		t.Fatal(err)
+	if status, _, _ := n.post("/webhooks/shop", n.signed("evt-late"), order); status != http.StatusServiceUnavailable {
+		t.Errorf("webhook while draining: %d", status)
 	}
-	callGRPC := func() (*dynamicpb.Message, error) {
-		request := dynamicpb.NewMessage(method.Input())
-		request.Set(method.Input().Fields().ByName("sku"), protoreflect.ValueOfString("coffee"))
-		request.Set(method.Input().Fields().ByName("quantity"), protoreflect.ValueOfInt32(2))
-		reply := dynamicpb.NewMessage(method.Output())
-		callCtx, done := context.WithTimeout(metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+bearerToken), 10*time.Second)
-		defer done()
-		return reply, conn.Invoke(callCtx, "/nine.Quotes/Quote", request, reply)
+	if status, _, _ := n.sseStart("bob", "late"); status != http.StatusServiceUnavailable {
+		t.Errorf("sse while draining: %d", status)
 	}
-	reply, err := callGRPC()
-	if err != nil {
-		t.Fatalf("grpc: %v", err)
+	if _, err := n.mcpSession(ctx, "bob"); err == nil {
+		t.Error("mcp: a draining application opened a session")
 	}
-	if got := reply.Get(method.Output().Fields().ByName("totalCents")).Int(); got != wantCents {
-		t.Fatalf("grpc returned totalCents %d", got)
+	if _, response, err := n.dialWS(ctx, "bob"); err == nil || response == nil || response.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("websocket while draining: %v %v", response, err)
 	}
-
-	// 3. WebSocket: in band, one message on one connection.
-	wsURL := "ws://" + httpListener.Addr().String() + "/ws"
-	socket, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{HTTPClient: client, HTTPHeader: http.Header{"Authorization": {"Bearer " + bearerToken}}})
-	if err != nil {
-		t.Fatalf("websocket: %v", err)
+	if _, err := n.callGRPC(ctx, "bob"); status.Code(err) != codes.Unavailable || status.Convert(err).Message() != "unavailable" {
+		t.Errorf("grpc while draining: %v", err)
 	}
-	if err := socket.Write(ctx, websocket.MessageText, []byte(`{"id":"q-1","input":`+order+`}`)); err != nil {
-		t.Fatal(err)
+	if state := n.app.State(); state != app.DrainingState {
+		t.Fatalf("the application is %s with six requests in flight; want draining", state)
 	}
-	_, frame, err := socket.Read(ctx)
-	if err != nil {
-		t.Fatal(err)
+	close(n.gate.release)
+	for range 6 {
+		select {
+		case o := <-outcomes:
+			if o.err != nil {
+				t.Errorf("%s did not complete: %v", o.via, o.err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("a held request never completed")
+		}
 	}
-	var wsReply struct {
-		Output json.RawMessage `json:"output"`
-		Error  string          `json:"error"`
+	if err := <-drained; err != nil {
+		t.Fatalf("drain: %v", err)
 	}
-	if err := json.Unmarshal(frame, &wsReply); err != nil || wsReply.Error != "" {
-		t.Fatalf("websocket reply %s: %v", frame, err)
+	for via, key := range map[string]string{"webhook": webhook.SubmissionKey("shop", "evt-held"), "sse": sse.SubmissionKey("orders", trigger.Principal{ID: "alice"}, "held")} {
+		if _, err := n.queue.Get(ctx, key); err != nil {
+			t.Errorf("%s was answered but not committed: %v", via, err)
+		}
 	}
-	cents(t, "websocket", wsReply.Output)
-	_ = socket.Close(websocket.StatusNormalClosure, "")
-
-	// 4. MCP: in band, through the official client.
-	mcpClient := sdk.NewClient(&sdk.Implementation{Name: "nine", Version: "1.0.0"}, nil)
-	session, err := mcpClient.Connect(ctx, &sdk.StreamableClientTransport{Endpoint: base + "/mcp", HTTPClient: &http.Client{Transport: bearerTransport{base: transport}}, MaxRetries: -1}, nil)
-	if err != nil {
-		t.Fatalf("mcp: %v", err)
-	}
-	result, err := session.CallTool(ctx, &sdk.CallToolParams{Name: tmcp.ToolName("selection/quote", "1.0.0"), Arguments: json.RawMessage(order)})
-	if err != nil || result.IsError {
-		t.Fatalf("mcp: result=%+v err=%v", result, err)
-	}
-	structured, _ := json.Marshal(result.StructuredContent)
-	cents(t, "mcp", structured)
 	_ = session.Close()
+	socket.CloseNow()
+	n.stop()
+	noLeaks(t, baseline)
+}
 
-	// 5. Webhook: durable, signed.
-	if statusCode, body := post("/webhooks/shop", signed("evt-1"), order); statusCode != http.StatusAccepted {
-		t.Fatalf("webhook: status=%d body=%s", statusCode, body)
+// TestNineTriggersUnderMixedLoad sends concurrent traffic through every
+// trigger at once over the one store and a pool of workers: every request
+// succeeds, every durable submission runs exactly once, and no worker sees
+// an error.
+func TestNineTriggersUnderMixedLoad(t *testing.T) {
+	baseline := goroutineSet()
+	const inBandLoad, durableLoad = 8, 40
+	n := newNine(t, 4)
+	close(n.begin)
+	ctx := context.Background()
+	var group sync.WaitGroup
+	failures := make(chan string, 4*inBandLoad+4*durableLoad)
+	fail := func(format string, args ...any) { failures <- fmt.Sprintf(format, args...) }
+	var keys []string
+	var keysMu sync.Mutex
+	key := func(k string) {
+		keysMu.Lock()
+		keys = append(keys, k)
+		keysMu.Unlock()
 	}
-
-	// 6. SSE: durable start; the stream is read after the work runs.
-	statusCode, body = post("/orders", map[string]string{"Authorization": "Bearer " + bearerToken, "Idempotency-Key": "order-1"}, order)
-	var started struct {
-		Stream string `json:"stream"`
-	}
-	if err := json.Unmarshal(body, &started); err != nil || statusCode != http.StatusAccepted || started.Stream == "" {
-		t.Fatalf("sse start: status=%d body=%s", statusCode, body)
-	}
-
-	// 7. Cron: a durable occurrence.
-	occurrence := time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
-	if _, err := scheduler.Add(ctx, cron.Schedule{Name: "nightly-quote", Spec: "0 0 1 1 *", TimeZone: "UTC", Kind: "quote.cron", Payload: json.RawMessage(order), InputSchema: quote.InputSchema, Principal: principal, MaxCatchUp: 1}); err != nil {
-		t.Fatal(err)
-	}
-	clock.set(occurrence)
-	ticked, err := scheduler.Tick(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(ticked) != 1 || len(ticked[0].Submitted) != 1 {
-		t.Fatalf("cron submitted %+v", ticked)
-	}
-
-	// 8. Pubsub: durable transfer; the broker is acknowledged after commit.
-	select {
-	case <-message.acked:
-	case <-time.After(5 * time.Second):
-		t.Fatal("pubsub never acknowledged its message")
-	}
-
-	// 9. Worker: a job enqueued directly.
-	if enqueued, err := queue.Enqueue(ctx, worker.EnqueueRequest{RequestKey: "worker:quote-1", Kind: "quote.worker", Payload: []byte(order), MaxAttempts: 3}); err != nil || !enqueued.Accepted {
-		t.Fatalf("worker enqueue: %+v %v", enqueued, err)
-	}
-
-	// One worker runs every durable submission, exactly once each.
-	outputs := map[string]json.RawMessage{}
-	var sseKey string
-	for {
-		processed, err := queue.ProcessOnce(ctx, func(ctx context.Context, _ *sql.Tx, job worker.Job) error {
-			via := strings.TrimPrefix(job.Kind, "quote.")
-			output, err := flow.run(ctx, via, job.Payload)
+	for i := range inBandLoad {
+		user := fmt.Sprintf("user-%d", i)
+		group.Add(4)
+		go func() {
+			defer group.Done()
+			if status, _, body := n.post("/quotes", auth(user), order); status != http.StatusOK {
+				fail("http %s: %d %s", user, status, body)
+			}
+		}()
+		go func() {
+			defer group.Done()
+			if reply, err := n.callGRPC(ctx, user); err != nil || n.grpcCents(reply) != wantCents {
+				fail("grpc %s: %v", user, err)
+			}
+		}()
+		go func() {
+			defer group.Done()
+			socket, _, err := n.dialWS(ctx, user)
 			if err != nil {
-				return err
+				fail("websocket %s: %v", user, err)
+				return
 			}
-			outputs[via] = output
-			if via == "sse" {
-				sseKey = job.RequestKey
+			defer socket.CloseNow()
+			if _, err := wsQuote(ctx, socket, "load"); err != nil {
+				fail("websocket %s: %v", user, err)
 			}
-			return nil
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !processed {
-			break
-		}
+		}()
+		go func() {
+			defer group.Done()
+			session, err := n.mcpSession(ctx, user)
+			if err != nil {
+				fail("mcp %s: %v", user, err)
+				return
+			}
+			defer session.Close()
+			if _, err := mcpQuote(ctx, session); err != nil {
+				fail("mcp %s: %v", user, err)
+			}
+		}()
 	}
-	for _, via := range durable {
-		cents(t, via, outputs[via])
+	for i := range durableLoad {
+		user := fmt.Sprintf("user-%d", i)
+		group.Add(4)
+		go func() {
+			defer group.Done()
+			id := fmt.Sprintf("evt-%d", i)
+			if status, _, body := n.post("/webhooks/shop", n.signed(id), order); status != http.StatusAccepted {
+				fail("webhook %s: %d %s", id, status, body)
+				return
+			}
+			key(webhook.SubmissionKey("shop", id))
+		}()
+		go func() {
+			defer group.Done()
+			if status, _, body := n.sseStart(user, "load"); status != http.StatusAccepted {
+				fail("sse %s: %d %s", user, status, body)
+				return
+			}
+			key(sse.SubmissionKey("orders", trigger.Principal{ID: user}, "load"))
+		}()
+		go func() {
+			defer group.Done()
+			id := fmt.Sprintf("m-%d", i)
+			n.broker.publish(t, id, []byte(order))
+			key(pubsub.SubmissionKey("orders", n.broker.messageID(id)))
+		}()
+		go func() {
+			defer group.Done()
+			requestKey := fmt.Sprintf("worker:load-%d", i)
+			if enqueued, err := n.queue.Enqueue(ctx, worker.EnqueueRequest{RequestKey: requestKey, Kind: "quote.worker", Payload: []byte(order), MaxAttempts: 3}); err != nil || !enqueued.Accepted {
+				fail("worker %s: %+v %v", requestKey, enqueued, err)
+				return
+			}
+			key(requestKey)
+		}()
 	}
-	if sse.StreamID(sseKey) != started.Stream {
-		t.Fatalf("the SSE job %q does not belong to stream %q", sseKey, started.Stream)
+	group.Wait()
+	close(failures)
+	for failure := range failures {
+		t.Error(failure)
 	}
-	if _, err := hub.Finish(started.Stream, sse.Result(outputs["sse"])); err != nil {
-		t.Fatal(err)
+	if t.Failed() {
+		t.FailNow()
 	}
-	subscription, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/orders/"+started.Stream, nil)
-	if err != nil {
-		t.Fatal(err)
+	n.broker.settled(t)
+	n.waitSettled(keys...)
+	for _, k := range keys {
+		cents(t, k, n.output(k))
 	}
-	subscription.Header.Set("Authorization", "Bearer "+bearerToken)
-	streamed, err := client.Do(subscription)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cents(t, "sse stream", resultEvent(t, streamed.Body))
-	streamed.Body.Close()
-
-	want := map[string]int{"http": 1, "grpc": 1, "websocket": 1, "mcp": 1, "webhook": 1, "sse": 1, "cron": 1, "pubsub": 1, "worker": 1}
-	if got := flow.counts(); fmt.Sprint(got) != fmt.Sprint(want) {
+	want := map[string]int{"http": inBandLoad, "grpc": inBandLoad, "websocket": inBandLoad, "mcp": inBandLoad, "webhook": durableLoad, "sse": durableLoad, "pubsub": durableLoad, "worker": durableLoad}
+	if got := n.flow.counts(); !maps.Equal(got, want) {
 		t.Fatalf("workflow runs by trigger %v, want %v", got, want)
 	}
-
-	// Stop the application: every application-gated trigger refuses.
-	if err := application.Shutdown(ctx); err != nil {
-		t.Fatalf("application shutdown: %v", err)
+	if errs := n.workerErrs.Load(); errs != 0 {
+		t.Fatalf("the worker pool saw %d errors under load; first %v", errs, n.firstErr.Load())
 	}
-	refused := map[string]int{}
-	refused["http"], _ = post("/quotes", map[string]string{"Authorization": "Bearer " + bearerToken}, order)
-	refused["webhook"], _ = post("/webhooks/shop", signed("evt-2"), order)
-	refused["sse"], _ = post("/orders", map[string]string{"Authorization": "Bearer " + bearerToken, "Idempotency-Key": "order-2"}, order)
-	refused["mcp"], _ = post("/mcp", map[string]string{"Authorization": "Bearer " + bearerToken, "Accept": "application/json, text/event-stream"}, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"late","version":"1"}}}`)
-	if _, response, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{HTTPClient: client, HTTPHeader: http.Header{"Authorization": {"Bearer " + bearerToken}}}); err == nil {
-		t.Fatal("websocket: a stopped application accepted a connection")
-	} else if response != nil {
-		refused["websocket"] = response.StatusCode
-	}
-	if len(refused) != 5 {
-		t.Errorf("refusals measured for %v; want http, webhook, sse, mcp and websocket", refused)
-	}
-	for via, code := range refused {
-		if code != http.StatusServiceUnavailable {
-			t.Errorf("%s: a stopped application answered %d, want 503", via, code)
-		}
-	}
-	if _, err := callGRPC(); status.Code(err) != codes.Unavailable {
-		t.Errorf("grpc: a stopped application answered %v, want Unavailable", err)
-	}
-	if processed, err := queue.ProcessOnce(ctx, func(context.Context, *sql.Tx, worker.Job) error { return errors.New("nothing should run") }); err != nil || processed {
-		t.Errorf("a refused trigger submitted work: processed=%v err=%v", processed, err)
-	}
-	if got := flow.counts(); fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Errorf("the workflow ran after the stop: %v", got)
-	}
-
-	// Shut every adapter down; goroutines return to their baseline.
-	stop, done := context.WithTimeout(context.Background(), 10*time.Second)
-	defer done()
-	stopConsumer()
-	if err := <-consumed; err != nil && !errors.Is(err, context.Canceled) {
-		t.Errorf("pubsub consumer: %v", err)
-	}
-	if err := errors.Join(tools.Shutdown(stop), sockets.Shutdown(stop), streams.Shutdown(stop), server.Shutdown(stop)); err != nil {
-		t.Errorf("shutdown: %v", err)
-	}
-	grpcServer.GracefulStop()
-	_ = conn.Close()
-	if err := <-served; !errors.Is(err, http.ErrServerClosed) {
-		t.Errorf("http serve: %v", err)
-	}
-	if err := <-grpcServed; err != nil {
-		t.Errorf("grpc serve: %v", err)
-	}
-	cancel()
-	if err := database.Close(); err != nil {
-		t.Errorf("store close: %v", err)
-	}
-	transport.CloseIdleConnections()
-	deadline := time.Now().Add(5 * time.Second)
-	for runtime.NumGoroutine() > baseline+2 {
-		if time.Now().After(deadline) {
-			stack := make([]byte, 1<<16)
-			t.Fatalf("goroutines %d, baseline %d\n%s", runtime.NumGoroutine(), baseline, stack[:runtime.Stack(stack, true)])
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	n.stop()
+	noLeaks(t, baseline)
 }
 
-// bearerTransport adds the bearer token to MCP requests.
-type bearerTransport struct{ base http.RoundTripper }
+// adapters are the trigger adapters this repository ships. The test
+// discovers trigger/... and requires this exact set, so a new adapter cannot
+// escape the removal rules below.
+var adapters = []string{"cron", "grpc", "http", "mcp", "pubsub", "pubsub/natsjs", "sse", "webhook", "websocket", "worker"}
 
-func (b bearerTransport) RoundTrip(request *http.Request) (*http.Response, error) {
-	request = request.Clone(request.Context())
-	request.Header.Set("Authorization", "Bearer "+bearerToken)
-	return b.base.RoundTrip(request)
+// owners lists, for every third-party module an adapter may link, the
+// adapters allowed to link it. The check is closed: a module missing here
+// fails it.
+var owners = map[string][]string{
+	"github.com/coder/websocket":                {"websocket"},
+	"github.com/nats-io/nats.go":                {"pubsub/natsjs"},
+	"github.com/nats-io/nkeys":                  {"pubsub/natsjs"},
+	"github.com/nats-io/nuid":                   {"pubsub/natsjs"},
+	"github.com/klauspost/compress":             {"pubsub/natsjs"},
+	"golang.org/x/crypto":                       {"pubsub/natsjs"},
+	"google.golang.org/grpc":                    {"grpc"},
+	"google.golang.org/protobuf":                {"grpc"},
+	"google.golang.org/genproto/googleapis/rpc": {"grpc"},
+	"golang.org/x/net":                          {"grpc"},
+	"golang.org/x/text":                         {"grpc"},
+	"github.com/modelcontextprotocol/go-sdk":    {"mcp"},
+	"github.com/google/jsonschema-go":           {"mcp"},
+	"github.com/segmentio/asm":                  {"mcp"},
+	"github.com/segmentio/encoding":             {"mcp"},
+	"github.com/yosida95/uritemplate/v3":        {"mcp"},
+	"golang.org/x/oauth2":                       {"mcp"},
+	"golang.org/x/sync":                         {"mcp"},
+	"golang.org/x/time":                         {"mcp"},
+	"golang.org/x/sys":                          {"grpc", "mcp", "pubsub/natsjs"},
 }
 
-// resultEvent reads an SSE stream up to its result event and returns its
-// data.
-func resultEvent(t *testing.T, stream io.Reader) []byte {
-	t.Helper()
-	lines := bufio.NewScanner(stream)
-	event := ""
-	for lines.Scan() {
-		line := lines.Text()
-		if name, ok := strings.CutPrefix(line, "event: "); ok {
-			event = name
-		}
-		if data, ok := strings.CutPrefix(line, "data: "); ok && event == "result" {
-			return []byte(data)
-		}
-	}
-	t.Fatalf("the stream ended without a result: %v", lines.Err())
-	return nil
-}
-
-// adapters are the nine trigger adapters and the NATS driver.
-var adapters = []string{"http", "webhook", "worker", "cron", "pubsub", "pubsub/natsjs", "grpc", "sse", "websocket", "mcp"}
-
-// TestAdaptersAreIndependentlyRemovable: no adapter links another adapter
-// except as declared, the store is linked only by the adapters that own
-// durable state, and each protocol library only by the adapter that speaks
-// it. So any adapter can be left out of a binary without dragging another
-// in, and a binary pays only for the adapters it selects.
+// TestAdaptersAreIndependentlyRemovable proves, for Linux, macOS and
+// Windows builds: no adapter links another adapter (except the NATS driver
+// on trigger/pubsub), only worker and cron link the store, and every
+// third-party module is linked only by the adapters that own it. Any
+// adapter can therefore be left out of a binary without dragging another in.
 func TestAdaptersAreIndependentlyRemovable(t *testing.T) {
-	declared := map[string][]string{"pubsub/natsjs": {"pubsub"}}
-	owners := map[string][]string{
-		module + "/store":                 {"worker", "cron"},
-		"database/sql":                    {"worker", "cron"},
-		"google.golang.org/grpc":          {"grpc"},
-		"github.com/coder/websocket":      {"websocket"},
-		"github.com/nats-io":              {"pubsub/natsjs"},
-		"github.com/modelcontextprotocol": {"mcp"},
-		"github.com/google/jsonschema-go": {"mcp"},
-		module + "/internal/engine":       {},
-		module + "/internal/journal":      {},
-		module + "/contract/conformance":  {},
+	discovered, err := exec.Command(goTool(t), "list", module+"/trigger/...").CombinedOutput()
+	if err != nil {
+		t.Fatalf("go list: %v\n%s", err, discovered)
 	}
-	footprint := map[string]int{}
-	for _, adapter := range adapters {
-		output, err := exec.Command(goTool(t), "list", "-deps", module+"/trigger/"+adapter).CombinedOutput()
-		if err != nil {
-			t.Fatalf("go list %s: %v\n%s", adapter, err, output)
+	var found []string
+	for _, path := range strings.Fields(string(discovered)) {
+		rel, ok := strings.CutPrefix(path, module+"/trigger/")
+		if !ok || strings.HasPrefix(rel, "testdata/") || slices.Contains(strings.Split(rel, "/"), "internal") {
+			continue
 		}
-		deps := strings.Fields(string(output))
-		footprint[adapter] = len(deps)
-		for _, dep := range deps {
-			rel, ok := strings.CutPrefix(dep, module+"/trigger/")
-			if ok && rel != adapter && !strings.Contains(rel, "internal") {
-				allowed := false
-				for _, other := range declared[adapter] {
-					allowed = allowed || rel == other
-				}
-				if !allowed {
-					t.Errorf("trigger/%s links trigger/%s", adapter, rel)
-				}
+		found = append(found, rel)
+	}
+	sort.Strings(found)
+	if !slices.Equal(found, adapters) {
+		t.Fatalf("adapters %v, want %v: a new adapter needs ownership rules here", found, adapters)
+	}
+	declared := map[string][]string{"pubsub/natsjs": {"pubsub"}}
+	store := map[string]bool{"worker": true, "cron": true}
+	for _, goos := range []string{"linux", "darwin", "windows"} {
+		footprint := map[string]int{}
+		for _, adapter := range adapters {
+			command := exec.Command(goTool(t), "list", "-deps", "-f", "{{.ImportPath}} {{with .Module}}{{.Path}}{{end}}", module+"/trigger/"+adapter)
+			command.Env = append(os.Environ(), "GOOS="+goos, "GOARCH=amd64", "CGO_ENABLED=0")
+			output, err := command.CombinedOutput()
+			if err != nil {
+				t.Fatalf("go list %s (%s): %v\n%s", adapter, goos, err, output)
 			}
-			for prefix, owned := range owners {
-				if dep != prefix && !strings.HasPrefix(dep, prefix+"/") {
+			lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+			footprint[adapter] = len(lines)
+			for _, line := range lines {
+				path, mod, _ := strings.Cut(line, " ")
+				if rel, ok := strings.CutPrefix(path, module+"/trigger/"); ok && rel != adapter && !slices.Contains(strings.Split(rel, "/"), "internal") && !slices.Contains(declared[adapter], rel) {
+					t.Errorf("%s: trigger/%s links trigger/%s", goos, adapter, rel)
+				}
+				if (path == "database/sql" || path == module+"/store" || strings.HasPrefix(path, module+"/store/")) && !store[adapter] {
+					t.Errorf("%s: trigger/%s links %s; only worker and cron own durable state", goos, adapter, path)
+				}
+				if mod == "" || mod == module {
 					continue
 				}
-				permitted := false
-				for _, owner := range owned {
-					permitted = permitted || owner == adapter
-				}
-				if !permitted {
-					t.Errorf("trigger/%s links %s, which only %v may", adapter, dep, owned)
+				allowed, known := owners[mod]
+				if !known {
+					t.Errorf("%s: trigger/%s links module %s, which has no declared owner", goos, adapter, mod)
+				} else if !slices.Contains(allowed, adapter) {
+					t.Errorf("%s: trigger/%s links module %s, which only %v may", goos, adapter, mod, allowed)
 				}
 			}
 		}
+		names := slices.Clone(adapters)
+		sort.Slice(names, func(i, j int) bool { return footprint[names[i]] < footprint[names[j]] })
+		report := make([]string, 0, len(names))
+		for _, name := range names {
+			report = append(report, fmt.Sprintf("%s=%d", name, footprint[name]))
+		}
+		t.Logf("%s packages linked per adapter: %s", goos, strings.Join(report, " "))
 	}
-	names := append([]string(nil), adapters...)
-	sort.Slice(names, func(i, j int) bool { return footprint[names[i]] < footprint[names[j]] })
-	report := make([]string, 0, len(names))
-	for _, name := range names {
-		report = append(report, fmt.Sprintf("%s=%d", name, footprint[name]))
-	}
-	t.Logf("packages linked per adapter: %s", strings.Join(report, " "))
 }
