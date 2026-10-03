@@ -89,6 +89,19 @@ the image now includes it and the artifact digest covers it. Corrected runs
 pass. The unit test using host filesystem assets did not detect that packaging
 omission; the actual container gate did.
 
+## Current retained-journal correction (2026-10-03)
+
+Commit `eecc5a6` connects readiness to actual SQLite journal artifact and
+checkpoint inventory, with missing/incompatible retained-run regression tests.
+The optional deployment server is isolated in `app/deploy`; native applications
+retain their ordinary `app` dependency. Docker Go 1.27.1 Linux/arm64 focused
+race tests (`./app/... ./examples/deploy ./internal/journal`), full vet,
+full race tests and build passed. `git diff --check` passed.
+
+The earlier container evidence below predates this correction and cannot certify
+its current container integration. Container reruns, independent review and
+native Windows execution remain outstanding; no CI or completion claim is made.
+
 ## Pending acceptance and review
 
 #49/PR #152 remains unmerged. The durable example's order-format marker and
