@@ -1,0 +1,18 @@
+{
+  "schemaVersion": "recipes/v1",
+  "seed": "synthetic-recipes-63",
+  "cases": [
+    { "id": "owner-crud", "expectedStatus": 200, "expectedRecords": 1, "expectedOutbox": 1 },
+    { "id": "owner-update", "expectedStatus": 200, "expectedOutbox": 2, "expectedValue": "updated" },
+    { "id": "owner-delete", "expectedStatus": 200, "expectedRecords": 0, "expectedOutbox": 2 },
+    { "id": "cross-principal-read", "expectedStatus": 400, "expectedEffects": 0 },
+    { "id": "cross-principal-update", "expectedStatus": 400, "expectedEffects": 0 },
+    { "id": "cross-principal-delete", "expectedStatus": 400, "expectedEffects": 0 },
+    { "id": "signed-webhook-first", "expectedStatus": 202, "expectedAcceptedJobs": 1 },
+    { "id": "signed-webhook-duplicate", "expectedStatus": 200, "expectedAcceptedJobs": 1 },
+    { "id": "signed-webhook-tampered", "expectedStatus": 401, "expectedAcceptedJobs": 0 },
+    { "id": "restart-worker", "expectedJobState": "completed", "expectedRecords": 1, "expectedOutbox": 1 },
+    { "id": "outbox-retry", "expectedPublishAttempts": 2, "expectedStableEventId": true },
+    { "id": "slow-subscriber", "expectedCloseReason": "slow_subscriber", "maxSubscriberQueue": 1 }
+  ]
+}

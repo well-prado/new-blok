@@ -1,0 +1,144 @@
+package main
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/well-prado/new-blok/examples/recipes/shop"
+	"github.com/well-prado/new-blok/store"
+	"github.com/well-prado/new-blok/store/sqlite"
+)
+
+func main() {
+	if err := run(os.Args[1:]); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func run(args []string) error {
+	if len(args) != 1 {
+		return errors.New("usage: shop {migrate-up|migrate-status|teardown|serve}")
+	}
+	switch args[0] {
+	case "migrate-up", "migrate-status", "teardown", "serve":
+	default:
+		return fmt.Errorf("unknown command %q; usage: shop {migrate-up|migrate-status|teardown|serve}", args[0])
+	}
+	path := os.Getenv("SHOP_DB_PATH")
+	if path == "" || path == ":memory:" {
+		return errors.New("SHOP_DB_PATH must name a persistent SQLite file")
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	database, err := (sqlite.Backend{}).Open(ctx, absolute)
+	if err != nil {
+		return err
+	}
+	defer database.Close()
+	switch args[0] {
+	case "migrate-up":
+		return shop.Migrate(ctx, database)
+	case "migrate-status":
+		var version int
+		if err := database.WithTx(ctx, func(tx *sql.Tx) error {
+			return tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) FROM shop_schema_migrations`).Scan(&version)
+		}); err != nil {
+			return err
+		}
+		fmt.Printf("shop schema version %d\n", version)
+		return nil
+	case "teardown":
+		return shop.Teardown(ctx, database)
+	case "serve":
+		return serve(ctx, database)
+	}
+	return errors.New("unreachable command")
+}
+
+func serve(parent context.Context, database store.Database) error {
+	address, err := required("SHOP_LISTEN_ADDR")
+	if err != nil {
+		return err
+	}
+	alice, err := required("SHOP_TOKEN_ALICE")
+	if err != nil {
+		return err
+	}
+	bob, err := required("SHOP_TOKEN_BOB")
+	if err != nil {
+		return err
+	}
+	webhookKey, err := required("SHOP_WEBHOOK_SECRET")
+	if err != nil {
+		return err
+	}
+	application, err := shop.New(parent, shop.Config{
+		Database:   database,
+		Tokens:     map[string]string{"alice": alice, "bob": bob},
+		WebhookKey: []byte(webhookKey),
+	})
+	if err != nil {
+		return err
+	}
+	if err := application.Start(parent); err != nil {
+		return err
+	}
+	server := &http.Server{Addr: address, Handler: application.Handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 32 << 10}
+	serverErrors := make(chan error, 1)
+	go func() { serverErrors <- server.ListenAndServe() }()
+	workerCtx, stopWorker := context.WithCancel(parent)
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		for workerCtx.Err() == nil {
+			processed, processErr := application.ProcessOne(workerCtx)
+			if processErr != nil && workerCtx.Err() == nil {
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			if !processed {
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
+	}()
+	ctx, stopSignals := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	select {
+	case <-ctx.Done():
+	case err := <-serverErrors:
+		if !errors.Is(err, http.ErrServerClosed) {
+			stopWorker()
+			<-workerDone
+			return err
+		}
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	stopWorker()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		return err
+	}
+	<-workerDone
+	return application.Shutdown(shutdownCtx)
+}
+
+func required(name string) (string, error) {
+	value := os.Getenv(name)
+	if strings.TrimSpace(value) == "" {
+		return "", fmt.Errorf("%s is required", name)
+	}
+	return value, nil
+}
