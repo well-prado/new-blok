@@ -1,4 +1,5 @@
 {
+  "expectedManifestDigest": "sha256:e910c4923ad52e9817a99da4541558eb49f49665fffec1758777208fb0122388",
   "manifest": {
     "formatVersion": 1,
     "identity": { "name": "shop/quote-node", "version": "1.0.0" },

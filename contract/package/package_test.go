@@ -35,6 +35,16 @@ func fixtureEnvironment() Environment {
 
 func TestPackageGoldenIdentityAndCompatibility(t *testing.T) {
 	bundle := fixtureBundle(t)
+	data, err := os.ReadFile(filepath.Join("..", "..", "testdata", "packages", "local-node-v1.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var golden struct {
+		ExpectedManifestDigest string `json:"expectedManifestDigest"`
+	}
+	if err := json.Unmarshal(data, &golden); err != nil {
+		t.Fatal(err)
+	}
 	verified, err := bundle.Verify(TrustPolicy{AllowUnsignedLocal: true}, fixtureEnvironment())
 	if err != nil {
 		t.Fatal(err)
@@ -42,7 +52,7 @@ func TestPackageGoldenIdentityAndCompatibility(t *testing.T) {
 	if verified.Trust != TrustUnsignedLocal || verified.Identity != bundle.Manifest.Identity {
 		t.Fatalf("unexpected verification result: %+v", verified)
 	}
-	if verified.ManifestDigest == "" || verified.ArtifactDigest != bundle.Manifest.ArtifactDigest {
+	if verified.ManifestDigest != golden.ExpectedManifestDigest || verified.ArtifactDigest != bundle.Manifest.ArtifactDigest {
 		t.Fatalf("missing content identity: %+v", verified)
 	}
 

@@ -29,10 +29,14 @@ signature, and artifact bytes (base64 in JSON). The manifest binds:
 - a required SPDX license identifier (or an explicitly named `LicenseRef`); and
 - source URL, hexadecimal source revision, and bounded builder identity.
 
-The canonical manifest is JSON marshaling of the typed document after sorting
-dependency entries by package name. Runtime-map keys use Go's deterministic
-JSON key ordering. The manifest digest is SHA-256 of those bytes. The signature
-is Ed25519 over the same canonical bytes; it therefore binds identity,
+The canonical manifest is compact UTF-8 JSON with struct fields in the order
+shown above, omitted `omitempty` fields absent, dependencies sorted by package
+name, and runtime-map keys sorted lexicographically. Strings use Go
+`encoding/json` escaping, including lowercase `\\u003c`, `\\u003e`, and
+`\\u0026` for `<`, `>`, and `&`; no insignificant whitespace or trailing
+newline is included. The golden digest in `local-node-v1.json` pins this byte
+profile for non-Go consumers. The manifest digest is SHA-256 of those bytes.
+The signature is Ed25519 over the same canonical bytes; it therefore binds identity,
 compatibility, license, provenance, dependencies, and artifact digest. The
 artifact digest separately checks the exact artifact bytes. A signature is an
 attestation, not proof that a build was reproducible or that source is safe.
@@ -131,4 +135,8 @@ package contract and all reported packages except the unrelated
 `trigger/sse.TestHeartbeatKeepsSilentStreamsAlive`, which observed an extra
 heartbeat at event 4. `trigger/cron` passed in that Linux run. The package
 signature test uses the fixed synthetic Ed25519 seed `0x42` repeated to the
-standard seed length. No GitHub Actions workflow was enabled or dispatched.
+standard seed length. After integrating `origin/main` at
+`a910ef39e151a316a01dd0fcc9a5f27952c0424c`, the complete bounded race command
+passed, including the contention and SSE suites; this makes the first SSE
+failure a reproduced flake rather than a persistent failure. No GitHub Actions
+workflow was enabled or dispatched.
