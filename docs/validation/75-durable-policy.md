@@ -112,6 +112,21 @@ Review R is ongoing; this audit is not an issue-completion claim.
 
 ## Completion limits
 
+The subsequent integrated audit merges current `origin/main` (`0a3f5ca`),
+the explicit worker shutdown deadline correction (`c56f594`), raw operation-key
+UTF-8 validation (`eab409b`), latest #74/#62 changes, and canonical catalog/null
+fixes. Full Go vet/race/build passed again. Node 22.18.0/Linux and
+24.21.0/Darwin lint/generated checks and all 26 SDK tests passed; the actual
+policy integration passed three repetitions on each (Linux race, Darwin
+non-race). Independent review cleared the scope-reentry and cleanup-redaction
+defects after three race repetitions. The permanent actual catalog-child
+regression proves a separately approved write cannot widen a read child's
+scope: zero write effects, one root attempt, zero trusted commits.
+
+These are integrated local checks, not merged-main, native-Windows, or
+deployment readiness certification. The PR remains pending dependency review
+and merge; no GitHub Actions result is claimed.
+
 - #74's reviewed resource-inclusive digest and worker-boundary corrections are
   merged locally and the resource-only approval regression passed. Its own
   dependency/review/merge state remains under #74's owner; local integration
