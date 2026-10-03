@@ -230,11 +230,15 @@ type rig struct {
 	mu       sync.Mutex
 	tokens   map[string]tool.Principal
 	stopped  bool
+	// A request authenticated as "alice-paused" signals paused and waits
+	// for resume, then proceeds as alice.
+	paused chan struct{}
+	resume chan struct{}
 }
 
 func newRig(t *testing.T, configure func(*tmcp.Config)) *rig {
 	t.Helper()
-	r := &rig{t: t, catalog: newCatalog(), wire: &wireLog{}, tokens: map[string]tool.Principal{
+	r := &rig{t: t, catalog: newCatalog(), wire: &wireLog{}, paused: make(chan struct{}, 1), resume: make(chan struct{}), tokens: map[string]tool.Principal{
 		"alice":  {ID: "alice", Capabilities: []string{"echo", "write"}, MaxDepth: 4},
 		"bob":    {ID: "bob", Capabilities: []string{"echo"}, MaxDepth: 4},
 		"nobody": {ID: "nobody", MaxDepth: 4},
@@ -272,6 +276,11 @@ func newRig(t *testing.T, configure func(*tmcp.Config)) *rig {
 }
 
 func (r *rig) authenticate(_ context.Context, token string, _ *http.Request) (tool.Principal, error) {
+	if token == "alice-paused" {
+		r.paused <- struct{}{}
+		<-r.resume
+		token = "alice"
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	principal, ok := r.tokens[token]
@@ -943,4 +952,40 @@ func TestLateSuccessIsADeadline(t *testing.T) {
 	if err != nil || !result.IsError || toolCode(result) != "deadline_exceeded" {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
+}
+
+// TestCallAdmittedBeforeShutdownIsRefused holds a call between the server's
+// admission and its handler while Shutdown begins (and gives up waiting for
+// another call, so sessions stay open): the handler must refuse it.
+func TestCallAdmittedBeforeShutdownIsRefused(t *testing.T) {
+	r := newRig(t, nil)
+	session := r.connect("alice")
+	version := session.InitializeResult().ProtocolVersion
+	go func() { _, _ = call(session, "demo.block_v1.0.0", map[string]any{}, nil) }()
+	<-r.catalog.started
+	type reply struct {
+		status int
+		body   string
+	}
+	replies := make(chan reply, 1)
+	echo := map[string]any{"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": map[string]any{"name": "demo.echo_v1.0.0", "arguments": map[string]any{"text": "a"}}}
+	go func() {
+		status, body := r.raw(http.MethodPost, "alice-paused", session.ID(), version, echo)
+		replies <- reply{status, body}
+	}()
+	<-r.paused
+	short, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := r.adapter.Shutdown(short); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("shutdown returned %v with a call in flight", err)
+	}
+	close(r.resume)
+	got := <-replies
+	if !strings.Contains(got.body, `\"code\":\"unavailable\"`) {
+		t.Fatalf("a call admitted before shutdown: status=%d body=%q", got.status, got.body)
+	}
+	if n := r.catalog.invocations.Load(); n != 1 {
+		t.Fatalf("the catalog saw %d calls; only the blocked one was admitted before shutdown", n)
+	}
+	close(r.catalog.release)
 }
