@@ -268,6 +268,15 @@ var schemaStatements = []string{
 		created_at INTEGER NOT NULL,
 		FOREIGN KEY (operation_key) REFERENCES journal_operations(operation_key)
 	)`,
+	`CREATE TABLE IF NOT EXISTS journal_audit (
+		audit_id TEXT PRIMARY KEY,
+		run_id TEXT NOT NULL,
+		request_key TEXT NOT NULL,
+		artifact_digest TEXT NOT NULL,
+		state TEXT NOT NULL,
+		output_json BLOB,
+		created_at INTEGER NOT NULL
+	)`,
 }
 
 func (j *Journal) Admit(ctx context.Context, request AdmissionRequest) (Admission, error) {
