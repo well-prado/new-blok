@@ -183,12 +183,20 @@ but releases its lease at once. Each call holds its own lease while it runs.
 A drain timeout cancels a request's own work (its authentication and
 building the session's view) and every call (#177); the request's response
 itself is not canceled.
-`Shutdown(ctx)` refuses new sessions and calls, waits for calls in flight,
-then closes every session (the registry, which holds every counted session
-even when its view was evicted, and every cached view's)
-and waits for their bookkeeping; each step returns `ctx.Err()` when ctx ends
-first. Closing a session waits for its in-flight requests, and an opening
-settles while writing its own first response, so an opening never closes its
+`Shutdown(ctx)` refuses new sessions and calls, waits for calls in flight
+and for the request carrying each of them to end, then closes every session
+(the registry, which holds every counted session even when its view was
+evicted, and every cached view's) and waits for their bookkeeping; each step
+returns `ctx.Err()` when ctx ends first. The SDK writes a call's answer on
+its request after the tool handler returns, and a session being closed
+refuses that write, so closing as soon as the calls end lost the answer to
+work that was done (#197). A call admitted before `Shutdown` began therefore
+has its answer written and flushed before any of its session's streams end.
+The request's context ends when the adapter's `ServeHTTP` returns, whatever
+server hosts it. A call refused because `Shutdown` has begun is not waited
+for: it did nothing, and its refusal may not arrive.
+Closing a session waits for its in-flight requests, and an opening settles
+while writing its own first response, so an opening never closes its
 session in place: one that settles before `Shutdown` takes its sessions is
 closed by `Shutdown`, one that settles after is closed on its own goroutine,
 which `Shutdown` does not wait for: that close waits only for the initialize
@@ -244,6 +252,16 @@ likely to be subtly wrong, and the official SDK tracks the specification.
   the adapter handles session-less calls with request-scoped cancellation.
 - A client that loses its connection loses its call: there is no event store
   and no resumption.
+- `Shutdown` delivers the answer to a call in flight to the wire, but cannot
+  make a client read it. Closing a session ends its standing GET stream, and
+  the Go SDK client (v1.8.0) reads that end and the answer on separate
+  connections in no fixed order. When it treats the end of the standing
+  stream as fatal at once (`MaxRetries` below zero), it can fail the
+  connection, and the call with it, before it reads an answer already on the
+  wire: in a probe of 100 calls, every answer was flushed before the stream
+  ended and 73 were still reported as failed. The SDK's default waits at
+  least a second before reconnecting; with it, the regression test's client
+  received every answer.
 - Prompts, sampling, elicitation, subscriptions and resource templates are
   not offered.
 
@@ -256,7 +274,9 @@ expected outcomes, catalog invocation counts and effect counts), approval
 evidence on the real E14-T02 stack, a composed workflow, revocation, hijack,
 protocol versions, deadline, client cancel, a dropped request, a bare DELETE,
 a late-queued call, a canceled call before the catalog, overload, per-principal slots, session bounds, output
-size, draining, a call outliving its request, shutdown, a session opened during
+size, draining, a call outliving its request, shutdown, a call answered on the
+wire and received when shutdown begins while it runs (100 trials, with the
+answer held after the handler returns), a session opened during
 and after shutdown, evicted views, view
 building, a panic while listing, the dependency rule and goroutine bounds.
 Every response byte, and the server's error log, is checked for the
