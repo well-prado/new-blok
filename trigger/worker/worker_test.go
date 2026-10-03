@@ -470,13 +470,19 @@ func TestConcurrentWorkersNeverFailBusy(t *testing.T) {
 	if err := queue.RegisterKind("busy", []byte(`{"type":"object"}`)); err != nil {
 		t.Fatal(err)
 	}
-	const jobs, workers = 200, 4
+	// Submitters keep at most 16 submissions in flight, as real clients do:
+	// an unbounded burst queues on the single writer past the busy timeout,
+	// which is saturation (#184), not what this test is about.
+	const jobs, workers, inFlight = 200, 4, 16
 	var submitters sync.WaitGroup
 	submitErrs := make(chan error, jobs)
+	slots := make(chan struct{}, inFlight)
 	for i := range jobs {
 		submitters.Add(1)
 		go func() {
 			defer submitters.Done()
+			slots <- struct{}{}
+			defer func() { <-slots }()
 			if _, err := queue.Submit(ctx, trigger.Submission{Key: fmt.Sprintf("busy-%d", i), Kind: "busy", Payload: []byte(`{}`)}); err != nil {
 				submitErrs <- err
 			}
