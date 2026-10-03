@@ -176,10 +176,13 @@ func (s *Supervisor) Call(ctx context.Context, call contract.Call) (contract.Res
 }
 
 func (s *Supervisor) Shutdown(ctx context.Context) error {
-	// One budget covers active-call drain as well as transport cleanup. In
-	// particular, Background must not let an active effect hold shutdown forever.
-	ctx, cancel := context.WithTimeout(ctx, cleanupTimeout)
-	defer cancel()
+	// Respect the application's explicit drain deadline. Only an unbounded
+	// context needs a default budget so Background cannot wait forever.
+	if _, bounded := ctx.Deadline(); !bounded {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, cleanupTimeout)
+		defer cancel()
+	}
 	s.mu.Lock()
 	if s.state == stateStopped {
 		s.mu.Unlock()

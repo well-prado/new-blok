@@ -212,6 +212,53 @@ func TestShutdownStalledDrainReapsRealProcess(t *testing.T) {
 	}
 }
 
+func TestExplicitShutdownBudgetAllowsRealActiveCallToFinish(t *testing.T) {
+	f := factory(t, freeAddress(t))
+	marker := filepath.Join(t.TempDir(), "drain-started")
+	f.Env = append(f.Env, "WORKER_EFFECT_MARK="+marker)
+	s, err := New(Config{Hello: hello(), Factory: f})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	p := s.conn.(*processConnection)
+	t.Cleanup(func() { _ = p.cmd.Process.Kill(); <-p.exited })
+	request := call("explicit-drain-budget")
+	request.Node = "drain-budget"
+	result := make(chan outcome, 1)
+	go func() {
+		value, err := s.Call(ctx, request)
+		result <- outcome{result: value, err: err}
+	}()
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			t.Fatal("worker did not start the bounded call")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	shutdown, stop := context.WithTimeout(context.Background(), 3*time.Second)
+	defer stop()
+	if err := s.Shutdown(shutdown); err != nil {
+		t.Fatalf("explicit three-second budget was shortened: %v", err)
+	}
+	got := <-result
+	if got.err != nil || string(got.result.Output) != string(request.Input) {
+		t.Fatalf("accepted call did not finish within configured drain: %+v %v", got.result, got.err)
+	}
+	select {
+	case <-p.exited:
+	default:
+		t.Fatal("shutdown returned before worker reap")
+	}
+}
+
 func TestBackgroundShutdownBoundsActiveEffectAndReapsRealProcess(t *testing.T) {
 	f := factory(t, freeAddress(t))
 	marker := filepath.Join(t.TempDir(), "synthetic-effect")

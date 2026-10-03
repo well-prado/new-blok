@@ -104,6 +104,14 @@ func (w testWorker) Connect(stream wire.Worker_ConnectServer) error {
 						return
 					}
 				}
+				if c.Node == "drain-budget" {
+					_ = os.WriteFile(os.Getenv("WORKER_EFFECT_MARK"), []byte("started"), 0600)
+					select {
+					case <-time.After(1250 * time.Millisecond):
+					case <-ctx.Done():
+						return
+					}
+				}
 				if c.Node == "late" {
 					time.Sleep(50 * time.Millisecond)
 				}
