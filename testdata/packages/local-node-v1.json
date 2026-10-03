@@ -1,0 +1,23 @@
+{
+  "manifest": {
+    "formatVersion": 1,
+    "identity": { "name": "shop/quote-node", "version": "1.0.0" },
+    "kind": "node",
+    "artifactDigest": "sha256:ba1467456cec325e50df6104876ee0b4ff4284d9cc86f843ad669d45d56cecba",
+    "dependencies": [
+      { "name": "shop/common", "version": ">=1.0.0 <2.0.0", "manifestDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+    ],
+    "compatibility": {
+      "engine": ">=1.0.0 <2.0.0",
+      "schema": ">=1.0.0 <2.0.0",
+      "runtimes": { "nodejs": ">=20.0.0 <25.0.0" }
+    },
+    "license": "Apache-2.0",
+    "provenance": {
+      "source": "https://github.com/well-prado/new-blok",
+      "revision": "0123456abcdef",
+      "builder": "new-blok-package-fixture"
+    }
+  },
+  "artifact": "c3ludGhldGljLW5vZGUtYXJ0aWZhY3QtdjE="
+}
