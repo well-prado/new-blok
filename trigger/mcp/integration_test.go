@@ -159,6 +159,11 @@ func newCatalog() *fakeCatalog {
 	add("demo/badcode", "echo", empty, nil, nil, func(context.Context, tmcp.Call) (json.RawMessage, error) {
 		return nil, classified{code: secretMarker, class: "domain"}
 	})
+	// late ignores its context and succeeds after any short deadline.
+	add("demo/late", "echo", empty, nil, nil, func(context.Context, tmcp.Call) (json.RawMessage, error) {
+		time.Sleep(300 * time.Millisecond)
+		return json.RawMessage(`{}`), nil
+	})
 	// block runs until its context ends or the test releases it, and
 	// reports how it ended.
 	add("demo/block", "echo", empty, nil, nil, func(ctx context.Context, _ tmcp.Call) (json.RawMessage, error) {
@@ -924,5 +929,18 @@ func TestNewRefusesInvalidConfiguration(t *testing.T) {
 	}
 	if _, err := tmcp.New(nil, valid()); err == nil {
 		t.Error("no application: accepted")
+	}
+}
+
+// TestLateSuccessIsADeadline: a catalog that returns after the call's
+// deadline has failed the call, whatever it returned.
+func TestLateSuccessIsADeadline(t *testing.T) {
+	r := newRig(t, func(c *tmcp.Config) {
+		c.Timeout = 100 * time.Millisecond
+		c.Expose = []string{"demo/late@1.0.0"}
+	})
+	result, err := call(r.connect("alice"), "demo.late_v1.0.0", map[string]any{}, nil)
+	if err != nil || !result.IsError || toolCode(result) != "deadline_exceeded" {
+		t.Fatalf("result=%+v err=%v", result, err)
 	}
 }
