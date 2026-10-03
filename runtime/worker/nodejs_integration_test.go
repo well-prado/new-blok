@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	contract "github.com/well-prado/new-blok/contract/runtime"
 	"github.com/well-prado/new-blok/flow"
 	"github.com/well-prado/new-blok/flowtest"
@@ -108,6 +109,19 @@ func TestActualNodeWorkerThroughTypedWorkflow(t *testing.T) {
 	}
 	call := func(id, name, body string) contract.Call {
 		return contract.Call{CallID: id, AttemptID: "attempt-" + id, Node: name, NodeVersion: "1.0.0", Generation: 1, Deadline: time.Now().Add(time.Second), Input: []byte(body), Capabilities: caps, IdempotencyKey: "logical-operation"}
+	}
+	for i, key := range []string{string([]byte{0xff}), strings.Repeat("x", 129)} {
+		request := call(fmt.Sprintf("invalid-key-%d", i), "fixture/echo", `{"value":"1"}`)
+		request.IdempotencyKey = key
+		if _, err := supervisor.Call(context.Background(), request); !errors.Is(err, contract.ErrLimitExceeded) {
+			t.Fatalf("invalid operation key crossed wire: %v", err)
+		}
+	}
+	business := call("business-key", "fixture/provider", `{"kind":"uncertain"}`)
+	business.IdempotencyKey = "order 123/ação"
+	businessResult, businessErr := supervisor.Call(context.Background(), business)
+	if businessErr != nil || businessResult.Error == nil || businessResult.Error.IdempotencyKey != business.IdempotencyKey || businessResult.Error.Class != contract.ErrorUncertain || businessResult.Error.SafeToRetry() {
+		t.Fatalf("business key rejected or lost, or prior rejection closed channel: %+v %v", businessResult, businessErr)
 	}
 	for i, n := range []string{"9223372036854775807", "-9223372036854775808"} {
 		id := []string{"max", "min"}[i]

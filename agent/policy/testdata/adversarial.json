@@ -1,0 +1,19 @@
+[
+  {"name":"accepted","error":"","effects":1,"attempts":1,"published":1},
+  {"name":"missing","error":"stale","effects":0,"attempts":0,"published":0},
+  {"name":"rejected","error":"stale","effects":0,"attempts":0,"published":0},
+  {"name":"expired","error":"stale","effects":0,"attempts":0,"published":0},
+  {"name":"unauthorized-reviewer","error":"stale","effects":0,"attempts":0,"published":0},
+  {"name":"changed-input","error":"stale","effects":0,"attempts":0,"published":0},
+  {"name":"changed-artifact","error":"stale","effects":0,"attempts":0,"published":0},
+  {"name":"changed-tool-digest","error":"stale","effects":0,"attempts":0,"published":0},
+  {"name":"changed-action","error":"stale","effects":0,"attempts":0,"published":0},
+  {"name":"changed-effects","error":"stale","effects":0,"attempts":0,"published":0},
+  {"name":"changed-path","error":"stale","effects":0,"attempts":0,"published":0},
+  {"name":"changed-iteration","error":"stale","effects":0,"attempts":0,"published":0},
+  {"name":"widened-scope","error":"stale","effects":0,"attempts":0,"published":0},
+  {"name":"forged-evidence","error":"evidence","effects":1,"attempts":1,"published":0},
+  {"name":"model-instruction","error":"evidence","effects":1,"attempts":1,"published":0},
+  {"name":"assertion-failed","error":"evidence","effects":1,"attempts":1,"published":0},
+  {"name":"expiry-during-dispatch","error":"stale","effects":1,"attempts":1,"published":0}
+]

@@ -172,7 +172,7 @@ export class Worker {
     return { ...h, capabilities: [...h.capabilities], limits: { maxFrameBytes: Math.min(h.limits.maxFrameBytes, this.limits.maxFrameBytes), maxBlobBytes: Math.min(h.limits.maxBlobBytes, this.limits.maxBlobBytes), maxConcurrentCalls: Math.min(h.limits.maxConcurrentCalls, this.limits.maxConcurrentCalls) } };
   }
   private validateCall(c: Call, h: Hello): void {
-    if (![c.callId, c.attemptId, c.node, c.nodeVersion].every(x => identity.test(x)) || c.generation !== this.options.generation || Buffer.byteLength(c.idempotencyKey) > 128 || (c.idempotencyKey !== "" && !identity.test(c.idempotencyKey))) throw new Error("invalid_call_identity");
+    if (![c.callId, c.attemptId, c.node, c.nodeVersion].every(x => identity.test(x)) || c.generation !== this.options.generation || Buffer.byteLength(c.idempotencyKey) > 128) throw new Error("invalid_call_identity");
     if (c.principal !== this.options.principal || !capabilities(c.capabilities) || c.capabilities.some(x => !h.capabilities.includes(x))) throw new DomainError("capability_denied");
     const deadline = BigInt(c.deadlineUnixNanos), now = BigInt(Date.now()) * 1000000n;
     if (deadline <= now) throw new DomainError("call_deadline","DEADLINE_EXCEEDED");

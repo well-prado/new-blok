@@ -34,6 +34,12 @@ and concurrent calls are 64. Calls and negotiation permit at most 128
 capabilities; calls permit at most 128 blob references. A call deadline is at
 most five minutes from validation, shared by Go and Node (not an unadvertised
 worker-only duration setting). Input reserves 1024 bytes for bounded call metadata.
+Logical idempotency keys are opaque valid UTF-8 strings of at most 128 bytes,
+not protocol identifiers: business keys may contain spaces, slashes and Unicode.
+Go validates their encoding before protobuf dispatch; both peers enforce the
+byte bound and preserve the key in uncertain/error results.
+Node scans each raw call key before protobuf decoding, rejecting malformed UTF-8
+without rejecting a legitimately encoded U+FFFD replacement character.
 The complete encoded call envelope is also checked against the negotiated
 frame ceiling before queueing: the 1024-byte input reserve alone does not bound
 128 capabilities or blob-reference metadata. An unset principal reserves the

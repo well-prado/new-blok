@@ -1,0 +1,8 @@
+{
+  "issue": 75,
+  "source": "Synthetic policy, catalog, provider and process-kill fixtures authored for E14-T02",
+  "license": "Apache-2.0",
+  "privateData": false,
+  "fixtures": ["adversarial.json", "catalog.json"],
+  "decision": "docs/decisions/0008-durable-tool-policy.md"
+}
