@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/well-prado/new-blok/contract/schema"
 )
@@ -209,6 +210,9 @@ func (c Call) Validate(limits Limits, generation uint64) error {
 	}
 	if len(c.Input) == 0 || len(c.Input) > limits.MaxFrameBytes-1024 || len(c.IdempotencyKey) > 128 || len(c.Blobs) > 128 || len(c.Capabilities) > 128 {
 		return fmt.Errorf("%w: input", ErrLimitExceeded)
+	}
+	if !utf8.ValidString(c.IdempotencyKey) {
+		return fmt.Errorf("%w: invalid key encoding", ErrLimitExceeded)
 	}
 	if c.Principal != "" && !identityPattern.MatchString(c.Principal) {
 		return ErrCapabilityDenied
