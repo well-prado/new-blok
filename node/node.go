@@ -44,9 +44,11 @@ func (e *DomainError) Error() string {
 	}
 	return e.Code + ": " + e.Err.Error()
 }
-func (e *DomainError) Unwrap() error     { return e.Err }
-func (e *DomainError) IsUncertain() bool { return e.Uncertain }
-func (e *DomainError) IsRetryable() bool { return e.Retryable }
+func (e *DomainError) Unwrap() error      { return e.Err }
+func (e *DomainError) IsUncertain() bool  { return e.Uncertain }
+func (e *DomainError) IsRetryable() bool  { return e.Retryable }
+func (e *DomainError) ErrorCode() string  { return e.Code }
+func (e *DomainError) ErrorClass() string { return e.Class }
 
 type Option func(*config)
 type config struct {

@@ -1,0 +1,165 @@
+{
+  "version": 1,
+  "inputSchema": {"type":"object","properties":{"sku":{"type":"string"},"quantity":{"type":"integer","minimum":1,"maximum":100},"principal":{"type":"string"}},"required":["sku","quantity"]},
+  "cases": [
+    {
+      "id": "map-valid",
+      "description": "An authenticated valid delivery reaches the workflow once with its mapped input and verified principal.",
+      "script": ["succeed"],
+      "deliveries": [{"key":"k-map","payload":{"sku":"coffee","quantity":2},"credential":"valid"}],
+      "expect": {"outcomes":["completed"],"codes":[""],"output":1,"errors":0,"effects":1,"dispatches":1,"duplicates":0,"principal":"user-1"}
+    },
+    {
+      "id": "principal-spoof",
+      "description": "A principal named in caller data never becomes the execution principal.",
+      "script": ["succeed"],
+      "deliveries": [{"key":"k-spoof","payload":{"sku":"coffee","quantity":1,"principal":"admin"},"credential":"valid"}],
+      "expect": {"outcomes":["completed"],"codes":[""],"output":1,"errors":0,"effects":1,"dispatches":1,"duplicates":0,"principal":"user-1"}
+    },
+    {
+      "id": "unauthenticated",
+      "description": "A caller without a credential is rejected before dispatch.",
+      "applies": {"authentication":"caller"},
+      "script": ["succeed"],
+      "deliveries": [{"key":"k-anon","payload":{"sku":"coffee","quantity":1}}],
+      "expect": {"outcomes":["rejected"],"codes":["unauthorized"],"output":0,"errors":1,"effects":0,"dispatches":0,"duplicates":0}
+    },
+    {
+      "id": "forged-credential",
+      "description": "An unverifiable credential is rejected before dispatch.",
+      "applies": {"authentication":"caller"},
+      "script": ["succeed"],
+      "deliveries": [{"key":"k-forged","payload":{"sku":"coffee","quantity":1},"credential":"forged"}],
+      "expect": {"outcomes":["rejected"],"codes":["unauthorized"],"output":0,"errors":1,"effects":0,"dispatches":0,"duplicates":0}
+    },
+    {
+      "id": "schema-invalid",
+      "description": "A wrong-typed field is rejected before dispatch and before durable acceptance.",
+      "script": ["succeed"],
+      "deliveries": [{"key":"k-type","payload":{"sku":"coffee","quantity":"two"},"credential":"valid"}],
+      "expect": {"outcomes":["rejected"],"codes":["invalid_input"],"output":0,"errors":1,"effects":0,"dispatches":0,"duplicates":0}
+    },
+    {
+      "id": "schema-out-of-range",
+      "description": "An integer outside the declared bounds is rejected before dispatch.",
+      "script": ["succeed"],
+      "deliveries": [{"key":"k-range","payload":{"sku":"coffee","quantity":1000},"credential":"valid"}],
+      "expect": {"outcomes":["rejected"],"codes":["invalid_input"],"output":0,"errors":1,"effects":0,"dispatches":0,"duplicates":0}
+    },
+    {
+      "id": "empty-payload",
+      "description": "An omitted payload cannot bypass required fields.",
+      "script": ["succeed"],
+      "deliveries": [{"key":"k-empty","credential":"valid"}],
+      "expect": {"outcomes":["rejected"],"codes":["invalid_input"],"output":0,"errors":1,"effects":0,"dispatches":0,"duplicates":0}
+    },
+    {
+      "id": "domain-error",
+      "description": "A classified business failure is surfaced by code and is not retried by the adapter.",
+      "script": ["domain-error"],
+      "deliveries": [{"key":"k-domain","payload":{"sku":"coffee","quantity":1},"credential":"valid"}],
+      "expect": {"outcomes":["rejected"],"codes":["out_of_stock"],"output":0,"errors":1,"effects":0,"dispatches":1,"duplicates":0,"principal":"user-1"}
+    },
+    {
+      "id": "internal-error",
+      "description": "An internal failure is reported without its text and is not retried by the adapter.",
+      "script": ["internal-error"],
+      "deliveries": [{"key":"k-internal","payload":{"sku":"coffee","quantity":1},"credential":"valid"}],
+      "expect": {"outcomes":["rejected"],"codes":["internal"],"output":0,"errors":1,"effects":0,"dispatches":1,"duplicates":0,"principal":"user-1"}
+    },
+    {
+      "id": "saturated-memory",
+      "description": "Memory work rejected for capacity becomes protocol backpressure without an adapter retry.",
+      "applies": {"completion":"memory"},
+      "script": ["saturated"],
+      "deliveries": [{"key":"k-sat-m","payload":{"sku":"coffee","quantity":1},"credential":"valid"}],
+      "expect": {"outcomes":["rejected"],"codes":["saturated"],"output":0,"errors":1,"effects":0,"dispatches":1,"duplicates":0,"principal":"user-1"}
+    },
+    {
+      "id": "saturated-detach",
+      "description": "A durable caller-facing adapter answers saturation with backpressure; nothing is accepted and the source retries.",
+      "applies": {"disconnect":"detach"},
+      "script": ["saturated"],
+      "deliveries": [{"key":"k-sat-x","payload":{"sku":"coffee","quantity":1},"credential":"valid"}],
+      "expect": {"outcomes":["rejected"],"codes":["saturated"],"output":0,"errors":1,"effects":0,"dispatches":1,"duplicates":0,"principal":"user-1"}
+    },
+    {
+      "id": "saturated-redeliver",
+      "description": "A queued delivery rejected for capacity is deferred, not dead-lettered, and completes on redelivery.",
+      "applies": {"disconnect":"redeliver"},
+      "script": ["saturated", "succeed"],
+      "deliveries": [{"key":"k-sat-d","payload":{"sku":"coffee","quantity":1},"credential":"valid"}],
+      "recover": true,
+      "expect": {"outcomes":["deferred","completed"],"codes":["",""],"output":1,"errors":0,"effects":1,"dispatches":2,"duplicates":0,"principal":"user-1"}
+    },
+    {
+      "id": "memory-no-dedup-claim",
+      "description": "Memory completion makes no deduplication claim: a repeated key is executed again.",
+      "applies": {"completion":"memory"},
+      "script": ["succeed"],
+      "deliveries": [
+        {"key":"k-mem","payload":{"sku":"coffee","quantity":1},"credential":"valid"},
+        {"key":"k-mem","payload":{"sku":"coffee","quantity":1},"credential":"valid"}
+      ],
+      "expect": {"outcomes":["completed","completed"],"codes":["",""],"output":2,"errors":0,"effects":2,"dispatches":2,"duplicates":0,"principal":"user-1"}
+    },
+    {
+      "id": "duplicate-delivery",
+      "description": "A repeated delivery key is accepted once and dispatched once.",
+      "applies": {"completion":"durable"},
+      "script": ["succeed"],
+      "deliveries": [
+        {"key":"k-dup","payload":{"sku":"coffee","quantity":1},"credential":"valid"},
+        {"key":"k-dup","payload":{"sku":"coffee","quantity":1},"credential":"valid"}
+      ],
+      "expect": {"outcomes":["completed","duplicate"],"codes":["",""],"output":1,"errors":0,"effects":1,"dispatches":1,"duplicates":1,"principal":"user-1"}
+    },
+    {
+      "id": "duplicate-after-restart",
+      "description": "Deduplication survives an adapter restart over the same durable state.",
+      "applies": {"completion":"durable"},
+      "script": ["succeed"],
+      "deliveries": [
+        {"key":"k-restart","payload":{"sku":"coffee","quantity":1},"credential":"valid"},
+        {"key":"k-restart","payload":{"sku":"coffee","quantity":1},"credential":"valid","restartBefore":true}
+      ],
+      "expect": {"outcomes":["completed","duplicate"],"codes":["",""],"output":1,"errors":0,"effects":1,"dispatches":1,"duplicates":1,"principal":"user-1"}
+    },
+    {
+      "id": "conflicting-duplicate",
+      "description": "A reused delivery key with a different payload is rejected instead of silently deduplicated.",
+      "applies": {"completion":"durable"},
+      "script": ["succeed"],
+      "deliveries": [
+        {"key":"k-conflict","payload":{"sku":"coffee","quantity":1},"credential":"valid"},
+        {"key":"k-conflict","payload":{"sku":"coffee","quantity":2},"credential":"valid"}
+      ],
+      "expect": {"outcomes":["completed","rejected"],"codes":["","conflict"],"output":1,"errors":1,"effects":1,"dispatches":1,"duplicates":0,"principal":"user-1"}
+    },
+    {
+      "id": "disconnect-cancel",
+      "description": "A lost caller cancels in-flight memory work; nothing is completed.",
+      "applies": {"disconnect":"cancel"},
+      "script": ["block"],
+      "deliveries": [{"key":"k-cancel","payload":{"sku":"coffee","quantity":1},"credential":"valid","disconnect":true}],
+      "expect": {"outcomes":["disconnected"],"codes":[""],"output":0,"errors":0,"effects":0,"dispatches":1,"duplicates":0,"principal":"user-1","canceled":true}
+    },
+    {
+      "id": "disconnect-detach",
+      "description": "A lost caller stops waiting; committed durable work still completes.",
+      "applies": {"disconnect":"detach"},
+      "script": ["detach"],
+      "deliveries": [{"key":"k-detach","payload":{"sku":"coffee","quantity":1},"credential":"valid","disconnect":true}],
+      "expect": {"outcomes":["disconnected"],"codes":[""],"output":0,"errors":0,"effects":1,"dispatches":1,"duplicates":0,"principal":"user-1","canceled":false}
+    },
+    {
+      "id": "disconnect-redeliver",
+      "description": "A consumer lost before acknowledgment leaves the delivery to be redelivered and completed once.",
+      "applies": {"disconnect":"redeliver"},
+      "script": ["block", "succeed"],
+      "deliveries": [{"key":"k-redeliver","payload":{"sku":"coffee","quantity":1},"credential":"valid","disconnect":true}],
+      "recover": true,
+      "expect": {"outcomes":["disconnected","completed"],"codes":["",""],"output":1,"errors":0,"effects":1,"dispatches":2,"duplicates":0,"principal":"user-1","canceled":true}
+    }
+  ]
+}
