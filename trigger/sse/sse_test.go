@@ -164,6 +164,17 @@ func newFixtureWithListener(t *testing.T, config sse.HubConfig, configure func(*
 	}
 	f.http = httptest.NewUnstartedServer(f.server)
 	if listener != nil {
+		unusedListener := f.http.Listener
+		unusedAddress := unusedListener.Addr().String()
+		if err := unusedListener.Close(); err != nil {
+			t.Fatalf("close unused httptest listener: %v", err)
+		}
+		probe, err := net.DialTimeout("tcp", unusedAddress, 100*time.Millisecond)
+		if err == nil {
+			_ = probe.Close()
+			closeErr := unusedListener.Close()
+			t.Fatalf("unused httptest listener still accepts connections; cleanup close: %v", closeErr)
+		}
 		f.http.Listener = listener
 	}
 	f.http.Start()
