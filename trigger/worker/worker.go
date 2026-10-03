@@ -396,6 +396,20 @@ func encodePrincipal(principal trigger.Principal) (string, error) {
 	return string(data), nil
 }
 
+// Settled reports whether the work submitted under a request key has
+// finished or been dead-lettered. A key never submitted has nothing running
+// and is settled.
+func (q *Queue) Settled(ctx context.Context, requestKey string) (bool, error) {
+	job, err := q.Get(ctx, requestKey)
+	if errors.Is(err, ErrNotFound) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return job.State == StateCompleted || job.State == StateDead, nil
+}
+
 func (q *Queue) Get(ctx context.Context, requestKey string) (Job, error) {
 	var job Job
 	err := q.withTx(ctx, func(tx *sql.Tx) error {

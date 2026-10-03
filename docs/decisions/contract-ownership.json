@@ -113,6 +113,14 @@
       "status": "implemented",
       "decision": "The server assigns connection identity; each connection runs one message at a time with a bounded queue; floods, slow readers and missed pongs close the connection with declared codes; OnDisconnect runs exactly once (ADR 0008).",
       "evidence": ["websocket-frame-fixtures", "websocket-handshake-origin-auth-ping", "websocket-isolation-spoofing", "websocket-slow-clients", "websocket-disconnect-races", "websocket-shutdown-bounds", "websocket-trigger-conformance"]
+    },
+    {
+      "id": "cron-occurrence-identity",
+      "question": "What is a cron occurrence across DST, clock shifts, downtime and restarts?",
+      "owner": "E09-T03",
+      "status": "implemented",
+      "decision": "An occurrence is its UTC instant under explicit gap/fold policies, submitted under a stable key before a never-backwards cursor is written; catch-up and overlap are bounded policies and one goroutine drives every schedule (ADR 0009).",
+      "evidence": ["cron-occurrence-corpus", "cron-exact-reference-every-zone", "cron-wall-clock-shifts", "cron-catch-up-late-occurrences", "cron-crash-around-commit", "cron-overlap-policies", "cron-concurrent-ticks", "cron-failure-backoff", "cron-many-schedules-profile", "cron-dense-schedules-profile", "cron-trigger-conformance"]
     }
   ]
 }
