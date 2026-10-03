@@ -55,7 +55,11 @@ descriptor does not have, which protobuf records as unknown.
 
 ### Order of a call
 
-1. application admission (Unavailable `unavailable`);
+1. application admission (Unavailable `unavailable`). The call holds its
+   lease until it answers; if the application's drain times out first, its
+   context is canceled and it answers `Canceled canceled`, not
+   `Unavailable`, which clients retry: it may have committed (ADR 0005,
+   #177);
 2. authentication from the call's context, its metadata or peer
    (Unauthenticated `unauthorized`);
 3. the binding's server-side `Authorize(principal, method)`, which is

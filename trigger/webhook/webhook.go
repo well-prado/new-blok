@@ -371,19 +371,28 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	// Submission is not canceled by the provider disconnecting: it either
 	// commits or fails as a unit, bounded by SubmitTimeout. An unacknowledged
 	// event is redelivered by the provider and deduplicated here.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(request.Context()), e.SubmitTimeout)
+	// It is canceled only if the application's drain times out first.
+	bound, unbind := lease.Bind(context.WithoutCancel(request.Context()))
+	defer unbind()
+	ctx, cancel := context.WithTimeout(bound, e.SubmitTimeout)
 	defer cancel()
 	accepted, err := e.Submit.Submit(ctx, trigger.Submission{Key: SubmissionKey(e.Provider, verified.EventID), Kind: e.Kind, Payload: body, Principal: e.Principal})
 	switch {
-	case errors.Is(err, trigger.ErrSaturated):
-		writer.Header().Set("Retry-After", "1")
-		respond(writer, http.StatusServiceUnavailable, "error", "saturated")
-		return
 	case errors.Is(err, trigger.ErrConflict):
 		respond(writer, http.StatusConflict, "error", "conflict")
 		return
 	case errors.Is(err, trigger.ErrInvalidInput):
 		respond(writer, http.StatusBadRequest, "error", "invalid_input")
+		return
+	case err != nil && app.Aborted(ctx):
+		// The drain timed out under the submission: the provider redelivers
+		// and the store deduplicates whatever did commit.
+		writer.Header().Set("Retry-After", "1")
+		respond(writer, http.StatusServiceUnavailable, "error", "unavailable")
+		return
+	case errors.Is(err, trigger.ErrSaturated):
+		writer.Header().Set("Retry-After", "1")
+		respond(writer, http.StatusServiceUnavailable, "error", "saturated")
 		return
 	case err != nil:
 		writeJSON(writer, http.StatusInternalServerError, map[string]string{"error": "internal", "requestId": s.newRequestID()})

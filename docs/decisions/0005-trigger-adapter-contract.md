@@ -84,6 +84,47 @@ saturation and a lost consumer consume a separate deferral budget instead
 (`MaxDeferrals` = 16, backoff 1s doubling to a 1-minute cap), after which the
 job is dead-lettered with `deferral_budget_exhausted`.
 
+### Drain timeout
+
+A caller-facing adapter (HTTP, webhook, SSE, gRPC, WebSocket, MCP) holds an
+application lease (`app.Application.Begin`) for the work it admits, and
+`app.Shutdown` waits for every lease up to `DrainTimeout` before it closes
+the application's dependencies. The queued sources (worker, pubsub, cron)
+take no leases: they are loops driven by their context
+(`worker.Queue.ProcessOnce`, `pubsub.Consumer.Run`, `cron.Scheduler.Run`),
+and they stop with the application only if the host runs each as an
+`app.Dependency` whose `Close` cancels that context and waits for the
+loop. Work can outlive that wait.
+Shutdown then cancels it rather than closing the store under it (#177):
+
+- Every such adapter derives the admitted work's context from its lease
+  (`Lease.Bind`) right after admission, so authentication is covered too.
+  When the drain times out, that context is canceled with cause
+  `app.ErrDrainTimeout`; work bound after that starts canceled.
+- `Shutdown` then waits up to `AbortGrace` (1 s by default) for the canceled
+  work to release its leases, and only then closes the dependencies; both
+  waits end early if `Shutdown`'s own ctx does, so a caller's deadline also
+  bounds the grace. Work that ignores its context beyond that still meets
+  closed dependencies: it fails with their error, and nothing it was
+  writing commits.
+- Aborted work may already have committed something, so it is answered as
+  a retry invitation only where a retry is harmless. The durable starts
+  (webhook, SSE) are keyed, so they answer 503 `unavailable` with
+  `Retry-After`; a final answer the submission already had (conflict,
+  invalid input) still wins. The in-band adapters have no key, and answer
+  as the cancellation it is, which clients do not retry by default (the
+  rule #190 set for a failure after an effect): HTTP 504, gRPC `Canceled`,
+  MCP and WebSocket `canceled` (HTTP 504 when the handler returns the
+  context's error; any other unclassified error stays 500). A handler that
+  returned success is still answered with it. An aborted WebSocket
+  `OnConnect` closes with 1013 (try again later); the disconnect workflow
+  that follows starts canceled.
+
+The alternative considered was to require `DrainTimeout` to cover every
+endpoint's read and submit bounds. It was rejected: it ties the
+application's configuration to every adapter's knobs, and it still fails
+for a dependency that hangs.
+
 ### Conformance harness
 
 `contract/conformance.RunTrigger` runs a versioned, embedded corpus
@@ -158,6 +199,9 @@ not applicable with a reason, never as passed. Failures are
 | The engine hides saturation after an earlier step's declared effect (#190) | behavioral | such a failure keeps its code and matches everything else it carried, but no longer `ErrSaturated`; its text gains `(after step "<id>" committed its effects)`. It is answered as a failure, never as a retryable refusal. A worker hosting such a workflow fails or dead-letters the job instead of deferring it |
 | Agent catalog workflow tools' dispatch steps declare their child's effects (#190) | behavioral | lets the engine hide saturation after a child's effect; dispatch steps are internal, so nothing else observes it |
 | `store.ErrBusy` text is `store: busy` | behavioral | log text only; match it with `errors.Is` |
+| `app.Lease.Context`/`Bind`, `app.Aborted`, `Config.AbortGrace` | additive | none |
+| A drain timeout cancels admitted work, waits up to `AbortGrace`, then closes the dependencies (#177) | behavioral (fix) | work that outlived `DrainTimeout` used to run on into closed dependencies. Handlers should observe their context |
+| HTTP's draining 503 carries `Retry-After` | additive | none |
 
 ## Limits
 

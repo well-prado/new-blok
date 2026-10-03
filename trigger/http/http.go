@@ -83,10 +83,16 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	}
 	lease, err := s.application.Begin()
 	if err != nil {
+		writer.Header().Set("Retry-After", "1")
 		writeJSON(writer, http.StatusServiceUnavailable, map[string]any{"error": "application unavailable"})
 		return
 	}
 	defer lease.Release()
+	// Everything the request does from here, authentication included,
+	// stops if the application's drain times out.
+	bound, unbind := lease.Bind(request.Context())
+	defer unbind()
+	request = request.WithContext(bound)
 	principal := Principal{}
 	if endpoint.Authenticate != nil {
 		principal, err = endpoint.Authenticate(request)
@@ -117,6 +123,9 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			return
 		}
 	}
+	// The handler stops when the client leaves, its timeout passes, or the
+	// application's drain times out. Work the drain cut off is answered as
+	// canceled, not as a refusal to retry: it may have committed.
 	ctx := request.Context()
 	var cancel context.CancelFunc
 	if endpoint.Timeout > 0 {
