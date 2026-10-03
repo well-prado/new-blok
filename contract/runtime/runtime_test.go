@@ -3,10 +3,43 @@ package runtime
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestCallSharedBounds(t *testing.T) {
+	c := Call{CallID: "shared", AttemptID: "attempt-shared", Node: "fixture/echo", NodeVersion: "1.0.0", Generation: 1, Deadline: time.Now().Add(90 * time.Second), Input: []byte(`{}`)}
+	for i := 0; i < 128; i++ {
+		c.Capabilities = append(c.Capabilities, Capability(fmt.Sprintf("synthetic:%d", i)))
+		c.Blobs = append(c.Blobs, BlobRef{Digest: artifact, Size: 0})
+	}
+	if err := c.Validate(DefaultLimits(), 1); err != nil {
+		t.Fatal(err)
+	}
+	c.Deadline = time.Now().Add(6 * time.Minute)
+	if err := c.Validate(DefaultLimits(), 1); !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("unbounded deadline: %v", err)
+	}
+}
+
+func TestLogicalOperationKeyUsesBoundedUTF8NotIdentityGrammar(t *testing.T) {
+	c := Call{CallID: "key", AttemptID: "attempt-key", Node: "fixture/echo", NodeVersion: "1.0.0", Generation: 1, Deadline: time.Now().Add(time.Second), Input: []byte(`{}`)}
+	for _, key := range []string{"", "order 123/ação", "\ufffd", strings.Repeat("é", 64), string(make([]byte, 128))} {
+		c.IdempotencyKey = key
+		if err := c.Validate(DefaultLimits(), 1); err != nil {
+			t.Fatalf("bounded UTF-8 key rejected: %v", err)
+		}
+	}
+	for _, key := range []string{string([]byte{0xff}), strings.Repeat("é", 64) + "x", string(make([]byte, 129))} {
+		c.IdempotencyKey = key
+		if err := c.Validate(DefaultLimits(), 1); !errors.Is(err, ErrLimitExceeded) {
+			t.Fatalf("invalid key accepted: %v", err)
+		}
+	}
+}
 
 func TestDeclaredNegotiationFixtures(t *testing.T) {
 	data, err := os.ReadFile("../../testdata/runtime/fixtures.json")

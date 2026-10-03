@@ -42,7 +42,9 @@ and active cooperative work; a selected process supervisor reaps the process.
 One persistent Connect stream negotiates protocol 1.0, exact catalog/artifact/
 generation and intersected bounds. Production does not implement unary Invoke.
 Default frame 1 MiB, blob declarations 8 MiB aggregate, concurrent execution 64,
-call duration 60 seconds, outbound queue 64 messages/2 MiB, stalled writes 5 seconds.
+call deadline at most five minutes (shared Go/Node contract), outbound queue 64
+messages/2 MiB, stalled writes 5 seconds. Calls and negotiation allow at most 128
+capabilities; calls allow at most 128 blob references within the aggregate byte bound.
 Inputs are normalized before execution, outputs before publication; exact int64
 uses decimal strings on wire and BigInt for unsafe native JSON integers.
 Cancellation reaches AbortSignal and fences output. An uncooperative node keeps

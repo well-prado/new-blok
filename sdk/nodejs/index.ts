@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { canonicalJSON, JSONNumber, parseJSON } from "./json.js";
 import { compileSchema, normalizeJSON, type Schema } from "./schema.js";
 export { canonicalJSON, JSONNumber, parseJSON } from "./json.js";
+export { createBlobReader, type BlobReference } from "./blob.js";
 export { compileSchema, normalize, normalizeJSON, SchemaError, type Schema } from "./schema.js";
 
 export interface Descriptor {
