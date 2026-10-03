@@ -27,9 +27,10 @@ followed with two requests:
 Its steps run in a fixed order:
 1. route and method (404/405);
 2. application admission (503). The start holds its application lease
-   until it has answered, so the application cannot stop while the durable
-   submission below is in flight (#175); a start that arrives while the
-   application drains is refused;
+   until it has answered, so `app.Shutdown` waits for its durable submission
+   below, up to `DrainTimeout` (#175); a start that arrives while the
+   application drains is refused with `Retry-After`. Authentication and the
+   bounded body read also run under the lease;
 3. authentication (401), before the body is read;
 4. the key, 1–256 printable ASCII characters (400 `invalid_key`);
 5. a body read bounded by `MaxBodyBytes` (413) and `ReadTimeout` (408);
@@ -77,6 +78,11 @@ it:
 - **Tracker failure:** the start answers 503 `unavailable` and the stream
   stays unverified; a subscriber is answered with the retry hint, and the
   next check decides.
+
+Hosts stop an SSE endpoint in this order: `Server.Shutdown` (ends the
+subscriptions), then the HTTP server, then `app.Shutdown` (waits for starts in
+flight). Shutting the HTTP server down first would wait on open
+subscriptions until its own deadline.
 
 ### Subscribe: `GET <path>/<stream>`, the EventSource protocol
 

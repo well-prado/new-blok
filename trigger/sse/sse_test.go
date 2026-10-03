@@ -1277,7 +1277,11 @@ func TestStartHoldsTheApplicationUntilSubmitted(t *testing.T) {
 		status, body := f.start(t, "alice", "held", `{"item":"pen"}`)
 		replies <- reply{status, body}
 	}()
-	<-f.submit.entered
+	select {
+	case <-f.submit.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the held start never reached its submission")
+	}
 	drained := make(chan error, 1)
 	go func() { drained <- f.app.Shutdown(context.Background()) }()
 	deadline := time.Now().Add(5 * time.Second)
@@ -1288,8 +1292,21 @@ func TestStartHoldsTheApplicationUntilSubmitted(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	before := f.submit.submissions()
-	if status, body := f.start(t, "alice", "late", `{"item":"book"}`); status != http.StatusServiceUnavailable {
-		t.Fatalf("a start while draining: %d %v", status, body)
+	late, err := http.NewRequest(http.MethodPost, f.http.URL+"/orders", strings.NewReader(`{"item":"book"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	late.Header.Set("Authorization", "Bearer alice")
+	late.Header.Set("Idempotency-Key", "late")
+	refused, err := f.client.Do(late)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var refusal map[string]any
+	_ = json.NewDecoder(refused.Body).Decode(&refusal)
+	refused.Body.Close()
+	if refused.StatusCode != http.StatusServiceUnavailable || refused.Header.Get("Retry-After") != "1" || refusal["error"] != "unavailable" {
+		t.Fatalf("a start while draining: %d Retry-After=%q %v", refused.StatusCode, refused.Header.Get("Retry-After"), refusal)
 	}
 	if got := f.submit.submissions(); got != before {
 		t.Fatalf("a refused start submitted (%d submissions, was %d)", got, before)
@@ -1298,8 +1315,13 @@ func TestStartHoldsTheApplicationUntilSubmitted(t *testing.T) {
 		t.Fatalf("the application is %s with a submission in flight; want draining", state)
 	}
 	release.Do(func() { close(f.submit.hold) })
-	if r := <-replies; r.status != http.StatusAccepted {
-		t.Fatalf("the held start answered %d %v", r.status, r.body)
+	select {
+	case r := <-replies:
+		if r.status != http.StatusAccepted {
+			t.Fatalf("the held start answered %d %v", r.status, r.body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the held start never answered")
 	}
 	select {
 	case err := <-drained:
