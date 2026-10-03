@@ -1,6 +1,6 @@
 # New Blok — delivery roadmap
 
-Revision 1 · 2026-10-01 · framework implementation
+Revision 2 · 2026-10-03 · framework implementation and native Windows gates
 
 ## 1. Goal and current state
 
@@ -16,6 +16,19 @@ Go is native. Node.js is the first external runtime, followed by the old framewo
 
 ## 3. Milestones and release evidence
 
+### Native Windows is mandatory, not a WSL workaround
+
+Windows is a first-class planned platform alongside macOS/Linux. Native Windows 11 x64 is the initial required baseline; publish other OS/architecture claims only after execution evidence. Ordinary installation and development must not require WSL, Bash, Docker, Unix utilities or administrator privileges. Go-only apps must not require Node. PowerShell installation, paths/permissions/file-lock semantics, Ctrl+C, bounded child-process tree cleanup, SQLite crash/reopen and actual Go/Node worker conformance require native Windows tests. Cross-compilation and Linux/container tests cannot certify Windows support.
+
+[E17-T05 / #156](https://github.com/well-prado/new-blok/issues/156) owns the M8
+native Windows lifecycle/conformance gate. On 2026-10-03 the maintainer explicitly
+authorized M4 completion and merges without Windows execution; this defers the
+evidence, not the Windows support requirement. [E11-T05 / #157](https://github.com/well-prado/new-blok/issues/157)
+owns the M6 easy-install/newcomer workflow. M6 and M9 cannot advertise supported Windows installation/release until
+their native clean-machine evidence passes. These are requirements, not claims
+that current Unix validation already proves Windows works. Keep local Windows
+validation separate from the current prohibition on consuming GitHub Actions.
+
 Milestones are capability gates without artificial dates. M0–M1 establish a native application; M2–M3 establish recoverable work; M4 establishes Node.js; M5–M7 expand adapters/tooling/AI/inspection; M8 proves distributed coverage; M9 gates production release. Task milestones may precede an epic's final milestone when later work consumes a foundation.
 
 | Milestone | Exit evidence |
@@ -24,12 +37,12 @@ Milestones are capability gates without artificial dates. M0–M1 establish a na
 | [M1 — Complete native Go application](https://github.com/well-prado/new-blok/milestone/2) | A newcomer builds, tests and serves a typed quote application without hand-editing IR or installing a foreign runtime. Invalid types have actionable diagnostics; bounded execution and real HTTP pass race and integration tests. |
 | [M2 — Durable orders and jobs](https://github.com/well-prado/new-blok/milestone/3) | One selected embedded backend atomically admits and resumes accepted orders/jobs. Process-kill tests prove acknowledgment barriers, deduplication, uncertainty and outbox behavior. |
 | [M3 — Recovery across control flow and versions](https://github.com/well-prado/new-blok/milestone/4) | Nested branches, loops, parallel joins, waits, signals and child runs recover after every specified crash boundary. Artifact mismatch, compaction, backup and reconciliation fail safely. |
-| [M4 — Node.js and persistent worker conformance](https://github.com/well-prado/new-blok/milestone/5) | Node.js is a real persistent gRPC worker with schema/error/cancellation/capacity/generation parity, authenticated transport and fault-tested lifecycle; tiny-call overhead is measured honestly. |
+| [M4 — Node.js and persistent worker conformance](https://github.com/well-prado/new-blok/milestone/5) | Node.js is a real persistent gRPC worker with schema/error/cancellation/capacity/generation parity, authenticated transport and fault-tested lifecycle; tiny-call overhead is measured honestly. Windows execution is unverified and explicitly deferred to #156; M4 completion is not Windows certification. |
 | [M5 — All nine modular triggers](https://github.com/well-prado/new-blok/milestone/6) | HTTP, webhook, worker, cron, pubsub, gRPC, SSE, WebSocket and MCP have real adapters, shared admission tests, protocol integration tests and removal/footprint evidence. |
-| [M6 — Developer tooling and package ecosystem](https://github.com/well-prado/new-blok/milestone/7) | CLI scaffold/generate/check/dev/test/inspect and node/workflow installation work in both layouts with deterministic locks, offline cache, atomic changes and trusted artifacts. Generic nodes and recipes use the same contracts. |
+| [M6 — Developer tooling and package ecosystem](https://github.com/well-prado/new-blok/milestone/7) | CLI scaffold/generate/check/dev/test/inspect and node/workflow installation work in both layouts with deterministic locks, offline cache, atomic changes and trusted artifacts. Generic nodes and recipes use the same contracts. Clean-machine native PowerShell installation and newcomer evidence passes #157. |
 | [M7 — AI tools, Studio APIs and observability](https://github.com/well-prado/new-blok/milestone/8) | Agents discover and compose nodes/workflows under enforced policy, including custom nodes. Versioned authorized notebook inspection and optional production telemetry are consumed by contract fixtures without placing Studio/Cloud UI here. |
 | [M8 — Distributed deployment and runtime coverage](https://github.com/well-prado/new-blok/milestone/9) | Self-hosted deployment contracts, multi-version routing, fenced ownership and resharding pass failures. Every target worker runs actual conformance on a published matrix. Capacity evidence includes distributed topology and overload. |
-| [M9 — Production release and ecosystem handoff](https://github.com/well-prado/new-blok/milestone/10) | Executable current-Blok parity, live-model DX evaluation, controlled native/worker/durable/fleet benchmarks, security review and signed reproducible releases pass. Publish supported limits and separate Studio/registry/Cloud handoffs. |
+| [M9 — Production release and ecosystem handoff](https://github.com/well-prado/new-blok/milestone/10) | Executable current-Blok parity, live-model DX evaluation, controlled native/worker/durable/fleet benchmarks, security review and signed reproducible releases pass. Publish supported limits and separate Studio/registry/Cloud handoffs. Native Windows gates #156/#157 and verified Windows artifacts/instructions are release blockers. |
 
 ## 4. Execution model and project fields
 
@@ -57,6 +70,7 @@ Read [architecture.md](docs/architecture.md) and [AGENTS.md](AGENTS.md). Each ta
 8. Debug telemetry can sample/drop with visible policy. Required audit/state uses reliable paths. Secret references stay opaque, data redaction is explicit, all fixtures are synthetic.
 9. Performance claims disclose workload/topology/guarantees, versions, raw repeated samples, warmup, distributions, saturation and failures. Equal step counts or no-op timing cannot establish application parity.
 10. CLI installs packages atomically with verified identities/locks/artifacts; native language managers still own language dependencies. Hosted ecosystem products remain separate.
+11. Windows portability and easy native installation are required alongside macOS/Linux. Each affected worker, CLI, filesystem/store and release issue inherits the Windows evidence gates above; platform-specific skips cannot silently waive them.
 
 ## 6. Definition of Done
 
@@ -1714,6 +1728,11 @@ Start persistent local workers only when selected, reuse authenticated channels,
 
 Nodes never import/invoke nodes; workflows compose. Builders do not execute effects. Native values preserve logical immutability. Trust/authentication, input validation and authorization are distinct. All execution queues/payloads/retries/depth are bounded. Durable acknowledgments follow committed state. Unknown effects are reconciled or protected by tested idempotency. Secret values/customer data never enter Git, issues or model-visible catalogs. Scale claims require equivalent representative measured workloads.
 
+## Native Windows roadmap gate (2026-10-03)
+
+- [ ] Native Windows process launch, authenticated gRPC reuse, Windows console cancellation and bounded whole-process-tree drain/reaping require actual execution evidence under #156; POSIX signal tests do not establish this.
+- [ ] Record native Windows OS/architecture, standard-user context, Go/Node/shell versions, exact commands and outcomes. Keep unsupported/unverified behavior explicit; do not consume prohibited Actions budget.
+
 ## Delivery and review
 
 One branch `codex/<issue-number>-<description>` and one PR, linked to this issue and project. Keep Status current. Review R means independent specialist review of the relevant contract/security/durability/performance evidence; record review conclusions. Completion requires every acceptance item and ROADMAP Definition of Done. Do not close a dependency/epic solely because this issue passed.
@@ -1768,6 +1787,11 @@ Implement typed JavaScript/TypeScript node descriptors and actual persistent gRP
 
 Nodes never import/invoke nodes; workflows compose. Builders do not execute effects. Native values preserve logical immutability. Trust/authentication, input validation and authorization are distinct. All execution queues/payloads/retries/depth are bounded. Durable acknowledgments follow committed state. Unknown effects are reconciled or protected by tested idempotency. Secret values/customer data never enter Git, issues or model-visible catalogs. Scale claims require equivalent representative measured workloads.
 
+## Native Windows roadmap gate (2026-10-03)
+
+- [ ] Run the persistent SDK/worker and native build/type/lint/conformance commands on the Windows Go/Node matrix tracked by #156. Native npm/executable resolution and paths with spaces/Unicode must work without Bash or WSL.
+- [ ] Record native Windows OS/architecture, standard-user context, Go/Node/shell versions, exact commands and outcomes. Keep unsupported/unverified behavior explicit; do not consume prohibited Actions budget.
+
 ## Delivery and review
 
 One branch `codex/<issue-number>-<description>` and one PR, linked to this issue and project. Keep Status current. Review R means independent specialist review of the relevant contract/security/durability/performance evidence; record review conclusions. Completion requires every acceptance item and ROADMAP Definition of Done. Do not close a dependency/epic solely because this issue passed.
@@ -1818,6 +1842,11 @@ Add mTLS or authenticated local transport, principal/capability scope, message/b
 ## Cross-cutting invariants
 
 Nodes never import/invoke nodes; workflows compose. Builders do not execute effects. Native values preserve logical immutability. Trust/authentication, input validation and authorization are distinct. All execution queues/payloads/retries/depth are bounded. Durable acknowledgments follow committed state. Unknown effects are reconciled or protected by tested idempotency. Secret values/customer data never enter Git, issues or model-visible catalogs. Scale claims require equivalent representative measured workloads.
+
+## Native Windows roadmap gate (2026-10-03)
+
+- [ ] Windows transport/authentication, schema/error/deadline/uncertainty parity, blob I/O, overload and actual equivalent full workflows require native Windows evidence under #156. Publish platform-specific performance measurements separately.
+- [ ] Record native Windows OS/architecture, standard-user context, Go/Node/shell versions, exact commands and outcomes. Keep unsupported/unverified behavior explicit; do not consume prohibited Actions budget.
 
 ## Delivery and review
 
@@ -2468,6 +2497,11 @@ Create initial Go starter and selected trigger configuration with deterministic 
 
 Nodes never import/invoke nodes; workflows compose. Builders do not execute effects. Native values preserve logical immutability. Trust/authentication, input validation and authorization are distinct. All execution queues/payloads/retries/depth are bounded. Durable acknowledgments follow committed state. Unknown effects are reconciled or protected by tested idempotency. Secret values/customer data never enter Git, issues or model-visible catalogs. Scale claims require equivalent representative measured workloads.
 
+## Native Windows roadmap gate (2026-10-03)
+
+- [ ] Windows scaffold/generate and Go-only quote onboarding must work in native PowerShell with safe path/case handling; #157 owns clean-machine easy installation evidence.
+- [ ] Record native Windows OS/architecture, standard-user context, Go/Node/shell versions, exact commands and outcomes. Keep unsupported/unverified behavior explicit; do not consume prohibited Actions budget.
+
 ## Delivery and review
 
 One branch `codex/<issue-number>-<description>` and one PR, linked to this issue and project. Keep Status current. Review A means automated checks plus normal maintainer review; record review conclusions. Completion requires every acceptance item and ROADMAP Definition of Done. Do not close a dependency/epic solely because this issue passed.
@@ -2520,6 +2554,11 @@ Wrap real compiler, test harness and catalog inspection with stable JSON diagnos
 ## Cross-cutting invariants
 
 Nodes never import/invoke nodes; workflows compose. Builders do not execute effects. Native values preserve logical immutability. Trust/authentication, input validation and authorization are distinct. All execution queues/payloads/retries/depth are bounded. Durable acknowledgments follow committed state. Unknown effects are reconciled or protected by tested idempotency. Secret values/customer data never enter Git, issues or model-visible catalogs. Scale claims require equivalent representative measured workloads.
+
+## Native Windows roadmap gate (2026-10-03)
+
+- [ ] Native Windows PowerShell check/test/inspect, diagnostics, stream failures and Ctrl+C must preserve exit/flush semantics. Coordinate clean-machine evidence with #157.
+- [ ] Record native Windows OS/architecture, standard-user context, Go/Node/shell versions, exact commands and outcomes. Keep unsupported/unverified behavior explicit; do not consume prohibited Actions budget.
 
 ## Delivery and review
 
@@ -2576,6 +2615,11 @@ Watch source, regenerate/build and gracefully restart application. Drain persist
 
 Nodes never import/invoke nodes; workflows compose. Builders do not execute effects. Native values preserve logical immutability. Trust/authentication, input validation and authorization are distinct. All execution queues/payloads/retries/depth are bounded. Durable acknowledgments follow committed state. Unknown effects are reconciled or protected by tested idempotency. Secret values/customer data never enter Git, issues or model-visible catalogs. Scale claims require equivalent representative measured workloads.
 
+## Native Windows roadmap gate (2026-10-03)
+
+- [ ] Native Windows filesystem watching, rebuild/reload, executable resolution and complete worker-tree cleanup are required; no Unix shell/signal assumption. Validate spaces/Unicode paths under #157.
+- [ ] Record native Windows OS/architecture, standard-user context, Go/Node/shell versions, exact commands and outcomes. Keep unsupported/unverified behavior explicit; do not consume prohibited Actions budget.
+
 ## Delivery and review
 
 One branch `codex/<issue-number>-<description>` and one PR, linked to this issue and project. Keep Status current. Review R means independent specialist review of the relevant contract/security/durability/performance evidence; record review conclusions. Completion requires every acceptance item and ROADMAP Definition of Done. Do not close a dependency/epic solely because this issue passed.
@@ -2629,9 +2673,54 @@ Validate configuration, dependency versions, bindings, stores, worker artifacts,
 
 Nodes never import/invoke nodes; workflows compose. Builders do not execute effects. Native values preserve logical immutability. Trust/authentication, input validation and authorization are distinct. All execution queues/payloads/retries/depth are bounded. Durable acknowledgments follow committed state. Unknown effects are reconciled or protected by tested idempotency. Secret values/customer data never enter Git, issues or model-visible catalogs. Scale claims require equivalent representative measured workloads.
 
+## Native Windows roadmap gate (2026-10-03)
+
+- [ ] Doctor must diagnose native Windows Go/Node/PATH, state directory ACLs/locks and Windows lifecycle prerequisites accurately, with actionable PowerShell fixes and no secret output. Coordinate #156/#157.
+- [ ] Record native Windows OS/architecture, standard-user context, Go/Node/shell versions, exact commands and outcomes. Keep unsupported/unverified behavior explicit; do not consume prohibited Actions budget.
+
 ## Delivery and review
 
 One branch `codex/<issue-number>-<description>` and one PR, linked to this issue and project. Keep Status current. Review A means automated checks plus normal maintainer review; record review conclusions. Completion requires every acceptance item and ROADMAP Definition of Done. Do not close a dependency/epic solely because this issue passed.
+
+#### E11-T05 — Deliver easy native Windows installation and newcomer workflow
+
+Issue: [E11-T05](https://github.com/well-prado/new-blok/issues/157) · Initial status: Backlog
+
+Roadmap ID: E11-T05
+Epic: [E11](https://github.com/well-prado/new-blok/issues/11)
+Milestone: M6
+Priority: P0 | Size: M | Review: R
+
+## Problem and intended result
+
+A Windows newcomer must be able to install BLOK and build, test, run and stop an application from native PowerShell without translating Unix instructions or installing WSL. Document a reproducible supported installation path; do not advertise flawless support until the actual clean-machine workflow passes.
+
+## Acceptance criteria
+
+- [ ] Provide an explicit versioned Windows installation/distribution path (native executable/package or documented Go installation), verified artifacts, PATH setup and non-admin per-user installation. Bootstrap/support claims remain truthful until published artifacts exist.
+- [ ] Document supported Windows versions/architectures, native Go and optional Node prerequisites, PowerShell commands, upgrade and uninstall; no mandatory Bash, curl aliases, chmod, make, WSL or Docker.
+- [ ] Install, PATH detection, help/version, scaffold/generate/check/test/inspect/dev and doctor work in native PowerShell; missing prerequisites yield actionable diagnostics without secret output.
+- [ ] Go-only applications require no Node; Node workflows discover the native runtime safely. Paths with spaces/Unicode, .exe/.cmd resolution, drive letters, permissions, file locks and case-insensitive names are covered.
+- [ ] Both supported project layouts and atomic package/lock/cache operations work on Windows; cancellation/reload cleans up owned child processes.
+- [ ] A first-time standard user can follow only the published Windows guide to obtain a correct quote response, run tests, enable a Node worker, stop it, upgrade and uninstall without destructive cleanup.
+
+## Validation
+
+- [ ] Clean Windows 11 x64 VM/host install-to-first-application exercise, recorded native OS/toolchain/shell versions and exact results; add other advertised matrix entries only with evidence.
+- [ ] PowerShell end-to-end happy/failure cases, standard-user permissions, paths with spaces/Unicode, process cleanup, corrupted downloads/locks, interrupted upgrade and reinstall.
+- [ ] No Linux-only script or cross-compiled binary counts as executed Windows evidence; collect newcomer usability failures and repair instructions.
+
+## Dependencies
+
+- [ ] https://github.com/well-prado/new-blok/issues/64
+- [ ] https://github.com/well-prado/new-blok/issues/65
+- [ ] https://github.com/well-prado/new-blok/issues/66
+- [ ] https://github.com/well-prado/new-blok/issues/102
+
+## Delivery and evidence
+
+Use one issue-specific codex branch and PR. Run focused tests, then applicable Go vet/race/build and native SDK checks. Record exact OS/architecture, Go/Node versions, commands, crash boundaries and results. Fixtures are synthetic. Independent Review R must inspect portability and lifecycle evidence. Native Windows execution is required: cross-compilation, mocks, Wine, WSL, Linux containers or file presence are insufficient. Do not consume GitHub Actions budget under the current repository restriction; use an available Windows host/VM and attach local evidence. Keep this task open until its Windows evidence passes.
+
 
 ### E12 — Unified and classic layouts with ownership enforcement
 
@@ -3611,6 +3700,11 @@ Define app manifest/config env handling, readiness/health/metrics, durable volum
 
 Nodes never import/invoke nodes; workflows compose. Builders do not execute effects. Native values preserve logical immutability. Trust/authentication, input validation and authorization are distinct. All execution queues/payloads/retries/depth are bounded. Durable acknowledgments follow committed state. Unknown effects are reconciled or protected by tested idempotency. Secret values/customer data never enter Git, issues or model-visible catalogs. Scale claims require equivalent representative measured workloads.
 
+## Native Windows roadmap gate (2026-10-03)
+
+- [ ] Coordinate native Windows executable deployment, standard-user state/secret permissions, actual SQLite/artifact/worker readiness and Windows lifecycle faults with #156. Containers and SIGTERM-only suites are additional modes, not Windows-native proof.
+- [ ] Record native Windows OS/architecture, standard-user context, Go/Node/shell versions, exact commands and outcomes. Keep unsupported/unverified behavior explicit; do not consume prohibited Actions budget.
+
 ## Delivery and review
 
 One branch `codex/<issue-number>-<description>` and one PR, linked to this issue and project. Keep Status current. Review R means independent specialist review of the relevant contract/security/durability/performance evidence; record review conclusions. Completion requires every acceptance item and ROADMAP Definition of Done. Do not close a dependency/epic solely because this issue passed.
@@ -3664,6 +3758,11 @@ Pin build/generation tools and dependency locks; produce target-matrix artifacts
 ## Cross-cutting invariants
 
 Nodes never import/invoke nodes; workflows compose. Builders do not execute effects. Native values preserve logical immutability. Trust/authentication, input validation and authorization are distinct. All execution queues/payloads/retries/depth are bounded. Durable acknowledgments follow committed state. Unknown effects are reconciled or protected by tested idempotency. Secret values/customer data never enter Git, issues or model-visible catalogs. Scale claims require equivalent representative measured workloads.
+
+## Native Windows roadmap gate (2026-10-03)
+
+- [ ] Produce verified Windows .exe/SDK distribution artifacts and document a safe native standard-user installation path, upgrades and uninstall. Execute artifacts on the published Windows matrix; cross-build success alone is insufficient. Coordinate #156/#157.
+- [ ] Record native Windows OS/architecture, standard-user context, Go/Node/shell versions, exact commands and outcomes. Keep unsupported/unverified behavior explicit; do not consume prohibited Actions budget.
 
 ## Delivery and review
 
@@ -3775,6 +3874,51 @@ Nodes never import/invoke nodes; workflows compose. Builders do not execute effe
 ## Delivery and review
 
 One branch `codex/<issue-number>-<description>` and one PR, linked to this issue and project. Keep Status current. Review R means independent specialist review of the relevant contract/security/durability/performance evidence; record review conclusions. Completion requires every acceptance item and ROADMAP Definition of Done. Do not close a dependency/epic solely because this issue passed.
+
+#### E17-T05 — Prove native Windows Go and Node application lifecycle
+
+Issue: [E17-T05](https://github.com/well-prado/new-blok/issues/156) · Initial status: Backlog
+
+Roadmap ID: E17-T05
+Epic: [E17](https://github.com/well-prado/new-blok/issues/17)
+Milestone: M8
+Priority: P0 | Size: M | Review: R
+
+## Problem and intended result
+
+Windows is a first-class New BLOK platform, not a WSL workaround. Deliver native Windows execution of Go-only and selected Go+Node applications with the same schema, authentication, bounds, durability and uncertainty guarantees as macOS/Linux. Native execution remains an M8 and production-release gate, explicitly deferred from M4 by the maintainer on 2026-10-03. Existing Unix tests do not certify Windows.
+
+## Acceptance criteria
+
+- [ ] Publish explicit supported Windows versions/architectures, initially covering Windows 11 x64; additional Windows/ARM64/Server claims require their own native evidence.
+- [ ] A standard non-administrator user can run a Go-only application without Node, Bash, WSL, Docker or Unix utilities; selecting Node requires only documented native prerequisites.
+- [ ] Native subprocess launch resolves executable paths safely, including spaces, Unicode, drive letters and .exe/.cmd wrappers, without shell injection.
+- [ ] Worker startup/authentication/catalog checks, cancellation, deadline fencing, bounded drain, crash isolation and generation changes agree on Windows; terminate/reap the complete owned process tree, with no orphan workers.
+- [ ] Ctrl+C/console shutdown and forced termination use Windows-appropriate lifecycle handling; no dependency on POSIX-only signals or ps/kill semantics.
+- [ ] Native SQLite durable admission, crash/reopen, file locking, backup/restore and incompatible-artifact readiness behave safely on Windows; state directories and secrets use appropriate Windows permissions.
+- [ ] Windows paths, case-insensitive filesystem behavior, atomic replacement/rename, cache locks, cleanup and long-path policy have executable positive/negative cases.
+- [ ] Every applicable acceptance gate in #51, #52, #53 and #81 includes actual native Windows evidence; containers remain an optional deployment mode, not the Windows installation prerequisite.
+
+## Validation
+
+- [ ] Actual native Go quote and Go+Node complete order workflows, including real loopback HTTP effects and exact schema/error/int64 parity.
+- [ ] Child process-count/leak checks, cancellation, startup faults, capacity saturation, lost-response uncertainty, forced kills before/after external effects and restart.
+- [ ] Actual durable volume/directory reopen and backup/restore, retained-checkpoint compatibility, overload/probes and bounded shutdown.
+- [ ] Synthetic fixtures with predeclared outputs/errors/effects and a clean standard-user Windows workspace whose path contains spaces and Unicode.
+
+## Dependencies
+
+- [ ] https://github.com/well-prado/new-blok/issues/40
+- [ ] https://github.com/well-prado/new-blok/issues/49
+- [ ] https://github.com/well-prado/new-blok/issues/51
+- [ ] https://github.com/well-prado/new-blok/issues/52
+- [ ] https://github.com/well-prado/new-blok/issues/53
+- [ ] https://github.com/well-prado/new-blok/issues/81
+
+## Delivery and evidence
+
+Use one issue-specific codex branch and PR. Run focused tests, then applicable Go vet/race/build and native SDK checks. Record exact OS/architecture, Go/Node versions, commands, crash boundaries and results. Fixtures are synthetic. Independent Review R must inspect portability and lifecycle evidence. Native Windows execution is required: cross-compilation, mocks, Wine, WSL, Linux containers or file presence are insufficient. Do not consume GitHub Actions budget under the current repository restriction; use an available Windows host/VM and attach local evidence. Keep this task open until its Windows evidence passes.
+
 
 ### E18 — Distributed ownership, fencing and capacity
 
@@ -4757,6 +4901,11 @@ Run equivalent business workflows with every worker, explicit supported matrices
 
 Nodes never import/invoke nodes; workflows compose. Builders do not execute effects. Native values preserve logical immutability. Trust/authentication, input validation and authorization are distinct. All execution queues/payloads/retries/depth are bounded. Durable acknowledgments follow committed state. Unknown effects are reconciled or protected by tested idempotency. Secret values/customer data never enter Git, issues or model-visible catalogs. Scale claims require equivalent representative measured workloads.
 
+## Native Windows roadmap gate (2026-10-03)
+
+- [ ] Include native Windows in the application/worker certification matrix. Go and Node support is mandatory via #156; every additional advertised language/OS/architecture pairing must run real conformance or have a truthful explicit limitation, never silently inherit Unix evidence.
+- [ ] Record native Windows OS/architecture, standard-user context, Go/Node/shell versions, exact commands and outcomes. Keep unsupported/unverified behavior explicit; do not consume prohibited Actions budget.
+
 ## Delivery and review
 
 One branch `codex/<issue-number>-<description>` and one PR, linked to this issue and project. Keep Status current. Review R means independent specialist review of the relevant contract/security/durability/performance evidence; record review conclusions. Completion requires every acceptance item and ROADMAP Definition of Done. Do not close a dependency/epic solely because this issue passed.
@@ -4927,6 +5076,11 @@ Audit capability/tenant isolation, parser/resource bounds, approvals/secrets, su
 
 Nodes never import/invoke nodes; workflows compose. Builders do not execute effects. Native values preserve logical immutability. Trust/authentication, input validation and authorization are distinct. All execution queues/payloads/retries/depth are bounded. Durable acknowledgments follow committed state. Unknown effects are reconciled or protected by tested idempotency. Secret values/customer data never enter Git, issues or model-visible catalogs. Scale claims require equivalent representative measured workloads.
 
+## Native Windows roadmap gate (2026-10-03)
+
+- [ ] The release audit must inspect actual Windows security, state permissions/locking, crash recovery, process-tree shutdown, install/upgrade and measured failure evidence. #156 and #157 must pass before Windows production support is accepted.
+- [ ] Record native Windows OS/architecture, standard-user context, Go/Node/shell versions, exact commands and outcomes. Keep unsupported/unverified behavior explicit; do not consume prohibited Actions budget.
+
 ## Delivery and review
 
 One branch `codex/<issue-number>-<description>` and one PR, linked to this issue and project. Keep Status current. Review R means independent specialist review of the relevant contract/security/durability/performance evidence; record review conclusions. Completion requires every acceptance item and ROADMAP Definition of Done. Do not close a dependency/epic solely because this issue passed.
@@ -4976,10 +5130,17 @@ Finalize stable API/brand/version compatibility after evidence review, signed ar
 ## Dependencies
 
 - [ ] [E20-T03](https://github.com/well-prado/new-blok/issues/110) — Complete security, fuzz, chaos and performance release audits
+- [ ] [E17-T05](https://github.com/well-prado/new-blok/issues/156) — Prove native Windows Go and Node application lifecycle
+- [ ] [E11-T05](https://github.com/well-prado/new-blok/issues/157) — Deliver easy native Windows installation and newcomer workflow
 
 ## Cross-cutting invariants
 
 Nodes never import/invoke nodes; workflows compose. Builders do not execute effects. Native values preserve logical immutability. Trust/authentication, input validation and authorization are distinct. All execution queues/payloads/retries/depth are bounded. Durable acknowledgments follow committed state. Unknown effects are reconciled or protected by tested idempotency. Secret values/customer data never enter Git, issues or model-visible catalogs. Scale claims require equivalent representative measured workloads.
+
+## Native Windows roadmap gate (2026-10-03)
+
+- [ ] Release is blocked on #156 and #157. Publish native Windows support and limitations, verified installable artifacts and PowerShell install/upgrade/uninstall instructions only after clean-machine execution. WSL/container/cross-compile evidence cannot substitute.
+- [ ] Record native Windows OS/architecture, standard-user context, Go/Node/shell versions, exact commands and outcomes. Keep unsupported/unverified behavior explicit; do not consume prohibited Actions budget.
 
 ## Delivery and review
 
