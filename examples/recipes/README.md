@@ -144,6 +144,13 @@ proposed #180 `worker.Tx` ABI will require an explicit recipe migration once
 the authoritative fix is reviewed and merged. No concurrent handler-SQL
 serialization guarantee is inferred from the proposed wrapper or from this
 recipe's tests.
+Parent-reported review evidence for the unmerged #180 proposal includes an
+independent concurrent-statement regression reproducer failing 3/3 runs:
+`SQLITE_FULL` rolls back the claim while a concurrently queued small insert
+commits a business row, and `ProcessOnce` returns nil. A sequential handler
+cancellation regression passed natively, but does not cover this concurrency
+failure. Do not use or merge the proposed fix until this is independently
+resolved and reviewed.
 
 The typed workflow here validates the command and prepares the stable event;
 the application handlers own the record and outbox SQL transaction. This is a
