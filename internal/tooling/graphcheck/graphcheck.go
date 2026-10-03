@@ -112,6 +112,9 @@ func Check(root string) ([]Diagnostic, error) {
 				if forbiddenEngineImport(imported) {
 					diagnostics = append(diagnostics, Diagnostic{Code: "engine_import_forbidden", Package: path, Import: imported, Message: "engine package imports an adapter, store, provider or product package"})
 				}
+				if external(g.Module, imported) {
+					diagnostics = append(diagnostics, Diagnostic{Code: "engine_external_import_forbidden", Package: path, Import: imported, Message: "engine packages import only the standard library and this module; broker, store and provider clients belong in adapters"})
+				}
 				if reachesForbidden(g, imported, map[string]bool{}) {
 					diagnostics = append(diagnostics, Diagnostic{Code: "engine_transitive_import_forbidden", Package: path, Import: imported, Message: "engine dependency transitively reaches a forbidden package"})
 				}
@@ -177,6 +180,16 @@ func isEngine(path, dir string) bool {
 	return path == "engine" || strings.HasSuffix(path, "/engine") || filepath.Base(dir) == "engine"
 }
 
+// external reports an import outside the standard library and this module.
+// Standard library paths have no dot in their first element.
+func external(module, path string) bool {
+	if path == module || strings.HasPrefix(path, module+"/") {
+		return false
+	}
+	first, _, _ := strings.Cut(path, "/")
+	return strings.Contains(first, ".")
+}
+
 func forbiddenEngineImport(path string) bool {
 	parts := strings.Split(path, "/")
 	for _, part := range parts {
@@ -189,7 +202,7 @@ func forbiddenEngineImport(path string) bool {
 }
 
 func reachesForbidden(g Graph, path string, seen map[string]bool) bool {
-	if forbiddenEngineImport(path) {
+	if forbiddenEngineImport(path) || external(g.Module, path) {
 		return true
 	}
 	if seen[path] {

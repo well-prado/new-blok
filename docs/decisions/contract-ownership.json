@@ -97,6 +97,14 @@
       "status": "implemented",
       "decision": "trigger.Submitter commits a keyed submission with its principal before returning; duplicates are reported, conflicts refused. worker.Queue implements it; webhooks acknowledge only after it returns (ADR 0006).",
       "evidence": ["webhook-signed-mutations", "webhook-key-rotation", "webhook-crash-around-ack", "webhook-concurrent-duplicates", "webhook-trigger-conformance"]
+    },
+    {
+      "id": "pubsub-delivery-transfer",
+      "question": "When does a broker message become Blok's, and who retries it?",
+      "owner": "E09-T04",
+      "status": "implemented",
+      "decision": "The consumer acknowledges the broker only after durable submission commits under a stable message key; execution retries belong to the queue, poison messages are dead-lettered before termination, and broker flow control bounds in-flight work (ADR 0007).",
+      "evidence": ["pubsub-transfer-fixtures", "nats-crash-boundaries", "nats-rebalance", "nats-connection-loss", "nats-slow-consumer-bound", "nats-trigger-conformance"]
     }
   ]
 }
