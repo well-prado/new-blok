@@ -2,10 +2,10 @@
   "version": 1,
   "roadmap": "E09-T08",
   "purpose": "Synthetic MCP tool exposure cases with predeclared outcomes, catalog invocation counts and effect counts. Every value is synthetic.",
-  "expose": ["demo/echo@1.0.0", "demo/write@1.0.0", "demo/list@1.0.0", "demo/panic@1.0.0", "demo/secret@1.0.0", "demo/badout@1.0.0", "demo/classified@1.0.0", "demo/config@1.0.0", "demo/budget@1.0.0", "demo/meta@1.0.0"],
+  "expose": ["demo/echo@1.0.0", "demo/write@1.0.0", "demo/list@1.0.0", "demo/panic@1.0.0", "demo/secret@1.0.0", "demo/badout@1.0.0", "demo/classified@1.0.0", "demo/config@1.0.0", "demo/budget@1.0.0", "demo/meta@1.0.0", "demo/capacity@1.0.0", "demo/evidence@1.0.0", "demo/conflict@1.0.0", "demo/badcode@1.0.0"],
   "discovery": [
-    {"token": "alice", "tools": ["demo.badout_v1.0.0", "demo.budget_v1.0.0", "demo.classified_v1.0.0", "demo.config_v1.0.0", "demo.echo_v1.0.0", "demo.meta_v1.0.0", "demo.panic_v1.0.0", "demo.secret_v1.0.0", "demo.write_v1.0.0"]},
-    {"token": "bob", "tools": ["demo.badout_v1.0.0", "demo.budget_v1.0.0", "demo.classified_v1.0.0", "demo.config_v1.0.0", "demo.echo_v1.0.0", "demo.meta_v1.0.0", "demo.panic_v1.0.0", "demo.secret_v1.0.0"]},
+    {"token": "alice", "tools": ["demo.badcode_v1.0.0", "demo.badout_v1.0.0", "demo.budget_v1.0.0", "demo.capacity_v1.0.0", "demo.classified_v1.0.0", "demo.config_v1.0.0", "demo.conflict_v1.0.0", "demo.echo_v1.0.0", "demo.evidence_v1.0.0", "demo.meta_v1.0.0", "demo.panic_v1.0.0", "demo.secret_v1.0.0", "demo.write_v1.0.0"]},
+    {"token": "bob", "tools": ["demo.badcode_v1.0.0", "demo.badout_v1.0.0", "demo.budget_v1.0.0", "demo.capacity_v1.0.0", "demo.classified_v1.0.0", "demo.config_v1.0.0", "demo.conflict_v1.0.0", "demo.echo_v1.0.0", "demo.evidence_v1.0.0", "demo.meta_v1.0.0", "demo.panic_v1.0.0", "demo.secret_v1.0.0"]},
     {"token": "nobody", "tools": []}
   ],
   "calls": [
@@ -27,6 +27,10 @@
     {"name": "a budget error keeps its stable code", "token": "bob", "tool": "demo.budget_v1.0.0", "arguments": {}, "expect": {"kind": "toolError", "code": "budget_exceeded", "invocations": 1, "effects": 0}},
     {"name": "a named approval reaches the catalog as a name only", "token": "bob", "tool": "demo.meta_v1.0.0", "arguments": {}, "approval": "review-7", "expect": {"kind": "result", "output": {"approval": "review-7"}, "invocations": 1, "effects": 0}},
     {"name": "an approval that is not a string is refused", "token": "bob", "tool": "demo.meta_v1.0.0", "arguments": {}, "approval": 7, "expect": {"kind": "protocol", "rpcCode": -32602, "message": "invalid_approval", "invocations": 0, "effects": 0}},
-    {"name": "an approval with spaces is refused", "token": "bob", "tool": "demo.meta_v1.0.0", "arguments": {}, "approval": "review 7", "expect": {"kind": "protocol", "rpcCode": -32602, "message": "invalid_approval", "invocations": 0, "effects": 0}}
+    {"name": "an approval with spaces is refused", "token": "bob", "tool": "demo.meta_v1.0.0", "arguments": {}, "approval": "review 7", "expect": {"kind": "protocol", "rpcCode": -32602, "message": "invalid_approval", "invocations": 0, "effects": 0}},
+    {"name": "catalog capacity is saturation", "token": "bob", "tool": "demo.capacity_v1.0.0", "arguments": {}, "expect": {"kind": "toolError", "code": "saturated", "invocations": 1, "effects": 0}},
+    {"name": "missing trusted evidence keeps its stable code", "token": "bob", "tool": "demo.evidence_v1.0.0", "arguments": {}, "expect": {"kind": "toolError", "code": "evidence_required", "invocations": 1, "effects": 0}},
+    {"name": "a decision conflict keeps its stable code", "token": "bob", "tool": "demo.conflict_v1.0.0", "arguments": {}, "expect": {"kind": "toolError", "code": "conflict", "invocations": 1, "effects": 0}},
+    {"name": "a classified error whose code is not a stable identifier is internal", "token": "bob", "tool": "demo.badcode_v1.0.0", "arguments": {}, "expect": {"kind": "toolError", "code": "internal", "invocations": 1, "effects": 0}}
   ]
 }

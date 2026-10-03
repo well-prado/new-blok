@@ -51,6 +51,7 @@ type fakeTool struct {
 // the calls that reach it and the effects its tools perform.
 type fakeCatalog struct {
 	tools       map[string]fakeTool
+	lists       atomic.Int64
 	invocations atomic.Int64
 	effects     atomic.Int64
 	mu          sync.Mutex
@@ -65,6 +66,7 @@ func allows(principal tool.Principal, capability string) bool {
 }
 
 func (c *fakeCatalog) List(_ context.Context, principal tool.Principal) ([]tmcp.Tool, error) {
+	c.lists.Add(1)
 	var listed []tmcp.Tool
 	for _, t := range c.tools {
 		if allows(principal, t.capability) {
@@ -144,6 +146,18 @@ func newCatalog() *fakeCatalog {
 	})
 	add("demo/meta", "echo", empty, objectSchema(`"approval":{"type":"string"}`), nil, func(_ context.Context, call tmcp.Call) (json.RawMessage, error) {
 		return json.Marshal(map[string]string{"approval": call.Approval})
+	})
+	add("demo/capacity", "echo", empty, nil, nil, func(context.Context, tmcp.Call) (json.RawMessage, error) {
+		return nil, fmt.Errorf("%s: %w", secretMarker, approval.ErrCapacity)
+	})
+	add("demo/evidence", "echo", empty, nil, nil, func(context.Context, tmcp.Call) (json.RawMessage, error) {
+		return nil, fmt.Errorf("%s: %w", secretMarker, approval.ErrEvidence)
+	})
+	add("demo/conflict", "echo", empty, nil, nil, func(context.Context, tmcp.Call) (json.RawMessage, error) {
+		return nil, fmt.Errorf("%s: %w", secretMarker, approval.ErrConflict)
+	})
+	add("demo/badcode", "echo", empty, nil, nil, func(context.Context, tmcp.Call) (json.RawMessage, error) {
+		return nil, classified{code: secretMarker, class: "domain"}
 	})
 	// block runs until its context ends or the test releases it, and
 	// reports how it ended.
@@ -408,7 +422,7 @@ func loadFixture(t *testing.T) fixture {
 	if err := decoder.Decode(&f); err != nil {
 		t.Fatal(err)
 	}
-	if f.Version != 1 || f.Roadmap != "E09-T08" || len(f.Calls) != 19 || len(f.Discovery) != 3 {
+	if f.Version != 1 || f.Roadmap != "E09-T08" || len(f.Calls) != 23 || len(f.Discovery) != 3 {
 		t.Fatalf("fixture version=%d roadmap=%q calls=%d discovery=%d", f.Version, f.Roadmap, len(f.Calls), len(f.Discovery))
 	}
 	return f
@@ -446,6 +460,16 @@ func TestFixtureCasesOverRealMCP(t *testing.T) {
 		sort.Strings(uris)
 		if !slices.Equal(uris, d.Tools) {
 			t.Fatalf("%s sees resources %v, want one per tool %v", d.Token, uris, d.Tools)
+		}
+	}
+	listed, err := session("alice").ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, announced := range listed.Tools {
+		effects := r.catalog.tools[announced.Title].tool.Effects
+		if announced.Annotations == nil || announced.Annotations.ReadOnlyHint != (len(effects) == 0) {
+			t.Fatalf("%s is announced read-only=%v with effects %v", announced.Name, announced.Annotations, effects)
 		}
 	}
 	read, err := session("bob").ReadResource(context.Background(), &sdk.ReadResourceParams{URI: "newblok://tools/demo/echo/1.0.0"})
@@ -495,8 +519,16 @@ func TestFixtureCasesOverRealMCP(t *testing.T) {
 			t.Fatalf("%s: invocations=%d effects=%d, want %d and %d", c.Name, calls, effects, c.Expect.Invocations, c.Expect.Effects)
 		}
 	}
-	if call := r.catalog.lastCall(); call.Name != "demo/meta" || call.Approval != "review-7" {
-		t.Fatalf("approval reached the catalog as %+v", call)
+	r.catalog.mu.Lock()
+	var approvals []string
+	for _, call := range r.catalog.calls {
+		if call.Approval != "" {
+			approvals = append(approvals, call.Name+"="+call.Approval)
+		}
+	}
+	r.catalog.mu.Unlock()
+	if !slices.Equal(approvals, []string{"demo/meta=review-7"}) {
+		t.Fatalf("approvals reached the catalog as %v", approvals)
 	}
 	for _, leaked := range []string{secretMarker, "postgres://", "password"} {
 		if strings.Contains(r.wire.String(), leaked) {
@@ -510,7 +542,8 @@ func TestFixtureCasesOverRealMCP(t *testing.T) {
 
 func TestUnauthenticatedCallersAreRefused(t *testing.T) {
 	r := newRig(t, nil)
-	for _, token := range []string{"", "forged"} {
+	r.grant("blank", tool.Principal{ID: " ", Capabilities: []string{"echo"}, MaxDepth: 4})
+	for _, token := range []string{"", "forged", "blank"} {
 		if session, err := r.dial(token); err == nil {
 			session.Close()
 			t.Fatalf("token %q opened a session", token)
@@ -537,6 +570,9 @@ func TestCallsRunAsTheCurrentPrincipal(t *testing.T) {
 	result, err := call(session, "demo.echo_v1.0.0", map[string]any{"text": "a"}, nil)
 	if err != nil || !result.IsError || toolCode(result) != "denied" {
 		t.Fatalf("revoked call: result=%+v err=%v", result, err)
+	}
+	if got := names(t, r.connect("bob")); len(got) != 0 {
+		t.Fatalf("a session opened after the revocation sees %v", got)
 	}
 }
 
@@ -783,6 +819,13 @@ func TestEvictedViewsSessionsCloseOnShutdown(t *testing.T) {
 	r.grant("carol", tool.Principal{ID: "carol", Capabilities: []string{"echo"}, MaxDepth: 4})
 	first := r.connect("alice")
 	second := r.connect("carol")
+	// One view fits: alice's was evicted for carol's, so alice's next
+	// session lists her tools again.
+	before := r.catalog.lists.Load()
+	_ = r.connect("alice")
+	if n := r.catalog.lists.Load() - before; n != 1 {
+		t.Fatalf("alice's view was rebuilt %d times; the cache holds one view", n)
+	}
 	for _, s := range []*sdk.ClientSession{first, second} {
 		if result, err := call(s, "demo.echo_v1.0.0", map[string]any{"text": "a"}, nil); err != nil || result.IsError {
 			t.Fatalf("result=%+v err=%v", result, err)
@@ -828,5 +871,58 @@ func TestNoGoroutinesOutliveTheServer(t *testing.T) {
 			t.Fatalf("goroutines %d, baseline %d\n%s", runtime.NumGoroutine(), baseline, buf[:runtime.Stack(buf, true)])
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestOversizedRequestIsRefused(t *testing.T) {
+	r := newRig(t, func(c *tmcp.Config) { c.MaxRequestBytes = 1024 })
+	session := r.connect("alice")
+	padding := strings.Repeat("x", 2048)
+	message := map[string]any{"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": map[string]any{"name": "demo.echo_v1.0.0", "arguments": map[string]any{"text": padding}}}
+	if status, _ := r.raw(http.MethodPost, "alice", session.ID(), session.InitializeResult().ProtocolVersion, message); status != http.StatusRequestEntityTooLarge {
+		t.Fatalf("an oversized request: status=%d", status)
+	}
+	if n := r.catalog.invocations.Load(); n != 0 {
+		t.Fatalf("an oversized request reached the catalog %d times", n)
+	}
+}
+
+func TestNewRefusesInvalidConfiguration(t *testing.T) {
+	application, err := app.New(app.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authenticate := func(context.Context, string, *http.Request) (tool.Principal, error) { return tool.Principal{}, nil }
+	valid := func() tmcp.Config {
+		return tmcp.Config{Name: "n", Version: "1", Catalog: newCatalog(), Authenticate: authenticate, Expose: []string{"demo/echo@1.0.0"}, Budget: budget()}
+	}
+	if _, err := tmcp.New(application, valid()); err != nil {
+		t.Fatalf("valid configuration refused: %v", err)
+	}
+	cases := map[string]func(*tmcp.Config){
+		"no catalog":              func(c *tmcp.Config) { c.Catalog = nil },
+		"no authenticator":        func(c *tmcp.Config) { c.Authenticate = nil },
+		"no name":                 func(c *tmcp.Config) { c.Name = "" },
+		"no version":              func(c *tmcp.Config) { c.Version = "" },
+		"nothing exposed":         func(c *tmcp.Config) { c.Expose = nil },
+		"reference without @":     func(c *tmcp.Config) { c.Expose = []string{"demo/echo"} },
+		"reference with spaces":   func(c *tmcp.Config) { c.Expose = []string{"demo echo@1"} },
+		"duplicate reference":     func(c *tmcp.Config) { c.Expose = []string{"demo/echo@1", "demo/echo@1"} },
+		"colliding MCP names":     func(c *tmcp.Config) { c.Expose = []string{"demo/echo@1", "demo.echo@1"} },
+		"timeout over limit":      func(c *tmcp.Config) { c.Timeout = tmcp.MaxTimeout + time.Second },
+		"concurrency over limit":  func(c *tmcp.Config) { c.MaxConcurrency = tmcp.MaxConcurrencyLimit + 1 },
+		"request size over limit": func(c *tmcp.Config) { c.MaxRequestBytes = tmcp.MaxRequestBytesLimit + 1 },
+		"principals over limit":   func(c *tmcp.Config) { c.MaxPrincipals = tmcp.MaxPrincipalsLimit + 1 },
+		"invalid budget":          func(c *tmcp.Config) { c.Budget = tool.Budget{} },
+	}
+	for name, mutate := range cases {
+		config := valid()
+		mutate(&config)
+		if _, err := tmcp.New(application, config); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	if _, err := tmcp.New(nil, valid()); err == nil {
+		t.Error("no application: accepted")
 	}
 }

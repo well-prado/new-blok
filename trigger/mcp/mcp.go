@@ -305,8 +305,6 @@ func (s *Server) endSession(request *http.Request) {
 	}
 }
 
-type principalKey struct{}
-
 // verify authenticates the bearer token. The token info's user id binds the
 // session to the principal: a request for that session as anyone else is
 // refused by the transport.
