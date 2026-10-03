@@ -92,3 +92,36 @@ The backend port uses `database/sql` transaction callbacks so E07-T02 can add
 journal transitions without coupling the engine to SQLite. A later backend can
 implement the same port, but it must reproduce the transaction, integrity,
 backup and acknowledgment semantics before selection changes.
+
+## Writer reservation policy (#179)
+
+SQLite cannot invoke its busy handler when upgrading a previously read
+transaction to a writer. Mutation callbacks must reserve the writer before
+their first read. Journal `withTx` therefore begins with an empty
+`UPDATE journal_runs SET run_id = run_id WHERE 0`: it obtains the write
+reservation without changing rows, invoking row triggers, or replaying the
+callback. Schema initialization is the exception: its first statement is
+`CREATE TABLE`, before `journal_runs` exists. `Records.Execute` uses the same
+empty-update rule on `provider_records`; its constructor starts with DDL.
+
+All journal mutation paths follow this rule: admission, replay, effect intent,
+attempt start/failure, effect commit/uncertainty, run completion/cancellation,
+wait scheduling/claim/cancellation, signals, checkpoint save, scope
+start/completion/cancellation, child and join recording, artifact registration,
+reconciliation, and compaction. Worker claims and cron occurrence admission
+already begin with writes in their respective adapters. No change is made to
+`Database.WithTx` globally: journal Run, Operation, Wait, AuditCount, Recover,
+RequireArtifact, PlanUpgrade and RetainedArtifacts remain read-only and can
+read committed WAL snapshots while a writer is active. Backup remains the
+backend's separate consistent-backup operation.
+
+`internal/journal/contention_test.go` covers all ten formerly read-first
+mutation callbacks against a held writer on another connection, checking that
+a real Run read still completes before releasing that writer. Reconciliation
+is tested at its single-transaction boundary, so its outer retry cannot hide
+the defect. `provider/database_contention_test.go` verifies the same contention
+and then verifies duplicate/conflicting operation behavior and exactly one
+business row plus one outbox row. These tests fail on the pre-fix callbacks.
+The existing 5-second busy timeout still bounds waiting: writer starvation or
+an exhausted timeout may legitimately return an error. This is not a promise
+of unlimited contention tolerance.

@@ -587,6 +587,15 @@ func (j *Journal) Operation(ctx context.Context, operationKey string) (Operation
 
 func (j *Journal) withTx(ctx context.Context, name string, fn func(*sql.Tx) error) error {
 	err := j.database.WithTx(ctx, func(tx *sql.Tx) error {
+		// Reserve the writer before reading a snapshot. SQLite cannot wait when
+		// upgrading a read transaction to a writer; even an empty UPDATE takes
+		// the writer reservation without changing any committed values.
+		// Schema creation already starts with DDL, before this table exists.
+		if name != "schema" {
+			if _, err := tx.ExecContext(ctx, `UPDATE journal_runs SET run_id = run_id WHERE 0`); err != nil {
+				return err
+			}
+		}
 		if err := fn(tx); err != nil {
 			return err
 		}
