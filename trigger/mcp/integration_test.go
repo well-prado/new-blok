@@ -256,6 +256,12 @@ type rig struct {
 
 func newRig(t *testing.T, configure func(*tmcp.Config)) *rig {
 	t.Helper()
+	return newWrappedRig(t, configure, nil)
+}
+
+// newWrappedRig serves the adapter through wrap, when given.
+func newWrappedRig(t *testing.T, configure func(*tmcp.Config), wrap func(http.Handler) http.Handler) *rig {
+	t.Helper()
 	r := &rig{t: t, catalog: newCatalog(), wire: &wireLog{}, serverLog: &wireLog{}, paused: make(chan struct{}, 1), resume: make(chan struct{}), tokens: map[string]tool.Principal{
 		"alice":  {ID: "alice", Capabilities: []string{"echo", "write"}, MaxDepth: 4},
 		"bob":    {ID: "bob", Capabilities: []string{"echo"}, MaxDepth: 4},
@@ -281,7 +287,11 @@ func newRig(t *testing.T, configure func(*tmcp.Config)) *rig {
 		t.Fatal(err)
 	}
 	r.app, r.adapter, r.endpoint = application, adapter, "http://"+listener.Addr().String()
-	r.server = &http.Server{Handler: adapter, ReadHeaderTimeout: 5 * time.Second, ErrorLog: log.New(r.serverLog, "", 0)}
+	var handler http.Handler = adapter
+	if wrap != nil {
+		handler = wrap(adapter)
+	}
+	r.server = &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ErrorLog: log.New(r.serverLog, "", 0)}
 	served := make(chan error, 1)
 	go func() { served <- r.server.Serve(listener) }()
 	t.Cleanup(func() {
@@ -1205,5 +1215,92 @@ func TestAdapterLinksNoStoreOrAgent(t *testing.T) {
 				t.Errorf("trigger/mcp links %s", dependency)
 			}
 		}
+	}
+}
+
+// gatedWriter holds its first Header call until gate closes.
+type gatedWriter struct {
+	http.ResponseWriter
+	once    *sync.Once
+	reached chan struct{}
+	gate    chan struct{}
+}
+
+func (g gatedWriter) Header() http.Header {
+	g.once.Do(func() { close(g.reached); <-g.gate })
+	return g.ResponseWriter.Header()
+}
+
+func (g gatedWriter) Flush() { _ = http.NewResponseController(g.ResponseWriter).Flush() }
+
+func (g gatedWriter) Unwrap() http.ResponseWriter { return g.ResponseWriter }
+
+// TestSessionOpenedDuringShutdownDoesNotHangIt holds bob's session opening
+// before its response while Shutdown starts and waits for alice's call. The
+// opening then settles while the server is closing; Shutdown must still
+// close bob's session and return.
+func TestSessionOpenedDuringShutdownDoesNotHangIt(t *testing.T) {
+	reached, gate := make(chan struct{}), make(chan struct{})
+	once := &sync.Once{}
+	r := newWrappedRig(t, nil, func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			// Gate bob's initialize: the SDK client sends a session-less
+			// server/discover probe first, which opens no session.
+			if request.Method == http.MethodPost && request.Header.Get("Mcp-Session-Id") == "" && request.Header.Get("Authorization") == "Bearer bob" {
+				body, err := io.ReadAll(request.Body)
+				if err != nil {
+					t.Error(err)
+				}
+				request.Body = io.NopCloser(bytes.NewReader(body))
+				if strings.Contains(string(body), `"method":"initialize"`) {
+					writer = gatedWriter{ResponseWriter: writer, once: once, reached: reached, gate: gate}
+				}
+			}
+			next.ServeHTTP(writer, request)
+		})
+	})
+	alice := r.connect("alice")
+	version := alice.InitializeResult().ProtocolVersion
+	go func() { _, _ = call(alice, "demo.block_v1.0.0", map[string]any{}, nil) }()
+	<-r.catalog.started
+	dialed := make(chan struct{})
+	go func() {
+		defer close(dialed)
+		if session, err := r.dial("bob"); err == nil {
+			_ = session.Close()
+		}
+	}()
+	<-reached
+	stopped := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		stopped <- r.adapter.Shutdown(ctx)
+	}()
+	list := map[string]any{"jsonrpc": "2.0", "id": 9, "method": "tools/list"}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if status, _ := r.raw(http.MethodPost, "alice", alice.ID(), version, list); status == http.StatusServiceUnavailable {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Shutdown never began closing")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	close(gate)
+	select {
+	case <-dialed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the session opened during Shutdown hung its own response")
+	}
+	close(r.catalog.release)
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Fatalf("Shutdown: %v", err)
+		}
+	case <-time.After(6 * time.Second):
+		t.Fatal("Shutdown hung")
 	}
 }

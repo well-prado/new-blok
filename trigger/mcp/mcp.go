@@ -155,24 +155,39 @@ type Server struct {
 	mu          sync.Mutex
 	views       map[string]*view
 	order       []string
-	// retired are evicted views whose sessions may still be open; Shutdown
-	// closes them too.
-	retired []*view
-	calls   sync.WaitGroup
-	closing bool
+	calls       sync.WaitGroup
+	closing     bool
 	// running counts each principal's calls in flight.
 	running map[string]int
 	// opened counts each principal's sessions, including those being
-	// opened; owners maps a live session to its principal.
+	// opened; live holds every counted session and its principal, so
+	// Shutdown closes it even if its view was evicted.
 	opened   map[string]int
 	sessions int
-	owners   map[string]string
+	live     map[string]liveSession
 	watchers sync.WaitGroup
+	// snapshotted is set once Shutdown has taken the sessions it closes; a
+	// session opened later is closed by its own opening.
+	snapshotted bool
 	// inflight holds the calls in flight by session id, so a session its
 	// owner ends cancels its calls; ended marks such sessions until they
 	// close, so a call that starts late is canceled at once.
 	inflight map[string]map[*context.CancelFunc]struct{}
 	ended    map[string]bool
+}
+
+type liveSession struct {
+	owner   string
+	session *sdk.ServerSession
+}
+
+// openingKey carries an opening's state from open to serverFor, so the
+// opening finds its session on the very server the transport used.
+type openingKey struct{}
+
+type openingState struct {
+	mu     sync.Mutex
+	server *sdk.Server
 }
 
 // view is the MCP server one principal sees.
@@ -234,7 +249,7 @@ func New(application *app.Application, config Config) (*Server, error) {
 		return nil, fmt.Errorf("mcp: budget: %w", err)
 	}
 	s := &Server{application: application, config: config, exposed: map[string]bool{}, slots: make(chan struct{}, config.MaxConcurrency), views: map[string]*view{},
-		running: map[string]int{}, opened: map[string]int{}, owners: map[string]string{}, inflight: map[string]map[*context.CancelFunc]struct{}{}, ended: map[string]bool{}}
+		running: map[string]int{}, opened: map[string]int{}, live: map[string]liveSession{}, inflight: map[string]map[*context.CancelFunc]struct{}{}, ended: map[string]bool{}}
 	names := map[string]string{}
 	for _, ref := range config.Expose {
 		if !toolRef.MatchString(ref) || s.exposed[ref] {
@@ -320,29 +335,45 @@ func (s *Server) open(writer http.ResponseWriter, request *http.Request, transpo
 	s.sessions++
 	s.opened[owner]++
 	s.mu.Unlock()
-	opening := &openingWriter{ResponseWriter: writer, settle: func(id string) { s.settle(principal, id) }}
-	transport.ServeHTTP(opening, request)
-	opening.settled()
+	state := &openingState{}
+	opening := &openingWriter{ResponseWriter: writer, settle: func(id string) { s.settle(owner, state, id) }}
+	defer opening.settled()
+	transport.ServeHTTP(opening, request.WithContext(context.WithValue(request.Context(), openingKey{}, state)))
 }
 
 // settle keeps a session the transport opened counted until it closes, and
-// releases the place of a request that opened none.
-func (s *Server) settle(principal tool.Principal, id string) {
-	owner := principal.ID
-	session := s.findSession(principal, id)
+// releases the place of a request that opened none. It runs as the opening's
+// response starts, possibly under the transport's stream lock and before
+// the initialize request has finished: it must never wait for the session.
+func (s *Server) settle(owner string, state *openingState, id string) {
+	var session *sdk.ServerSession
+	state.mu.Lock()
+	server := state.server
+	state.mu.Unlock()
+	if server != nil && id != "" {
+		for candidate := range server.Sessions() {
+			if candidate.ID() == id {
+				session = candidate
+				break
+			}
+		}
+	}
 	if session == nil {
 		s.closed(owner, "")
 		return
 	}
 	s.mu.Lock()
-	if s.closing {
-		// Shutdown may already be past the sessions it closes.
+	if s.snapshotted {
+		// Shutdown has already taken the sessions it closes. Closing waits
+		// for this very response, so it happens elsewhere.
 		s.mu.Unlock()
-		_ = session.Close()
-		s.closed(owner, "")
+		go func() {
+			_ = session.Close()
+			s.closed(owner, "")
+		}()
 		return
 	}
-	s.owners[id] = owner
+	s.live[id] = liveSession{owner: owner, session: session}
 	s.watchers.Add(1)
 	s.mu.Unlock()
 	go func() {
@@ -384,30 +415,6 @@ func (w *openingWriter) Flush() {
 
 func (w *openingWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
-// findSession returns the open session id of principal's view, if any.
-func (s *Server) findSession(principal tool.Principal, id string) *sdk.ServerSession {
-	if id == "" {
-		return nil
-	}
-	s.mu.Lock()
-	var servers []*sdk.Server
-	if v, ok := s.views[viewKey(principal)]; ok {
-		servers = append(servers, v.server)
-	}
-	for _, v := range s.retired {
-		servers = append(servers, v.server)
-	}
-	s.mu.Unlock()
-	for _, server := range servers {
-		for session := range server.Sessions() {
-			if session.ID() == id {
-				return session
-			}
-		}
-	}
-	return nil
-}
-
 func (s *Server) closed(owner, id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -416,7 +423,7 @@ func (s *Server) closed(owner, id string) {
 		delete(s.opened, owner)
 	}
 	if id != "" {
-		delete(s.owners, id)
+		delete(s.live, id)
 		delete(s.ended, id)
 	}
 }
@@ -460,7 +467,7 @@ func (s *Server) endSession(request *http.Request) {
 		return
 	}
 	s.mu.Lock()
-	if owner, ok := s.owners[session]; !ok || owner != info.UserID {
+	if live, ok := s.live[session]; !ok || live.owner != info.UserID {
 		s.mu.Unlock()
 		return
 	}
@@ -507,6 +514,13 @@ func (s *Server) serverFor(request *http.Request) (server *sdk.Server) {
 	if principal.ID == "" {
 		return nil
 	}
+	if state, ok := request.Context().Value(openingKey{}).(*openingState); ok {
+		defer func() {
+			state.mu.Lock()
+			state.server = server
+			state.mu.Unlock()
+		}()
+	}
 	key := viewKey(principal)
 	s.mu.Lock()
 	v, ok := s.views[key]
@@ -538,28 +552,14 @@ func (s *Server) serverFor(request *http.Request) (server *sdk.Server) {
 		return existing.server
 	}
 	if len(s.order) >= s.config.MaxPrincipals {
-		// The oldest view goes; its open sessions keep their server until
-		// they end or Shutdown closes them.
-		live := s.retired[:0]
-		for _, old := range s.retired {
-			if hasSessions(old.server) {
-				live = append(live, old)
-			}
-		}
-		s.retired = append(live, s.views[s.order[0]])
+		// The oldest view goes; its open sessions keep their server, and the
+		// session registry keeps them reachable for Shutdown.
 		delete(s.views, s.order[0])
 		s.order = s.order[1:]
 	}
 	s.views[key] = v
 	s.order = append(s.order, key)
 	return v.server
-}
-
-func hasSessions(server *sdk.Server) bool {
-	for range server.Sessions() {
-		return true
-	}
-	return false
 }
 
 func viewKey(principal tool.Principal) string {
@@ -724,6 +724,14 @@ func (s *Server) handler(owner tool.Principal, t Tool, input schema.Schema, outp
 			}
 			named = text
 		}
+		// A call already canceled (its session ended or its request is
+		// gone) never reaches the catalog.
+		if carrier != nil && carrier.Err() != nil {
+			cancel()
+		}
+		if err := ctx.Err(); err != nil {
+			return failure(codeFor(ctx, err)), nil
+		}
 		budget := s.config.Budget
 		budget.Deadline, _ = ctx.Deadline()
 		out, err := s.config.Catalog.Invoke(ctx, principal, Call{Name: t.Name, Version: t.Version, Input: normalized, Approval: named, Budget: budget})
@@ -778,7 +786,8 @@ func codeFor(ctx context.Context, err error) string {
 }
 
 // Shutdown refuses new sessions and calls, waits for the calls in flight,
-// closes every session and waits for its bookkeeping to settle.
+// closes every session and waits for its bookkeeping to settle, all within
+// ctx.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.mu.Lock()
 	s.closing = true
@@ -787,15 +796,31 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		return err
 	}
 	s.mu.Lock()
-	views := append(make([]*view, 0, len(s.views)+len(s.retired)), s.retired...)
+	s.snapshotted = true
+	sessions := map[*sdk.ServerSession]bool{}
+	for _, live := range s.live {
+		sessions[live.session] = true
+	}
+	views := make([]*view, 0, len(s.views))
 	for _, v := range s.views {
 		views = append(views, v)
 	}
 	s.mu.Unlock()
 	for _, v := range views {
 		for session := range v.server.Sessions() {
-			_ = session.Close()
+			sessions[session] = true
 		}
+	}
+	var closing sync.WaitGroup
+	for session := range sessions {
+		closing.Add(1)
+		go func() {
+			defer closing.Done()
+			_ = session.Close()
+		}()
+	}
+	if err := wait(ctx, &closing); err != nil {
+		return err
 	}
 	return wait(ctx, &s.watchers)
 }

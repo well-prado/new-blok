@@ -5,20 +5,26 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/auth"
+	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/well-prado/new-blok/app"
+	"github.com/well-prado/new-blok/contract/schema"
 	"github.com/well-prado/new-blok/contract/tool"
 )
 
-type emptyCatalog struct{}
+type emptyCatalog struct{ invocations *atomic.Int64 }
 
 func (emptyCatalog) List(context.Context, tool.Principal) ([]Tool, error) { return nil, nil }
-func (emptyCatalog) Invoke(context.Context, tool.Principal, Call) (json.RawMessage, error) {
-	return nil, ErrDenied
+func (c emptyCatalog) Invoke(context.Context, tool.Principal, Call) (json.RawMessage, error) {
+	if c.invocations != nil {
+		c.invocations.Add(1)
+	}
+	return json.RawMessage(`{}`), nil
 }
 
 // TestEndedSessionCancelsLateCalls: a call that registers after its owner
@@ -35,7 +41,7 @@ func TestEndedSessionCancelsLateCalls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.owners["alice-session"] = "alice"
+	s.live["alice-session"] = liveSession{owner: "alice"}
 	end := auth.RequireBearerToken(s.verify, nil)(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) { s.endSession(request) }))
 	remove := func(token string) {
 		request := httptest.NewRequest(http.MethodDelete, "/", nil)
@@ -60,8 +66,8 @@ func TestEndedSessionCancelsLateCalls(t *testing.T) {
 	}
 	s.sessions, s.opened["alice"] = 1, 1
 	s.closed("alice", "alice-session")
-	if s.ended["alice-session"] || s.owners["alice-session"] != "" || s.sessions != 0 || len(s.opened) != 0 {
-		t.Fatalf("closing the session left state behind: ended=%v owners=%v sessions=%d opened=%v", s.ended, s.owners, s.sessions, s.opened)
+	if s.ended["alice-session"] || s.live["alice-session"].owner != "" || s.sessions != 0 || len(s.opened) != 0 {
+		t.Fatalf("closing the session left state behind: ended=%v live=%v sessions=%d opened=%v", s.ended, s.live, s.sessions, s.opened)
 	}
 }
 
@@ -107,4 +113,47 @@ func TestSessionOpeningSettlesBeforeTheResponse(t *testing.T) {
 	if probe.Code != http.StatusBadRequest || probe.sessions != 0 || s.sessions != 0 || len(s.opened) != 0 {
 		t.Fatalf("status=%d sessions at header=%d after=%d opened=%v", probe.Code, probe.sessions, s.sessions, s.opened)
 	}
+}
+
+// TestCanceledCallNeverReachesTheCatalog: a call whose request is already
+// gone is refused before the catalog sees it.
+func TestCanceledCallNeverReachesTheCatalog(t *testing.T) {
+	application, err := app.New(app.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := application.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer application.Shutdown(context.Background())
+	invocations := &atomic.Int64{}
+	s, err := New(application, Config{Name: "n", Version: "1", Catalog: emptyCatalog{invocations: invocations}, Authenticate: func(_ context.Context, token string, _ *http.Request) (tool.Principal, error) {
+		return tool.Principal{ID: token, MaxDepth: 4}, nil
+	}, Expose: []string{"demo/echo@1"}, Budget: tool.Budget{MaxDepth: 4, MaxInputBytes: 1024, MaxOutputBytes: 1024, MaxTokens: 1, MaxCalls: 1, Deadline: time.Now().Add(time.Hour)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := tool.Principal{ID: "alice", MaxDepth: 4}
+	handler := s.handler(principal, Tool{Name: "demo/echo", Version: "1"}, mustParse(t, `{"type":"object"}`), nil)
+	request := func(carrier context.Context) *sdk.CallToolRequest {
+		return &sdk.CallToolRequest{Params: &sdk.CallToolParamsRaw{Name: "demo.echo_v1", Arguments: json.RawMessage(`{}`)}, Extra: &sdk.RequestExtra{TokenInfo: &auth.TokenInfo{UserID: "alice", Extra: map[string]any{"principal": principal, "request": carrier}}}}
+	}
+	if result, err := handler(context.Background(), request(context.Background())); err != nil || result.IsError || invocations.Load() != 1 {
+		t.Fatalf("a live call: result=%+v err=%v invocations=%d", result, err, invocations.Load())
+	}
+	gone, cancel := context.WithCancel(context.Background())
+	cancel()
+	result, err := handler(context.Background(), request(gone))
+	if err != nil || !result.IsError || invocations.Load() != 1 {
+		t.Fatalf("a call whose request is gone: result=%+v err=%v invocations=%d", result, err, invocations.Load())
+	}
+}
+
+func mustParse(t *testing.T, text string) schema.Schema {
+	t.Helper()
+	parsed, err := schema.Parse([]byte(text))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return parsed
 }

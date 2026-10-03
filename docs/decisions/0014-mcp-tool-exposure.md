@@ -72,7 +72,7 @@ A view (the tools of one principal and capability set) is built only by a
 request that opens a session; the SDK asks for a server on every request, and
 every other request uses a cached view or none. Up to `MaxPrincipals` views
 are kept (oldest evicted; its sessions keep their server until they end or
-`Shutdown` closes them). A panic while listing refuses that session only.
+`Shutdown` closes them through the session registry). A panic while listing refuses that session only.
 
 ### A call, in order
 
@@ -168,16 +168,26 @@ Sessions are bounded: a request that would open more than `MaxSessions`
 sessions, or more than `MaxSessionsPerPrincipal` for its principal, is
 refused with 503 and `Retry-After`. A session is counted from the request
 that opens it until it closes (DELETE, `SessionTimeout` or `Shutdown`); a
-request that opens none frees its place before its response starts.
+request that opens none frees its place before its response starts. The
+opening finds its session on the very server the transport used for it, so
+evicting views meanwhile cannot leave a session uncounted, and every counted
+session is kept in a registry `Shutdown` closes.
 
 ### Lifecycle
 
 Each request takes an application lease; a draining application answers 503
 with `Retry-After`. A GET is the session's standing stream, so it is admitted
 but releases its lease at once. Each call holds its own lease while it runs.
-`Shutdown(ctx)` refuses new sessions and calls, waits for calls in flight
-(returning `ctx.Err()` if they outlast it), then closes every session,
-including those of evicted views, and waits for their bookkeeping.
+`Shutdown(ctx)` refuses new sessions and calls, waits for calls in flight,
+then closes every session (the registry, which holds every counted session
+even when its view was evicted, and every cached view's)
+and waits for their bookkeeping; each step returns `ctx.Err()` when ctx ends
+first. Closing a session waits for its in-flight requests, and an opening
+settles while writing its own first response, so an opening never closes its
+session in place: one that settles before `Shutdown` takes its sessions is
+closed by `Shutdown`, one that settles after is closed on its own goroutine.
+A call that is already canceled when it would reach the catalog (its
+session ended or its request is gone) is refused without reaching it.
 
 ### Bounds
 
@@ -236,8 +246,9 @@ fixture `testdata/mcp/cases.json` (23 calls and 3 discovery views with
 expected outcomes, catalog invocation counts and effect counts), approval
 evidence on the real E14-T02 stack, a composed workflow, revocation, hijack,
 protocol versions, deadline, client cancel, a dropped request, a bare DELETE,
-a late-queued call, overload, per-principal slots, session bounds, output
-size, draining, a call outliving its request, shutdown, evicted views, view
+a late-queued call, a canceled call before the catalog, overload, per-principal slots, session bounds, output
+size, draining, a call outliving its request, shutdown, a session opened during
+shutdown, evicted views, view
 building, a panic while listing, the dependency rule and goroutine bounds.
 Every response byte, and the server's error log, is checked for the
 synthetic secret.

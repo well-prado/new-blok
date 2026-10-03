@@ -100,7 +100,10 @@ type approvalRig struct {
 	principal tool.Principal
 	clock     time.Time
 	effects   atomic.Int64
-	session   *sdk.ClientSession
+	// expected is the effect count the step under way may reach; evidence
+	// for any other count is refused.
+	expected atomic.Int64
+	session  *sdk.ClientSession
 	// other holds the same capabilities as principal.
 	other        tool.Principal
 	otherSession *sdk.ClientSession
@@ -151,7 +154,7 @@ func newApprovalRig(t *testing.T) *approvalRig {
 		t.Fatal(err)
 	}
 	if err := r.gate.Bind("native/charge", "1.0.0", []string{"payment:write"}, verifier(func(_ context.Context, _ approval.Proposal, out []byte, claims []approval.Assertion) error {
-		if string(out) != `{"id":"synthetic-receipt"}` || r.effects.Load() == 0 || len(claims) != 0 {
+		if string(out) != `{"id":"synthetic-receipt"}` || r.effects.Load() != r.expected.Load() || len(claims) != 0 {
 			return approval.ErrEvidence
 		}
 		return nil
@@ -270,6 +273,7 @@ func TestEffectStaysBlockedUntilAScopedDecision(t *testing.T) {
 		if step.arguments != nil {
 			arguments = step.arguments
 		}
+		r.expected.Store(step.effects)
 		result, err := r.charge(t, session, arguments, step.approval)
 		if err != nil {
 			t.Fatalf("%s: %v", step.name, err)
