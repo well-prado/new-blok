@@ -20,6 +20,9 @@ func TestRecoveryReusesCompletedNestedPathsAndRejectsChangedArtifact(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := j.RegisterArtifact(context.Background(), ArtifactRecord{Digest: "sha256:artifact", Version: "1.0.0", ManifestJSON: []byte(`{"name":"nested","version":"1.0.0"}`)}); err != nil {
+		t.Fatal(err)
+	}
 	run, err := j.Admit(context.Background(), AdmissionRequest{RequestKey: "recovery", Workflow: "nested", ArtifactDigest: "sha256:artifact", Input: []byte(`{"items":[1,2]}`)})
 	if err != nil {
 		t.Fatal(err)
@@ -63,6 +66,9 @@ func TestCancellationNeverClaimsEffectWasUndone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := j.RegisterArtifact(context.Background(), ArtifactRecord{Digest: "sha256:artifact", Version: "1.0.0", ManifestJSON: []byte(`{"name":"effect","version":"1.0.0"}`)}); err != nil {
+		t.Fatal(err)
+	}
 	run, err := j.Admit(context.Background(), AdmissionRequest{RequestKey: "cancel", Workflow: "effect", ArtifactDigest: "sha256:artifact", Input: []byte(`{}`)})
 	if err != nil {
 		t.Fatal(err)
@@ -83,5 +89,27 @@ func TestCancellationNeverClaimsEffectWasUndone(t *testing.T) {
 	_ = recovered
 	if err := j.CompleteScope(context.Background(), run.RunID, "charge", []byte(`{"charged":false}`)); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("canceled effect was completed: %v", err)
+	}
+}
+
+func TestRecoveryBlocksMissingArtifact(t *testing.T) {
+	database, err := (sqlite.Backend{}).Open(context.Background(), filepath.Join(t.TempDir(), "missing-artifact.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	j, err := New(context.Background(), database, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := j.Admit(context.Background(), AdmissionRequest{RequestKey: "missing-artifact", Workflow: "orders", ArtifactDigest: "sha256:missing", Input: []byte(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := j.SaveCheckpoint(context.Background(), Checkpoint{RunID: run.RunID, ArtifactDigest: "sha256:missing", CheckpointDigest: "sha256:checkpoint", State: []byte(`{"pc":"start"}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.Recover(context.Background(), run.RunID, "sha256:missing", "sha256:checkpoint"); !errors.Is(err, ErrArtifactMissing) {
+		t.Fatalf("missing artifact recovery error=%v", err)
 	}
 }
