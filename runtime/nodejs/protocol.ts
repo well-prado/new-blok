@@ -40,8 +40,59 @@ export function validateFrameBytes(bytes: Buffer): void {
     const byte = bytes[at++];
     if (byte === undefined) throw new Error("invalid_frame");
     length += (byte & 127) * factor;
-    if (!(byte & 128)) { if (at + length !== bytes.length) throw new Error("invalid_frame"); return; }
+    if (!(byte & 128)) {
+      if (at + length !== bytes.length) throw new Error("invalid_frame");
+      if (tag === 26) validateCallKeyBytes(bytes.subarray(at));
+      return;
+    }
     factor *= 128;
   }
   throw new Error("invalid_frame");
+}
+
+// Scan the bounded Call envelope before protobuf replaces malformed string
+// bytes. Validate every occurrence, including keys shadowed by a later field.
+function validateCallKeyBytes(bytes: Buffer): void {
+  let at = 0;
+  const varint = (): number => {
+    let value = 0, factor = 1;
+    for (let i = 0; i < 5; i++) {
+      const byte = bytes[at++];
+      if (byte === undefined) throw new Error("invalid_call_wire");
+      value += (byte & 127) * factor;
+      if (!(byte & 128)) {
+        if (value > 0xffffffff) throw new Error("invalid_call_wire");
+        return value;
+      }
+      factor *= 128;
+    }
+    throw new Error("invalid_call_wire");
+  };
+  while (at < bytes.length) {
+    const tag = varint(), field = Math.floor(tag / 8), wire = tag % 8;
+    if (field === 0 || (field === 6 && wire !== 2)) throw new Error("invalid_call_wire");
+    if (wire === 2) {
+      const length = varint(), end = at + length;
+      if (end > bytes.length) throw new Error("invalid_call_wire");
+      if (field === 6) {
+        if (length > 128) throw new Error("invalid_operation_key");
+        new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(at, end));
+      }
+      at = end;
+    } else if (wire === 0) {
+      // int64 deadlines/generations may occupy ten bytes; do not convert them.
+      let ended = false;
+      for (let i = 0; i < 10; i++) {
+        const byte = bytes[at++];
+        if (byte === undefined || (i === 9 && byte > 1)) throw new Error("invalid_call_wire");
+        if (!(byte & 128)) { ended = true; break; }
+      }
+      if (!ended) throw new Error("invalid_call_wire");
+    } else if (wire === 1 || wire === 5) {
+      at += wire === 1 ? 8 : 4;
+      if (at > bytes.length) throw new Error("invalid_call_wire");
+    } else {
+      throw new Error("invalid_call_wire");
+    }
+  }
 }
