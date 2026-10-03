@@ -735,17 +735,16 @@ func TestBusyStoreSubmissionIsSaturation(t *testing.T) {
 			if _, err := tx.ExecContext(ctx, `UPDATE worker_jobs SET updated_at = updated_at`); err != nil {
 				return err
 			}
-			if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS hold (x INTEGER)`); err != nil {
-				return err
-			}
 			close(holding)
 			<-release
 			return nil
 		})
 	}()
 	<-holding
+	var released sync.Once
+	t.Cleanup(func() { released.Do(func() { close(release) }) })
 	_, err = queue.Submit(ctx, trigger.Submission{Key: "busy-1", Kind: "busy", Payload: []byte(`{}`)})
-	close(release)
+	released.Do(func() { close(release) })
 	if !errors.Is(err, trigger.ErrSaturated) || !errors.Is(err, store.ErrBusy) {
 		t.Fatalf("a submission to a busy store returned %v; want saturation", err)
 	}
@@ -757,5 +756,47 @@ func TestBusyStoreSubmissionIsSaturation(t *testing.T) {
 	}
 	if accepted, err := queue.Submit(ctx, trigger.Submission{Key: "busy-1", Kind: "busy", Payload: []byte(`{}`)}); err != nil || !accepted {
 		t.Fatalf("the retry: accepted=%v err=%v", accepted, err)
+	}
+}
+
+// TestHandlerSubmittingToItsOwnStoreFails: a handler that writes to the
+// store outside tx, here by submitting to its own queue, waits on the write
+// lock its own claim holds. That busy store is not saturation: the job
+// fails like any handler error instead of being deferred, again and again,
+// into the same deadlock.
+func TestHandlerSubmittingToItsOwnStoreFails(t *testing.T) {
+	ctx := context.Background()
+	database, err := (sqlite.Backend{}).Open(ctx, filepath.Join(t.TempDir(), "self.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	queue, err := New(ctx, database, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.RegisterKind("self", []byte(`{"type":"object"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queue.Enqueue(ctx, EnqueueRequest{RequestKey: "outer", Kind: "self", Payload: []byte(`{}`), MaxAttempts: 1}); err != nil {
+		t.Fatal(err)
+	}
+	var nested error
+	processed, err := queue.ProcessOnce(ctx, func(ctx context.Context, _ *sql.Tx, _ Job) error {
+		_, nested = queue.Submit(ctx, trigger.Submission{Key: "inner", Kind: "self", Payload: []byte(`{}`)})
+		return nested
+	})
+	if err != nil || !processed {
+		t.Fatalf("processed=%v err=%v", processed, err)
+	}
+	if !errors.Is(nested, store.ErrBusy) {
+		t.Fatalf("the nested submission returned %v; want a busy store", nested)
+	}
+	job, err := queue.Get(ctx, "outer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.Deferrals != 0 || job.State != StateDead {
+		t.Fatalf("the self-deadlocked job is %s with %d deferrals; want dead with none", job.State, job.Deferrals)
 	}
 }

@@ -655,15 +655,14 @@ func TestBusyStoreAnswersSaturated(t *testing.T) {
 			if _, err := tx.ExecContext(context.Background(), `UPDATE worker_jobs SET updated_at = updated_at`); err != nil {
 				return err
 			}
-			if _, err := tx.ExecContext(context.Background(), `CREATE TABLE IF NOT EXISTS hold (x INTEGER)`); err != nil {
-				return err
-			}
 			close(holding)
 			<-release
 			return nil
 		})
 	}()
 	<-holding
+	var released sync.Once
+	t.Cleanup(func() { released.Do(func() { close(release) }) })
 	r := sign(key, "evt_busy", t0, []byte(f.Body))
 	request, err := http.NewRequest(r.method, e.server.URL+r.path, bytes.NewReader(r.body))
 	if err != nil {
@@ -680,7 +679,7 @@ func TestBusyStoreAnswersSaturated(t *testing.T) {
 	var answer map[string]string
 	_ = json.NewDecoder(response.Body).Decode(&answer)
 	response.Body.Close()
-	close(release)
+	released.Do(func() { close(release) })
 	if err := <-held; err != nil {
 		t.Fatal(err)
 	}
@@ -692,5 +691,72 @@ func TestBusyStoreAnswersSaturated(t *testing.T) {
 	}
 	if status, code := e.send(t, r); status != http.StatusAccepted {
 		t.Fatalf("the provider's retry: %d %s", status, code)
+	}
+}
+
+// TestBusyStoreBurstAnswersSaturated: a burst larger than the store's
+// connection pool arrives while the store is write-locked. Deliveries whose
+// submit deadline runs out, waiting for a connection or for the lock, are
+// saturation too: every one is answered 503 saturated, none 500, and
+// nothing is committed.
+func TestBusyStoreBurstAnswersSaturated(t *testing.T) {
+	f := loadFixture(t)
+	key := secret(t, "k1")
+	e := newEnv(t, f, []webhook.Key{{ID: "k1", Secret: key}}, nil, func(endpoint *webhook.Endpoint) { endpoint.SubmitTimeout = 2 * time.Second })
+	holding, release, held := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+	go func() {
+		held <- e.database.WithTx(context.Background(), func(tx *sql.Tx) error {
+			if _, err := tx.ExecContext(context.Background(), `UPDATE worker_jobs SET updated_at = updated_at`); err != nil {
+				return err
+			}
+			close(holding)
+			<-release
+			return nil
+		})
+	}()
+	<-holding
+	var released sync.Once
+	t.Cleanup(func() { released.Do(func() { close(release) }) })
+	const burst = 24
+	statuses := make(chan string, burst)
+	var group sync.WaitGroup
+	for i := range burst {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			r := sign(key, fmt.Sprintf("evt_burst_%d", i), t0, []byte(f.Body))
+			request, err := http.NewRequest(r.method, e.server.URL+r.path, bytes.NewReader(r.body))
+			if err != nil {
+				statuses <- err.Error()
+				return
+			}
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("webhook-id", r.id)
+			request.Header.Set("webhook-timestamp", r.timestamp)
+			request.Header.Set("webhook-signature", r.signature)
+			response, err := e.server.Client().Do(request)
+			if err != nil {
+				statuses <- err.Error()
+				return
+			}
+			var answer map[string]string
+			_ = json.NewDecoder(response.Body).Decode(&answer)
+			response.Body.Close()
+			statuses <- fmt.Sprintf("%d %s %s", response.StatusCode, answer["error"], response.Header.Get("Retry-After"))
+		}()
+	}
+	group.Wait()
+	close(statuses)
+	released.Do(func() { close(release) })
+	if err := <-held; err != nil {
+		t.Fatal(err)
+	}
+	for status := range statuses {
+		if status != "503 saturated 1" {
+			t.Errorf("a delivery to a busy store answered %q; want 503 saturated with Retry-After", status)
+		}
+	}
+	if n := e.jobs(t); n != 0 {
+		t.Fatalf("saturated deliveries committed %d jobs", n)
 	}
 }

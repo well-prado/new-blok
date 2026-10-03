@@ -27,10 +27,15 @@ was already committed with the same kind, payload and principal (a duplicate).
 `trigger.ErrConflict` means the key was reused with different content, which is
 never silently deduplicated. `trigger.ErrInvalidInput` and
 `trigger.ErrSaturated` refuse the submission before acceptance. A store too
-busy to take the submission within its busy timeout (`store.ErrBusy`) is
-reported as `trigger.ErrSaturated` (#184): each trigger answers with its
-saturation response (503 `saturated` with `Retry-After`, a delayed nak) and
-nothing is committed.
+busy to take the submission in time, because the write lock or a connection
+was not available before the busy timeout or the submit deadline, is
+reported as `trigger.ErrSaturated` (#184), and nothing is committed: webhook
+and SSE answer 503 `saturated` with `Retry-After`, pubsub naks with a delay
+without spending its delivery budget, and cron keeps the occurrence for its
+next attempt. A busy store seen from inside a worker handler is not
+saturation: the handler's own claim holds the write lock (it wrote outside
+`tx`, for example by submitting to the same store), so it fails rather than
+deferring into the same deadlock.
 
 `worker.Queue` implements the port. It persists the principal established by the
 trusted producer (`EnqueueRequest.Principal`, `Job.Principal`) and makes it part
