@@ -190,6 +190,14 @@ type EffectLedger interface {
 	CommittedEffects(context.Context) (int, error)
 }
 
+// PrincipalSource is implemented by trusted-producer drivers whose adapter
+// establishes a principal from configuration (for example a subscription's
+// principal). Every dispatch must then carry exactly that principal; without
+// it, a trusted-producer adapter must pass none. Caller data can never set it.
+type PrincipalSource interface {
+	ConfiguredPrincipal() trigger.Principal
+}
+
 // TriggerOptions bounds harness waits.
 type TriggerOptions struct {
 	// CancelTimeout bounds how long a blocked workflow waits for
@@ -574,6 +582,9 @@ func (h *harness) run(ctx context.Context, driver TriggerDriver, d trigger.Decla
 	wantPrincipal := c.Expect.Principal
 	if d.Authentication == trigger.TrustedProducer {
 		wantPrincipal = ""
+		if source, ok := driver.(PrincipalSource); ok {
+			wantPrincipal = source.ConfiguredPrincipal().ID
+		}
 	}
 	payloads := map[string]bool{}
 	for _, delivery := range c.Deliveries {
