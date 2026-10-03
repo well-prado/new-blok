@@ -261,6 +261,17 @@ func (q *Queue) Enqueue(ctx context.Context, request EnqueueRequest) (EnqueueRes
 		return nil
 	})
 	if err != nil {
+		// A WithTx error means nothing was committed (the driver rolls back
+		// any failed COMMIT). The deadline is also read from ctx: if it ran
+		// out just before COMMIT, database/sql may report ErrTxDone instead.
+		if errors.Is(err, store.ErrBusy) || errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			// A store too busy to take the submission before the lock wait
+			// or the caller's deadline runs out is saturation: nothing was
+			// committed (database/sql checks the deadline before COMMIT),
+			// so the submission may be retried. A caller that canceled is
+			// not saturation.
+			return EnqueueResult{}, fmt.Errorf("worker: enqueue: %w: %w", trigger.ErrSaturated, err)
+		}
 		return EnqueueResult{}, fmt.Errorf("worker: enqueue: %w", err)
 	}
 	return result, nil
@@ -335,7 +346,11 @@ func (q *Queue) ProcessOnce(ctx context.Context, handler Handler) (bool, error) 
 		if _, err := tx.ExecContext(txCtx, `RELEASE SAVEPOINT worker_handler`); err != nil {
 			return err
 		}
-		if errors.Is(handlerErr, trigger.ErrSaturated) {
+		// A busy store seen from inside a handler is not backpressure: the
+		// handler's own claim holds the store's only write lock (it wrote
+		// outside tx, for example by submitting to the same store), and
+		// deferring would only repeat the deadlock. It is a failure.
+		if errors.Is(handlerErr, trigger.ErrSaturated) && !errors.Is(handlerErr, store.ErrBusy) && !errors.Is(handlerErr, context.DeadlineExceeded) {
 			// Saturation is backpressure, not a handler failure: the job is
 			// deferred without consuming an attempt, within its deferral budget.
 			state, message := StatePending, ""
