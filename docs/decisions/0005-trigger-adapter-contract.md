@@ -135,9 +135,15 @@ order, which `trigger/nine_test.go` drives with work in flight (#173):
    `mcp.Server.Shutdown` refuses new sessions and calls and waits for the
    calls in flight and their answers (#197), the gRPC server's `GracefulStop` finishes its calls, and
    the HTTP server's `Shutdown` finishes its requests (HTTP, webhook, SSE
-   starts). The application stays ready meanwhile, so work they hold
-   completes and is answered. A WebSocket message in flight is not: closing
-   the connection cancels it, and the client resends.
+   starts). The order matters: SSE subscriptions and MCP standing streams
+   keep their connections active, so the HTTP server's `Shutdown` would
+   wait on them until its deadline if they were not ended first. The
+   application stays ready meanwhile, so work they hold completes and is
+   answered, and until the HTTP server's `Shutdown` runs, HTTP, webhook and
+   SSE starts are still admitted (an SSE start admitted then is followed
+   from another instance, or after the restart). A WebSocket message in
+   flight is not answered: closing the connection cancels it, and the
+   client resends; the websocket package's own shutdown tests cover that.
 2. **The application.** `app.Shutdown` drains what is left. The queued
    sources (cron, pubsub, the worker pool) are registered as its
    dependencies, after the store if the store is one, so they stop before

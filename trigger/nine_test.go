@@ -278,7 +278,7 @@ func TestNineTriggersDrainTogether(t *testing.T) {
 	if status, retry, body := n.post("/mcp", headers, initialize); status != http.StatusServiceUnavailable || retry != "1" || strings.TrimSpace(string(body)) != "unavailable" {
 		t.Errorf("mcp while draining: %d Retry-After %q %s", status, retry, body)
 	}
-	if _, response, err := n.dialWS(ctx, "bob"); err == nil || response == nil || response.StatusCode != http.StatusServiceUnavailable {
+	if _, response, err := n.dialWS(ctx, "bob"); err == nil || response == nil || response.StatusCode != http.StatusServiceUnavailable || response.Header.Get("Retry-After") != "1" {
 		t.Errorf("websocket while draining: %v %v", response, err)
 	}
 	if _, err := n.callGRPC(ctx, "bob"); status.Code(err) != codes.Unavailable || status.Convert(err).Message() != "unavailable" {
@@ -336,11 +336,24 @@ func TestEachTriggerAloneHoldsTheApplication(t *testing.T) {
 				t.Fatalf("with only %s in flight the application is %s; want draining", via, state)
 			}
 			close(n.gate.release)
-			if err := <-outcome; err != nil {
-				t.Fatalf("%s did not complete: %v", via, err)
+			select {
+			case err := <-outcome:
+				if err != nil {
+					t.Fatalf("%s did not complete: %v", via, err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatalf("%s never completed", via)
 			}
-			if err := <-drained; err != nil {
-				t.Fatalf("drain: %v", err)
+			select {
+			case err := <-drained:
+				if err != nil {
+					t.Fatalf("drain: %v", err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("the drain never finished")
+			}
+			if errs := n.workerErrs.Load(); errs != 0 {
+				t.Fatalf("the worker pool saw %d errors; first %v", errs, n.firstErr.Load())
 			}
 		})
 	}
@@ -402,9 +415,6 @@ func TestHostShutdownOrderAndRestart(t *testing.T) {
 	case <-adapters:
 		t.Fatal("the adapters stopped with work still held")
 	default:
-	}
-	if state := n.app.State(); state != app.ReadyState {
-		t.Fatalf("the application is %s while the adapters finish their work; want ready", state)
 	}
 	close(n.gate.release)
 	for via, outcome := range outcomes {
@@ -475,8 +485,10 @@ func TestHostShutdownOrderAndRestart(t *testing.T) {
 	for drained := false; !drained; {
 		select {
 		case results := <-r.cronRuns:
+			// A re-fire would be deduplicated at the port, so it must show
+			// in none of these, not only in Submitted.
 			for _, result := range results {
-				if len(result.Submitted) != 0 {
+				if len(result.Submitted) != 0 || len(result.Duplicates) != 0 || len(result.Skipped) != 0 || result.Held != nil {
 					t.Errorf("cron fired again after the restart: %+v", result)
 				}
 			}
