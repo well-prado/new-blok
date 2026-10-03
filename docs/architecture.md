@@ -82,7 +82,7 @@ The implemented bounded subset requires exactly one union branch to match,
 including null. A null schema rejects non-null values. The pure catalog's
 generic numeric envelope preserves exact JSON integers; its supplied inner
 schema owns integer range/wire rules. Template expansion preflights the byte
-budget before allocating output. See [ADR 0007](decisions/0007-catalog-null-and-template-bounds.md)
+budget before allocating output. See [ADR 0012](decisions/0012-catalog-null-and-template-bounds.md)
 for the correction, supported array limits and pending Node mirror integration.
 
 Logical values are immutable. Maps, slices and pointers require isolation between nodes and branches. Typed native fast paths must preserve this rule, and benchmarks include required validation/copies. Portable encodings serve journals and worker boundaries. Stable diagnostics name code, file/line, workflow, step, field, expected/actual and remediation.
