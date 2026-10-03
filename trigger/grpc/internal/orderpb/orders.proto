@@ -1,0 +1,97 @@
+// Synthetic service for trigger/grpc tests: the conformance order, kinds
+// the mapping supports, and kinds it refuses at startup.
+syntax = "proto3";
+
+package newblok.test.orders.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/well-prado/new-blok/trigger/grpc/internal/orderpb;orderpb";
+
+message Order {
+  optional string sku = 1;
+  optional int32 quantity = 2;
+  optional string principal = 3;
+}
+
+message Placed {
+  Order echo = 1;
+}
+
+// Kinds covers every field kind the mapping supports.
+message Kinds {
+  string name = 1;
+  bool active = 2;
+  int32 small = 3;
+  int64 large = 4;
+  uint32 count = 5;
+  double ratio = 6;
+  bytes blob = 7;
+  Color color = 8;
+  Order order = 9;
+  repeated string tags = 10;
+  repeated Order lines = 11;
+  optional string note = 12;
+  repeated int32 counts = 13;
+}
+
+enum Color {
+  COLOR_UNSPECIFIED = 0;
+  COLOR_RED = 1;
+  COLOR_BLUE = 2;
+}
+
+message WithOneof {
+  oneof choice {
+    string a = 1;
+    int32 b = 2;
+  }
+}
+
+message WithUint64 {
+  uint64 big = 1;
+}
+
+message WithMap {
+  map<string, string> labels = 1;
+}
+
+message WithTimestamp {
+  google.protobuf.Timestamp at = 1;
+}
+
+// Node nests itself, for the nesting bound.
+message Node {
+  string name = 1;
+  Node child = 2;
+}
+
+// Wide has many implicit-presence fields, each written with its default.
+message Wide {
+  string field_with_a_long_name_01 = 1;
+  string field_with_a_long_name_02 = 2;
+  string field_with_a_long_name_03 = 3;
+  string field_with_a_long_name_04 = 4;
+  string field_with_a_long_name_05 = 5;
+  string field_with_a_long_name_06 = 6;
+  string field_with_a_long_name_07 = 7;
+  string field_with_a_long_name_08 = 8;
+  string field_with_a_long_name_09 = 9;
+  string field_with_a_long_name_10 = 10;
+}
+
+message Rows {
+  repeated Wide rows = 1;
+}
+
+service Orders {
+  rpc Place(Order) returns (Placed);
+  rpc Inspect(Kinds) returns (Kinds);
+  rpc Watch(Order) returns (stream Placed);
+  rpc Choose(WithOneof) returns (Placed);
+  rpc Count(WithUint64) returns (Placed);
+  rpc Label(WithMap) returns (Placed);
+  rpc Stamp(WithTimestamp) returns (Placed);
+  rpc Walk(Node) returns (Node);
+  rpc Fill(Rows) returns (Node);
+}

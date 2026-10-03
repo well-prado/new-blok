@@ -115,7 +115,7 @@ func TestBinaryWithHTTPSelectedServesAndDrains(t *testing.T) {
 	if len(linked(deps, module+"/trigger/http")) == 0 || len(linked(deps, "net/http")) == 0 {
 		t.Fatal("selected HTTP trigger is not linked")
 	}
-	for _, forbidden := range []string{module + "/trigger/worker", module + "/trigger/pubsub", module + "/trigger/websocket", module + "/trigger/sse", module + "/store", "database/sql", module + "/contract/conformance", "github.com/nats-io", "github.com/coder/websocket"} {
+	for _, forbidden := range []string{module + "/trigger/worker", module + "/trigger/pubsub", module + "/trigger/websocket", module + "/trigger/sse", module + "/trigger/grpc", "google.golang.org/grpc", module + "/store", "database/sql", module + "/contract/conformance", "github.com/nats-io", "github.com/coder/websocket"} {
 		if found := linked(deps, forbidden); len(found) != 0 {
 			t.Fatalf("HTTP-only binary links unselected %v", found)
 		}

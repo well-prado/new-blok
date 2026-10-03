@@ -1,0 +1,1554 @@
+{
+ "version": 1,
+ "roadmap": "E09-T05",
+ "order": {
+  "type": "object",
+  "properties": {
+   "sku": {
+    "type": "string"
+   },
+   "quantity": {
+    "type": "integer",
+    "minimum": 1,
+    "maximum": 100
+   },
+   "principal": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "sku",
+   "quantity"
+  ]
+ },
+ "placed": {
+  "type": "object",
+  "properties": {
+   "echo": {
+    "type": "object",
+    "properties": {
+     "sku": {
+      "type": "string"
+     },
+     "quantity": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100
+     },
+     "principal": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "sku",
+     "quantity"
+    ]
+   }
+  }
+ },
+ "startup": [
+  {
+   "name": "order maps both ways",
+   "method": "Place",
+   "input": {
+    "type": "object",
+    "properties": {
+     "sku": {
+      "type": "string"
+     },
+     "quantity": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100
+     },
+     "principal": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "sku",
+     "quantity"
+    ]
+   },
+   "output": {
+    "type": "object",
+    "properties": {
+     "echo": {
+      "type": "object",
+      "properties": {
+       "sku": {
+        "type": "string"
+       },
+       "quantity": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100
+       },
+       "principal": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "sku",
+       "quantity"
+      ]
+     }
+    }
+   },
+   "expect": ""
+  },
+  {
+   "name": "every supported kind maps both ways",
+   "method": "Inspect",
+   "input": {
+    "type": "object",
+    "properties": {
+     "name": {
+      "type": "string"
+     },
+     "active": {
+      "type": "boolean"
+     },
+     "small": {
+      "type": "integer",
+      "minimum": -2147483648,
+      "maximum": 2147483647
+     },
+     "large": {
+      "type": "integer",
+      "wire": "int64-string"
+     },
+     "count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+     },
+     "ratio": {
+      "type": "number"
+     },
+     "blob": {
+      "type": "string",
+      "format": "byte"
+     },
+     "color": {
+      "type": "string"
+     },
+     "order": {
+      "type": "object",
+      "properties": {
+       "sku": {
+        "type": "string"
+       },
+       "quantity": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100
+       },
+       "principal": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "sku",
+       "quantity"
+      ]
+     },
+     "tags": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "lines": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "sku": {
+         "type": "string"
+        },
+        "quantity": {
+         "type": "integer",
+         "minimum": 1,
+         "maximum": 100
+        },
+        "principal": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "sku",
+        "quantity"
+       ]
+      }
+     },
+     "note": {
+      "type": "string"
+     },
+     "counts": {
+      "type": "array",
+      "items": {
+       "type": "integer",
+       "minimum": -2147483648,
+       "maximum": 2147483647
+      }
+     }
+    }
+   },
+   "output": {
+    "type": "object",
+    "properties": {
+     "name": {
+      "type": "string"
+     },
+     "active": {
+      "type": "boolean"
+     },
+     "small": {
+      "type": "integer",
+      "minimum": -2147483648,
+      "maximum": 2147483647
+     },
+     "large": {
+      "type": "integer",
+      "wire": "int64-string"
+     },
+     "count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+     },
+     "ratio": {
+      "type": "number"
+     },
+     "blob": {
+      "type": "string",
+      "format": "byte"
+     },
+     "color": {
+      "type": "string"
+     },
+     "order": {
+      "type": "object",
+      "properties": {
+       "sku": {
+        "type": "string"
+       },
+       "quantity": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100
+       },
+       "principal": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "sku",
+       "quantity"
+      ]
+     },
+     "tags": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "lines": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "sku": {
+         "type": "string"
+        },
+        "quantity": {
+         "type": "integer",
+         "minimum": 1,
+         "maximum": 100
+        },
+        "principal": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "sku",
+        "quantity"
+       ]
+      }
+     },
+     "note": {
+      "type": "string"
+     },
+     "counts": {
+      "type": "array",
+      "items": {
+       "type": "integer",
+       "minimum": -2147483648,
+       "maximum": 2147483647
+      }
+     }
+    }
+   },
+   "expect": ""
+  },
+  {
+   "name": "server streaming is refused",
+   "method": "Watch",
+   "input": {
+    "type": "object",
+    "properties": {
+     "sku": {
+      "type": "string"
+     },
+     "quantity": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100
+     },
+     "principal": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "sku",
+     "quantity"
+    ]
+   },
+   "output": {
+    "type": "object",
+    "properties": {
+     "echo": {
+      "type": "object",
+      "properties": {
+       "sku": {
+        "type": "string"
+       },
+       "quantity": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100
+       },
+       "principal": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "sku",
+       "quantity"
+      ]
+     }
+    }
+   },
+   "expect": "streaming_unsupported"
+  },
+  {
+   "name": "oneof is refused",
+   "method": "Choose",
+   "input": {
+    "type": "object",
+    "properties": {
+     "a": {
+      "type": "string"
+     },
+     "b": {
+      "type": "integer"
+     }
+    }
+   },
+   "output": {
+    "type": "object",
+    "properties": {
+     "echo": {
+      "type": "object",
+      "properties": {
+       "sku": {
+        "type": "string"
+       },
+       "quantity": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100
+       },
+       "principal": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "sku",
+       "quantity"
+      ]
+     }
+    }
+   },
+   "expect": "oneof_unsupported"
+  },
+  {
+   "name": "uint64 is refused",
+   "method": "Count",
+   "input": {
+    "type": "object",
+    "properties": {
+     "big": {
+      "type": "integer"
+     }
+    }
+   },
+   "output": {
+    "type": "object",
+    "properties": {
+     "echo": {
+      "type": "object",
+      "properties": {
+       "sku": {
+        "type": "string"
+       },
+       "quantity": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100
+       },
+       "principal": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "sku",
+       "quantity"
+      ]
+     }
+    }
+   },
+   "expect": "uint64_unsupported"
+  },
+  {
+   "name": "map is refused",
+   "method": "Label",
+   "input": {
+    "type": "object",
+    "properties": {
+     "labels": {
+      "type": "object",
+      "additionalProperties": true
+     }
+    }
+   },
+   "output": {
+    "type": "object",
+    "properties": {
+     "echo": {
+      "type": "object",
+      "properties": {
+       "sku": {
+        "type": "string"
+       },
+       "quantity": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100
+       },
+       "principal": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "sku",
+       "quantity"
+      ]
+     }
+    }
+   },
+   "expect": "map_unsupported"
+  },
+  {
+   "name": "well-known type is refused",
+   "method": "Stamp",
+   "input": {
+    "type": "object",
+    "properties": {
+     "at": {
+      "type": "object",
+      "additionalProperties": true
+     }
+    }
+   },
+   "output": {
+    "type": "object",
+    "properties": {
+     "echo": {
+      "type": "object",
+      "properties": {
+       "sku": {
+        "type": "string"
+       },
+       "quantity": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100
+       },
+       "principal": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "sku",
+       "quantity"
+      ]
+     }
+    }
+   },
+   "expect": "well_known_unsupported"
+  },
+  {
+   "name": "int32 field declared as a string",
+   "method": "Place",
+   "input": {
+    "type": "object",
+    "properties": {
+     "sku": {
+      "type": "string"
+     },
+     "quantity": {
+      "type": "string"
+     },
+     "principal": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "sku",
+     "quantity"
+    ]
+   },
+   "workflow": {
+    "type": "object",
+    "properties": {
+     "sku": {
+      "type": "string"
+     },
+     "quantity": {
+      "type": "string"
+     },
+     "principal": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "sku",
+     "quantity"
+    ]
+   },
+   "output": {
+    "type": "object",
+    "properties": {
+     "echo": {
+      "type": "object",
+      "properties": {
+       "sku": {
+        "type": "string"
+       },
+       "quantity": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100
+       },
+       "principal": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "sku",
+       "quantity"
+      ]
+     }
+    }
+   },
+   "expect": "kind_mismatch"
+  },
+  {
+   "name": "int64 field without the int64-string wire form",
+   "method": "Inspect",
+   "input": {
+    "type": "object",
+    "properties": {
+     "name": {
+      "type": "string"
+     },
+     "active": {
+      "type": "boolean"
+     },
+     "small": {
+      "type": "integer",
+      "minimum": -2147483648,
+      "maximum": 2147483647
+     },
+     "large": {
+      "type": "integer"
+     },
+     "count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+     },
+     "ratio": {
+      "type": "number"
+     },
+     "blob": {
+      "type": "string",
+      "format": "byte"
+     },
+     "color": {
+      "type": "string"
+     },
+     "order": {
+      "type": "object",
+      "properties": {
+       "sku": {
+        "type": "string"
+       },
+       "quantity": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100
+       },
+       "principal": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "sku",
+       "quantity"
+      ]
+     },
+     "tags": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "lines": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "sku": {
+         "type": "string"
+        },
+        "quantity": {
+         "type": "integer",
+         "minimum": 1,
+         "maximum": 100
+        },
+        "principal": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "sku",
+        "quantity"
+       ]
+      }
+     },
+     "note": {
+      "type": "string"
+     },
+     "counts": {
+      "type": "array",
+      "items": {
+       "type": "integer",
+       "minimum": -2147483648,
+       "maximum": 2147483647
+      }
+     }
+    }
+   },
+   "output": {
+    "type": "object",
+    "properties": {
+     "name": {
+      "type": "string"
+     },
+     "active": {
+      "type": "boolean"
+     },
+     "small": {
+      "type": "integer",
+      "minimum": -2147483648,
+      "maximum": 2147483647
+     },
+     "large": {
+      "type": "integer",
+      "wire": "int64-string"
+     },
+     "count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+     },
+     "ratio": {
+      "type": "number"
+     },
+     "blob": {
+      "type": "string",
+      "format": "byte"
+     },
+     "color": {
+      "type": "string"
+     },
+     "order": {
+      "type": "object",
+      "properties": {
+       "sku": {
+        "type": "string"
+       },
+       "quantity": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100
+       },
+       "principal": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "sku",
+       "quantity"
+      ]
+     },
+     "tags": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "lines": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "sku": {
+         "type": "string"
+        },
+        "quantity": {
+         "type": "integer",
+         "minimum": 1,
+         "maximum": 100
+        },
+        "principal": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "sku",
+        "quantity"
+       ]
+      }
+     },
+     "note": {
+      "type": "string"
+     },
+     "counts": {
+      "type": "array",
+      "items": {
+       "type": "integer",
+       "minimum": -2147483648,
+       "maximum": 2147483647
+      }
+     }
+    }
+   },
+   "expect": "kind_mismatch"
+  },
+  {
+   "name": "bytes field without format byte",
+   "method": "Inspect",
+   "input": {
+    "type": "object",
+    "properties": {
+     "name": {
+      "type": "string"
+     },
+     "active": {
+      "type": "boolean"
+     },
+     "small": {
+      "type": "integer",
+      "minimum": -2147483648,
+      "maximum": 2147483647
+     },
+     "large": {
+      "type": "integer",
+      "wire": "int64-string"
+     },
+     "count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+     },
+     "ratio": {
+      "type": "number"
+     },
+     "blob": {
+      "type": "string"
+     },
+     "color": {
+      "type": "string"
+     },
+     "order": {
+      "type": "object",
+      "properties": {
+       "sku": {
+        "type": "string"
+       },
+       "quantity": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100
+       },
+       "principal": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "sku",
+       "quantity"
+      ]
+     },
+     "tags": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "lines": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "sku": {
+         "type": "string"
+        },
+        "quantity": {
+         "type": "integer",
+         "minimum": 1,
+         "maximum": 100
+        },
+        "principal": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "sku",
+        "quantity"
+       ]
+      }
+     },
+     "note": {
+      "type": "string"
+     },
+     "counts": {
+      "type": "array",
+      "items": {
+       "type": "integer",
+       "minimum": -2147483648,
+       "maximum": 2147483647
+      }
+     }
+    }
+   },
+   "output": {
+    "type": "object",
+    "properties": {
+     "name": {
+      "type": "string"
+     },
+     "active": {
+      "type": "boolean"
+     },
+     "small": {
+      "type": "integer",
+      "minimum": -2147483648,
+      "maximum": 2147483647
+     },
+     "large": {
+      "type": "integer",
+      "wire": "int64-string"
+     },
+     "count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+     },
+     "ratio": {
+      "type": "number"
+     },
+     "blob": {
+      "type": "string",
+      "format": "byte"
+     },
+     "color": {
+      "type": "string"
+     },
+     "order": {
+      "type": "object",
+      "properties": {
+       "sku": {
+        "type": "string"
+       },
+       "quantity": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100
+       },
+       "principal": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "sku",
+       "quantity"
+      ]
+     },
+     "tags": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "lines": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "sku": {
+         "type": "string"
+        },
+        "quantity": {
+         "type": "integer",
+         "minimum": 1,
+         "maximum": 100
+        },
+        "principal": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "sku",
+        "quantity"
+       ]
+      }
+     },
+     "note": {
+      "type": "string"
+     },
+     "counts": {
+      "type": "array",
+      "items": {
+       "type": "integer",
+       "minimum": -2147483648,
+       "maximum": 2147483647
+      }
+     }
+    }
+   },
+   "expect": "kind_mismatch"
+  },
+  {
+   "name": "request field missing from a closed schema",
+   "method": "Place",
+   "input": {
+    "type": "object",
+    "properties": {
+     "sku": {
+      "type": "string"
+     },
+     "quantity": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100
+     }
+    },
+    "required": [
+     "sku",
+     "quantity"
+    ]
+   },
+   "workflow": {
+    "type": "object",
+    "properties": {
+     "sku": {
+      "type": "string"
+     },
+     "quantity": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100
+     }
+    },
+    "required": [
+     "sku",
+     "quantity"
+    ]
+   },
+   "output": {
+    "type": "object",
+    "properties": {
+     "echo": {
+      "type": "object",
+      "properties": {
+       "sku": {
+        "type": "string"
+       },
+       "quantity": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100
+       },
+       "principal": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "sku",
+       "quantity"
+      ]
+     }
+    }
+   },
+   "expect": "unmapped_field"
+  },
+  {
+   "name": "schema property with no request field",
+   "method": "Place",
+   "input": {
+    "type": "object",
+    "properties": {
+     "sku": {
+      "type": "string"
+     },
+     "quantity": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100
+     },
+     "principal": {
+      "type": "string"
+     },
+     "note": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "sku",
+     "quantity"
+    ]
+   },
+   "workflow": {
+    "type": "object",
+    "properties": {
+     "sku": {
+      "type": "string"
+     },
+     "quantity": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100
+     },
+     "principal": {
+      "type": "string"
+     },
+     "note": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "sku",
+     "quantity"
+    ]
+   },
+   "output": {
+    "type": "object",
+    "properties": {
+     "echo": {
+      "type": "object",
+      "properties": {
+       "sku": {
+        "type": "string"
+       },
+       "quantity": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100
+       },
+       "principal": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "sku",
+       "quantity"
+      ]
+     }
+    }
+   },
+   "expect": "missing_field"
+  },
+  {
+   "name": "open output object",
+   "method": "Place",
+   "input": {
+    "type": "object",
+    "properties": {
+     "sku": {
+      "type": "string"
+     },
+     "quantity": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100
+     },
+     "principal": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "sku",
+     "quantity"
+    ]
+   },
+   "output": {
+    "type": "object",
+    "properties": {
+     "echo": {
+      "type": "object",
+      "properties": {
+       "sku": {
+        "type": "string"
+       },
+       "quantity": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100
+       },
+       "principal": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "sku",
+       "quantity"
+      ],
+      "additionalProperties": true
+     }
+    }
+   },
+   "expect": "open_output"
+  },
+  {
+   "name": "output int32 without bounds",
+   "method": "Place",
+   "input": {
+    "type": "object",
+    "properties": {
+     "sku": {
+      "type": "string"
+     },
+     "quantity": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100
+     },
+     "principal": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "sku",
+     "quantity"
+    ]
+   },
+   "output": {
+    "type": "object",
+    "properties": {
+     "echo": {
+      "type": "object",
+      "properties": {
+       "sku": {
+        "type": "string"
+       },
+       "quantity": {
+        "type": "integer",
+        "minimum": 1
+       },
+       "principal": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "sku",
+       "quantity"
+      ]
+     }
+    }
+   },
+   "expect": "range_unproven"
+  },
+  {
+   "name": "request range wider than the workflow's",
+   "method": "Place",
+   "input": {
+    "type": "object",
+    "properties": {
+     "sku": {
+      "type": "string"
+     },
+     "quantity": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000
+     },
+     "principal": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "sku",
+     "quantity"
+    ]
+   },
+   "workflow": {
+    "type": "object",
+    "properties": {
+     "sku": {
+      "type": "string"
+     },
+     "quantity": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100
+     },
+     "principal": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "sku",
+     "quantity"
+    ]
+   },
+   "output": {
+    "type": "object",
+    "properties": {
+     "echo": {
+      "type": "object",
+      "properties": {
+       "sku": {
+        "type": "string"
+       },
+       "quantity": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100
+       },
+       "principal": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "sku",
+       "quantity"
+      ]
+     }
+    }
+   },
+   "expect": "workflow_mismatch"
+  },
+  {
+   "name": "worker runtime service is reserved",
+   "method": "worker",
+   "input": {
+    "type": "object",
+    "properties": {
+     "sku": {
+      "type": "string"
+     },
+     "quantity": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100
+     },
+     "principal": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "sku",
+     "quantity"
+    ]
+   },
+   "output": {
+    "type": "object",
+    "properties": {
+     "echo": {
+      "type": "object",
+      "properties": {
+       "sku": {
+        "type": "string"
+       },
+       "quantity": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100
+       },
+       "principal": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "sku",
+       "quantity"
+      ]
+     }
+    }
+   },
+   "expect": "reserved_service"
+  },
+  {
+   "name": "an open schema still refuses a map",
+   "method": "Label",
+   "input": {
+    "type": "object",
+    "additionalProperties": true
+   },
+   "output": {
+    "type": "object",
+    "properties": {
+     "echo": {
+      "type": "object",
+      "properties": {
+       "sku": {
+        "type": "string"
+       },
+       "quantity": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100
+       },
+       "principal": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "sku",
+       "quantity"
+      ]
+     }
+    }
+   },
+   "expect": "map_unsupported"
+  },
+  {
+   "name": "an open schema still refuses uint64",
+   "method": "Count",
+   "input": {
+    "type": "object",
+    "additionalProperties": true
+   },
+   "output": {
+    "type": "object",
+    "properties": {
+     "echo": {
+      "type": "object",
+      "properties": {
+       "sku": {
+        "type": "string"
+       },
+       "quantity": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100
+       },
+       "principal": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "sku",
+       "quantity"
+      ]
+     }
+    }
+   },
+   "expect": "uint64_unsupported"
+  }
+ ],
+ "calls": [
+  {
+   "name": "valid order",
+   "credential": "alice",
+   "request": {
+    "sku": "coffee",
+    "quantity": 2
+   },
+   "behavior": "echo",
+   "code": "OK",
+   "reason": ""
+  },
+  {
+   "name": "no credential",
+   "credential": "",
+   "request": {
+    "sku": "coffee",
+    "quantity": 2
+   },
+   "behavior": "echo",
+   "code": "UNAUTHENTICATED",
+   "reason": "unauthorized"
+  },
+  {
+   "name": "authenticated but not allowed",
+   "credential": "guest",
+   "request": {
+    "sku": "coffee",
+    "quantity": 2
+   },
+   "behavior": "echo",
+   "code": "PERMISSION_DENIED",
+   "reason": "forbidden"
+  },
+  {
+   "name": "identity checked before the body",
+   "credential": "",
+   "raw": "ffff",
+   "behavior": "echo",
+   "code": "UNAUTHENTICATED",
+   "reason": "unauthorized"
+  },
+  {
+   "name": "unknown field",
+   "credential": "alice",
+   "request": {
+    "sku": "coffee",
+    "quantity": 2,
+    "extra": "x"
+   },
+   "behavior": "echo",
+   "code": "INVALID_ARGUMENT",
+   "reason": "invalid_input"
+  },
+  {
+   "name": "quantity out of range",
+   "credential": "alice",
+   "request": {
+    "sku": "coffee",
+    "quantity": 1000
+   },
+   "behavior": "echo",
+   "code": "INVALID_ARGUMENT",
+   "reason": "invalid_input"
+  },
+  {
+   "name": "required field missing",
+   "credential": "alice",
+   "request": {
+    "quantity": 2
+   },
+   "behavior": "echo",
+   "code": "INVALID_ARGUMENT",
+   "reason": "invalid_input"
+  },
+  {
+   "name": "field sent with the wrong wire type",
+   "credential": "alice",
+   "request": {
+    "sku": "coffee",
+    "quantity": "two"
+   },
+   "behavior": "echo",
+   "code": "INVALID_ARGUMENT",
+   "reason": "invalid_input"
+  },
+  {
+   "name": "malformed protobuf",
+   "credential": "alice",
+   "raw": "ffff",
+   "behavior": "echo",
+   "code": "INVALID_ARGUMENT",
+   "reason": "invalid_input"
+  },
+  {
+   "name": "domain validation error",
+   "credential": "alice",
+   "request": {
+    "sku": "coffee",
+    "quantity": 2
+   },
+   "behavior": "domain:out_of_stock:validation",
+   "code": "INVALID_ARGUMENT",
+   "reason": "out_of_stock"
+  },
+  {
+   "name": "domain error of another class",
+   "credential": "alice",
+   "request": {
+    "sku": "coffee",
+    "quantity": 2
+   },
+   "behavior": "domain:order_closed:state",
+   "code": "FAILED_PRECONDITION",
+   "reason": "order_closed"
+  },
+  {
+   "name": "configuration error stays internal",
+   "credential": "alice",
+   "request": {
+    "sku": "coffee",
+    "quantity": 2
+   },
+   "behavior": "domain:unknown_node:configuration",
+   "code": "INTERNAL",
+   "reason": "internal"
+  },
+  {
+   "name": "internal error text is not sent",
+   "credential": "alice",
+   "request": {
+    "sku": "coffee",
+    "quantity": 2
+   },
+   "behavior": "internal",
+   "code": "INTERNAL",
+   "reason": "internal"
+  },
+  {
+   "name": "saturated workflow",
+   "credential": "alice",
+   "request": {
+    "sku": "coffee",
+    "quantity": 2
+   },
+   "behavior": "saturated",
+   "code": "RESOURCE_EXHAUSTED",
+   "reason": "saturated"
+  },
+  {
+   "name": "output the response cannot carry",
+   "credential": "alice",
+   "request": {
+    "sku": "coffee",
+    "quantity": 2
+   },
+   "behavior": "output:{\"echo\":{\"sku\":\"coffee\",\"quantity\":500}}",
+   "code": "INTERNAL",
+   "reason": "invalid_output"
+  }
+ ],
+ "expected": {
+  "startupAccepted": 2,
+  "startupRefused": 16,
+  "callsOK": 1,
+  "callsRefused": 14,
+  "dispatches": 7,
+  "effects": 1
+ }
+}
