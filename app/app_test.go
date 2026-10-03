@@ -199,3 +199,29 @@ func TestBindAfterAbortIsAlreadyCanceled(t *testing.T) {
 		unbind()
 	}
 }
+
+// TestShutdownDeadlineBoundsTheAbortGrace: the caller's deadline bounds the
+// grace too; Shutdown never outlives its own ctx by the grace (#177).
+func TestShutdownDeadlineBoundsTheAbortGrace(t *testing.T) {
+	application, err := New(Config{DrainTimeout: 5 * time.Second, AbortGrace: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := application.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := application.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	begin := time.Now()
+	if err := application.Shutdown(ctx); !errors.Is(err, ErrDrainTimeout) {
+		t.Fatalf("shutdown returned %v", err)
+	}
+	if elapsed := time.Since(begin); elapsed > time.Second {
+		t.Fatalf("shutdown took %v with a 100ms deadline", elapsed)
+	}
+}

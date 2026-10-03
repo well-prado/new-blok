@@ -114,9 +114,11 @@ Shutdown then cancels it rather than closing the store under it (#177):
   invalid input) still wins. The in-band adapters have no key, and answer
   as the cancellation it is, which clients do not retry by default (the
   rule #190 set for a failure after an effect): HTTP 504, gRPC `Canceled`,
-  MCP and WebSocket `canceled`. A handler that returned success is still
-  answered with it. An aborted WebSocket `OnConnect` closes with 1013, as a
-  shutdown does; the disconnect workflow that follows starts canceled.
+  MCP and WebSocket `canceled` (HTTP 504 when the handler returns the
+  context's error; any other unclassified error stays 500). A handler that
+  returned success is still answered with it. An aborted WebSocket
+  `OnConnect` closes with 1013 (try again later); the disconnect workflow
+  that follows starts canceled.
 
 The alternative considered was to require `DrainTimeout` to cover every
 endpoint's read and submit bounds. It was rejected: it ties the

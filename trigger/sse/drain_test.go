@@ -182,3 +182,30 @@ func TestDrainTimeoutCancelsStartAuthentication(t *testing.T) {
 		t.Fatalf("aborted authentication answered %d; want 401", status)
 	}
 }
+
+// TestDrainTimeoutCancelsSubscribeAuthentication: a subscription's
+// authentication runs under its lease, so a drain timeout cancels it too
+// (#177).
+func TestDrainTimeoutCancelsSubscribeAuthentication(t *testing.T) {
+	probe := &drainprobe.Probe{}
+	var work *drainprobe.Held
+	f := newFixtureWith(t, probe.Config(50*time.Millisecond), sse.HubConfig{}, func(e *sse.Endpoint) {
+		e.Authenticate = func(request *http.Request) (trigger.Principal, error) {
+			return trigger.Principal{ID: "alice"}, work.Run(request.Context())
+		}
+	}, nil)
+	work = drainprobe.NewHeld(t, probe)
+	answered := make(chan int, 1)
+	go func() {
+		_, refused, err := subscribe(context.Background(), f.client, f.url(strings.Repeat("a", 64)), "alice", "")
+		if err != nil || refused == nil {
+			answered <- 0
+			return
+		}
+		answered <- refused.StatusCode
+	}()
+	drainprobe.Abort(t, f.app, probe, work)
+	if status := <-answered; status != http.StatusUnauthorized {
+		t.Fatalf("aborted authentication answered %d; want 401", status)
+	}
+}
