@@ -4,7 +4,14 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 )
+
+// ErrBusy reports that a transaction could not get, or keep, the store's
+// write lock: it waited out the busy timeout, or another writer committed
+// after it read. The store is contended, nothing was committed, and the same
+// work may succeed when retried later.
+var ErrBusy = errors.New("store: busy")
 
 // Backend opens a durable database without exposing its implementation to the
 // engine or journal callers.

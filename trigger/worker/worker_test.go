@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/well-prado/new-blok/store"
 	"github.com/well-prado/new-blok/store/sqlite"
 	"github.com/well-prado/new-blok/trigger"
 )
@@ -469,13 +470,19 @@ func TestConcurrentWorkersNeverFailBusy(t *testing.T) {
 	if err := queue.RegisterKind("busy", []byte(`{"type":"object"}`)); err != nil {
 		t.Fatal(err)
 	}
-	const jobs, workers = 200, 4
+	// Submitters keep at most 16 submissions in flight, as real clients do:
+	// an unbounded burst queues on the single writer past the busy timeout,
+	// which is saturation (#184), not what this test is about.
+	const jobs, workers, inFlight = 200, 4, 16
 	var submitters sync.WaitGroup
 	submitErrs := make(chan error, jobs)
+	slots := make(chan struct{}, inFlight)
 	for i := range jobs {
 		submitters.Add(1)
 		go func() {
 			defer submitters.Done()
+			slots <- struct{}{}
+			defer func() { <-slots }()
 			if _, err := queue.Submit(ctx, trigger.Submission{Key: fmt.Sprintf("busy-%d", i), Kind: "busy", Payload: []byte(`{}`)}); err != nil {
 				submitErrs <- err
 			}
@@ -702,5 +709,94 @@ func TestMeasureClaimContention(t *testing.T) {
 		group.Wait()
 		t.Logf("sample=%d jobs=%d busy_errors=%d elapsed=%s", sample, runs, busy, time.Since(begin).Round(time.Millisecond))
 		_ = database.Close()
+	}
+}
+
+// TestBusyStoreSubmissionIsSaturation: a submission that cannot get the
+// store's write lock within the busy timeout is saturation, retryable, and
+// commits nothing.
+func TestBusyStoreSubmissionIsSaturation(t *testing.T) {
+	ctx := context.Background()
+	database, err := (sqlite.Backend{}).Open(ctx, filepath.Join(t.TempDir(), "saturated.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	queue, err := New(ctx, database, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.RegisterKind("busy", []byte(`{"type":"object"}`)); err != nil {
+		t.Fatal(err)
+	}
+	holding, release, held := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+	go func() {
+		held <- database.WithTx(ctx, func(tx *sql.Tx) error {
+			if _, err := tx.ExecContext(ctx, `UPDATE worker_jobs SET updated_at = updated_at`); err != nil {
+				return err
+			}
+			close(holding)
+			<-release
+			return nil
+		})
+	}()
+	<-holding
+	var released sync.Once
+	t.Cleanup(func() { released.Do(func() { close(release) }) })
+	_, err = queue.Submit(ctx, trigger.Submission{Key: "busy-1", Kind: "busy", Payload: []byte(`{}`)})
+	released.Do(func() { close(release) })
+	if !errors.Is(err, trigger.ErrSaturated) || !errors.Is(err, store.ErrBusy) {
+		t.Fatalf("a submission to a busy store returned %v; want saturation", err)
+	}
+	if err := <-held; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queue.Get(ctx, "busy-1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("a saturated submission was committed: %v", err)
+	}
+	if accepted, err := queue.Submit(ctx, trigger.Submission{Key: "busy-1", Kind: "busy", Payload: []byte(`{}`)}); err != nil || !accepted {
+		t.Fatalf("the retry: accepted=%v err=%v", accepted, err)
+	}
+}
+
+// TestHandlerSubmittingToItsOwnStoreFails: a handler that writes to the
+// store outside tx, here by submitting to its own queue, waits on the write
+// lock its own claim holds. That busy store is not saturation: the job
+// fails like any handler error instead of being deferred, again and again,
+// into the same deadlock.
+func TestHandlerSubmittingToItsOwnStoreFails(t *testing.T) {
+	ctx := context.Background()
+	database, err := (sqlite.Backend{}).Open(ctx, filepath.Join(t.TempDir(), "self.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	queue, err := New(ctx, database, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.RegisterKind("self", []byte(`{"type":"object"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queue.Enqueue(ctx, EnqueueRequest{RequestKey: "outer", Kind: "self", Payload: []byte(`{}`), MaxAttempts: 1}); err != nil {
+		t.Fatal(err)
+	}
+	var nested error
+	processed, err := queue.ProcessOnce(ctx, func(ctx context.Context, _ *sql.Tx, _ Job) error {
+		_, nested = queue.Submit(ctx, trigger.Submission{Key: "inner", Kind: "self", Payload: []byte(`{}`)})
+		return nested
+	})
+	if err != nil || !processed {
+		t.Fatalf("processed=%v err=%v", processed, err)
+	}
+	if !errors.Is(nested, store.ErrBusy) {
+		t.Fatalf("the nested submission returned %v; want a busy store", nested)
+	}
+	job, err := queue.Get(ctx, "outer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.Deferrals != 0 || job.State != StateDead {
+		t.Fatalf("the self-deadlocked job is %s with %d deferrals; want dead with none", job.State, job.Deferrals)
 	}
 }

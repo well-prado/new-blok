@@ -38,7 +38,9 @@ handler runs inside its claim's write transaction, so concurrent workers run
 handlers one at a time, and every other writer (submissions, cron, the
 journal) waits for them under one busy-timeout budget per statement. A writer
 that waits longer than 5 seconds, behind one slow handler or several queued
-ones, still fails with `SQLITE_BUSY`; handlers must stay short. A worker
+ones, still fails with `SQLITE_BUSY`; handlers must stay short. Such a
+failure is saturation, not a fault: every transaction error caused by
+`SQLITE_BUSY` matches `store.ErrBusy` (#184), so callers can retry it. A worker
 whose consumer is canceled while it waits reports `ErrConsumerLost`, after
 up to the busy timeout, because the driver does not interrupt a busy wait.
 
