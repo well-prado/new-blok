@@ -98,21 +98,26 @@ retain their ordinary `app` dependency. Docker Go 1.27.1 Linux/arm64 focused
 race tests (`./app/... ./examples/deploy ./internal/journal`), full vet,
 full race tests and build passed. `git diff --check` passed.
 
-The earlier container evidence below predates this correction and cannot certify
-its current container integration. Container reruns, independent review and
-native Windows execution remain outstanding; no CI or completion claim is made.
+Current `bash examples/deploy/container-test.sh` and
+`bash examples/deploy/node-container-test.sh` both passed on `0f76baa`.
+The native/durable suite verified committed journal admission/checkpoints,
+volume restart, no repeated processing, live readiness withdrawal with zero
+new admissions, and cold missing-artifact/incompatible-codec/manifest failures.
+The Node suite verified real worker quotes, startup failures, overload/probes,
+accepted-request SIGTERM drain, worker loss, restart and deadline expiry.
+Synthetic evidence is retained at `/tmp/new-blok-81-volume.3YFxTj` and
+`/tmp/new-blok-81-worker.CiP4cl`. No CI or Windows completion claim is made.
 
 ## Pending acceptance and review
 
-#49/PR #152 remains unmerged. The durable example's order-format marker and
-SQLite integrity check are not actual retained journal checkpoint enumeration,
-restored-run compatibility, artifact availability, backup/restore or compaction
-evidence. `app.ArtifactProbe` is tested only against a supplied synthetic
-inventory. That deployment criterion remains open until real inventories from
-the owning persistence implementation are wired and fault tested.
+#49/PR #152 is merged and its journal/store implementation is integrated here.
+Actual retained inventory now gates startup and readiness; synthetic
+`app.ArtifactProbe` tests are no longer the only evidence. This single-version
+example refuses incompatible retained executable identities rather than
+claiming transparent upgrades or multi-version routing.
 
-#51's dedicated review fixes and any later #53/#74 changes remain their owners'
-work; this record only covers the committed dependency version above. Passing
+#51's explicit shutdown deadline fix `c56f594` is integrated. Later #53/#74
+changes remain their owners' work. Passing
 local cooperative SIGTERM tests does not establish bounded shutdown for every
 broken/noncooperative transport. Independent R review is still required.
 
