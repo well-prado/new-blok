@@ -5,6 +5,8 @@ import (
 	"errors"
 	"os"
 	"reflect"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -97,5 +99,75 @@ func TestShutdownTimeoutStillClosesAndSignalsRun(t *testing.T) {
 	signals <- os.Interrupt
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestDrainTimeoutCancelsAdmittedWorkBeforeClosing: work a lease admitted
+// that outlives the drain is canceled with ErrDrainTimeout as its cause,
+// and the application closes its dependencies only after that work has
+// stopped (#177).
+func TestDrainTimeoutCancelsAdmittedWorkBeforeClosing(t *testing.T) {
+	var mu sync.Mutex
+	var order []string
+	note := func(event string) { mu.Lock(); order = append(order, event); mu.Unlock() }
+	application, err := New(Config{DrainTimeout: 100 * time.Millisecond, AbortGrace: 5 * time.Second, Dependencies: []Dependency{{
+		Name:  "store",
+		Start: func(context.Context) error { return nil },
+		Close: func(context.Context) error { note("store closed"); return nil },
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := application.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := application.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopped := make(chan bool, 1)
+	go func() {
+		<-lease.Context().Done()
+		stopped <- Aborted(lease.Context())
+		note("work stopped")
+		lease.Release()
+	}()
+	if err := application.Shutdown(context.Background()); !errors.Is(err, ErrDrainTimeout) {
+		t.Fatalf("shutdown returned %v; want ErrDrainTimeout", err)
+	}
+	if !<-stopped {
+		t.Fatal("the work was not canceled by the drain timeout")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if strings.Join(order, ", ") != "work stopped, store closed" {
+		t.Fatalf("order: %v; the store closed under running work", order)
+	}
+}
+
+// TestAbortGraceBoundsStubbornWork: work that ignores the cancellation
+// cannot hold the application open past DrainTimeout plus AbortGrace.
+func TestAbortGraceBoundsStubbornWork(t *testing.T) {
+	application, err := New(Config{DrainTimeout: 50 * time.Millisecond, AbortGrace: 100 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := application.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := application.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	begin := time.Now()
+	if err := application.Shutdown(context.Background()); !errors.Is(err, ErrDrainTimeout) {
+		t.Fatalf("shutdown returned %v", err)
+	}
+	if elapsed := time.Since(begin); elapsed > 2*time.Second {
+		t.Fatalf("shutdown waited %v for work that ignores cancellation", elapsed)
+	}
+	if application.State() != StoppedState {
+		t.Fatalf("state %s", application.State())
 	}
 }

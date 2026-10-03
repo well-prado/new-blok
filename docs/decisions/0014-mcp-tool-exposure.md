@@ -88,7 +88,9 @@ are kept (oldest evicted; its sessions keep their server until they end or
    slot (`MaxConcurrency`); none free → tool error `saturated` at once, never
    a queue.
 5. An application lease for the call itself, so the application cannot stop
-   under it even after its request is gone; draining → `unavailable`.
+   under it even after its request is gone; draining → `unavailable`. If the
+   drain times out first, the call is canceled and answered `unavailable`
+   (ADR 0005, #177).
 6. The arguments are normalized against the input schema; failure is the
    tool error `invalid_input`, before the catalog sees the call. It is a tool
    error, not a protocol error, so the model can correct its arguments.
@@ -178,6 +180,8 @@ session is kept in a registry `Shutdown` closes.
 Each request takes an application lease; a draining application answers 503
 with `Retry-After`. A GET is the session's standing stream, so it is admitted
 but releases its lease at once. Each call holds its own lease while it runs.
+A drain timeout cancels a request's own work (building the session's view)
+and every call (#177); the request's response itself is not canceled.
 `Shutdown(ctx)` refuses new sessions and calls, waits for calls in flight,
 then closes every session (the registry, which holds every counted session
 even when its view was evicted, and every cached view's)

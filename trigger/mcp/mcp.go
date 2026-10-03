@@ -303,6 +303,10 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		lease.Release()
 	} else {
 		defer lease.Release()
+		// The request's own work (building the session's view) also
+		// stops if the application's drain times out. Only that work is
+		// bound: canceling the request itself would drop its response.
+		request = request.WithContext(context.WithValue(request.Context(), leaseKey{}, lease))
 	}
 	s.mu.Lock()
 	closing := s.closing
@@ -314,6 +318,9 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	}
 	s.transport.ServeHTTP(writer, request)
 }
+
+// leaseKey carries a request's application lease to the work it does.
+type leaseKey struct{}
 
 // open admits a request that opens a session within the session bounds, and
 // keeps the session counted until it closes. The count settles as the
@@ -539,6 +546,11 @@ func (s *Server) serverFor(request *http.Request) (server *sdk.Server) {
 	}()
 	ctx, cancel := context.WithTimeout(request.Context(), s.config.Timeout)
 	defer cancel()
+	if lease, ok := request.Context().Value(leaseKey{}).(*app.Lease); ok {
+		bound, unbind := lease.Bind(ctx)
+		defer unbind()
+		ctx = bound
+	}
 	v, err := s.build(ctx, principal)
 	if err != nil {
 		return nil
@@ -704,6 +716,9 @@ func (s *Server) handler(owner tool.Principal, t Tool, input schema.Schema, outp
 			return failure("unavailable"), nil
 		}
 		defer lease.Release()
+		// The call also stops if the application's drain times out.
+		ctx, unbind := lease.Bind(ctx)
+		defer unbind()
 		arguments := request.Params.Arguments
 		if len(arguments) == 0 {
 			arguments = json.RawMessage("{}")
@@ -762,6 +777,8 @@ func (s *Server) handler(owner tool.Principal, t Tool, input schema.Schema, outp
 // codeFor maps a catalog error to a stable code, never its text.
 func codeFor(ctx context.Context, err error) string {
 	switch {
+	case app.Aborted(ctx):
+		return "unavailable"
 	case errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded):
 		return "deadline_exceeded"
 	case errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled):

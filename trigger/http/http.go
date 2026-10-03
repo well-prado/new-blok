@@ -83,6 +83,7 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	}
 	lease, err := s.application.Begin()
 	if err != nil {
+		writer.Header().Set("Retry-After", "1")
 		writeJSON(writer, http.StatusServiceUnavailable, map[string]any{"error": "application unavailable"})
 		return
 	}
@@ -117,7 +118,10 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			return
 		}
 	}
-	ctx := request.Context()
+	// The handler stops when the client leaves, its timeout passes, or the
+	// application's drain times out.
+	ctx, unbind := lease.Bind(request.Context())
+	defer unbind()
 	var cancel context.CancelFunc
 	if endpoint.Timeout > 0 {
 		ctx, cancel = context.WithTimeout(ctx, endpoint.Timeout)
@@ -125,6 +129,11 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	}
 	input := Input{Body: body, Params: params, Query: request.URL.Query(), Principal: principal}
 	result, err := endpoint.Handle(ctx, input)
+	if err != nil && app.Aborted(ctx) {
+		writer.Header().Set("Retry-After", "1")
+		writeJSON(writer, http.StatusServiceUnavailable, map[string]any{"error": "application unavailable"})
+		return
+	}
 	if err != nil {
 		status := statusFor(err)
 		requestID := s.newRequestID()

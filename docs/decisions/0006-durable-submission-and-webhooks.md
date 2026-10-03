@@ -93,7 +93,7 @@ Each request goes through these steps in a fixed order:
 4. provider verification over the original header and exact body bytes (401);
 5. the replay window `Tolerance`, 5 minutes by default and 24 hours at most, past and future (400 `stale_event`);
 6. input validation against the endpoint schema (400 `invalid_input`);
-7. durable submission, under a context the provider cannot cancel, bounded by `SubmitTimeout`.
+7. durable submission, under a context the provider cannot cancel, bounded by `SubmitTimeout`. It is canceled only if the application's drain times out first; the delivery is then answered 503 `unavailable` with `Retry-After`, and the provider redelivers (ADR 0005, #177).
 
 The window compares instants (`ts < received−tolerance || ts > received+tolerance`),
 never durations, so a far-future timestamp cannot overflow past it. The
