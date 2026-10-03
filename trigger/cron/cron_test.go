@@ -841,54 +841,46 @@ func TestLateAfterIsInclusive(t *testing.T) {
 	}
 }
 
-// TestAddWhileTicking registers schedules while ticks write cursors to the
-// same store: every registration succeeds instead of failing with
-// SQLITE_BUSY.
-func TestAddWhileTicking(t *testing.T) {
+// TestAddWaitsForACursorWrite: a registration made while a tick holds the
+// store's write lock (its cursor write) waits for it and succeeds. Reading
+// before writing would fail: the read takes a snapshot that the tick's
+// commit makes stale, and SQLite refuses to upgrade it (SQLITE_BUSY).
+func TestAddWaitsForACursorWrite(t *testing.T) {
 	database, queue := openQueue(t)
 	clock := newClock(at(10, 30))
 	s, err := cron.New(context.Background(), database, queue, queue, clock)
 	if err != nil {
 		t.Fatal(err)
 	}
-	all := make([]cron.Schedule, 50)
-	for i := range all {
-		all[i] = schedule(fmt.Sprintf("base-%d", i), "* * * * *")
-	}
-	if _, err := s.AddAll(context.Background(), all); err != nil {
+	if _, err := s.Add(context.Background(), schedule("base", "* * * * *")); err != nil {
 		t.Fatal(err)
 	}
-	stop := make(chan struct{})
-	ticked := make(chan int, 1)
+	holding := make(chan struct{})
+	held := make(chan error, 1)
+	const hold = 300 * time.Millisecond
 	go func() {
-		n := 0
-		defer func() { ticked <- n }()
-		now := at(10, 30)
-		for {
-			select {
-			case <-stop:
-				return
-			default:
+		held <- database.WithTx(context.Background(), func(tx *sql.Tx) error {
+			// A cursor write, as a tick's flush makes it.
+			if _, err := tx.ExecContext(context.Background(), `UPDATE cron_cursors SET updated_at = updated_at + 1`); err != nil {
+				return err
 			}
-			now = now.Add(time.Minute)
-			clock.Set(now)
-			if _, err := s.Tick(context.Background()); err != nil {
-				t.Error(err)
-				return
-			}
-			n++
-		}
+			close(holding)
+			time.Sleep(hold)
+			return nil
+		})
 	}()
-	for i := 0; i < 200; i++ {
-		if _, err := s.Add(context.Background(), schedule(fmt.Sprintf("late-%d", i), "0 * * * *")); err != nil {
-			close(stop)
-			<-ticked
-			t.Fatalf("add %d while ticking: %v", i, err)
-		}
+	<-holding
+	began := time.Now()
+	_, err = s.Add(context.Background(), schedule("late", "0 * * * *"))
+	waited := time.Since(began)
+	if err := <-held; err != nil {
+		t.Fatal(err)
 	}
-	close(stop)
-	if n := <-ticked; n == 0 {
-		t.Fatal("no tick ran alongside the registrations")
+	if err != nil {
+		t.Fatalf("a registration during a cursor write failed after %v: %v", waited, err)
+	}
+	if waited < hold/2 {
+		t.Fatalf("the registration did not wait for the cursor write (%v)", waited)
 	}
 }
 
