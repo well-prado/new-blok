@@ -55,13 +55,13 @@ func setup(t *testing.T, gate tool.Gate) (*Catalog, node.Definition[value, value
 	r := node.NewRegistry()
 	count := &atomic.Int32{}
 	read := node.MustDefine("native/read", "1.0.0", func(ctx context.Context, in value) (value, error) { count.Add(1); return value{in.Value + 1}, nil }, node.Description("read"), node.Schemas(valueSchema, valueSchema), node.Effects("db:read"))
-	write := node.MustDefine("worker/write", "1.0.0", func(ctx context.Context, in value) (value, error) {
+	write := node.MustDefine("native/write", "1.0.0", func(ctx context.Context, in value) (value, error) {
 		count.Add(1)
 		if tool.TokenLimit(ctx) != 10 {
-			return value{}, errors.New("missing injected worker token bound")
+			return value{}, errors.New("missing injected native provider token bound")
 		}
 		return value{in.Value * 2}, nil
-	}, node.Description("injected worker boundary"), node.Schemas(valueSchema, valueSchema), node.Effects("db:write"))
+	}, node.Description("trusted native provider boundary"), node.Schemas(valueSchema, valueSchema), node.Effects("db:write"))
 	for _, n := range []node.Any{read.Any(), write.Any()} {
 		if err := r.Register(n); err != nil {
 			t.Fatal(err)
@@ -116,7 +116,7 @@ func TestHostileCatalogAndWorkflowAdmission(t *testing.T) {
 		{"calls-reserved-before-effects", principal("read", "write"), `{}`, func(b *Budget) { b.MaxCalls = 1 }, ErrBudget, "", 0},
 		{"depth-enforced-before-effects", principal("read", "write"), `{}`, func(b *Budget) { b.MaxDepth = 1 }, ErrBudget, "", 0},
 		{"expired-before-effects", principal("read", "write"), `{}`, func(b *Budget) { b.Deadline = time.Now().Add(-time.Second) }, ErrBudget, "", 0},
-		{"native-worker-seam-chaining-defaults", principal("read", "write"), `{}`, nil, nil, `{"value":6}`, 2},
+		{"native-provider-chaining-defaults", principal("read", "write"), `{}`, nil, nil, `{"value":6}`, 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			count.Store(0)
@@ -228,7 +228,7 @@ type testGate struct {
 
 func (g *testGate) Authorize(ctx context.Context, a tool.Admission) error {
 	g.requests = append(g.requests, a)
-	if g.deny || a.Name == "worker/write" {
+	if g.deny || a.Name == "native/write" {
 		return ErrDenied
 	}
 	return nil

@@ -1,4 +1,4 @@
-# ADR 0006: Reviewed catalog and tool admission (#74 / E14-T01)
+# ADR 0011: Reviewed catalog and tool admission (#74 / E14-T01)
 
 Status: implemented pre-alpha. Version 1 manifests explicitly declare
 `agent-compatible`, exact effects/capabilities and determinism. Missing, invalid,

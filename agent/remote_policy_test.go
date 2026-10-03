@@ -110,6 +110,9 @@ func TestActualNodeEffectScopeCannotWidenOrBypassTokenBudget(t *testing.T) {
 		t.Fatalf("direct adapter widened scope: %v", err)
 	}
 	actor.Capabilities = []string{"http:charges"}
+	if _, err := remote.Invoke(tool.WithTokenLimit(context.Background(), 1), struct{}{}); !errors.Is(err, tool.ErrBudget) {
+		t.Fatalf("unscoped adapter lost reservation: %v", err)
+	}
 	if _, err := remote.Invoke(tool.WithTokenLimit(tool.WithScope(context.Background(), actor), 1), struct{}{}); !errors.Is(err, tool.ErrBudget) {
 		t.Fatalf("direct adapter lost reservation: %v", err)
 	}

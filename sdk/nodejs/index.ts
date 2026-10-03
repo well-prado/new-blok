@@ -79,6 +79,7 @@ export function defineNode<I, O, D>(spec: {
   const inputSchema = compileSchema(spec.input), outputSchema = compileSchema(spec.output);
   const effects = Object.freeze([...new Set(spec.effects ?? [])].sort());
   const requiredCapabilities = Object.freeze([...new Set(spec.requiredCapabilities ?? [])].sort());
+  if(effects.length>128 || requiredCapabilities.length>128)throw new Error("invalid_capability");
   if ([...effects, ...requiredCapabilities].some(c => !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(c) || c.includes("orchestrate"))) throw new Error("invalid_capability");
   if (spec.deterministic && effects.length) throw new Error("invalid_effect_declaration");
   const descriptor: Descriptor = Object.freeze({ name: spec.name, version: spec.version, description: spec.description, inputSchema, outputSchema, ...(effects.length ? { effects } : {}), ...(requiredCapabilities.length ? { requiredCapabilities } : {}), deterministic: spec.deterministic ?? false });
