@@ -6,7 +6,8 @@ import { builtinModules } from "node:module";
 // Explicit application-owned node directories, never inferred from descriptor names.
 // Utility imports are traversed too: re-exporting through a helper is not a bypass.
 export function checkOwnership(entries, roots) {
-  const owned = roots.map(root => realpathSync(root));
+  // A nested node owns its subtree regardless of configuration order.
+  const owned = roots.map(root => realpathSync(root)).sort((a, b) => b.length - a.length);
   const owner = file => owned.findIndex(root => {
     const path = relative(root, file);
     return path === "" || (!path.startsWith("..") && !isAbsolute(path));

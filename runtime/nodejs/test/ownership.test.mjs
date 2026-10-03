@@ -34,6 +34,27 @@ function packageFixture(run) {
   return Promise.resolve().then(() => run(fixture)).finally(() => rmSync(root, { recursive: true, force: true }));
 }
 
+test("nested node ownership is independent of root order", () => {
+  const root = mkdtempSync(join(tmpdir(), "blok-ownership-nested-"));
+  try {
+    const a = join(root, "a"), b = join(a, "b");
+    mkdirSync(b, { recursive: true });
+    const parent = join(a, "index.mjs"), child = join(b, "index.mjs");
+    writeFileSync(child, "export const value = 1;");
+    writeFileSync(parent, "import './b/index.mjs';");
+    for (const roots of [[a, b], [b, a]]) {
+      assert.throws(() => checkOwnership([parent], roots), /node imports another node/);
+      assert.doesNotThrow(() => checkOwnership([child], roots));
+    }
+    writeFileSync(parent, "export const value = 2;");
+    writeFileSync(child, "import '../index.mjs';");
+    for (const roots of [[a, b], [b, a]]) {
+      assert.throws(() => checkOwnership([child], roots), /node imports another node/);
+      assert.doesNotThrow(() => checkOwnership([parent], roots));
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("package value imports traverse executable exports despite harmless declarations", () => packageFixture(async ({ a, b, pkg, entry, runtimeEntry }) => {
   writeFileSync(join(pkg, "runtime.js"), "export { value } from '../../b/index.js';");
   writeFileSync(join(pkg, "runtime.cjs"), "module.exports = require('../../b/index.cjs');");
