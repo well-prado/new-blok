@@ -41,8 +41,10 @@ dependency. It defines:
   publisher as a `caller`. Every other kind must authenticate its caller, so
   a caller-facing adapter cannot opt out of the authentication cases.
 - `Principal`: produced only by an adapter's authenticator.
-- `ErrSaturated`: returned by an admission handler without capacity. Adapters
-  translate it into protocol backpressure and never retry it themselves.
+- `ErrSaturated`: returned by an admission handler without capacity, or by
+  anything a handler calls that ran out of capacity: a busy store's
+  `store.ErrBusy` matches it (#190). Adapters translate it into protocol
+  backpressure and never retry it themselves.
 - `Classified` / `Classify`: a stable public `ErrorCode()`/`ErrorClass()` pair.
   `internal/engine.Error` and `node.DomainError` implement it, so adapters map
   domain errors without importing the engine. Codes are source-visible, so

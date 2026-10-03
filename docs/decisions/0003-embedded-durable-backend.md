@@ -40,7 +40,11 @@ journal) waits for them under one busy-timeout budget per statement. A writer
 that waits longer than 5 seconds, behind one slow handler or several queued
 ones, still fails with `SQLITE_BUSY`; handlers must stay short. Such a
 failure is saturation, not a fault: every transaction error caused by
-`SQLITE_BUSY` matches `store.ErrBusy` (#184), so callers can retry it. A worker
+`SQLITE_BUSY` matches `store.ErrBusy` (#184), so callers can retry it.
+`store.ErrBusy` also matches `trigger.ErrSaturated` (#190): an error that
+carries it, through the engine or not, gets every trigger's saturation
+response, including the in-band ones (HTTP 503 with `Retry-After`, gRPC
+`ResourceExhausted`, WebSocket and MCP `saturated`). A worker
 whose consumer is canceled while it waits reports `ErrConsumerLost`, after
 up to the busy timeout, because the driver does not interrupt a busy wait.
 
