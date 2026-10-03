@@ -12,8 +12,21 @@ import (
 	"path/filepath"
 
 	"github.com/well-prado/new-blok/store"
-	_ "modernc.org/sqlite"
+	driver "modernc.org/sqlite"
 )
+
+// sqliteBusy is SQLITE_BUSY; extended codes carry it in their low byte.
+const sqliteBusy = 5
+
+// busy marks an error caused by SQLITE_BUSY as store.ErrBusy, so callers can
+// tell a saturated store from a failure.
+func busy(err error) error {
+	var failure *driver.Error
+	if err != nil && errors.As(err, &failure) && failure.Code()&0xff == sqliteBusy && !errors.Is(err, store.ErrBusy) {
+		return fmt.Errorf("%w: %w", store.ErrBusy, err)
+	}
+	return err
+}
 
 const (
 	journalMode = "WAL"
@@ -87,17 +100,17 @@ func (c *connection) WithTx(ctx context.Context, fn func(*sql.Tx) error) error {
 	}
 	tx, err := c.database.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
-		return fmt.Errorf("sqlite: begin: %w", err)
+		return busy(fmt.Errorf("sqlite: begin: %w", err))
 	}
 	if err := fn(tx); err != nil {
 		_ = tx.Rollback()
-		return err
+		return busy(err)
 	}
 	if c.beforeCommit != nil {
 		c.beforeCommit()
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("sqlite: commit: %w", err)
+		return busy(fmt.Errorf("sqlite: commit: %w", err))
 	}
 	if c.afterCommit != nil {
 		c.afterCommit()
