@@ -1241,24 +1241,7 @@ func (g gatedWriter) Unwrap() http.ResponseWriter { return g.ResponseWriter }
 // close bob's session and return.
 func TestSessionOpenedDuringShutdownDoesNotHangIt(t *testing.T) {
 	reached, gate := make(chan struct{}), make(chan struct{})
-	once := &sync.Once{}
-	r := newWrappedRig(t, nil, func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-			// Gate bob's initialize: the SDK client sends a session-less
-			// server/discover probe first, which opens no session.
-			if request.Method == http.MethodPost && request.Header.Get("Mcp-Session-Id") == "" && request.Header.Get("Authorization") == "Bearer bob" {
-				body, err := io.ReadAll(request.Body)
-				if err != nil {
-					t.Error(err)
-				}
-				request.Body = io.NopCloser(bytes.NewReader(body))
-				if strings.Contains(string(body), `"method":"initialize"`) {
-					writer = gatedWriter{ResponseWriter: writer, once: once, reached: reached, gate: gate}
-				}
-			}
-			next.ServeHTTP(writer, request)
-		})
-	})
+	r := newWrappedRig(t, nil, gateInitialize("bob", reached, gate))
 	alice := r.connect("alice")
 	version := alice.InitializeResult().ProtocolVersion
 	go func() { _, _ = call(alice, "demo.block_v1.0.0", map[string]any{}, nil) }()
@@ -1302,5 +1285,56 @@ func TestSessionOpenedDuringShutdownDoesNotHangIt(t *testing.T) {
 		}
 	case <-time.After(6 * time.Second):
 		t.Fatal("Shutdown hung")
+	}
+}
+
+// gateInitialize holds token's initialize at its first response header until
+// gate closes. The SDK client sends a session-less server/discover probe
+// first, which opens no session, so only initialize is gated.
+func gateInitialize(token string, reached, gate chan struct{}) func(http.Handler) http.Handler {
+	once := &sync.Once{}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			if request.Method == http.MethodPost && request.Header.Get("Mcp-Session-Id") == "" && request.Header.Get("Authorization") == "Bearer "+token {
+				body, _ := io.ReadAll(request.Body)
+				request.Body = io.NopCloser(bytes.NewReader(body))
+				if strings.Contains(string(body), `"method":"initialize"`) {
+					writer = gatedWriter{ResponseWriter: writer, once: once, reached: reached, gate: gate}
+				}
+			}
+			next.ServeHTTP(writer, request)
+		})
+	}
+}
+
+// TestSessionOpenedAfterShutdownClosesItself holds bob's initialize until
+// Shutdown has finished: bob's view was evicted, so Shutdown cannot reach
+// his session, and returning proves it took its sessions. The opening must
+// then close its own session without waiting on itself.
+func TestSessionOpenedAfterShutdownClosesItself(t *testing.T) {
+	reached, gate := make(chan struct{}), make(chan struct{})
+	r := newWrappedRig(t, func(c *tmcp.Config) { c.MaxPrincipals = 1 }, gateInitialize("bob", reached, gate))
+	r.grant("carol", tool.Principal{ID: "carol", Capabilities: []string{"echo"}, MaxDepth: 4})
+	dialed := make(chan error, 1)
+	go func() {
+		session, err := r.dial("bob")
+		if err == nil {
+			err = session.Wait()
+		}
+		dialed <- err
+	}()
+	<-reached
+	// carol's view evicts bob's.
+	_ = r.connect("carol")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := r.adapter.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	close(gate)
+	select {
+	case <-dialed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a session opened after Shutdown was neither refused nor closed")
 	}
 }

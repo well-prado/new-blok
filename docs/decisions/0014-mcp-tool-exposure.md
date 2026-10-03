@@ -185,7 +185,11 @@ and waits for their bookkeeping; each step returns `ctx.Err()` when ctx ends
 first. Closing a session waits for its in-flight requests, and an opening
 settles while writing its own first response, so an opening never closes its
 session in place: one that settles before `Shutdown` takes its sessions is
-closed by `Shutdown`, one that settles after is closed on its own goroutine.
+closed by `Shutdown`, one that settles after is closed on its own goroutine,
+which `Shutdown` does not wait for: that close waits only for the initialize
+already being answered, every other request is refused with 503, and the
+opening request's own lease keeps the application from stopping until it
+finishes.
 A call that is already canceled when it would reach the catalog (its
 session ended or its request is gone) is refused without reaching it.
 
@@ -248,7 +252,7 @@ evidence on the real E14-T02 stack, a composed workflow, revocation, hijack,
 protocol versions, deadline, client cancel, a dropped request, a bare DELETE,
 a late-queued call, a canceled call before the catalog, overload, per-principal slots, session bounds, output
 size, draining, a call outliving its request, shutdown, a session opened during
-shutdown, evicted views, view
+and after shutdown, evicted views, view
 building, a panic while listing, the dependency rule and goroutine bounds.
 Every response byte, and the server's error log, is checked for the
 synthetic secret.
