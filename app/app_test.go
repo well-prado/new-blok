@@ -171,3 +171,31 @@ func TestAbortGraceBoundsStubbornWork(t *testing.T) {
 		t.Fatalf("state %s", application.State())
 	}
 }
+
+// TestBindAfterAbortIsAlreadyCanceled: work bound after the drain timed out
+// starts canceled, not some time later (#177).
+func TestBindAfterAbortIsAlreadyCanceled(t *testing.T) {
+	application, err := New(Config{DrainTimeout: 10 * time.Millisecond, AbortGrace: 10 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := application.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := application.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if err := application.Shutdown(context.Background()); !errors.Is(err, ErrDrainTimeout) {
+		t.Fatalf("shutdown: %v", err)
+	}
+	for range 1000 {
+		ctx, unbind := lease.Bind(context.Background())
+		if !Aborted(ctx) {
+			unbind()
+			t.Fatal("a context bound after the abort was not yet canceled")
+		}
+		unbind()
+	}
+}

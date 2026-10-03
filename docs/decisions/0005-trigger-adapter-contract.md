@@ -90,23 +90,33 @@ A caller-facing adapter (HTTP, webhook, SSE, gRPC, WebSocket, MCP) holds an
 application lease (`app.Application.Begin`) for the work it admits, and
 `app.Shutdown` waits for every lease up to `DrainTimeout` before it closes
 the application's dependencies. The queued sources (worker, pubsub, cron)
-run as dependencies instead, and stop their work in their own `Close`. Work can outlive that wait.
+take no leases: they are loops driven by their context
+(`worker.Queue.ProcessOnce`, `pubsub.Consumer.Run`, `cron.Scheduler.Run`),
+and they stop with the application only if the host runs each as an
+`app.Dependency` whose `Close` cancels that context and waits for the
+loop. Work can outlive that wait.
 Shutdown then cancels it rather than closing the store under it (#177):
 
 - Every such adapter derives the admitted work's context from its lease
-  (`Lease.Bind`). When the drain times out, that context is canceled with
-  cause `app.ErrDrainTimeout`.
+  (`Lease.Bind`) right after admission, so authentication is covered too.
+  When the drain times out, that context is canceled with cause
+  `app.ErrDrainTimeout`; work bound after that starts canceled.
 - `Shutdown` then waits up to `AbortGrace` (1 s by default) for the canceled
-  work to release its leases, and only then closes the dependencies. Work
-  that ignores its context beyond that grace still meets closed
-  dependencies: it fails with their error, and nothing it was writing
-  commits.
-- An adapter answers aborted work (`app.Aborted(ctx)`) as *unavailable*, a
-  retryable answer: HTTP 503 `application unavailable` and webhook and SSE
-  start 503 `unavailable`, all with `Retry-After`; gRPC `Unavailable
-  unavailable`; WebSocket and MCP `unavailable`, and an aborted WebSocket
-  `OnConnect` closes with 1013. An answer the work already had that is
-  final (conflict, invalid input) still wins.
+  work to release its leases, and only then closes the dependencies; both
+  waits end early if `Shutdown`'s own ctx does, so a caller's deadline also
+  bounds the grace. Work that ignores its context beyond that still meets
+  closed dependencies: it fails with their error, and nothing it was
+  writing commits.
+- Aborted work may already have committed something, so it is answered as
+  a retry invitation only where a retry is harmless. The durable starts
+  (webhook, SSE) are keyed, so they answer 503 `unavailable` with
+  `Retry-After`; a final answer the submission already had (conflict,
+  invalid input) still wins. The in-band adapters have no key, and answer
+  as the cancellation it is, which clients do not retry by default (the
+  rule #190 set for a failure after an effect): HTTP 504, gRPC `Canceled`,
+  MCP and WebSocket `canceled`. A handler that returned success is still
+  answered with it. An aborted WebSocket `OnConnect` closes with 1013, as a
+  shutdown does; the disconnect workflow that follows starts canceled.
 
 The alternative considered was to require `DrainTimeout` to cover every
 endpoint's read and submit bounds. It was rejected: it ties the

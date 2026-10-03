@@ -37,7 +37,8 @@ type Config struct {
 	// DrainTimeout bounds how long Shutdown waits for admitted work.
 	DrainTimeout time.Duration
 	// AbortGrace is how long Shutdown waits, after DrainTimeout, for work it
-	// has canceled to stop before it closes the dependencies anyway.
+	// has canceled to stop before it closes the dependencies anyway; zero
+	// means DefaultAbortGrace. Shutdown's own ctx bounds both waits.
 	AbortGrace time.Duration
 }
 
@@ -159,6 +160,11 @@ func (l *Lease) Context() context.Context {
 // returned function releases the binding.
 func (l *Lease) Bind(parent context.Context) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancelCause(parent)
+	if l.Context().Err() != nil {
+		// Already aborted: the bound context is canceled before it is
+		// returned, not later on AfterFunc's goroutine.
+		cancel(ErrDrainTimeout)
+	}
 	stop := context.AfterFunc(l.Context(), func() { cancel(ErrDrainTimeout) })
 	return ctx, func() {
 		stop()
@@ -229,7 +235,7 @@ func (a *Application) Shutdown(ctx context.Context) error {
 			// Admitted work outlived the drain: cancel it, give it a
 			// bounded grace to stop, then close the dependencies anyway.
 			a.abortWork(ErrDrainTimeout)
-			a.awaitIdle(a.config.AbortGrace)
+			a.awaitIdle(ctx, a.config.AbortGrace)
 			a.closeInitialized(ctx)
 			a.mu.Lock()
 			a.state = StoppedState
@@ -257,8 +263,9 @@ func (a *Application) Run(ctx context.Context, signals <-chan os.Signal) error {
 	}
 }
 
-// awaitIdle waits up to grace for every lease to be released.
-func (a *Application) awaitIdle(grace time.Duration) {
+// awaitIdle waits up to grace, and no longer than ctx allows, for every
+// lease to be released.
+func (a *Application) awaitIdle(ctx context.Context, grace time.Duration) {
 	deadline := time.NewTimer(grace)
 	defer deadline.Stop()
 	for {
@@ -269,6 +276,8 @@ func (a *Application) awaitIdle(grace time.Duration) {
 			return
 		}
 		select {
+		case <-ctx.Done():
+			return
 		case <-deadline.C:
 			return
 		case <-a.changed:

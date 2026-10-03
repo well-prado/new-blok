@@ -57,7 +57,8 @@ descriptor does not have, which protobuf records as unknown.
 
 1. application admission (Unavailable `unavailable`). The call holds its
    lease until it answers; if the application's drain times out first, its
-   context is canceled and it answers Unavailable `unavailable` (ADR 0005,
+   context is canceled and it answers `Canceled canceled`, not
+   `Unavailable`, which clients retry: it may have committed (ADR 0005,
    #177);
 2. authentication from the call's context, its metadata or peer
    (Unauthenticated `unauthorized`);

@@ -48,7 +48,8 @@ func (b bearer) RoundTrip(request *http.Request) (*http.Response, error) {
 
 // TestDrainTimeoutCancelsAToolCall: when the drain times out under a tool
 // call, the call is canceled and stops before the application closes its
-// dependencies, and the result says the service is unavailable (#177).
+// dependencies. It is answered canceled, not as a refusal to retry: it may
+// have committed (#177).
 func TestDrainTimeoutCancelsAToolCall(t *testing.T) {
 	probe := &drainprobe.Probe{}
 	application := probe.Start(t, 50*time.Millisecond)
@@ -90,8 +91,8 @@ func TestDrainTimeoutCancelsAToolCall(t *testing.T) {
 		answered <- answer{text: text}
 	}()
 	drainprobe.Abort(t, application, probe, work)
-	if got := <-answered; got.err != nil || got.text != `{"code":"unavailable"}` {
-		t.Fatalf("tool call answered %+v; want unavailable", got)
+	if got := <-answered; got.err != nil || got.text != `{"code":"canceled"}` {
+		t.Fatalf("tool call answered %+v; want canceled", got)
 	}
 	stop, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -127,6 +128,38 @@ func TestDrainTimeoutCancelsAListing(t *testing.T) {
 	drainprobe.Abort(t, application, probe, work)
 	if err := <-connected; err == nil {
 		t.Fatal("a session opened although its listing was aborted")
+	}
+	stop, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = adapter.Shutdown(stop)
+}
+
+// TestDrainTimeoutCancelsAuthentication: a request's authentication runs
+// under its lease, so a drain timeout cancels it too (#177).
+func TestDrainTimeoutCancelsAuthentication(t *testing.T) {
+	probe := &drainprobe.Probe{}
+	application := probe.Start(t, 50*time.Millisecond)
+	work := drainprobe.NewHeld(t, probe)
+	adapter, err := tmcp.New(application, tmcp.Config{Name: "drain", Version: "1.0.0", Catalog: heldCatalog{work: work}, Authenticate: func(ctx context.Context, _ string, _ *http.Request) (tool.Principal, error) {
+		return tool.Principal{ID: "alice", MaxDepth: 4}, work.Run(ctx)
+	}, Expose: []string{"drain/hold@1.0.0"}, Budget: budget(), Timeout: 30 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	web := httptest.NewServer(adapter)
+	defer web.Close()
+	defer work.Release() // before web.Close waits for the request
+	connected := make(chan error, 1)
+	go func() {
+		session, err := sdk.NewClient(&sdk.Implementation{Name: "drain", Version: "1"}, nil).Connect(context.Background(), &sdk.StreamableClientTransport{Endpoint: web.URL, HTTPClient: &http.Client{Transport: bearer{base: http.DefaultTransport}}, MaxRetries: -1}, nil)
+		if err == nil {
+			_ = session.Close()
+		}
+		connected <- err
+	}()
+	drainprobe.Abort(t, application, probe, work)
+	if err := <-connected; err == nil {
+		t.Fatal("a session opened although its authentication was aborted")
 	}
 	stop, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

@@ -497,6 +497,13 @@ func (s *Server) endSession(request *http.Request) {
 // also carries the request's context: a call ends with the request that
 // carries it.
 func (s *Server) verify(ctx context.Context, token string, request *http.Request) (*auth.TokenInfo, error) {
+	// Authentication runs under the request's lease: it also stops if the
+	// application's drain times out.
+	if lease, ok := request.Context().Value(leaseKey{}).(*app.Lease); ok {
+		bound, unbind := lease.Bind(ctx)
+		defer unbind()
+		ctx = bound
+	}
 	principal, err := s.config.Authenticate(ctx, token, request)
 	if err != nil || strings.TrimSpace(principal.ID) == "" {
 		return nil, auth.ErrInvalidToken
@@ -777,8 +784,6 @@ func (s *Server) handler(owner tool.Principal, t Tool, input schema.Schema, outp
 // codeFor maps a catalog error to a stable code, never its text.
 func codeFor(ctx context.Context, err error) string {
 	switch {
-	case app.Aborted(ctx):
-		return "unavailable"
 	case errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded):
 		return "deadline_exceeded"
 	case errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled):

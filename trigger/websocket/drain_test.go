@@ -19,7 +19,8 @@ import (
 
 // TestDrainTimeoutCancelsAMessage: when the drain times out under a
 // message, its handler is canceled and stops before the application closes
-// its dependencies, and the reply says the service is unavailable (#177).
+// its dependencies. The reply is canceled, not a refusal to retry: it may
+// have committed (#177).
 func TestDrainTimeoutCancelsAMessage(t *testing.T) {
 	probe := &drainprobe.Probe{}
 	application := probe.Start(t, 50*time.Millisecond)
@@ -58,8 +59,8 @@ func TestDrainTimeoutCancelsAMessage(t *testing.T) {
 		answered <- answer{reply: reply, err: err}
 	}()
 	drainprobe.Abort(t, application, probe, work)
-	if got := <-answered; got.err != nil || got.reply["id"] != "1" || got.reply["error"] != "unavailable" {
-		t.Fatalf("message answered %+v; want unavailable", got)
+	if got := <-answered; got.err != nil || got.reply["id"] != "1" || got.reply["error"] != "canceled" {
+		t.Fatalf("message answered %+v; want canceled", got)
 	}
 	socket.CloseNow()
 	stop, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -76,14 +77,25 @@ func aliceOnly(request *http.Request) (trigger.Principal, error) {
 
 // TestDrainTimeoutCancelsAConnectionWorkflow: when the drain times out
 // under OnConnect, it is canceled and stops before the application closes
-// its dependencies, and the client is closed with "try again later" (#177).
+// its dependencies, and the client is closed with "try again later". The
+// disconnect workflow that follows runs without a lease, as the
+// application is stopping, but its context is already canceled, so it
+// cannot reach the closed store (#177).
 func TestDrainTimeoutCancelsAConnectionWorkflow(t *testing.T) {
 	probe := &drainprobe.Probe{}
 	application := probe.Start(t, 50*time.Millisecond)
 	work := drainprobe.NewHeld(t, probe)
+	type disconnect struct {
+		canceled bool
+		reason   string
+	}
+	disconnected := make(chan disconnect, 1)
 	sockets, err := blokws.New(application, blokws.Endpoint{Path: "/ws", InputSchema: []byte(`{"type":"object"}`), MessageTimeout: 30 * time.Second, Authenticate: aliceOnly,
 		OnConnect: func(ctx context.Context, _ blokws.Connection) error { return work.Run(ctx) },
 		OnMessage: func(context.Context, blokws.Message) (json.RawMessage, error) { return json.RawMessage(`{}`), nil },
+		OnDisconnect: func(ctx context.Context, d blokws.Disconnected) {
+			disconnected <- disconnect{canceled: ctx.Err() != nil, reason: d.Reason}
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -105,6 +117,14 @@ func TestDrainTimeoutCancelsAConnectionWorkflow(t *testing.T) {
 	var closing websocket.CloseError
 	if err := <-closed; !errors.As(err, &closing) || closing.Code != websocket.StatusTryAgainLater || closing.Reason != "unavailable" {
 		t.Fatalf("connection closed with %v; want 1013 unavailable", err)
+	}
+	select {
+	case d := <-disconnected:
+		if !d.canceled || d.reason != blokws.ReasonShutdown {
+			t.Fatalf("disconnect workflow ran with canceled=%v reason=%q; want a canceled context and %q", d.canceled, d.reason, blokws.ReasonShutdown)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the disconnect workflow never ran")
 	}
 	stop, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()

@@ -158,3 +158,27 @@ func TestDrainTimeoutCancelsAStart(t *testing.T) {
 		t.Fatalf("start answered %+v; want 503 unavailable with Retry-After", got)
 	}
 }
+
+// TestDrainTimeoutCancelsStartAuthentication: a start's authentication
+// runs under its lease, so a drain timeout cancels it too (#177).
+func TestDrainTimeoutCancelsStartAuthentication(t *testing.T) {
+	probe := &drainprobe.Probe{}
+	var work *drainprobe.Held
+	f := newFixtureWith(t, probe.Config(50*time.Millisecond), sse.HubConfig{}, func(e *sse.Endpoint) {
+		e.Authenticate = func(request *http.Request) (trigger.Principal, error) {
+			return trigger.Principal{ID: "alice"}, work.Run(request.Context())
+		}
+	}, nil)
+	// Created after the fixture, so it is released before the fixture's
+	// server waits for the request, even when the test fails.
+	work = drainprobe.NewHeld(t, probe)
+	answered := make(chan int, 1)
+	go func() {
+		status, _ := f.start(t, "alice", "k", `{"item":"book"}`)
+		answered <- status
+	}()
+	drainprobe.Abort(t, f.app, probe, work)
+	if status := <-answered; status != http.StatusUnauthorized {
+		t.Fatalf("aborted authentication answered %d; want 401", status)
+	}
+}

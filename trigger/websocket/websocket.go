@@ -190,6 +190,9 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		http.Error(writer, `{"error":"unavailable"}`, http.StatusServiceUnavailable)
 		return
 	}
+	// abort ends when the application's drain times out; a disconnect
+	// workflow that runs without a lease still stops then.
+	abort := lease.Context()
 	lease.Release()
 	// Cheap checks first: a foreign origin and a full endpoint are refused
 	// before the authenticator runs, so neither can drive it without bound.
@@ -203,6 +206,7 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		http.Error(writer, `{"error":"saturated"}`, http.StatusServiceUnavailable)
 		return
 	}
+	c.abort = abort
 	principal, err := s.endpoint.Authenticate(request)
 	if err != nil || strings.TrimSpace(principal.ID) == "" {
 		s.release(c)
@@ -310,6 +314,7 @@ type conn struct {
 	// cancels the in-flight message.
 	ctx        context.Context
 	cancel     context.CancelFunc
+	abort      context.Context
 	queue      chan []byte
 	reason     string
 	stopOnce   sync.Once
@@ -366,14 +371,14 @@ func (c *conn) serve() {
 	}
 	if e.OnConnect != nil {
 		if err := c.connect(); err != nil {
-			status, code := websocket.StatusPolicyViolation, "rejected"
+			status, code, reason := websocket.StatusPolicyViolation, "rejected", ReasonRejected
 			if errors.Is(err, errConnectAborted) {
-				status, code = websocket.StatusTryAgainLater, "unavailable"
+				status, code, reason = websocket.StatusTryAgainLater, "unavailable", ReasonShutdown
 			} else if classified, _, ok := trigger.Classify(err); ok {
 				code = classified
 			}
 			c.stopOnce.Do(func() {
-				c.reason = ReasonRejected
+				c.reason = reason
 				c.cancel()
 				_ = c.socket.Close(status, code)
 				close(c.closed)
@@ -518,8 +523,6 @@ func (c *conn) handle(r request) reply {
 	switch {
 	case err == nil:
 		return reply{ID: r.ID, Output: output}
-	case app.Aborted(ctx):
-		return reply{ID: r.ID, Error: "unavailable"}
 	case errors.Is(err, trigger.ErrSaturated):
 		return reply{ID: r.ID, Error: "saturated"}
 	case errors.Is(err, context.DeadlineExceeded) && c.ctx.Err() == nil:
@@ -527,6 +530,11 @@ func (c *conn) handle(r request) reply {
 	}
 	if code, _, ok := trigger.Classify(err); ok {
 		return reply{ID: r.ID, Error: code}
+	}
+	if app.Aborted(ctx) {
+		// The drain timed out under the message. Its outcome is unknown,
+		// so it is not answered as a refusal to retry.
+		return reply{ID: r.ID, Error: "canceled"}
 	}
 	return reply{ID: r.ID, Error: "internal"}
 }
@@ -597,7 +605,12 @@ func (c *conn) disconnected() {
 		if e.OnDisconnect == nil {
 			return
 		}
-		ctx := context.Background()
+		// Without a lease (the application drains) it still stops when the
+		// drain times out, before the dependencies close.
+		ctx := c.abort
+		if ctx == nil {
+			ctx = context.Background()
+		}
 		if lease, err := c.server.application.Begin(); err == nil {
 			defer lease.Release()
 			// Under a lease, it also stops if the application's drain

@@ -16,7 +16,8 @@ import (
 
 // TestDrainTimeoutCancelsACall: when the drain times out under a call, its
 // handler is canceled and stops before the application closes its
-// dependencies, and the caller is told the service is unavailable (#177).
+// dependencies. It is answered Canceled, not Unavailable, which clients
+// retry: it may have committed (#177).
 func TestDrainTimeoutCancelsACall(t *testing.T) {
 	f := loadCases(t)
 	probe := &drainprobe.Probe{}
@@ -40,7 +41,7 @@ func TestDrainTimeoutCancelsACall(t *testing.T) {
 		answered <- err
 	}()
 	drainprobe.Abort(t, application, probe, work)
-	if err := <-answered; status.Code(err) != codes.Unavailable || reason(err) != "unavailable" {
-		t.Fatalf("call answered %v; want Unavailable unavailable", err)
+	if err := <-answered; status.Code(err) != codes.Canceled || reason(err) != "canceled" {
+		t.Fatalf("call answered %v; want Canceled canceled", err)
 	}
 }

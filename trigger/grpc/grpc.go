@@ -607,8 +607,6 @@ func hasUnknown(message protoreflect.Message) bool {
 func statusFor(ctx context.Context, err error, ended time.Time) error {
 	deadline, bounded := ctx.Deadline()
 	switch {
-	case app.Aborted(ctx):
-		return refusal(codes.Unavailable, "unavailable")
 	case ctx.Err() != nil && bounded && !ended.Before(deadline):
 		return refusal(codes.DeadlineExceeded, "deadline_exceeded")
 	case errors.Is(ctx.Err(), context.Canceled), errors.Is(ctx.Err(), context.DeadlineExceeded):
