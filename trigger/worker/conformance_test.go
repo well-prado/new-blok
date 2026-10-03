@@ -77,7 +77,7 @@ func (d *workerDriver) construct(ctx context.Context) error {
 // Start has nothing to do: the queue claims work only when ProcessOnce runs.
 func (d *workerDriver) Start(context.Context) error { return nil }
 
-func (d *workerDriver) handler(ctx context.Context, tx *sql.Tx, job Job) error {
+func (d *workerDriver) handler(ctx context.Context, tx Tx, job Job) error {
 	if _, err := d.env.Workflow(ctx, conformance.Call{Input: job.Payload}); err != nil {
 		return err
 	}
@@ -121,7 +121,7 @@ func (d *workerDriver) Deliver(ctx context.Context, delivery conformance.Deliver
 func (d *workerDriver) Recover(ctx context.Context) (conformance.Outcome, error) {
 	d.advance(time.Minute)
 	var key string
-	if _, err := d.queue.ProcessOnce(ctx, func(ctx context.Context, tx *sql.Tx, job Job) error {
+	if _, err := d.queue.ProcessOnce(ctx, func(ctx context.Context, tx Tx, job Job) error {
 		key = job.RequestKey
 		return d.handler(ctx, tx, job)
 	}); err != nil {

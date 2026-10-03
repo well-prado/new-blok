@@ -39,6 +39,40 @@ example by submitting to the same store), and deferring would repeat the
 deadlock. This also treats a busy *other* store as a failure; telling the
 two apart is tracked separately.
 
+A worker handler writes through `worker.Tx`, the claim's own transaction,
+so its writes commit only if the job is acknowledged. SQLite can end that
+transaction under the handler: it rolls the whole transaction back when a
+statement is interrupted (its context was canceled or ran out: the consumer
+was lost, or the handler's own deadline passed), fails for want of space, memory or I/O, or hits a
+constraint declared `ON CONFLICT ROLLBACK` or a trigger's
+`RAISE(ROLLBACK)`. `database/sql` cannot see that, and every later
+statement would then commit on its own, outside the claim, and again on
+redelivery (#180). `Tx` therefore fails closed:
+
+- When a statement fails, `Tx` reads the job on the claim's own
+  connection. While the transaction lives, it sees its own uncommitted
+  lease; once SQLite has rolled back, it sees the job as it was before the
+  claim. If the lease is gone, the claim is lost: that statement returns
+  its own error, and every later one returns `worker.ErrClaimLost` and runs
+  nothing.
+- One lock covers each statement and the check after it, so a handler
+  using `Tx` from several goroutines cannot start a statement on a
+  transaction that has already ended.
+- A statement that begins with a transaction-control keyword (`BEGIN`,
+  `COMMIT`, `END`, `ROLLBACK`, `SAVEPOINT`, `RELEASE`, after any leading
+  whitespace, comments and empty statements such as a lone `;`) is refused with `worker.ErrTransactionControl`: the claim owns
+  its transaction. A multi-statement string that hides one after another
+  statement is not detected; handlers must not issue them.
+- Statements still run under the handler's context, so cancellation and
+  deadlines keep working. `ProcessOnce` routes its own post-claim
+  statements through the same check.
+
+A claim lost to consumer cancellation is deferred as before. A claim lost
+any other way is a failed attempt, charged in a fresh transaction: the job
+is retried after a backoff, or dead-lettered once `MaxAttempts` is spent,
+with error `claim transaction ended`. Like any failed attempt, `ProcessOnce`
+reports it as processed without an error; the job's error records why.
+
 `worker.Queue` implements the port. It persists the principal established by the
 trusted producer (`EnqueueRequest.Principal`, `Job.Principal`) and makes it part
 of request identity. `worker.New` migrates existing queues in place by adding a

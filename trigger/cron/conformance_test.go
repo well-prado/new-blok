@@ -85,7 +85,7 @@ func (d *cronDriver) construct(ctx context.Context) error {
 
 func (d *cronDriver) Start(context.Context) error { d.stopped = false; return nil }
 
-func (d *cronDriver) handle(ctx context.Context, tx *sql.Tx, job worker.Job) error {
+func (d *cronDriver) handle(ctx context.Context, tx worker.Tx, job worker.Job) error {
 	if _, err := d.env.Workflow(ctx, conformance.Call{Input: job.Payload, Principal: job.Principal}); err != nil {
 		return err
 	}
@@ -144,7 +144,7 @@ func (d *cronDriver) Deliver(ctx context.Context, delivery conformance.Delivery)
 func (d *cronDriver) Recover(ctx context.Context) (conformance.Outcome, error) {
 	d.clock.Set(d.clock.Now().Add(2 * time.Minute))
 	var key string
-	if _, err := d.queue.ProcessOnce(ctx, func(ctx context.Context, tx *sql.Tx, job worker.Job) error {
+	if _, err := d.queue.ProcessOnce(ctx, func(ctx context.Context, tx worker.Tx, job worker.Job) error {
 		key = job.RequestKey
 		return d.handle(ctx, tx, job)
 	}); err != nil {
