@@ -42,8 +42,8 @@ two apart is tracked separately.
 A worker handler writes through `worker.Tx`, the claim's own transaction,
 so its writes commit only if the job is acknowledged. SQLite can end that
 transaction under the handler: it rolls the whole transaction back when a
-statement is interrupted (the consumer was lost and the statement observed
-the canceled context), fails for want of space, memory or I/O, or hits a
+statement is interrupted (its context was canceled or ran out: the consumer
+was lost, or the handler's own deadline passed), fails for want of space, memory or I/O, or hits a
 constraint declared `ON CONFLICT ROLLBACK` or a trigger's
 `RAISE(ROLLBACK)`. `database/sql` cannot see that, and every later
 statement would then commit on its own, outside the claim, and again on
@@ -60,7 +60,7 @@ redelivery (#180). `Tx` therefore fails closed:
   transaction that has already ended.
 - A statement that begins with a transaction-control keyword (`BEGIN`,
   `COMMIT`, `END`, `ROLLBACK`, `SAVEPOINT`, `RELEASE`, after any leading
-  comments) is refused with `worker.ErrTransactionControl`: the claim owns
+  whitespace, comments and empty statements such as a lone `;`) is refused with `worker.ErrTransactionControl`: the claim owns
   its transaction. A multi-statement string that hides one after another
   statement is not detected; handlers must not issue them.
 - Statements still run under the handler's context, so cancellation and

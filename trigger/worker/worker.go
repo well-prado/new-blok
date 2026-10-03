@@ -109,7 +109,8 @@ type Handler func(ctx context.Context, tx Tx, job Job) error
 
 // ErrClaimLost reports that the claim's transaction ended while a handler
 // was running: SQLite rolls a whole transaction back when one of its
-// statements is interrupted or fails for want of space, memory or I/O.
+// statements is interrupted, fails for want of space, memory or I/O, or
+// hits an ON CONFLICT ROLLBACK constraint or a trigger's RAISE(ROLLBACK).
 // Nothing the handler wrote was committed, and no further statement runs.
 var ErrClaimLost = errors.New("worker: the claim's transaction ended")
 
@@ -181,10 +182,11 @@ func (c *claimTx) exec(ctx context.Context, query string, args ...any) (sql.Resu
 var ErrTransactionControl = errors.New("worker: a handler cannot control the claim's transaction")
 
 // controls reports whether a statement begins with a transaction-control
-// keyword, after any leading whitespace and comments.
+// keyword, after any leading whitespace, comments and empty statements (a
+// lone ";", which SQLite skips).
 func controls(query string) bool {
 	for {
-		query = strings.TrimLeftFunc(query, unicode.IsSpace)
+		query = strings.TrimLeftFunc(query, func(r rune) bool { return unicode.IsSpace(r) || r == ';' })
 		switch {
 		case strings.HasPrefix(query, "--"):
 			_, rest, found := strings.Cut(query, "\n")

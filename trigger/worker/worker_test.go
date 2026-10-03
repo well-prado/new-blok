@@ -1088,7 +1088,7 @@ func TestConcurrentHandlerWritesNeverEscapeTheClaim(t *testing.T) {
 // refused before it runs, and the claim stays intact (#180).
 func TestHandlerCannotControlTheClaimTransaction(t *testing.T) {
 	queue, database := claimQueue(t, 1)
-	statements := []string{"COMMIT", " rollback", "END TRANSACTION", "BEGIN", "SAVEPOINT s", "release s", "/* a */ COMMIT", "-- a\nROLLBACK"}
+	statements := []string{"COMMIT", " rollback", "END TRANSACTION", "BEGIN", "SAVEPOINT s", "release s", "/* a */ COMMIT", "-- a\nROLLBACK", ";COMMIT", ";; END", "/**/;ROLLBACK", " ; -- a\n;release s"}
 	processed, err := queue.ProcessOnce(context.Background(), func(ctx context.Context, tx Tx, _ Job) error {
 		for _, statement := range statements {
 			if _, err := tx.ExecContext(ctx, statement); !errors.Is(err, ErrTransactionControl) {
