@@ -1,0 +1,11 @@
+{
+  "name": "nested-join-recovery",
+  "synthetic": true,
+  "expected": {
+    "completedScopes": 1,
+    "completedChildren": 1,
+    "completedJoins": 1,
+    "effectDispatchesAfterResume": 0,
+    "artifactMismatchError": "journal: checkpoint artifact does not match"
+  }
+}

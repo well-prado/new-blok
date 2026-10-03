@@ -44,9 +44,11 @@ func (e *DomainError) Error() string {
 	}
 	return e.Code + ": " + e.Err.Error()
 }
-func (e *DomainError) Unwrap() error     { return e.Err }
-func (e *DomainError) IsUncertain() bool { return e.Uncertain }
-func (e *DomainError) IsRetryable() bool { return e.Retryable }
+func (e *DomainError) Unwrap() error      { return e.Err }
+func (e *DomainError) IsUncertain() bool  { return e.Uncertain }
+func (e *DomainError) IsRetryable() bool  { return e.Retryable }
+func (e *DomainError) ErrorCode() string  { return e.Code }
+func (e *DomainError) ErrorClass() string { return e.Class }
 
 type Option func(*config)
 type config struct {
@@ -202,6 +204,10 @@ func (r *Registry) Lookup(name, version string) (Any, bool) {
 	value, ok := r.nodes[name+"@"+version]
 	return value, ok
 }
+
+// ValidateDescriptor applies the same declaration rules at registry and foreign
+// catalog boundaries. Canonical hashing alone is not descriptor validation.
+func ValidateDescriptor(d Descriptor) error { return validateDescriptor(d) }
 
 func validateDescriptor(d Descriptor) error {
 	if !regexp.MustCompile(`^[a-z][a-z0-9_/-]{0,127}$`).MatchString(d.Name) || strings.Contains(d.Name, "..") {

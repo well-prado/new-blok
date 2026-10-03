@@ -117,24 +117,51 @@ func Template() node.Definition[TemplateInput, TemplateOutput] {
 		if len(input.Values) > MaxCollectionItems {
 			return TemplateOutput{}, fmt.Errorf("catalog/template: collection_limit: values exceed %d", MaxCollectionItems)
 		}
-		missing := ""
-		result := templateVariable.ReplaceAllStringFunc(input.Template, func(match string) string {
-			key := strings.TrimSuffix(strings.TrimPrefix(match, "{{"), "}}")
-			value, ok := input.Values[key]
-			if !ok {
-				missing = key
-				return match
+		// Preflight every literal and substitution before allocating output.
+		// Stop at the first overflow; repeated placeholders cannot amplify memory.
+		size := 0
+		if err := walkTemplate(input, func(part string) error {
+			if len(part) > MaxTemplateBytes-size {
+				return fmt.Errorf("catalog/template: template_limit: rendered output exceeds %d bytes", MaxTemplateBytes)
 			}
-			return value
-		})
-		if missing != "" {
-			return TemplateOutput{}, fmt.Errorf("catalog/template: missing_field: values.%s is required", missing)
+			size += len(part)
+			return nil
+		}); err != nil {
+			return TemplateOutput{}, err
 		}
-		if len(result) > MaxTemplateBytes {
-			return TemplateOutput{}, fmt.Errorf("catalog/template: template_limit: rendered output exceeds %d bytes", MaxTemplateBytes)
+		var result strings.Builder
+		result.Grow(size)
+		if err := walkTemplate(input, func(part string) error {
+			result.WriteString(part)
+			return nil
+		}); err != nil {
+			return TemplateOutput{}, err
 		}
-		return TemplateOutput{Value: result}, nil
+		return TemplateOutput{Value: result.String()}, nil
 	}, node.Description("Renders bounded named values without arbitrary evaluation"), node.Schemas(templateInputSchema, templateOutputSchema), node.Pure())
+}
+
+// walkTemplate visits borrowed substrings and values, never expanded output.
+func walkTemplate(input TemplateInput, visit func(string) error) error {
+	remaining := input.Template
+	for {
+		match := templateVariable.FindStringSubmatchIndex(remaining)
+		if match == nil {
+			return visit(remaining)
+		}
+		if err := visit(remaining[:match[0]]); err != nil {
+			return err
+		}
+		key := remaining[match[2]:match[3]]
+		value, ok := input.Values[key]
+		if !ok {
+			return fmt.Errorf("catalog/template: missing_field: values.%s is required", key)
+		}
+		if err := visit(value); err != nil {
+			return err
+		}
+		remaining = remaining[match[1]:]
+	}
 }
 
 type IntegerInput struct {
@@ -191,8 +218,10 @@ func selectPath(value any, path string) (any, error) {
 	return value, nil
 }
 
-var validateInputSchema = []byte(`{"type":"object","properties":{"value":{"anyOf":[{"type":"object","additionalProperties":true},{"type":"array","items":{"type":"string"}},{"type":"string"},{"type":"integer"},{"type":"number"},{"type":"boolean"},{"type":"null"}]},"schema":{"type":"object","additionalProperties":true}},"required":["value","schema"],"additionalProperties":false}`)
-var validateOutputSchema = []byte(`{"type":"object","properties":{"value":{"anyOf":[{"type":"object","additionalProperties":true},{"type":"array","items":{"type":"string"}},{"type":"string"},{"type":"integer"},{"type":"number"},{"type":"boolean"},{"type":"null"}]}},"required":["value"],"additionalProperties":false}`)
+// The number branch also carries exact JSON integers. Adding an integer branch
+// would make those values ambiguous under the canonical exclusive union rule.
+var validateInputSchema = []byte(`{"type":"object","properties":{"value":{"anyOf":[{"type":"object","additionalProperties":true},{"type":"array","items":{"type":"string"}},{"type":"string"},{"type":"number"},{"type":"boolean"},{"type":"null"}]},"schema":{"type":"object","additionalProperties":true}},"required":["value","schema"],"additionalProperties":false}`)
+var validateOutputSchema = []byte(`{"type":"object","properties":{"value":{"anyOf":[{"type":"object","additionalProperties":true},{"type":"array","items":{"type":"string"}},{"type":"string"},{"type":"number"},{"type":"boolean"},{"type":"null"}]}},"required":["value"],"additionalProperties":false}`)
 var mapInputSchema = []byte(`{"type":"object","properties":{"value":{"anyOf":[{"type":"object","additionalProperties":true},{"type":"array","items":{"type":"string"}}]},"fields":{"type":"object","additionalProperties":true}},"required":["value","fields"],"additionalProperties":false}`)
 var templateInputSchema = []byte(`{"type":"object","properties":{"template":{"type":"string"},"values":{"type":"object","additionalProperties":true}},"required":["template","values"],"additionalProperties":false}`)
 var templateOutputSchema = []byte(`{"type":"object","properties":{"value":{"type":"string"}},"required":["value"],"additionalProperties":false}`)

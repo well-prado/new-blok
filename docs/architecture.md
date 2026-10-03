@@ -78,6 +78,13 @@ The human-readable document is independent from protobuf transport encoding. Ado
 
 Define missing versus null, signed integer ranges, exact money, timestamps, defaults, unknown fields, optional objects, collections, unions and binary/blob references. JSON Schema defaults are annotations; normalization is a specified operation. Static compatibility supports a declared subset; unprovable edges yield a diagnostic or runtime validation requirement.
 
+The implemented bounded subset requires exactly one union branch to match,
+including null. A null schema rejects non-null values. The pure catalog's
+generic numeric envelope preserves exact JSON integers; its supplied inner
+schema owns integer range/wire rules. Template expansion preflights the byte
+budget before allocating output. See [ADR 0012](decisions/0012-catalog-null-and-template-bounds.md)
+for the correction, supported array limits and pending Node mirror integration.
+
 Logical values are immutable. Maps, slices and pointers require isolation between nodes and branches. Typed native fast paths must preserve this rule, and benchmarks include required validation/copies. Portable encodings serve journals and worker boundaries. Stable diagnostics name code, file/line, workflow, step, field, expected/actual and remediation.
 
 ## 5. Control flow
@@ -102,7 +109,7 @@ One admission path authenticates/authorizes, maps and validates input, deduplica
 | WebSocket | connection/message/disconnect, identity, framing and backpressure |
 | MCP | tools/resources, schemas, caller authorization and output mapping |
 
-HTTP and one durable job path ship first. Other adapters pass shared conformance plus actual protocol integration tests. They implement no second interpreter, mapper or retry engine. Multiple bindings can share a listener where protocols permit; independent TLS/listeners remain selectable. Queue acknowledgment follows an explicit transfer model and stable delivery deduplication.
+HTTP and one durable job path ship first. Other adapters pass shared conformance plus actual protocol integration tests. They implement no second interpreter, mapper or retry engine. The shared `trigger` contract, the per-kind completion/disconnect table and the `contract/conformance.RunTrigger` harness are recorded in [ADR 0005](decisions/0005-trigger-adapter-contract.md). Multiple bindings can share a listener where protocols permit; independent TLS/listeners remain selectable. Queue acknowledgment follows an explicit transfer model and stable delivery deduplication.
 
 ## 7. Durability, effects and artifacts
 
@@ -114,7 +121,7 @@ An external success followed by a crash before result commit creates an uncertai
 
 Deployment manifests bind workflow document, native binary, worker artifacts, schemas, module locks, runtime versions, compiler and checkpoint formats. Immutable versions cannot be overwritten. Initial upgrades drain/retain compatible executables or refuse startup with actionable diagnostics. A later multi-version manager retains old workers for old runs. Replay creates a new run with lineage; partial reruns require separate tested effect semantics.
 
-Retention, compaction, backup, corruption checks and restore must preserve verified checkpoints and audit obligations. Business tables remain application-owned; the journal is not an ORM or a substitute for domain persistence.
+Retention, compaction, backup, corruption checks and restore must preserve verified checkpoints and audit obligations. The current SQLite backup contract uses `VACUUM INTO` to create a new, transaction-consistent snapshot; it never overwrites an existing destination. Restore first runs `PRAGMA integrity_check`, copies into a temporary file, syncs it, and renames it into a new destination before checking the restored database again. These guarantees cover one local filesystem only: they do not provide disk-loss survival, replication, or multi-host failover. Business tables remain application-owned; the journal is not an ORM or a substitute for domain persistence.
 
 ## 8. Workers and runtime coverage
 

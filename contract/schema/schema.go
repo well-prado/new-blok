@@ -181,11 +181,8 @@ func (s Schema) normalizeValueAt(v any, path string, depth int) (any, error) {
 	if depth > MaxDepth {
 		return nil, &Error{Code: "depth_exceeded", Path: path, Message: "value exceeds maximum depth"}
 	}
-	if v == nil {
-		if s.Nullable || s.Type == "null" {
-			return nil, nil
-		}
-		return nil, &Error{Code: "null_not_allowed", Path: path, Message: "null is not allowed"}
+	if v == nil && s.Nullable {
+		return nil, nil
 	}
 	if len(s.AnyOf) > 0 {
 		var match any
@@ -201,6 +198,12 @@ func (s Schema) normalizeValueAt(v any, path string, depth int) (any, error) {
 			return nil, &Error{Code: "compatibility_unproven", Path: path, Message: "value does not match exactly one union branch"}
 		}
 		return match, nil
+	}
+	if v == nil {
+		if s.Type == "null" {
+			return nil, nil
+		}
+		return nil, &Error{Code: "null_not_allowed", Path: path, Message: "null is not allowed"}
 	}
 	switch s.Type {
 	case "object":
@@ -283,7 +286,7 @@ func (s Schema) normalizeValueAt(v any, path string, depth int) (any, error) {
 	case "number":
 		return normalizeNumber(v, s, path)
 	case "null":
-		return nil, nil
+		return nil, typeError(path, "null")
 	default:
 		return nil, &Error{Code: "unsupported_schema", Path: path, Message: "schema type is not supported"}
 	}
