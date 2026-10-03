@@ -544,6 +544,10 @@ func TestSessionsCannotBeHijacked(t *testing.T) {
 	r := newRig(t, nil)
 	alice := r.connect("alice")
 	version := alice.InitializeResult().ProtocolVersion
+	t.Logf("negotiated protocol %s, session %q", version, alice.ID())
+	if alice.ID() == "" {
+		t.Fatal("the transport opened no session")
+	}
 	list := map[string]any{"jsonrpc": "2.0", "id": 9, "method": "tools/list"}
 	if status, _ := r.raw(http.MethodPost, "bob", alice.ID(), version, list); status != http.StatusForbidden {
 		t.Fatalf("bob used alice's session: status=%d", status)
@@ -575,6 +579,15 @@ func TestUnsupportedProtocolVersionIsRefused(t *testing.T) {
 	list := map[string]any{"jsonrpc": "2.0", "id": 9, "method": "tools/list"}
 	if status, _ := r.raw(http.MethodPost, "alice", alice.ID(), "1999-01-01", list); status != http.StatusBadRequest {
 		t.Fatalf("an unsupported protocol version was served: status=%d", status)
+	}
+	// A session-less call under the draft protocol would escape the session
+	// that binds a caller and ends its work; the server must refuse it.
+	draft := map[string]any{"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": map[string]any{"name": "demo.echo_v1.0.0", "arguments": map[string]any{"text": "a"}, "_meta": map[string]any{"io.modelcontextprotocol/protocolVersion": "2026-07-28"}}}
+	if status, body := r.raw(http.MethodPost, "alice", "", "2026-07-28", draft); status != http.StatusBadRequest || !strings.Contains(body, "-32022") {
+		t.Fatalf("a session-less draft-protocol call: status=%d body=%q", status, body)
+	}
+	if n := r.catalog.invocations.Load(); n != 0 {
+		t.Fatalf("a refused protocol reached the catalog %d times", n)
 	}
 	initialize := map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{"protocolVersion": "1999-01-01", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "old", "version": "0"}}}
 	status, body := r.raw(http.MethodPost, "alice", "", "", initialize)
