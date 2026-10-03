@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "roadmap": "E09-T06",
+  "cursorCases": [
+    {"name": "no cursor, nothing dropped", "retainEvents": 16, "published": 5, "cursor": "", "expect": {"outcome": "replay", "replay": [1, 2, 3, 4, 5]}},
+    {"name": "cursor inside retention", "retainEvents": 16, "published": 5, "cursor": "seq:3", "expect": {"outcome": "replay", "replay": [4, 5]}},
+    {"name": "cursor at the latest event", "retainEvents": 16, "published": 5, "cursor": "seq:5", "expect": {"outcome": "replay", "replay": []}},
+    {"name": "cursor zero means before the first event", "retainEvents": 16, "published": 2, "cursor": "seq:0", "expect": {"outcome": "replay", "replay": [1, 2]}},
+    {"name": "cursor older than retention", "retainEvents": 4, "published": 10, "cursor": "seq:2", "expect": {"outcome": "replay", "gap": "retention", "missed": 4, "gapID": 6, "replay": [7, 8, 9, 10]}},
+    {"name": "cursor just before retention", "retainEvents": 4, "published": 10, "cursor": "seq:6", "expect": {"outcome": "replay", "replay": [7, 8, 9, 10]}},
+    {"name": "no cursor, earliest events dropped", "retainEvents": 4, "published": 10, "cursor": "", "expect": {"outcome": "replay", "gap": "retention", "missed": 6, "gapID": 6, "replay": [7, 8, 9, 10]}},
+    {"name": "cursor from another epoch", "retainEvents": 16, "published": 3, "cursor": "other:9", "expect": {"outcome": "replay", "gap": "restart", "gapID": 0, "replay": [1, 2, 3]}},
+    {"name": "another epoch, earliest events dropped", "retainEvents": 2, "published": 5, "cursor": "other:1", "expect": {"outcome": "replay", "gap": "restart", "gapID": 3, "replay": [4, 5]}},
+    {"name": "finished stream replays to its final event", "retainEvents": 16, "published": 3, "finished": true, "cursor": "seq:1", "expect": {"outcome": "finished", "replay": [2, 3, 4]}},
+    {"name": "finished stream at its final event", "retainEvents": 16, "published": 3, "finished": true, "cursor": "seq:4", "expect": {"outcome": "finished", "replay": []}},
+    {"name": "future cursor", "retainEvents": 16, "published": 3, "cursor": "seq:4", "expect": {"outcome": "invalid_cursor"}},
+    {"name": "malformed cursor", "retainEvents": 16, "published": 3, "cursor": "raw:garbage", "expect": {"outcome": "invalid_cursor"}},
+    {"name": "uppercase epoch", "retainEvents": 16, "published": 3, "cursor": "raw:ABCDEF0123456789.1:1", "expect": {"outcome": "invalid_cursor"}},
+    {"name": "leading zero sequence", "retainEvents": 16, "published": 3, "cursor": "raw:0123456789abcdef.1:01", "expect": {"outcome": "invalid_cursor"}},
+    {"name": "negative sequence", "retainEvents": 16, "published": 3, "cursor": "raw:0123456789abcdef.1:-1", "expect": {"outcome": "invalid_cursor"}},
+    {"name": "cursor without an incarnation", "retainEvents": 16, "published": 3, "cursor": "raw:0123456789abcdef:1", "expect": {"outcome": "invalid_cursor"}},
+    {"name": "incarnation zero", "retainEvents": 16, "published": 3, "cursor": "raw:0123456789abcdef.0:1", "expect": {"outcome": "invalid_cursor"}},
+    {"name": "leading zero incarnation", "retainEvents": 16, "published": 3, "cursor": "raw:0123456789abcdef.01:1", "expect": {"outcome": "invalid_cursor"}},
+    {"name": "a later incarnation than the stream's", "retainEvents": 16, "published": 3, "cursor": "inc:2:1", "expect": {"outcome": "invalid_cursor"}},
+    {"name": "an earlier incarnation of the stream", "retainEvents": 16, "published": 3, "incarnation": 2, "cursor": "inc:1:9", "expect": {"outcome": "replay", "gap": "retention", "gapID": 0, "replay": [1, 2, 3]}}
+  ],
+  "eventCases": [
+    {"name": "compact JSON on one data line", "type": "progress", "data": "{\n  \"percent\": 50\n}", "wire": "event: progress\ndata: {\"percent\":50}\n"},
+    {"name": "embedded newline stays escaped", "type": "log", "data": "\"line\\nbreak\"", "wire": "event: log\ndata: \"line\\nbreak\"\n"},
+    {"name": "empty data is null", "type": "tick", "data": "", "wire": "event: tick\ndata: null\n"},
+    {"name": "dotted type", "type": "order.shipped", "data": "1", "wire": "event: order.shipped\ndata: 1\n"},
+    {"name": "type with a space", "type": "bad type", "data": "1", "error": "invalid_event"},
+    {"name": "type with a newline", "type": "progress\nevent: forged", "data": "1", "error": "invalid_event"},
+    {"name": "uppercase type", "type": "Progress", "data": "1", "error": "invalid_event"},
+    {"name": "reserved gap type", "type": "gap", "data": "1", "error": "invalid_event"},
+    {"name": "data that is not JSON", "type": "progress", "data": "data: forged", "error": "invalid_event"},
+    {"name": "data over the event bound", "type": "progress", "dataBytes": 70000, "error": "invalid_event"}
+  ],
+  "expected": {"output": 16, "errors": 15}
+}
