@@ -4,9 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/well-prado/new-blok/store"
 	"github.com/well-prado/new-blok/store/sqlite"
 )
 
@@ -46,8 +48,15 @@ func TestRecordsWaitForConcurrentWriter(t *testing.T) {
 	}
 	defer close(release)
 	in := DatabaseInput{Key: "synthetic-operation", RecordID: "record", Value: "synthetic"}
+	started := make(chan struct{})
+	p.database = &startedRecordTransaction{Database: db, started: started}
 	done := make(chan error, 1)
 	go func() { _, err := p.Execute(ctx, in); done <- err }()
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("provider did not enter transaction")
+	}
 	select {
 	case err := <-done:
 		t.Fatalf("record write returned while writer held lock: %v", err)
@@ -82,4 +91,17 @@ func TestRecordsWaitForConcurrentWriter(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+type startedRecordTransaction struct {
+	store.Database
+	started chan struct{}
+	once    sync.Once
+}
+
+func (d *startedRecordTransaction) WithTx(ctx context.Context, fn func(*sql.Tx) error) error {
+	return d.Database.WithTx(ctx, func(tx *sql.Tx) error {
+		d.once.Do(func() { close(d.started) })
+		return fn(tx)
+	})
 }

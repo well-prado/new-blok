@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -98,12 +99,30 @@ func TestJournalTransitionsWaitForConcurrentWriter(t *testing.T) {
 					panic("unknown transition")
 				}
 			}
-			contendJournal(t, ctx, db, transition, func() error { _, err := j.Run(ctx, run.RunID); return err })
+			reader := *j
+			started := make(chan struct{})
+			j.database = &startedTransaction{Database: db, started: started}
+			contendJournal(t, ctx, db, started, transition, func() error { _, err := reader.Run(ctx, run.RunID); return err })
 		})
 	}
 }
 
-func contendJournal(t *testing.T, ctx context.Context, db store.Database, transition, read func() error) {
+// Signal only after BeginTx has entered the actual mutation callback, not
+// merely when the test's contender goroutine has been scheduled.
+type startedTransaction struct {
+	store.Database
+	started chan struct{}
+	once    sync.Once
+}
+
+func (d *startedTransaction) WithTx(ctx context.Context, fn func(*sql.Tx) error) error {
+	return d.Database.WithTx(ctx, func(tx *sql.Tx) error {
+		d.once.Do(func() { close(d.started) })
+		return fn(tx)
+	})
+}
+
+func contendJournal(t *testing.T, ctx context.Context, db store.Database, started <-chan struct{}, transition, read func() error) {
 	t.Helper()
 	locked, release, writerDone := make(chan struct{}), make(chan struct{}), make(chan error, 1)
 	go func() {
@@ -140,6 +159,11 @@ func contendJournal(t *testing.T, ctx context.Context, db store.Database, transi
 	}
 	done := make(chan error, 1)
 	go func() { done <- transition() }()
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("transition did not enter transaction")
+	}
 	select {
 	case err := <-done:
 		t.Fatalf("transition returned while writer held lock: %v", err)
