@@ -10,8 +10,10 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/well-prado/new-blok/contract/schema"
 	"github.com/well-prado/new-blok/store"
@@ -101,8 +103,8 @@ type HandlerError struct {
 func (e *HandlerError) Error() string { return e.Message }
 
 // Handler processes one job. Its writes go through tx, in the same
-// transaction as the job's acknowledgment, so they commit exactly when the
-// job does. ctx is the consumer's: it is canceled when the consumer is lost.
+// transaction as the job's acknowledgment, so they commit only if the job
+// does. ctx is the consumer's: it is canceled when the consumer is lost.
 type Handler func(ctx context.Context, tx Tx, job Job) error
 
 // ErrClaimLost reports that the claim's transaction ended while a handler
@@ -117,6 +119,9 @@ var ErrClaimLost = errors.New("worker: the claim's transaction ended")
 // transaction SQLite rolled back is otherwise invisible to database/sql, and
 // a handler that went on writing would commit outside the claim, and again
 // on redelivery (#180). ProcessOnce counts a lost claim as a failed attempt.
+// Tx is safe for concurrent use. It refuses statements that would begin,
+// end or nest the transaction (ErrTransactionControl); a handler must not
+// hide one inside a multi-statement string.
 type Tx struct{ claim *claimTx }
 
 // claimTx is the claim's transaction and what identifies the claim in it.
@@ -124,26 +129,31 @@ type claimTx struct {
 	tx    *sql.Tx
 	jobID string
 	lease int64
-	mu    sync.Mutex
-	dead  bool
+	// mu is held across each statement and the check after it, so no
+	// statement, from any goroutine, starts on a transaction SQLite has
+	// ended before the claim is known to be lost.
+	mu   sync.Mutex
+	dead bool
 }
 
 func (c *claimTx) lost() bool { c.mu.Lock(); defer c.mu.Unlock(); return c.dead }
 
-func (c *claimTx) guard() error {
+// do runs one statement in the claim's transaction. It refuses to run once
+// the claim is lost. When the statement fails, the failure may have ended
+// the whole transaction: the claim is still held only if the transaction
+// still sees its own uncommitted lease on the job (read on the claim's own
+// connection; once SQLite has rolled back, that read sees the job as it was
+// before the claim).
+func (c *claimTx) do(statement func() error) error {
 	if c == nil {
 		return ErrClaimLost
 	}
-	if c.lost() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.dead {
 		return ErrClaimLost
 	}
-	return nil
-}
-
-// check runs after a statement: if it failed, the failure may have ended
-// the whole transaction. The claim is still held only if the transaction
-// still sees its own lease on the job; otherwise the claim is lost.
-func (c *claimTx) check(err error) error {
+	err := statement()
 	if err == nil || errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
@@ -151,44 +161,97 @@ func (c *claimTx) check(err error) error {
 	var lease sql.NullInt64
 	probe := c.tx.QueryRowContext(context.Background(), `SELECT state, lease_until FROM worker_jobs WHERE job_id = ?`, c.jobID).Scan(&state, &lease)
 	if probe != nil || state != StateProcessing || !lease.Valid || lease.Int64 != c.lease {
-		c.mu.Lock()
 		c.dead = true
-		c.mu.Unlock()
 	}
 	return err
 }
 
 func (c *claimTx) exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
-	if err := c.guard(); err != nil {
-		return nil, err
+	var result sql.Result
+	err := c.do(func() error {
+		var err error
+		result, err = c.tx.ExecContext(ctx, query, args...)
+		return err
+	})
+	return result, err
+}
+
+// ErrTransactionControl reports a handler statement that would begin, end
+// or nest the claim's transaction: the claim owns it.
+var ErrTransactionControl = errors.New("worker: a handler cannot control the claim's transaction")
+
+// controls reports whether a statement begins with a transaction-control
+// keyword, after any leading whitespace and comments.
+func controls(query string) bool {
+	for {
+		query = strings.TrimLeftFunc(query, unicode.IsSpace)
+		switch {
+		case strings.HasPrefix(query, "--"):
+			_, rest, found := strings.Cut(query, "\n")
+			if !found {
+				return false
+			}
+			query = rest
+		case strings.HasPrefix(query, "/*"):
+			_, rest, found := strings.Cut(query[2:], "*/")
+			if !found {
+				return false
+			}
+			query = rest
+		default:
+			end := strings.IndexFunc(query, func(r rune) bool { return !unicode.IsLetter(r) })
+			if end < 0 {
+				end = len(query)
+			}
+			switch strings.ToUpper(query[:end]) {
+			case "BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE":
+				return true
+			}
+			return false
+		}
 	}
-	result, err := c.tx.ExecContext(ctx, query, args...)
-	return result, c.check(err)
 }
 
 // ExecContext runs a statement in the claim's transaction.
 func (t Tx) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	if controls(query) {
+		return nil, ErrTransactionControl
+	}
 	return t.claim.exec(ctx, query, args...)
 }
 
 // QueryContext runs a query in the claim's transaction.
 func (t Tx) QueryContext(ctx context.Context, query string, args ...any) (*Rows, error) {
-	if err := t.claim.guard(); err != nil {
-		return nil, err
+	if controls(query) {
+		return nil, ErrTransactionControl
 	}
-	rows, err := t.claim.tx.QueryContext(ctx, query, args...)
+	var rows *sql.Rows
+	err := t.claim.do(func() error {
+		var err error
+		rows, err = t.claim.tx.QueryContext(ctx, query, args...)
+		return err
+	})
 	if err != nil {
-		return nil, t.claim.check(err)
+		return nil, err
 	}
 	return &Rows{rows: rows, claim: t.claim}, nil
 }
 
-// QueryRowContext runs a single-row query in the claim's transaction.
+// QueryRowContext runs a single-row query in the claim's transaction. The
+// query runs, and its failure is checked, before it returns.
 func (t Tx) QueryRowContext(ctx context.Context, query string, args ...any) *Row {
-	if err := t.claim.guard(); err != nil {
+	if controls(query) {
+		return &Row{err: ErrTransactionControl}
+	}
+	var row *sql.Row
+	err := t.claim.do(func() error {
+		row = t.claim.tx.QueryRowContext(ctx, query, args...)
+		return row.Err()
+	})
+	if err != nil {
 		return &Row{err: err}
 	}
-	return &Row{row: t.claim.tx.QueryRowContext(ctx, query, args...), claim: t.claim}
+	return &Row{row: row, claim: t.claim}
 }
 
 // Row is the result of Tx.QueryRowContext.
@@ -203,37 +266,47 @@ func (r *Row) Scan(dest ...any) error {
 	if r.err != nil {
 		return r.err
 	}
-	return r.claim.check(r.row.Scan(dest...))
+	return r.claim.do(func() error { return r.row.Scan(dest...) })
 }
 
 // Err reports the row's error without scanning, like sql.Row.Err.
-func (r *Row) Err() error {
-	if r.err != nil {
-		return r.err
-	}
-	return r.claim.check(r.row.Err())
-}
+func (r *Row) Err() error { return r.err }
 
 // Rows is the result of Tx.QueryContext.
 type Rows struct {
 	rows  *sql.Rows
 	claim *claimTx
+	err   error
 }
 
-// Next prepares the next row, like sql.Rows.Next.
+// Next prepares the next row, like sql.Rows.Next. When it returns false,
+// Err reports why.
 func (r *Rows) Next() bool {
-	if r.rows.Next() {
-		return true
+	next := false
+	if err := r.claim.do(func() error {
+		next = r.rows.Next()
+		if next {
+			return nil
+		}
+		return r.rows.Err()
+	}); err != nil {
+		r.err = err
 	}
-	_ = r.claim.check(r.rows.Err())
-	return false
+	return next
 }
 
 // Scan copies the current row's columns into dest, like sql.Rows.Scan.
-func (r *Rows) Scan(dest ...any) error { return r.claim.check(r.rows.Scan(dest...)) }
+func (r *Rows) Scan(dest ...any) error {
+	return r.claim.do(func() error { return r.rows.Scan(dest...) })
+}
 
 // Err reports the error, if any, that ended the iteration.
-func (r *Rows) Err() error { return r.claim.check(r.rows.Err()) }
+func (r *Rows) Err() error {
+	if r.err != nil {
+		return r.err
+	}
+	return r.rows.Err()
+}
 
 // Close closes the rows.
 func (r *Rows) Close() error { return r.rows.Close() }

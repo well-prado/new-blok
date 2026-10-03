@@ -955,3 +955,162 @@ func TestLostClaimRefusesWritesAndCountsTheAttempt(t *testing.T) {
 		t.Fatalf("the lost claim left the job %s at attempt %d; want dead at attempt 1", job.State, job.Attempt)
 	}
 }
+
+// claimQueue is a queue with one job and a business table, for the
+// claim-transaction tests.
+func claimQueue(t *testing.T, maxAttempts int) (*Queue, store.Database) {
+	t.Helper()
+	ctx := context.Background()
+	database, err := (sqlite.Backend{}).Open(ctx, filepath.Join(t.TempDir(), "claim.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	queue, err := New(ctx, database, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.WithTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `CREATE TABLE business (request_key TEXT NOT NULL UNIQUE ON CONFLICT ROLLBACK, data BLOB)`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queue.Enqueue(ctx, EnqueueRequest{RequestKey: "claim-1", Kind: "claim", Payload: []byte(`{}`), MaxAttempts: maxAttempts}); err != nil {
+		t.Fatal(err)
+	}
+	return queue, database
+}
+
+func businessRows(t *testing.T, database store.Database) int {
+	t.Helper()
+	rows := 0
+	if err := database.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return tx.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM business`).Scan(&rows)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return rows
+}
+
+// TestConflictRollbackEndsTheClaim: a constraint declared ON CONFLICT
+// ROLLBACK ends the whole transaction when it fires, whichever way the
+// handler runs the statement. The handler's next write is refused, nothing
+// commits, and the attempt is counted (#180).
+func TestConflictRollbackEndsTheClaim(t *testing.T) {
+	const duplicate = `INSERT INTO business (request_key) VALUES ('a') RETURNING request_key`
+	for _, test := range []struct {
+		name     string
+		conflict func(context.Context, Tx) error
+	}{
+		{"exec", func(ctx context.Context, tx Tx) error {
+			_, err := tx.ExecContext(ctx, duplicate)
+			return err
+		}},
+		{"query row", func(ctx context.Context, tx Tx) error {
+			var key string
+			return tx.QueryRowContext(ctx, duplicate).Scan(&key)
+		}},
+		{"query row error", func(ctx context.Context, tx Tx) error {
+			return tx.QueryRowContext(ctx, duplicate).Err()
+		}},
+		{"query", func(ctx context.Context, tx Tx) error {
+			rows, err := tx.QueryContext(ctx, duplicate)
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+			for rows.Next() {
+			}
+			return rows.Err()
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			queue, database := claimQueue(t, 1)
+			var conflict, refused error
+			processed, err := queue.ProcessOnce(context.Background(), func(ctx context.Context, tx Tx, _ Job) error {
+				if _, err := tx.ExecContext(ctx, `INSERT INTO business (request_key) VALUES ('a')`); err != nil {
+					return err
+				}
+				conflict = test.conflict(ctx, tx)
+				_, refused = tx.ExecContext(ctx, `INSERT INTO business (request_key) VALUES ('b')`)
+				return nil
+			})
+			if err != nil || !processed || conflict == nil || !errors.Is(refused, ErrClaimLost) {
+				t.Fatalf("processed=%v err=%v conflict=%v refused=%v; want the conflict to end the claim and the next write refused", processed, err, conflict, refused)
+			}
+			if rows := businessRows(t, database); rows != 0 {
+				t.Fatalf("%d business rows committed outside the lost claim", rows)
+			}
+			if job, err := queue.Get(context.Background(), "claim-1"); err != nil || job.State != StateDead || job.Attempt != 1 {
+				t.Fatalf("job %+v %v; want dead at attempt 1", job, err)
+			}
+		})
+	}
+}
+
+// TestConcurrentHandlerWritesNeverEscapeTheClaim: a handler writes from two
+// goroutines while one statement ends the claim's transaction. Every
+// statement is checked before the next starts, so none runs on the ended
+// transaction and nothing commits (#180).
+func TestConcurrentHandlerWritesNeverEscapeTheClaim(t *testing.T) {
+	for trial := range 30 {
+		queue, database := claimQueue(t, 1)
+		_, err := queue.ProcessOnce(context.Background(), func(ctx context.Context, tx Tx, _ Job) error {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO business (request_key) VALUES ('seed')`); err != nil {
+				return err
+			}
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				for i := 0; ; i++ {
+					if _, err := tx.ExecContext(ctx, `INSERT INTO business (request_key) VALUES (?)`, fmt.Sprint("w-", i)); errors.Is(err, ErrClaimLost) {
+						return
+					}
+				}
+			}()
+			time.Sleep(time.Millisecond)
+			_, _ = tx.ExecContext(ctx, `INSERT INTO business (request_key) VALUES ('seed')`)
+			<-done
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rows := businessRows(t, database); rows != 0 {
+			t.Fatalf("trial %d: %d business rows committed outside the lost claim", trial, rows)
+		}
+	}
+}
+
+// TestHandlerCannotControlTheClaimTransaction: the claim owns its
+// transaction. A handler statement that would begin, end or nest it is
+// refused before it runs, and the claim stays intact (#180).
+func TestHandlerCannotControlTheClaimTransaction(t *testing.T) {
+	queue, database := claimQueue(t, 1)
+	statements := []string{"COMMIT", " rollback", "END TRANSACTION", "BEGIN", "SAVEPOINT s", "release s", "/* a */ COMMIT", "-- a\nROLLBACK"}
+	processed, err := queue.ProcessOnce(context.Background(), func(ctx context.Context, tx Tx, _ Job) error {
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); !errors.Is(err, ErrTransactionControl) {
+				return fmt.Errorf("exec %q: %v, want ErrTransactionControl", statement, err)
+			}
+			if _, err := tx.QueryContext(ctx, statement); !errors.Is(err, ErrTransactionControl) {
+				return fmt.Errorf("query %q: %v, want ErrTransactionControl", statement, err)
+			}
+			if err := tx.QueryRowContext(ctx, statement).Scan(); !errors.Is(err, ErrTransactionControl) {
+				return fmt.Errorf("query row %q: %v, want ErrTransactionControl", statement, err)
+			}
+		}
+		_, err := tx.ExecContext(ctx, `INSERT INTO business (request_key) VALUES ('kept')`)
+		return err
+	})
+	if err != nil || !processed {
+		t.Fatalf("processed=%v err=%v", processed, err)
+	}
+	if job, err := queue.Get(context.Background(), "claim-1"); err != nil || job.State != StateCompleted {
+		t.Fatalf("job %+v %v; want completed", job, err)
+	}
+	if rows := businessRows(t, database); rows != 1 {
+		t.Fatalf("%d business rows; want the handler's one", rows)
+	}
+}
