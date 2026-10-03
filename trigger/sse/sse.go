@@ -272,26 +272,28 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	respond(writer, http.StatusNotFound, "error", "not_found")
 }
 
-// admit takes and releases an application lease: new work is refused while
-// the application is not ready or is draining.
-func (s *Server) admit(writer http.ResponseWriter) bool {
+// admit takes an application lease for a start: new work is refused while
+// the application is not ready or is draining, and the application cannot
+// stop until the start, its durable submission included, has answered.
+func (s *Server) admit(writer http.ResponseWriter) (*app.Lease, bool) {
 	lease, err := s.application.Begin()
 	if err != nil {
 		writer.Header().Set("Retry-After", "1")
 		respond(writer, http.StatusServiceUnavailable, "error", "unavailable")
-		return false
+		return nil, false
 	}
-	lease.Release()
-	return true
+	return lease, true
 }
 
 // start runs a start request's steps in a fixed order: admission,
 // authentication, idempotency key, bounded body read, input validation, a
 // stream slot in the hub, and the durable submission.
 func (s *Server) start(writer http.ResponseWriter, request *http.Request, e *endpoint) {
-	if !s.admit(writer) {
+	lease, admitted := s.admit(writer)
+	if !admitted {
 		return
 	}
+	defer lease.Release()
 	principal, err := e.Authenticate(request)
 	if err != nil || strings.TrimSpace(principal.ID) == "" {
 		respond(writer, http.StatusUnauthorized, "error", "unauthorized")

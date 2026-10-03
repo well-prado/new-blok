@@ -26,7 +26,10 @@ followed with two requests:
 
 Its steps run in a fixed order:
 1. route and method (404/405);
-2. application admission (503);
+2. application admission (503). The start holds its application lease
+   until it has answered, so the application cannot stop while the durable
+   submission below is in flight (#175); a start that arrives while the
+   application drains is refused;
 3. authentication (401), before the body is read;
 4. the key, 1–256 printable ASCII characters (400 `invalid_key`);
 5. a body read bounded by `MaxBodyBytes` (413) and `ReadTimeout` (408);
@@ -78,7 +81,8 @@ it:
 ### Subscribe: `GET <path>/<stream>`, the EventSource protocol
 
 Everything is decided before the response status, in this order:
-admission; authentication (401); the stream id format; whether the writer
+admission (a subscription is long-lived, so it is admitted but does not hold
+the application open); authentication (401); the stream id format; whether the writer
 supports write deadlines (500 if not, because writes must be bounded and
 interruptible; the small JSON refusals before this point are written
 without one); subscriber limits; the `Last-Event-ID` cursor (400
