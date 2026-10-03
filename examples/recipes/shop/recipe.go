@@ -5,9 +5,11 @@ package shop
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,16 +31,26 @@ import (
 )
 
 const (
-	RecordSchema = `{"type":"object","additionalProperties":false,"properties":{"id":{"type":"string"},"value":{"type":"string"}},"required":["id","value"]}`
-	JobSchema    = `{"type":"object","additionalProperties":false,"properties":{"requestKey":{"type":"string"},"recordId":{"type":"string"},"value":{"type":"string"}},"required":["requestKey","recordId","value"]}`
-	UpdateSchema = `{"type":"object","additionalProperties":false,"properties":{"requestKey":{"type":"string"},"value":{"type":"string"}},"required":["requestKey","value"]}`
-	JobKind      = "shop.record"
+	RecordSchema       = `{"type":"object","additionalProperties":false,"properties":{"id":{"type":"string"},"value":{"type":"string"}},"required":["id","value"]}`
+	JobSchema          = `{"type":"object","additionalProperties":false,"properties":{"requestKey":{"type":"string"},"recordId":{"type":"string"},"value":{"type":"string"}},"required":["requestKey","recordId","value"]}`
+	UpdateSchema       = `{"type":"object","additionalProperties":false,"properties":{"requestKey":{"type":"string"},"value":{"type":"string"}},"required":["requestKey","value"]}`
+	JobKind            = "shop.record"
+	defaultOutboxLease = 30 * time.Second
+	maxOutboxLease     = 5 * time.Minute
 )
 
 type Config struct {
-	Database   store.Database
-	Tokens     map[string]string
-	WebhookKey []byte
+	Database    store.Database
+	Tokens      map[string]string
+	WebhookKey  []byte
+	Publisher   OutboxPublisher
+	OutboxLease time.Duration
+}
+
+// OutboxPublisher is the explicit external delivery port used by the recipe.
+// Implementations must durably deduplicate repeated event IDs.
+type OutboxPublisher interface {
+	Publish(context.Context, string, []byte) error
 }
 
 type Record struct {
@@ -51,6 +63,17 @@ type jobInput struct {
 	RequestKey string `json:"requestKey"`
 	RecordID   string `json:"recordId"`
 	Value      string `json:"value"`
+}
+
+type recordCommand struct {
+	Record  Record `json:"record"`
+	EventID string `json:"eventId"`
+}
+
+type RecordEvent struct {
+	Type    string `json:"type"`
+	Record  Record `json:"record"`
+	EventID string `json:"eventId"`
 }
 
 // hiddenRecord keeps missing and another-owner rows indistinguishable. The
@@ -75,6 +98,8 @@ type Application struct {
 	engine         *engine.Engine
 	program        contract.InternalProgram
 	streamClosures chan string
+	publisher      OutboxPublisher
+	outboxLease    time.Duration
 }
 
 // Migrate applies the recipe's ordered, application-owned schema migrations.
@@ -108,6 +133,7 @@ func Migrate(ctx context.Context, database store.Database) error {
 var migrations = [][]string{
 	{`CREATE TABLE shop_records (record_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, value TEXT NOT NULL, created_at INTEGER NOT NULL)`},
 	{`ALTER TABLE shop_records ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0`, `CREATE TABLE shop_outbox (event_id TEXT PRIMARY KEY, record_id TEXT NOT NULL, payload_json BLOB NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL)`},
+	{`ALTER TABLE shop_outbox ADD COLUMN claimed_until INTEGER NOT NULL DEFAULT 0`, `ALTER TABLE shop_outbox ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''`},
 }
 
 // Teardown removes only this recipe's tables and the worker queue table it
@@ -130,6 +156,15 @@ func New(ctx context.Context, config Config) (*Application, error) {
 	if config.Database == nil {
 		return nil, errors.New("shop: database is required")
 	}
+	if config.Publisher == nil {
+		return nil, errors.New("shop: explicit outbox publisher is required")
+	}
+	if config.OutboxLease <= 0 {
+		config.OutboxLease = defaultOutboxLease
+	}
+	if config.OutboxLease < 100*time.Millisecond || config.OutboxLease > maxOutboxLease {
+		return nil, fmt.Errorf("shop: outbox lease must be between 100ms and %s", maxOutboxLease)
+	}
 	if err := Migrate(ctx, config.Database); err != nil {
 		return nil, err
 	}
@@ -138,7 +173,11 @@ func New(ctx context.Context, config Config) (*Application, error) {
 			return nil, fmt.Errorf("shop: token for %s must contain at least 16 bytes", name)
 		}
 	}
-	if config.Tokens["alice"] == config.Tokens["bob"] {
+	callerTokens := map[string]string{
+		"alice": strings.Clone(config.Tokens["alice"]),
+		"bob":   strings.Clone(config.Tokens["bob"]),
+	}
+	if callerTokens["alice"] == callerTokens["bob"] {
 		return nil, errors.New("shop: alice and bob tokens must be distinct")
 	}
 	secret, err := webhook.NewSecret(config.WebhookKey)
@@ -152,21 +191,33 @@ func New(ctx context.Context, config Config) (*Application, error) {
 	if err := queue.RegisterKind(JobKind, []byte(JobSchema)); err != nil {
 		return nil, err
 	}
-	service := &Application{Database: config.Database, Queue: queue, streamClosures: make(chan string, 64)}
-	recordNode, err := node.Define("recipes/validate-record", "1.0.0", func(_ context.Context, record Record) (Record, error) {
+	service := &Application{Database: config.Database, Queue: queue, streamClosures: make(chan string, 64), publisher: config.Publisher, outboxLease: config.OutboxLease}
+	commandSchema := []byte(`{"type":"object","additionalProperties":false,"properties":{"record":{"type":"object","additionalProperties":false,"properties":{"id":{"type":"string"},"value":{"type":"string"},"owner":{"type":"string"}},"required":["id","value","owner"]},"eventId":{"type":"string"}},"required":["record","eventId"]}`)
+	recordNode, err := node.Define("recipes/validate-record", "1.0.0", func(_ context.Context, command recordCommand) (recordCommand, error) {
+		record := command.Record
 		if record.ID == "" || len(record.ID) > 128 || len(record.Value) > 4096 || record.Owner == "" {
-			return Record{}, &node.DomainError{Code: "invalid_record", Class: "validation"}
+			return recordCommand{}, &node.DomainError{Code: "invalid_record", Class: "validation"}
 		}
-		return record, nil
+		if command.EventID == "" || len(command.EventID) > 512 {
+			return recordCommand{}, &node.DomainError{Code: "invalid_event_id", Class: "validation"}
+		}
+		return command, nil
 	}, node.Description("Validates the recipe record value"), node.Schemas(
-		[]byte(`{"type":"object","additionalProperties":false,"properties":{"id":{"type":"string"},"value":{"type":"string"},"owner":{"type":"string"}},"required":["id","value","owner"]}`),
-		[]byte(`{"type":"object","additionalProperties":false,"properties":{"id":{"type":"string"},"value":{"type":"string"},"owner":{"type":"string"}},"required":["id","value","owner"]}`),
+		commandSchema, commandSchema,
 	), node.Pure())
 	if err != nil {
 		return nil, err
 	}
-	recordFlow, err := flow.Define(flow.Spec{Name: "shop/validate-record", Version: "1.0.0"}, func(builder *flow.Builder, input flow.Ref[Record]) flow.Ref[Record] {
-		return flow.Call(builder, "validate-record", recordNode, input)
+	eventSchema := []byte(`{"type":"object","additionalProperties":false,"properties":{"type":{"type":"string"},"record":{"type":"object","additionalProperties":false,"properties":{"id":{"type":"string"},"value":{"type":"string"},"owner":{"type":"string"}},"required":["id","value","owner"]},"eventId":{"type":"string"}},"required":["type","record","eventId"]}`)
+	eventNode, err := node.Define("recipes/prepare-record-event", "1.0.0", func(_ context.Context, command recordCommand) (RecordEvent, error) {
+		return RecordEvent{Type: "shop.record.changed", Record: command.Record, EventID: command.EventID}, nil
+	}, node.Description("Prepares the stable business event published from the outbox"), node.Schemas(commandSchema, eventSchema), node.Pure())
+	if err != nil {
+		return nil, err
+	}
+	recordFlow, err := flow.Define(flow.Spec{Name: "shop/record-event", Version: "1.0.0"}, func(builder *flow.Builder, input flow.Ref[recordCommand]) flow.Ref[RecordEvent] {
+		validated := flow.Call(builder, "validate-record", recordNode, input)
+		return flow.Call(builder, "prepare-record-event", eventNode, validated)
 	})
 	if err != nil {
 		return nil, err
@@ -175,7 +226,7 @@ func New(ctx context.Context, config Config) (*Application, error) {
 	if err != nil {
 		return nil, err
 	}
-	service.engine = engine.New(map[string]node.Any{recordNode.Descriptor().Name: recordNode.Any()})
+	service.engine = engine.New(map[string]node.Any{recordNode.Descriptor().Name: recordNode.Any(), eventNode.Descriptor().Name: eventNode.Any()})
 	service.Hub, err = sse.NewHub(sse.HubConfig{
 		MaxStreams: 128, MaxStreamsPerOwner: 16, RetainEvents: 32,
 		RetainBytes: 64 << 10, MaxEventBytes: 8 << 10, Retention: 5 * time.Minute,
@@ -190,14 +241,14 @@ func New(ctx context.Context, config Config) (*Application, error) {
 		}
 		for _, name := range []string{"alice", "bob"} {
 			providedDigest := sha256.Sum256([]byte(value))
-			configuredDigest := sha256.Sum256([]byte(config.Tokens[name]))
+			configuredDigest := sha256.Sum256([]byte(callerTokens[name]))
 			if subtle.ConstantTimeCompare(providedDigest[:], configuredDigest[:]) == 1 {
 				return trigger.Principal{ID: name}, nil
 			}
 		}
 		return trigger.Principal{}, errors.New("invalid bearer token")
 	}
-	workflowNames := []app.Workflow{{Name: "shop/validate-record"}, {Name: "shop.records.create"}, {Name: "shop.records.get"}, {Name: "shop.records.delete"}, {Name: "shop.jobs.submit"}}
+	workflowNames := []app.Workflow{{Name: "shop/record-event"}, {Name: "shop.records.create"}, {Name: "shop.records.get"}, {Name: "shop.records.delete"}, {Name: "shop.jobs.submit"}}
 	workflowNames = append(workflowNames, app.Workflow{Name: "shop.records.update"})
 	routes := []app.Route{{Method: "POST", Path: "/records", Workflow: "shop.records.create"}, {Method: "GET", Path: "/records/:id", Workflow: "shop.records.get"}, {Method: "PUT", Path: "/records/:id", Workflow: "shop.records.update"}, {Method: "DELETE", Path: "/records/:id", Workflow: "shop.records.delete"}, {Method: "POST", Path: "/jobs", Workflow: "shop.jobs.submit"}}
 	service.app, err = app.New(app.Config{Workflows: workflowNames, Routes: routes, DrainTimeout: 5 * time.Second})
@@ -267,20 +318,21 @@ func (a *Application) createRecord(ctx context.Context, input blokhttp.Input) (a
 	if err := json.Unmarshal(input.Body, &request); err != nil {
 		return nil, &node.DomainError{Code: "invalid_record", Class: "validation", Err: err}
 	}
-	record, err := a.runRecord(ctx, Record{ID: request.ID, Value: request.Value, Owner: input.Principal.ID})
+	event, err := a.prepareRecordEvent(ctx, Record{ID: request.ID, Value: request.Value, Owner: input.Principal.ID}, "record.created:"+request.ID)
 	if err != nil {
 		return nil, err
 	}
+	record := event.Record
 	err = a.Database.WithTx(ctx, func(tx *sql.Tx) error {
 		now := time.Now().UTC().UnixNano()
 		if _, err := tx.ExecContext(ctx, `INSERT INTO shop_records(record_id, owner_id, value, created_at, updated_at) VALUES(?, ?, ?, ?, ?)`, record.ID, record.Owner, record.Value, now, now); err != nil {
 			return err
 		}
-		payload, err := json.Marshal(record)
+		payload, err := json.Marshal(event)
 		if err != nil {
 			return err
 		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO shop_outbox(event_id, record_id, payload_json, state, created_at) VALUES(?, ?, ?, 'pending', ?)`, "record.created:"+record.ID, record.ID, payload, now)
+		_, err = tx.ExecContext(ctx, `INSERT INTO shop_outbox(event_id, record_id, payload_json, state, created_at) VALUES(?, ?, ?, 'pending', ?)`, event.EventID, record.ID, payload, now)
 		return err
 	})
 	if err != nil {
@@ -315,16 +367,17 @@ func (a *Application) updateRecord(ctx context.Context, input blokhttp.Input) (a
 		return nil, &node.DomainError{Code: "invalid_update", Class: "validation"}
 	}
 	record := Record{ID: input.Params["id"], Value: request.Value, Owner: input.Principal.ID}
-	validated, err := a.runRecord(ctx, record)
+	event, err := a.prepareRecordEvent(ctx, record, "record.updated:"+request.RequestKey)
 	if err != nil {
 		return nil, err
 	}
-	payload, err := json.Marshal(validated)
+	validated := event.Record
+	payload, err := json.Marshal(event)
 	if err != nil {
 		return nil, err
 	}
 	err = a.Database.WithTx(ctx, func(tx *sql.Tx) error {
-		eventID := "record.updated:" + request.RequestKey
+		eventID := event.EventID
 		insert, err := tx.ExecContext(ctx, `INSERT INTO shop_outbox(event_id, record_id, payload_json, state, created_at) VALUES(?, ?, ?, 'pending', ?) ON CONFLICT(event_id) DO NOTHING`, eventID, validated.ID, payload, time.Now().UTC().UnixNano())
 		if err != nil {
 			return err
@@ -408,14 +461,18 @@ func (a *Application) ProcessOne(ctx context.Context) (bool, error) {
 			return handlerErr
 		}
 		record = Record{ID: request.RecordID, Value: request.Value, Owner: job.Principal.ID}
-		validated, runErr := a.runRecord(ctx, record)
+		event, runErr := a.prepareRecordEvent(ctx, record, "job.completed:"+job.RequestKey)
 		if runErr != nil {
 			handlerErr = runErr
 			return runErr
 		}
-		record = validated
+		record = event.Record
+		// The worker's consumer context is canceled when a worker disappears.
+		// Complete bounded SQL on the transaction's non-cancelable lifetime so
+		// ProcessOnce can observe cancellation and roll back the whole claim.
+		sqlCtx := workerTransactionSQLContext(ctx)
 		now := time.Now().UTC().UnixNano()
-		inserted, err := tx.ExecContext(ctx, `INSERT INTO shop_records(record_id, owner_id, value, created_at, updated_at) VALUES(?, ?, ?, ?, ?) ON CONFLICT(record_id) DO NOTHING`, record.ID, record.Owner, record.Value, now, now)
+		inserted, err := tx.ExecContext(sqlCtx, `INSERT INTO shop_records(record_id, owner_id, value, created_at, updated_at) VALUES(?, ?, ?, ?, ?) ON CONFLICT(record_id) DO NOTHING`, record.ID, record.Owner, record.Value, now, now)
 		if err != nil {
 			return err
 		}
@@ -425,18 +482,18 @@ func (a *Application) ProcessOne(ctx context.Context) (bool, error) {
 		}
 		if count == 0 {
 			var owner, value string
-			if err := tx.QueryRowContext(ctx, `SELECT owner_id, value FROM shop_records WHERE record_id = ?`, record.ID).Scan(&owner, &value); err != nil {
+			if err := tx.QueryRowContext(sqlCtx, `SELECT owner_id, value FROM shop_records WHERE record_id = ?`, record.ID).Scan(&owner, &value); err != nil {
 				return err
 			}
 			if owner != record.Owner || value != record.Value {
 				return &worker.HandlerError{Message: "record key conflicts with existing data"}
 			}
 		}
-		payload, err := json.Marshal(record)
+		payload, err := json.Marshal(event)
 		if err != nil {
 			return err
 		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO shop_outbox(event_id, record_id, payload_json, state, created_at) VALUES(?, ?, ?, 'pending', ?) ON CONFLICT(event_id) DO NOTHING`, "job.completed:"+job.RequestKey, record.ID, payload, now)
+		_, err = tx.ExecContext(sqlCtx, `INSERT INTO shop_outbox(event_id, record_id, payload_json, state, created_at) VALUES(?, ?, ?, 'pending', ?) ON CONFLICT(event_id) DO NOTHING`, event.EventID, record.ID, payload, now)
 		return err
 	})
 	if err != nil || !processed {
@@ -460,40 +517,83 @@ func (a *Application) ProcessOne(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-func (a *Application) runRecord(ctx context.Context, record Record) (Record, error) {
-	result, err := a.engine.Run(ctx, a.program, record)
-	if err != nil {
-		return Record{}, err
-	}
-	validated, ok := result.Output.(Record)
-	if !ok {
-		return Record{}, errors.New("shop: workflow returned an unexpected output type")
-	}
-	return validated, nil
+func workerTransactionSQLContext(consumerCtx context.Context) context.Context {
+	return context.WithoutCancel(consumerCtx)
 }
 
-// DrainOutbox delivers pending outbox entries with stable event identities.
-// A sink must deduplicate Event.ID across an ambiguous publish/retry window.
-func (a *Application) DrainOutbox(ctx context.Context, publish func(context.Context, string, []byte) error) (bool, error) {
-	if publish == nil {
-		return false, errors.New("shop: outbox publisher is required")
+func (a *Application) prepareRecordEvent(ctx context.Context, record Record, eventID string) (RecordEvent, error) {
+	result, err := a.engine.Run(ctx, a.program, recordCommand{Record: record, EventID: eventID})
+	if err != nil {
+		return RecordEvent{}, err
 	}
-	sent := false
-	err := a.Database.WithTx(ctx, func(tx *sql.Tx) error {
-		var eventID string
-		var payload []byte
-		if err := tx.QueryRowContext(ctx, `SELECT event_id, payload_json FROM shop_outbox WHERE state = 'pending' ORDER BY created_at, event_id LIMIT 1`).Scan(&eventID, &payload); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return nil
-			}
+	event, ok := result.Output.(RecordEvent)
+	if !ok {
+		return RecordEvent{}, errors.New("shop: workflow returned an unexpected output type")
+	}
+	return event, nil
+}
+
+// DrainOutbox atomically claims one row, commits the claim, then publishes
+// outside the SQLite write transaction. Failed or ambiguous delivery remains
+// leased until expiry; the publisher deduplicates by stable EventID.
+func (a *Application) DrainOutbox(ctx context.Context) (bool, error) {
+	tokenBytes := make([]byte, 16)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		return false, fmt.Errorf("shop: create outbox claim token: %w", err)
+	}
+	token := hex.EncodeToString(tokenBytes)
+	now := time.Now().UTC().UnixNano()
+	claim := struct {
+		eventID string
+		payload []byte
+	}{}
+	claimed := false
+	claimErr := a.Database.WithTx(ctx, func(tx *sql.Tx) error {
+		// UPDATE is the transaction's first statement: SQLite obtains the write
+		// reservation before selecting, so competing drainers cannot both claim.
+		err := tx.QueryRowContext(ctx, `UPDATE shop_outbox
+			SET state = 'claimed', claim_token = ?, claimed_until = ?
+			WHERE event_id = (
+				SELECT event_id FROM shop_outbox
+				WHERE state = 'pending' OR (state = 'claimed' AND claimed_until <= ?)
+				ORDER BY created_at, event_id LIMIT 1
+			)
+			AND (state = 'pending' OR (state = 'claimed' AND claimed_until <= ?))
+			RETURNING event_id, payload_json`, token, now+int64(a.outboxLease), now, now).Scan(&claim.eventID, &claim.payload)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
 			return err
 		}
-		sent = true
-		if err := publish(ctx, eventID, append([]byte(nil), payload...)); err != nil {
-			return err
-		}
-		_, err := tx.ExecContext(ctx, `UPDATE shop_outbox SET state = 'sent' WHERE event_id = ? AND state = 'pending'`, eventID)
-		return err
+		claimed = true
+		return nil
 	})
-	return sent, err
+	if claimErr != nil || !claimed {
+		return claimed, claimErr
+	}
+	publishCtx, cancel := context.WithTimeout(ctx, a.outboxLease/2)
+	err := a.publisher.Publish(publishCtx, claim.eventID, append([]byte(nil), claim.payload...))
+	cancel()
+	if err != nil {
+		return true, err
+	}
+	// Once accepted by the sink, finish the local acknowledgment even if the
+	// consumer context was canceled; this SQL remains bounded by store limits.
+	ackCtx, cancelAck := context.WithTimeout(context.WithoutCancel(ctx), a.outboxLease/4)
+	defer cancelAck()
+	return true, a.Database.WithTx(ackCtx, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ackCtx, `UPDATE shop_outbox SET state = 'sent', claim_token = '', claimed_until = 0 WHERE event_id = ? AND state = 'claimed' AND claim_token = ?`, claim.eventID, token)
+		if err != nil {
+			return err
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rows != 1 {
+			return errors.New("shop: outbox claim expired or was replaced after publish")
+		}
+		return nil
+	})
 }

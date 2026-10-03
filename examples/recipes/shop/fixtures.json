@@ -12,7 +12,11 @@
     { "id": "signed-webhook-duplicate", "expectedStatus": 200, "expectedAcceptedJobs": 1 },
     { "id": "signed-webhook-tampered", "expectedStatus": 401, "expectedAcceptedJobs": 0 },
     { "id": "restart-worker", "expectedJobState": "completed", "expectedRecords": 1, "expectedOutbox": 1 },
-    { "id": "outbox-retry", "expectedPublishAttempts": 2, "expectedStableEventId": true },
+    { "id": "outbox-retry", "expectedPublishAttempts": 2, "expectedStableEventId": true, "expectedEffects": 1 },
+    { "id": "outbox-atomic-claim", "expectedMaxClaims": 1 },
+    { "id": "concurrent-storage", "expectedRecords": 16, "expectedOutbox": 16 },
+    { "id": "worker-cancellation", "expectedJobState": "pending", "expectedEffects": 0 },
+    { "id": "external-module-composition", "expectedEffects": 1 },
     { "id": "slow-subscriber", "expectedCloseReason": "slow_subscriber", "maxSubscriberQueue": 1 }
   ]
 }

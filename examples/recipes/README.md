@@ -16,6 +16,7 @@ below are synthetic.
 | Caller authentication | Recipe bearer-token authenticator | `SHOP_TOKEN_ALICE`, `SHOP_TOKEN_BOB` (each at least 16 bytes) |
 | Provider verification | `trigger/webhook` Standard Webhooks verifier | `SHOP_WEBHOOK_SECRET` (at least 16 bytes; production should resolve it from an external secret manager) |
 | Durable admission and worker | `trigger/worker` on the same `store.Database` | Queue schema is installed by `worker.New` |
+| Outbox delivery | Exported `shop.OutboxPublisher` port; executable selects `shop.SyntheticSink` | Separate durable `SHOP_SINK_DB_PATH`; one event per atomic claim; 30-second default lease |
 | Streaming | `trigger/sse` with the durable worker as submitter/tracker | queue depth 1; 32 endpoint subscribers; 4 per stream; 8 KiB event ceiling |
 | Business schema | This recipe's numbered migrations | `shop_schema_migrations`, `shop_records`, `shop_outbox` |
 | Listener | Standard library `net/http` | `SHOP_LISTEN_ADDR` |
@@ -23,8 +24,8 @@ below are synthetic.
 The two configured caller tokens establish the `alice` and `bob` principals.
 Record reads, updates, and deletes include the authenticated owner in their
 database predicate; another principal receives the same stable `not_found`
-response as an unknown record. The current `trigger/http` adapter maps its available
-classified validation errors to HTTP 400 and has no not-found status class,
+response as an unknown record. The current `trigger/http` adapter maps its
+available classified validation errors to HTTP 400 and has no not-found status class,
 so the recipe preserves concealment and reports that status limitation rather
 than changing the trigger package. The webhook principal is established only
 after signature verification. A caller cannot set any principal through JSON.
@@ -38,6 +39,7 @@ export SHOP_DB_PATH="$PWD/.local/shop.db"
 export SHOP_TOKEN_ALICE='synthetic-alice-token-0001'
 export SHOP_TOKEN_BOB='synthetic-bob-token-00002'
 export SHOP_WEBHOOK_SECRET='synthetic-webhook-key-00000001'
+export SHOP_SINK_DB_PATH="$PWD/.local/synthetic-receiver.db"
 export SHOP_LISTEN_ADDR='127.0.0.1:8080'
 
 go run ./examples/recipes/cmd/shop migrate-up
@@ -45,12 +47,21 @@ go run ./examples/recipes/cmd/shop migrate-status
 go run ./examples/recipes/cmd/shop serve
 ```
 
-`migrate-up` creates the parent directory and database, applies v1 then v2 in
-transactions, and is safe to replay. `serve` requires every token, the
-webhook key, and listener address explicitly; it does not choose example
-credentials or a hidden database path. The worker polls the durable queue and
-commits the business record, outbox event, and delivery acknowledgment in one
-worker transaction.
+`migrate-up` creates the parent directory and database, applies ordered
+migrations in transactions, and is safe to replay. `serve` requires every
+token, the webhook key, listener address, and a separate sink database
+explicitly; it does not choose example credentials or a hidden database path.
+Its bounded poll loop consumes one durable job and then claims/publishes at
+most one outbox event. Business state, outbox event, and worker acknowledgment
+share the worker transaction. Publishing happens after an atomic lease claim
+has committed, outside the app database write transaction.
+
+The independent consumer module at
+[`external/shopapp`](external/shopapp) imports the exported recipe and SQLite
+packages from outside the root Go module. From that directory, run
+`go test ./...` to exercise the exported composition, then `go run .` with the
+same environment. Its local `replace` points to this checkout; use a released
+module version when consuming a published release.
 
 CRUD example:
 
@@ -85,8 +96,9 @@ disconnect stops waiting; it does not cancel an accepted job.
 ### Migrations, replay, and teardown
 
 The app-owned v1 migration creates `shop_records`; v2 adds `updated_at` and
-creates `shop_outbox`. The worker package independently installs and upgrades
-`worker_jobs`. The test suite starts from both an empty database and a v1
+creates `shop_outbox`; v3 adds lease and claim-token columns. The worker
+package independently installs and upgrades `worker_jobs`. The test suite
+starts from both an empty database and a v1
 database, replays migrations, verifies the resulting schema, and tears down
 then installs again. To remove this recipe's tables, stop every process using
 the file and ensure the SQLite file is dedicated to this recipe (the worker
@@ -103,19 +115,35 @@ SQLite file and any unrelated application tables in place.
 
 The fixture [shop/fixtures.json](shop/fixtures.json) predeclares outcomes for
 owner CRUD and idempotent update, cross-principal denial, signed duplicate
-delivery, outbox retry, process restart, and slow subscriber bounds. Tests run
-real HTTP handlers, SQLite transactions, the durable queue, webhook
-verification, and an SSE HTTP connection. The job restart test reopens the
-same database in a separate test process.
+delivery, atomic competing outbox claims, accepted-then-error reconciliation
+after process restart, worker cancellation rollback, external-module
+composition, and slow subscriber bounds. Tests run real HTTP handlers, SQLite
+transactions, the durable queue, webhook verification, and an SSE HTTP
+connection. The two-node typed workflow validates the record command and
+builds a stable `shop.record.changed` event consumed by transactional app
+handlers; it does not claim every persistence operation is an engine node. The
+synthetic receiver durably deduplicates event IDs and rejects changed payloads
+under a reused ID.
 
-- Composition, migrations, CRUD, job handler, and outbox: `shop/recipe.go`
-- Typed record validator and workflow execution: `shop/recipe.go` (`node.Define`, `flow.Define`, `engine.Run`)
+- Composition, migrations, CRUD, job handler, and bounded outbox claims: `shop/recipe.go`
+- Durable deduplicating local receiver: `shop/sink.go`
+- Typed validation and stable-event preparation workflow invoked by create, update, and worker handlers: `shop/recipe.go` (`node.Define`, `flow.Define`, `engine.Run`)
 - Real HTTP, migration replay/upgrade/teardown, process restart, and streaming tests: `shop/recipe_test.go`
 - Runnable commands and explicit environment validation: `cmd/shop/main.go`
+- Independent consumer module and executable: `external/shopapp/`
 - Expected synthetic outcomes: `shop/fixtures.json`
 
-Run the focused evidence with `go test ./examples/recipes/...`. This recipe
-does not claim exactly-once external publication: outbox consumers must
-deduplicate by stable event ID if a publish succeeds but its state update does
-not commit. SQLite is a local single-host store, and the in-memory SSE replay
-hub starts a new epoch after process restart.
+The worker adapter cancellation issue tracked by #180 is not changed here and
+remains an upstream dependency. This recipe passes a cancellation-independent
+context to its bounded worker-transaction SQL and includes a focused rollback
+scenario; that scoped defense is not a substitute for the adapter fix. Re-run
+the scenario against the independently reviewed upstream change before
+claiming the root behavior is resolved.
+
+Run root-module evidence with `go test ./examples/recipes/...`, and the
+external-consumer evidence with `cd examples/recipes/external/shopapp && go test ./...`.
+Delivery remains at least once across lease expiry, so a receiver
+must durably deduplicate stable event IDs. The synthetic receiver implements
+and tests that contract, including accept-then-error followed by app restart.
+SQLite is a local single-host store, and the in-memory SSE replay hub starts a
+new epoch after process restart.

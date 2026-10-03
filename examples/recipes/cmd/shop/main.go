@@ -85,10 +85,35 @@ func serve(parent context.Context, database store.Database) error {
 	if err != nil {
 		return err
 	}
+	sinkPath, err := required("SHOP_SINK_DB_PATH")
+	if err != nil {
+		return err
+	}
+	appPath, err := filepath.Abs(os.Getenv("SHOP_DB_PATH"))
+	if err != nil {
+		return err
+	}
+	sinkPath, err = filepath.Abs(sinkPath)
+	if err != nil {
+		return err
+	}
+	if appPath == sinkPath {
+		return errors.New("SHOP_SINK_DB_PATH must be separate from SHOP_DB_PATH")
+	}
+	sinkDatabase, err := (sqlite.Backend{}).Open(parent, sinkPath)
+	if err != nil {
+		return err
+	}
+	defer sinkDatabase.Close()
+	sink, err := shop.NewSyntheticSink(parent, sinkDatabase)
+	if err != nil {
+		return err
+	}
 	application, err := shop.New(parent, shop.Config{
 		Database:   database,
 		Tokens:     map[string]string{"alice": alice, "bob": bob},
 		WebhookKey: []byte(webhookKey),
+		Publisher:  sink,
 	})
 	if err != nil {
 		return err
@@ -104,7 +129,7 @@ func serve(parent context.Context, database store.Database) error {
 	go func() {
 		defer close(workerDone)
 		for workerCtx.Err() == nil {
-			processed, processErr := application.ProcessOne(workerCtx)
+			processed, processErr := processAvailable(workerCtx, application)
 			if processErr != nil && workerCtx.Err() == nil {
 				time.Sleep(100 * time.Millisecond)
 				continue
@@ -133,6 +158,12 @@ func serve(parent context.Context, database store.Database) error {
 	}
 	<-workerDone
 	return application.Shutdown(shutdownCtx)
+}
+
+func processAvailable(ctx context.Context, application *shop.Application) (bool, error) {
+	processed, processErr := application.ProcessOne(ctx)
+	drained, drainErr := application.DrainOutbox(ctx)
+	return processed || drained, errors.Join(processErr, drainErr)
 }
 
 func required(name string) (string, error) {

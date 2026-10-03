@@ -14,10 +14,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/well-prado/new-blok/store/sqlite"
+	"github.com/well-prado/new-blok/trigger"
 	"github.com/well-prado/new-blok/trigger/sse"
 	"github.com/well-prado/new-blok/trigger/webhook"
 	"github.com/well-prado/new-blok/trigger/worker"
@@ -39,6 +41,7 @@ type expectedCase struct {
 	ExpectedPublishAttempts int    `json:"expectedPublishAttempts"`
 	ExpectedStableEventID   bool   `json:"expectedStableEventId"`
 	ExpectedValue           string `json:"expectedValue"`
+	ExpectedMaxClaims       int    `json:"expectedMaxClaims"`
 }
 
 func fixture(t testing.TB, id string) expectedCase {
@@ -74,16 +77,30 @@ func openRecipe(t testing.TB, path string) (*Application, func()) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	application, err := New(context.Background(), Config{
-		Database:   database,
-		Tokens:     map[string]string{"alice": aliceToken, "bob": bobToken},
-		WebhookKey: []byte(webhookKey),
-	})
+	sinkDatabase, err := (sqlite.Backend{}).Open(context.Background(), path+".sink.db")
 	if err != nil {
 		_ = database.Close()
 		t.Fatal(err)
 	}
-	return application, func() { _ = database.Close() }
+	sink, err := NewSyntheticSink(context.Background(), sinkDatabase)
+	if err != nil {
+		_ = sinkDatabase.Close()
+		_ = database.Close()
+		t.Fatal(err)
+	}
+	application, err := New(context.Background(), Config{
+		Database:    database,
+		Tokens:      map[string]string{"alice": aliceToken, "bob": bobToken},
+		WebhookKey:  []byte(webhookKey),
+		Publisher:   sink,
+		OutboxLease: 120 * time.Millisecond,
+	})
+	if err != nil {
+		_ = sinkDatabase.Close()
+		_ = database.Close()
+		t.Fatal(err)
+	}
+	return application, func() { _ = database.Close(); _ = sinkDatabase.Close() }
 }
 
 func TestMigrationsReplayUpgradeAndTeardown(t *testing.T) {
@@ -144,8 +161,8 @@ func TestMigrationsReplayUpgradeAndTeardown(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if version != 2 || migrationsApplied != 2 {
-		t.Fatalf("version=%d migration rows=%d, want 2 and 2", version, migrationsApplied)
+	if version != 3 || migrationsApplied != 3 {
+		t.Fatalf("version=%d migration rows=%d, want 3 and 3", version, migrationsApplied)
 	}
 	if _, err := worker.New(context.Background(), database, nil); err != nil {
 		t.Fatal(err)
@@ -276,9 +293,84 @@ func TestCallerPrincipalsRequireDistinctTokens(t *testing.T) {
 		Database:   database,
 		Tokens:     map[string]string{"alice": aliceToken, "bob": aliceToken},
 		WebhookKey: []byte(webhookKey),
+		Publisher:  &SyntheticSink{},
 	})
 	if err == nil || !strings.Contains(err.Error(), "tokens must be distinct") {
 		t.Fatalf("New with duplicate caller tokens error=%v", err)
+	}
+}
+
+func TestAuthenticationSnapshotsCallerOwnedTokenMap(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "token-snapshot.db")
+	database, err := (sqlite.Backend{}).Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	sinkDatabase, err := (sqlite.Backend{}).Open(ctx, path+".sink.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sinkDatabase.Close()
+	sink, err := NewSyntheticSink(ctx, sinkDatabase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokens := map[string]string{"alice": aliceToken, "bob": bobToken}
+	application, err := New(ctx, Config{Database: database, Tokens: tokens, WebhookKey: []byte(webhookKey), Publisher: sink})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokens["alice"], tokens["bob"] = bobToken, aliceToken
+	if err := application.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer application.Shutdown(ctx)
+	server := httptest.NewServer(application.Handler)
+	defer server.Close()
+	mutateDone := make(chan struct{})
+	mutatorStopped := make(chan struct{})
+	go func() {
+		defer close(mutatorStopped)
+		for {
+			select {
+			case <-mutateDone:
+				return
+			default:
+				tokens["alice"], tokens["bob"] = aliceToken, bobToken
+				tokens["alice"], tokens["bob"] = bobToken, aliceToken
+			}
+		}
+	}()
+	defer func() {
+		close(mutateDone)
+		<-mutatorStopped
+	}()
+	for _, principal := range []struct {
+		token string
+		owner string
+		id    string
+	}{{token: aliceToken, owner: "alice", id: "snapshot-alice"}, {token: bobToken, owner: "bob", id: "snapshot-bob"}} {
+		response := request(t, server.Client(), http.MethodPost, server.URL+"/records", principal.token, `{"id":"`+principal.id+`","value":"stable principal"}`)
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("original token for %s status=%d body=%s", principal.owner, response.StatusCode, responseBody(t, response))
+		}
+		var record Record
+		if err := json.NewDecoder(response.Body).Decode(&record); err != nil {
+			t.Fatal(err)
+		}
+		_ = response.Body.Close()
+		if record.Owner != principal.owner {
+			t.Fatalf("original token authenticated as %q, want %q", record.Owner, principal.owner)
+		}
+	}
+	for range 8 {
+		response := request(t, server.Client(), http.MethodGet, server.URL+"/records/no-such-record", aliceToken, "")
+		if response.StatusCode != http.StatusBadRequest {
+			t.Fatalf("concurrent map mutation changed authentication status to %d", response.StatusCode)
+		}
+		_ = response.Body.Close()
 	}
 }
 
@@ -359,7 +451,182 @@ func TestSignedWebhookDuplicateSurvivesProcessRestart(t *testing.T) {
 }
 
 func TestOutboxFailureRetainsEventAndRetryUsesSameIdentity(t *testing.T) {
-	application, closeDatabase := openRecipe(t, filepath.Join(t.TempDir(), "outbox.db"))
+	path := filepath.Join(t.TempDir(), "restart-outbox.db")
+	application, closeDatabase := openRecipe(t, path)
+	defer closeDatabase()
+	server := httptest.NewServer(application.Handler)
+	defer server.Close()
+	if err := application.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	created := request(t, server.Client(), http.MethodPost, server.URL+"/records", aliceToken, `{"id":"outbox-1","value":"retry"}`)
+	if created.StatusCode != http.StatusOK {
+		t.Fatalf("create status=%d body=%s", created.StatusCode, responseBody(t, created))
+	}
+	_ = created.Body.Close()
+	expected := fixture(t, "outbox-retry")
+	sink := application.publisher.(*SyntheticSink)
+	sink.FailAfterAcceptOnce()
+	first, err := application.DrainOutbox(context.Background())
+	if !first || err == nil {
+		t.Fatalf("accepted-then-error processed=%v err=%v", first, err)
+	}
+	eventID, err := latestOutboxID(t, application)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var published RecordEvent
+	if err := application.Database.WithTx(context.Background(), func(tx *sql.Tx) error {
+		var payload []byte
+		if err := tx.QueryRow(`SELECT payload_json FROM shop_outbox WHERE event_id = ?`, eventID).Scan(&payload); err != nil {
+			return err
+		}
+		return json.Unmarshal(payload, &published)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if published.Type != "shop.record.changed" || published.EventID != eventID {
+		t.Fatalf("typed workflow outbox event=%+v", published)
+	}
+	if count := sinkEventCount(t, sink); count != expected.ExpectedEffects {
+		t.Fatalf("sink accepted %d effects before simulated response loss", count)
+	}
+	server.Close()
+	if err := application.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	closeDatabase()
+
+	// A fresh app process sees the durable lease, waits for expiry, retries the
+	// same event ID, and reconciles the receiver's already-accepted effect.
+	restarted, closeRestarted := openRecipe(t, path)
+	defer closeRestarted()
+	time.Sleep(restarted.outboxLease + 20*time.Millisecond)
+	processed, err := restarted.DrainOutbox(context.Background())
+	if !processed || err != nil {
+		t.Fatalf("post-restart reconciliation processed=%v err=%v", processed, err)
+	}
+	restartedSink := restarted.publisher.(*SyntheticSink)
+	if count := sinkEventCount(t, restartedSink); count != expected.ExpectedEffects {
+		t.Fatalf("sink effects after deduplicated restart retry=%d", count)
+	}
+	if err := restartedSink.Publish(context.Background(), eventID, []byte(`{"type":"changed"}`)); err == nil {
+		t.Fatal("synthetic sink accepted a changed payload under an existing event ID")
+	}
+	state, retriedID := outboxState(t, restarted)
+	if state != "sent" || expected.ExpectedPublishAttempts != 2 || (expected.ExpectedStableEventID && retriedID != eventID) {
+		t.Fatalf("outbox state=%q eventID=%q original=%q", state, retriedID, eventID)
+	}
+	processed, err = restarted.DrainOutbox(context.Background())
+	if processed || err != nil {
+		t.Fatalf("post-ack drain processed=%v err=%v", processed, err)
+	}
+}
+
+func latestOutboxID(t *testing.T, application *Application) (string, error) {
+	t.Helper()
+	var eventID string
+	err := application.Database.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return tx.QueryRow(`SELECT event_id FROM shop_outbox ORDER BY created_at DESC, event_id DESC LIMIT 1`).Scan(&eventID)
+	})
+	return eventID, err
+}
+
+func outboxState(t *testing.T, application *Application) (string, string) {
+	t.Helper()
+	var state, eventID string
+	if err := application.Database.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return tx.QueryRow(`SELECT state, event_id FROM shop_outbox ORDER BY created_at DESC, event_id DESC LIMIT 1`).Scan(&state, &eventID)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return state, eventID
+}
+
+func sinkEventCount(t *testing.T, sink *SyntheticSink) int {
+	t.Helper()
+	var count int
+	if err := sink.database.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return tx.QueryRow(`SELECT COUNT(*) FROM synthetic_sink_events`).Scan(&count)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+
+type blockingPublisher struct {
+	inner   OutboxPublisher
+	started chan struct{}
+	release chan struct{}
+}
+
+func (p blockingPublisher) Publish(ctx context.Context, eventID string, payload []byte) error {
+	close(p.started)
+	<-p.release
+	return p.inner.Publish(ctx, eventID, payload)
+}
+
+func TestOutboxClaimIsAtomicAndPublisherHoldsNoSQLiteWriteLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "claim.db")
+	application, closeDatabase := openRecipe(t, path)
+	defer closeDatabase()
+	if err := application.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer application.Shutdown(context.Background())
+	secondDrainer, closeSecondDrainer := openRecipe(t, path)
+	defer closeSecondDrainer()
+	application.outboxLease = 5 * time.Second
+	expected := fixture(t, "outbox-atomic-claim")
+	server := httptest.NewServer(application.Handler)
+	defer server.Close()
+	created := request(t, server.Client(), http.MethodPost, server.URL+"/records", aliceToken, `{"id":"claim-1","value":"bounded"}`)
+	if created.StatusCode != http.StatusOK {
+		t.Fatalf("create status=%d body=%s", created.StatusCode, responseBody(t, created))
+	}
+	_ = created.Body.Close()
+	blocking := blockingPublisher{inner: application.publisher, started: make(chan struct{}), release: make(chan struct{})}
+	application.publisher = blocking
+	firstResult := make(chan error, 1)
+	go func() {
+		processed, err := application.DrainOutbox(context.Background())
+		if err == nil && !processed {
+			err = errors.New("first drainer did not claim the pending event")
+		}
+		firstResult <- err
+	}()
+	select {
+	case <-blocking.started:
+	case <-time.After(time.Second):
+		t.Fatal("publisher did not start")
+	}
+	// A write from another connection must proceed while the external publisher
+	// is blocked; publication cannot hold the claim transaction open.
+	writerCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := application.Database.WithTx(writerCtx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(writerCtx, `CREATE TABLE IF NOT EXISTS contention_probe (id INTEGER PRIMARY KEY)`)
+		return err
+	}); err != nil {
+		t.Fatalf("concurrent sqlite writer was blocked by publisher: %v", err)
+	}
+	for range 3 {
+		processed, err := secondDrainer.DrainOutbox(context.Background())
+		if err != nil || processed || expected.ExpectedMaxClaims != 1 {
+			t.Fatalf("competing drainer processed=%v err=%v; event must remain leased", processed, err)
+		}
+	}
+	close(blocking.release)
+	if err := <-firstResult; err != nil {
+		t.Fatal(err)
+	}
+	if count := sinkEventCount(t, application.publisher.(blockingPublisher).inner.(*SyntheticSink)); count != 1 {
+		t.Fatalf("sink event effects=%d, want one", count)
+	}
+}
+
+func TestConcurrentTwoPrincipalWritesUnderStorageLoad(t *testing.T) {
+	application, closeDatabase := openRecipe(t, filepath.Join(t.TempDir(), "concurrent.db"))
 	defer closeDatabase()
 	if err := application.Start(context.Background()); err != nil {
 		t.Fatal(err)
@@ -367,36 +634,82 @@ func TestOutboxFailureRetainsEventAndRetryUsesSameIdentity(t *testing.T) {
 	defer application.Shutdown(context.Background())
 	server := httptest.NewServer(application.Handler)
 	defer server.Close()
-	created := request(t, server.Client(), http.MethodPost, server.URL+"/records", aliceToken, `{"id":"outbox-1","value":"retry"}`)
-	if created.StatusCode != http.StatusOK {
-		t.Fatalf("create status=%d body=%s", created.StatusCode, responseBody(t, created))
+	const concurrentRequests = 16
+	expected := fixture(t, "concurrent-storage")
+	errorsFound := make(chan error, concurrentRequests)
+	var writers sync.WaitGroup
+	for index := range concurrentRequests {
+		writers.Add(1)
+		go func() {
+			defer writers.Done()
+			token := aliceToken
+			if index%2 != 0 {
+				token = bobToken
+			}
+			body := fmt.Sprintf(`{"id":"load-%02d","value":"bounded"}`, index)
+			request, err := http.NewRequest(http.MethodPost, server.URL+"/records", strings.NewReader(body))
+			if err != nil {
+				errorsFound <- err
+				return
+			}
+			request.Header.Set("Authorization", "Bearer "+token)
+			request.Header.Set("Content-Type", "application/json")
+			response, err := server.Client().Do(request)
+			if err != nil {
+				errorsFound <- err
+				return
+			}
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusOK {
+				body, _ := io.ReadAll(response.Body)
+				errorsFound <- fmt.Errorf("concurrent create %d status=%d body=%s", index, response.StatusCode, body)
+			}
+		}()
 	}
-	_ = created.Body.Close()
-	expected := fixture(t, "outbox-retry")
-	var IDs []string
-	processed, err := application.DrainOutbox(context.Background(), func(_ context.Context, id string, _ []byte) error {
-		IDs = append(IDs, id)
-		return errors.New("synthetic sink unavailable")
+	writers.Wait()
+	close(errorsFound)
+	for err := range errorsFound {
+		t.Error(err)
+	}
+	records, outbox := recipeCounts(t, application)
+	if records != expected.ExpectedRecords || outbox != expected.ExpectedOutbox {
+		t.Fatalf("concurrent storage records=%d outbox=%d", records, outbox)
+	}
+}
+
+func TestWorkerConsumerCancellationRollsBackNonCancelableSQL(t *testing.T) {
+	application, closeDatabase := openRecipe(t, filepath.Join(t.TempDir(), "cancel-worker.db"))
+	defer closeDatabase()
+	expected := fixture(t, "worker-cancellation")
+	job, err := application.Queue.Enqueue(context.Background(), worker.EnqueueRequest{
+		RequestKey: "cancel-write", Kind: JobKind,
+		Payload:   []byte(`{"requestKey":"cancel-write","recordId":"cancel-record","value":"rolled-back"}`),
+		Principal: trigger.Principal{ID: "alice"},
 	})
-	if !processed || err == nil {
-		t.Fatalf("failed publish processed=%v err=%v", processed, err)
+	if err != nil {
+		t.Fatal(err)
 	}
-	processed, err = application.DrainOutbox(context.Background(), func(_ context.Context, id string, _ []byte) error {
-		IDs = append(IDs, id)
-		return nil
+	ctx, cancel := context.WithCancel(context.Background())
+	processed, err := application.Queue.ProcessOnce(ctx, func(ctx context.Context, tx *sql.Tx, _ worker.Job) error {
+		_, err := tx.ExecContext(workerTransactionSQLContext(ctx), `INSERT INTO shop_records(record_id, owner_id, value, created_at, updated_at) VALUES('cancel-record', 'alice', 'rolled-back', 1, 1)`)
+		cancel()
+		return err
 	})
-	if !processed || err != nil {
-		t.Fatalf("retry publish processed=%v err=%v", processed, err)
+	if err == nil || processed {
+		t.Fatalf("canceled worker processed=%v err=%v", processed, err)
 	}
-	if len(IDs) != expected.ExpectedPublishAttempts || len(IDs) != 2 || expected.ExpectedStableEventID && IDs[0] != IDs[1] {
-		t.Fatalf("published IDs=%v", IDs)
+	var records int
+	if err := application.Database.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return tx.QueryRow(`SELECT COUNT(*) FROM shop_records WHERE record_id = 'cancel-record'`).Scan(&records)
+	}); err != nil {
+		t.Fatal(err)
 	}
-	processed, err = application.DrainOutbox(context.Background(), func(context.Context, string, []byte) error {
-		t.Fatal("sent event was selected again")
-		return nil
-	})
-	if processed || err != nil {
-		t.Fatalf("post-success drain processed=%v err=%v", processed, err)
+	if records != expected.ExpectedEffects {
+		t.Fatalf("canceled worker committed %d business rows", records)
+	}
+	stored, err := application.Queue.Get(context.Background(), job.Job.RequestKey)
+	if err != nil || stored.State != expected.ExpectedJobState {
+		t.Fatalf("canceled job state=%q err=%v, want redeliverable pending", stored.State, err)
 	}
 }
 
