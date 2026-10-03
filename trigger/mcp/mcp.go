@@ -156,7 +156,11 @@ type Server struct {
 	views       map[string]*view
 	order       []string
 	calls       sync.WaitGroup
-	closing     bool
+	// answers counts the calls admitted whose carrying request has not
+	// ended: the SDK writes a call's answer on that request after the
+	// handler returns, so Shutdown closes no session before it (#197).
+	answers sync.WaitGroup
+	closing bool
 	// running counts each principal's calls in flight.
 	running map[string]int
 	// opened counts each principal's sessions, including those being
@@ -308,6 +312,11 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		// bound: canceling the request itself would drop its response.
 		request = request.WithContext(context.WithValue(request.Context(), leaseKey{}, lease))
 	}
+	// The request's context ends when this handler returns, whatever
+	// server hosts it: a call's answer is written by then.
+	ctx, finish := context.WithCancel(request.Context())
+	defer finish()
+	request = request.WithContext(ctx)
 	s.mu.Lock()
 	closing := s.closing
 	s.mu.Unlock()
@@ -695,6 +704,12 @@ func (s *Server) handler(owner tool.Principal, t Tool, input schema.Schema, outp
 			s.mu.Unlock()
 			return failure("unavailable"), nil
 		}
+		// The answer is written on the carrying request after this handler
+		// returns; Shutdown waits for that request to end (#197).
+		if carrier != nil {
+			s.answers.Add(1)
+			context.AfterFunc(carrier, s.answers.Done)
+		}
 		if s.running[principal.ID] >= s.config.MaxCallsPerPrincipal {
 			s.mu.Unlock()
 			return failure("saturated"), nil
@@ -807,7 +822,8 @@ func codeFor(ctx context.Context, err error) string {
 	return "internal"
 }
 
-// Shutdown refuses new sessions and calls, waits for the calls in flight,
+// Shutdown refuses new sessions and calls, waits for the calls in flight
+// and for the requests that carry them to finish writing their answers,
 // closes every session and waits for its bookkeeping to settle, all within
 // ctx.
 func (s *Server) Shutdown(ctx context.Context) error {
@@ -815,6 +831,12 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.closing = true
 	s.mu.Unlock()
 	if err := wait(ctx, &s.calls); err != nil {
+		return err
+	}
+	// A call's handler returns before its answer is written: closing its
+	// session in between would end the session's streams with the answer
+	// unwritten (#197).
+	if err := wait(ctx, &s.answers); err != nil {
 		return err
 	}
 	s.mu.Lock()
