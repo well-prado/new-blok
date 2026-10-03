@@ -42,6 +42,11 @@ func (p *Records) Execute(ctx context.Context, in DatabaseInput) (DatabaseOutput
 	}
 	result := DatabaseOutput{RecordID: in.RecordID, EventID: "event:" + in.Key}
 	err := p.database.WithTx(ctx, func(tx *sql.Tx) error {
+		// Take the write reservation before idempotency reads. An empty UPDATE
+		// waits for concurrent writers but never changes business records.
+		if _, err := tx.ExecContext(ctx, `UPDATE provider_records SET record_id = record_id WHERE 0`); err != nil {
+			return err
+		}
 		var recordID, value string
 		err := tx.QueryRowContext(ctx, `SELECT record_id,value FROM provider_records WHERE operation_key=?`, in.Key).Scan(&recordID, &value)
 		if err == nil {
