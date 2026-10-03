@@ -144,13 +144,16 @@ proposed #180 `worker.Tx` ABI will require an explicit recipe migration once
 the authoritative fix is reviewed and merged. No concurrent handler-SQL
 serialization guarantee is inferred from the proposed wrapper or from this
 recipe's tests.
-Parent-reported review evidence for the unmerged #180 proposal includes an
-independent concurrent-statement regression reproducer failing 3/3 runs:
-`SQLITE_FULL` rolls back the claim while a concurrently queued small insert
-commits a business row, and `ProcessOnce` returns nil. A sequential handler
-cancellation regression passed natively, but does not cover this concurrency
-failure. Do not use or merge the proposed fix until this is independently
-resolved and reviewed.
+
+The earlier parent-reported `SQLITE_FULL` concurrent-statement failure claim
+is retracted: the fixture counted a committed business row without checking
+the acknowledgment state. Adding `Queue.Get` showed the job was completed,
+so that fixture does not establish an effect outside acknowledgment. The
+associated 3/3 failure claim is invalid. Separate parent-reported SQL-batch
+rollback evidence leaves a dead job with a committed business row and remains
+an unresolved boundary defect under #180. A concurrent `RAISE(ROLLBACK)`
+fixture with an acknowledgment-state oracle is still being developed; no
+result is claimed for it. Acceptance awaits independent resolution and review.
 
 The typed workflow here validates the command and prepares the stable event;
 the application handlers own the record and outbox SQL transaction. This is a
