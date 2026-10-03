@@ -20,10 +20,11 @@ Go is native. Node.js is the first external runtime, followed by the old framewo
 
 Windows is a first-class planned platform alongside macOS/Linux. Native Windows 11 x64 is the initial required baseline; publish other OS/architecture claims only after execution evidence. Ordinary installation and development must not require WSL, Bash, Docker, Unix utilities or administrator privileges. Go-only apps must not require Node. PowerShell installation, paths/permissions/file-lock semantics, Ctrl+C, bounded child-process tree cleanup, SQLite crash/reopen and actual Go/Node worker conformance require native Windows tests. Cross-compilation and Linux/container tests cannot certify Windows support.
 
-[E17-T05 / #156](https://github.com/well-prado/new-blok/issues/156) is the M4
-native Windows lifecycle/conformance gate. [E11-T05 / #157](https://github.com/well-prado/new-blok/issues/157)
-owns the M6 easy-install/newcomer workflow. M4 cannot close without the Windows
-gate; M6 and M9 cannot advertise supported Windows installation/release until
+[E17-T05 / #156](https://github.com/well-prado/new-blok/issues/156) owns the M8
+native Windows lifecycle/conformance gate. On 2026-10-03 the maintainer explicitly
+authorized M4 completion and merges without Windows execution; this defers the
+evidence, not the Windows support requirement. [E11-T05 / #157](https://github.com/well-prado/new-blok/issues/157)
+owns the M6 easy-install/newcomer workflow. M6 and M9 cannot advertise supported Windows installation/release until
 their native clean-machine evidence passes. These are requirements, not claims
 that current Unix validation already proves Windows works. Keep local Windows
 validation separate from the current prohibition on consuming GitHub Actions.
@@ -36,7 +37,7 @@ Milestones are capability gates without artificial dates. M0–M1 establish a na
 | [M1 — Complete native Go application](https://github.com/well-prado/new-blok/milestone/2) | A newcomer builds, tests and serves a typed quote application without hand-editing IR or installing a foreign runtime. Invalid types have actionable diagnostics; bounded execution and real HTTP pass race and integration tests. |
 | [M2 — Durable orders and jobs](https://github.com/well-prado/new-blok/milestone/3) | One selected embedded backend atomically admits and resumes accepted orders/jobs. Process-kill tests prove acknowledgment barriers, deduplication, uncertainty and outbox behavior. |
 | [M3 — Recovery across control flow and versions](https://github.com/well-prado/new-blok/milestone/4) | Nested branches, loops, parallel joins, waits, signals and child runs recover after every specified crash boundary. Artifact mismatch, compaction, backup and reconciliation fail safely. |
-| [M4 — Node.js and persistent worker conformance](https://github.com/well-prado/new-blok/milestone/5) | Node.js is a real persistent gRPC worker with schema/error/cancellation/capacity/generation parity, authenticated transport and fault-tested lifecycle; tiny-call overhead is measured honestly. Native Windows lifecycle and durability evidence passes #156. |
+| [M4 — Node.js and persistent worker conformance](https://github.com/well-prado/new-blok/milestone/5) | Node.js is a real persistent gRPC worker with schema/error/cancellation/capacity/generation parity, authenticated transport and fault-tested lifecycle; tiny-call overhead is measured honestly. Windows execution is unverified and explicitly deferred to #156; M4 completion is not Windows certification. |
 | [M5 — All nine modular triggers](https://github.com/well-prado/new-blok/milestone/6) | HTTP, webhook, worker, cron, pubsub, gRPC, SSE, WebSocket and MCP have real adapters, shared admission tests, protocol integration tests and removal/footprint evidence. |
 | [M6 — Developer tooling and package ecosystem](https://github.com/well-prado/new-blok/milestone/7) | CLI scaffold/generate/check/dev/test/inspect and node/workflow installation work in both layouts with deterministic locks, offline cache, atomic changes and trusted artifacts. Generic nodes and recipes use the same contracts. Clean-machine native PowerShell installation and newcomer evidence passes #157. |
 | [M7 — AI tools, Studio APIs and observability](https://github.com/well-prado/new-blok/milestone/8) | Agents discover and compose nodes/workflows under enforced policy, including custom nodes. Versioned authorized notebook inspection and optional production telemetry are consumed by contract fixtures without placing Studio/Cloud UI here. |
@@ -3880,12 +3881,12 @@ Issue: [E17-T05](https://github.com/well-prado/new-blok/issues/156) · Initial s
 
 Roadmap ID: E17-T05
 Epic: [E17](https://github.com/well-prado/new-blok/issues/17)
-Milestone: M4
+Milestone: M8
 Priority: P0 | Size: M | Review: R
 
 ## Problem and intended result
 
-Windows is a first-class New BLOK platform, not a WSL workaround. Deliver native Windows execution of Go-only and selected Go+Node applications with the same schema, authentication, bounds, durability and uncertainty guarantees as macOS/Linux. This is an M4 exit gate, not a production-support claim from existing Unix tests.
+Windows is a first-class New BLOK platform, not a WSL workaround. Deliver native Windows execution of Go-only and selected Go+Node applications with the same schema, authentication, bounds, durability and uncertainty guarantees as macOS/Linux. Native execution remains an M8 and production-release gate, explicitly deferred from M4 by the maintainer on 2026-10-03. Existing Unix tests do not certify Windows.
 
 ## Acceptance criteria
 

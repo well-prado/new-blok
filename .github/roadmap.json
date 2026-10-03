@@ -1393,7 +1393,7 @@
     "E17-T05": {
       "kind": "task",
       "epic": "E17",
-      "milestone": "M4",
+      "milestone": "M8",
       "dependencies": [
         "E06-T01",
         "E07-T07",
