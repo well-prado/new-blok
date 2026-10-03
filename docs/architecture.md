@@ -78,6 +78,13 @@ The human-readable document is independent from protobuf transport encoding. Ado
 
 Define missing versus null, signed integer ranges, exact money, timestamps, defaults, unknown fields, optional objects, collections, unions and binary/blob references. JSON Schema defaults are annotations; normalization is a specified operation. Static compatibility supports a declared subset; unprovable edges yield a diagnostic or runtime validation requirement.
 
+The implemented bounded subset requires exactly one union branch to match,
+including null. A null schema rejects non-null values. The pure catalog's
+generic numeric envelope preserves exact JSON integers; its supplied inner
+schema owns integer range/wire rules. Template expansion preflights the byte
+budget before allocating output. See [ADR 0012](decisions/0012-catalog-null-and-template-bounds.md)
+for the correction, supported array limits and pending Node mirror integration.
+
 Logical values are immutable. Maps, slices and pointers require isolation between nodes and branches. Typed native fast paths must preserve this rule, and benchmarks include required validation/copies. Portable encodings serve journals and worker boundaries. Stable diagnostics name code, file/line, workflow, step, field, expected/actual and remediation.
 
 ## 5. Control flow
@@ -114,7 +121,7 @@ An external success followed by a crash before result commit creates an uncertai
 
 Deployment manifests bind workflow document, native binary, worker artifacts, schemas, module locks, runtime versions, compiler and checkpoint formats. Immutable versions cannot be overwritten. Initial upgrades drain/retain compatible executables or refuse startup with actionable diagnostics. A later multi-version manager retains old workers for old runs. Replay creates a new run with lineage; partial reruns require separate tested effect semantics.
 
-Retention, compaction, backup, corruption checks and restore must preserve verified checkpoints and audit obligations. Business tables remain application-owned; the journal is not an ORM or a substitute for domain persistence.
+Retention, compaction, backup, corruption checks and restore must preserve verified checkpoints and audit obligations. The current SQLite backup contract uses `VACUUM INTO` to create a new, transaction-consistent snapshot; it never overwrites an existing destination. Restore first runs `PRAGMA integrity_check`, copies into a temporary file, syncs it, and renames it into a new destination before checking the restored database again. These guarantees cover one local filesystem only: they do not provide disk-loss survival, replication, or multi-host failover. Business tables remain application-owned; the journal is not an ORM or a substitute for domain persistence.
 
 ## 8. Workers and runtime coverage
 
@@ -129,6 +136,8 @@ Each runtime issue requires full schema, cancellation, overload, restart, genera
 Native code shares application trust. Remote processes become security boundaries only with credentials, filesystem/network/OS isolation and scoped policy. Separate application authorization from input validation. Secret providers resolve opaque references only for authorized executions; inputs, outputs, errors, logs and inspection have redaction/access policies.
 
 Agent catalogs fail closed for missing/invalid policy. A node is a typed tool; a workflow is a composed tool with typed input/output, declared effects and inherited limits. Child calls cannot widen authority. Approvals bind action/input/workflow/artifact digests, approver, scope and lifetime and persist reliably. Assertions, evidence and trusted provenance are checked before result publication; model output is not authority.
+
+The implemented pre-alpha durable tool policy is described in [ADR 0008](decisions/0008-durable-tool-policy.md). Its trusted catalog adapter also binds the actual registered tool/program digest, including transitive child identities and resource reservations, independently of the admitted deployment artifact. SQLite decisions and audit survive process restart; deterministic child/root verification precedes trusted commit. Ambiguous dispatched operations block redispatch pending #48's reconciliation and exact executable retention; this slice does not establish safe-upgrade or distributed recovery guarantees.
 
 CLI and read-only development MCP expose versioned inspection/validation projections with source/test references and stable diagnostics. Bounded repair validates every proposal against the real compiler. Generic nodes and custom nodes use the same descriptor and review path. Complete recipes cover authenticated CRUD, jobs, signed webhooks, schedules, streaming and MCP with explicit storage/migration/module dependencies.
 

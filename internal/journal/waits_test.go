@@ -74,6 +74,31 @@ func TestUnauthorizedLateAndCancelSignalOutcomes(t *testing.T) {
 	}
 }
 
+func TestSignalArrivingBeforeWaitIsConsumedAtomically(t *testing.T) {
+	database, journal := openWaitJournal(t, filepath.Join(t.TempDir(), "journal.db"))
+	defer database.Close()
+	admission, err := journal.Admit(context.Background(), AdmissionRequest{RequestKey: "prewait", Workflow: "orders", ArtifactDigest: "sha256:artifact", Input: []byte(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope := signal.Envelope{RunID: admission.RunID, SignalID: "prewait-signal", Name: "approval", Principal: "operator", Payload: []byte(`{"approved":true}`)}
+	result, err := journal.Signal(context.Background(), envelope, true)
+	if err != nil || !result.Accepted || result.Resumed {
+		t.Fatalf("pre-wait signal=%+v err=%v", result, err)
+	}
+	record, err := journal.ScheduleWait(context.Background(), WaitRequest{RunID: admission.RunID, WaitID: "prewait-wait", Name: "approval", DueAt: time.Unix(300, 0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.State != waitResumed || record.SignalID != envelope.SignalID || string(record.Payload) != string(envelope.Payload) {
+		t.Fatalf("wait did not consume pre-wait signal: %+v", record)
+	}
+	duplicate, err := journal.Signal(context.Background(), envelope, true)
+	if err != nil || !duplicate.Duplicate || !duplicate.Accepted || !duplicate.Resumed {
+		t.Fatalf("duplicate pre-wait signal=%+v err=%v", duplicate, err)
+	}
+}
+
 func openWaitJournal(t *testing.T, path string) (interface{ Close() error }, *Journal) {
 	t.Helper()
 	database, err := (sqlite.Backend{}).Open(context.Background(), path)

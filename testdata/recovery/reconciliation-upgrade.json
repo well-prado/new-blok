@@ -1,0 +1,12 @@
+{
+  "name": "reconciliation-upgrade-safety",
+  "synthetic": true,
+  "expected": {
+    "unauthorizedReconciliation": "rejected",
+    "concurrentSuccessfulReconciliations": 1,
+    "duplicateReconciliation": "idempotent",
+    "missingArtifact": "blocks_recovery",
+    "upgradeWithAcceptedRuns": "retain_or_reject",
+    "externalEffectUndoClaim": false
+  }
+}

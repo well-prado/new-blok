@@ -1,0 +1,10 @@
+{
+  "compilerOptions": {
+    "target": "ES2023", "module": "NodeNext", "moduleResolution": "NodeNext",
+    "strict": true, "noUncheckedIndexedAccess": true, "exactOptionalPropertyTypes": true,
+    "rootDir": "../..", "outDir": "dist", "declaration": true,
+    "types": ["node"], "skipLibCheck": true
+  },
+  "include": ["*.ts", "generated/**/*.ts", "test/**/*.ts", "../../sdk/nodejs/**/*.ts", "../../testdata/worker/nodejs/nodes.ts", "../../testdata/worker/nodejs/types.ts"],
+  "exclude": ["dist", "node_modules"]
+}

@@ -86,7 +86,7 @@ func noEmbeddedAssets(t *testing.T, deps map[string]int) {
 
 func TestBinaryWithoutTriggerLinksNoAdapterListenerOrStore(t *testing.T) {
 	deps := dependencies(t, "none")
-	for _, forbidden := range []string{module + "/trigger", "net", "net/http", "database/sql", module + "/store", module + "/contract/conformance"} {
+	for _, forbidden := range []string{module + "/trigger", "net", "net/http", "database/sql", module + "/store", module + "/contract/conformance", "github.com/nats-io", "github.com/coder/websocket"} {
 		if found := linked(deps, forbidden); len(found) != 0 {
 			t.Fatalf("binary with no trigger links %v", found)
 		}
@@ -115,7 +115,7 @@ func TestBinaryWithHTTPSelectedServesAndDrains(t *testing.T) {
 	if len(linked(deps, module+"/trigger/http")) == 0 || len(linked(deps, "net/http")) == 0 {
 		t.Fatal("selected HTTP trigger is not linked")
 	}
-	for _, forbidden := range []string{module + "/trigger/worker", module + "/store", "database/sql", module + "/contract/conformance"} {
+	for _, forbidden := range []string{module + "/trigger/worker", module + "/trigger/pubsub", module + "/trigger/websocket", module + "/trigger/sse", module + "/store", "database/sql", module + "/contract/conformance", "github.com/nats-io", "github.com/coder/websocket"} {
 		if found := linked(deps, forbidden); len(found) != 0 {
 			t.Fatalf("HTTP-only binary links unselected %v", found)
 		}
@@ -175,7 +175,7 @@ func TestBinaryWithWorkerSelectedProcessesDurableJob(t *testing.T) {
 	if len(linked(deps, module+"/trigger/worker")) == 0 || len(linked(deps, module+"/store/sqlite")) == 0 {
 		t.Fatal("selected worker trigger or its store is not linked")
 	}
-	for _, forbidden := range []string{module + "/trigger/http", "net/http", module + "/contract/conformance"} {
+	for _, forbidden := range []string{module + "/trigger/http", module + "/trigger/pubsub", "net/http", module + "/contract/conformance", "github.com/nats-io", "github.com/coder/websocket"} {
 		if found := linked(deps, forbidden); len(found) != 0 {
 			t.Fatalf("worker-only binary links unselected %v", found)
 		}

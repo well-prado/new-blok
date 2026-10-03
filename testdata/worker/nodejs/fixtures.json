@@ -1,0 +1,8 @@
+[
+ {"id":"quote","node":"fixture/quote","input":{"sku":"coffee","quantity":2},"output":{"totalCents":"3000"},"expectedOutputs":1,"expectedErrors":0,"expectedEffects":0},
+ {"id":"invalid-quantity","node":"fixture/quote","input":{"sku":"coffee","quantity":0},"expectedOutputs":0,"expectedErrors":1,"expectedEffects":0},
+ {"id":"max-int64","node":"fixture/echo","input":{"value":"9223372036854775807"},"output":{"value":"9223372036854775807"},"expectedOutputs":1,"expectedErrors":0,"expectedEffects":0},
+ {"id":"overflow","node":"fixture/echo","input":{"value":"9223372036854775808"},"expectedOutputs":0,"expectedErrors":1,"expectedEffects":0},
+ {"id":"panic","node":"fixture/panic","input":{},"expectedOutputs":0,"expectedErrors":1,"expectedEffects":0},
+ {"id":"uncertain-provider-rejection","node":"fixture/provider","input":{"kind":"uncertain"},"expectedOutputs":0,"expectedErrors":1,"expectedEffects":0}
+]
