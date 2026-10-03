@@ -1,5 +1,5 @@
 {
-  "source": "synthetic fixtures authored for E01-T03",
+  "source": "synthetic fixtures authored for E01-T03, E09-T01 and E09-T04",
   "license": "Apache-2.0",
   "privateData": false,
   "expected": {
@@ -7,6 +7,9 @@
     "bad-engine": {"outputRecords": 0, "errorRecords": 1, "effectRecords": 0},
     "bad-transitive": {"outputRecords": 0, "errorRecords": 1, "effectRecords": 0},
     "bad-node-unified": {"outputRecords": 0, "errorRecords": 1, "effectRecords": 0},
-    "bad-node-classic": {"outputRecords": 0, "errorRecords": 1, "effectRecords": 0}
+    "bad-node-classic": {"outputRecords": 0, "errorRecords": 1, "effectRecords": 0},
+    "bad-trigger": {"outputRecords": 0, "errorRecords": 7, "effectRecords": 0},
+    "bad-engine-broker": {"outputRecords": 0, "errorRecords": 1, "effectRecords": 0},
+    "bad-engine-broker-transitive": {"outputRecords": 0, "errorRecords": 1, "effectRecords": 0}
   }
 }

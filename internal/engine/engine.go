@@ -30,6 +30,11 @@ func (e *Error) Error() string {
 }
 func (e *Error) Unwrap() error { return e.Err }
 
+// ErrorCode and ErrorClass expose the stable classification to adapters
+// without requiring them to import the engine.
+func (e *Error) ErrorCode() string  { return e.Code }
+func (e *Error) ErrorClass() string { return e.Class }
+
 type Result struct {
 	Output any
 	State  map[string]any

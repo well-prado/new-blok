@@ -81,6 +81,30 @@
       "status": "open",
       "decision": "Require behaviorally equivalent application workloads, security/fuzz/chaos evidence and controlled repeated measurements.",
       "evidence": ["current-blok-parity", "live-ai-evaluation", "fleet-load-with-failures"]
+    },
+    {
+      "id": "trigger-adapter-contract",
+      "question": "What must every trigger adapter declare and prove, and how does an extension author check it?",
+      "owner": "E09-T01",
+      "status": "implemented",
+      "decision": "Adapters publish a validated completion/disconnect/authentication Declaration, dispatch through an injected handler without interpreting or retrying, and pass contract/conformance.RunTrigger plus import-graph checks (ADR 0005).",
+      "evidence": ["trigger-corpus-v1", "broken-adapter-negative-suite", "selection-binaries", "multi-binding-fixture", "extension-module-conformance"]
+    },
+    {
+      "id": "durable-submission-port",
+      "question": "How does an adapter hand verified work to durable admission and acknowledge only after commit?",
+      "owner": "E09-T02",
+      "status": "implemented",
+      "decision": "trigger.Submitter commits a keyed submission with its principal before returning; duplicates are reported, conflicts refused. worker.Queue implements it; webhooks acknowledge only after it returns (ADR 0006).",
+      "evidence": ["webhook-signed-mutations", "webhook-key-rotation", "webhook-crash-around-ack", "webhook-concurrent-duplicates", "webhook-trigger-conformance"]
+    },
+    {
+      "id": "pubsub-delivery-transfer",
+      "question": "When does a broker message become Blok's, and who retries it?",
+      "owner": "E09-T04",
+      "status": "implemented",
+      "decision": "The consumer acknowledges the broker only after durable submission commits under a stable message key; execution retries belong to the queue, poison messages are dead-lettered before termination, and broker flow control bounds in-flight work (ADR 0007).",
+      "evidence": ["pubsub-transfer-fixtures", "nats-crash-boundaries", "nats-rebalance", "nats-connection-loss", "nats-slow-consumer-bound", "nats-trigger-conformance"]
     }
   ]
 }
