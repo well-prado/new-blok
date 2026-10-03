@@ -125,6 +125,36 @@ endpoint's read and submit bounds. It was rejected: it ties the
 application's configuration to every adapter's knobs, and it still fails
 for a dependency that hangs.
 
+### Host shutdown order
+
+A host that runs several adapters over one application stops them in this
+order, which `trigger/nine_test.go` drives with work in flight (#173):
+
+1. **The adapters.** `sse.Server.Shutdown` ends subscriptions,
+   `websocket.Server.Shutdown` closes connections as going away (1001),
+   `mcp.Server.Shutdown` refuses new sessions and calls and waits for the
+   calls in flight and their answers (#197), the gRPC server's `GracefulStop` finishes its calls, and
+   the HTTP server's `Shutdown` finishes its requests (HTTP, webhook, SSE
+   starts). The order matters: SSE subscriptions and MCP standing streams
+   keep their connections active, so the HTTP server's `Shutdown` would
+   wait on them until its deadline if they were not ended first. The
+   application stays ready meanwhile, so work they hold completes and is
+   answered, and until the HTTP server's `Shutdown` runs, HTTP, webhook and
+   SSE starts are still admitted (an SSE start admitted then is followed
+   from another instance, or after the restart). A WebSocket message in
+   flight is not answered: closing the connection cancels it, and the
+   client resends; the websocket package's own shutdown tests cover that.
+2. **The application.** `app.Shutdown` drains what is left. The queued
+   sources (cron, pubsub, the worker pool) are registered as its
+   dependencies, after the store if the store is one, so they stop before
+   it: a worker job in flight is canceled with its consumer, rolled back and
+   left pending without spending an attempt.
+3. **The store and broker connections**, closed last, by the application as
+   its first dependencies or by the host after `app.Shutdown` returns.
+
+The queued sources stop with the application only because the host
+registers them as dependencies; nothing else stops them.
+
 ### Conformance harness
 
 `contract/conformance.RunTrigger` runs a versioned, embedded corpus
