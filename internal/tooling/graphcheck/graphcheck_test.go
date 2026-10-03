@@ -15,6 +15,8 @@ func TestSyntheticGraphs(t *testing.T) {
 		{"good", "good", nil},
 		{"direct engine boundary", "bad-engine", [][2]string{{"engine_import_forbidden", "fixture.test/engine"}}},
 		{"transitive engine boundary", "bad-transitive", [][2]string{{"engine_transitive_import_forbidden", "fixture.test/engine"}}},
+		{"engine imports a broker client", "bad-engine-broker", [][2]string{{"engine_external_import_forbidden", "fixture.test/engine"}}},
+		{"engine reaches a broker client through a module package", "bad-engine-broker-transitive", [][2]string{{"engine_transitive_import_forbidden", "fixture.test/engine"}}},
 		{"unified node alias", "bad-node-unified", [][2]string{{"node_import_forbidden", "fixture.test/nodes/go/alpha"}}},
 		{"classic node alias", "bad-node-classic", [][2]string{{"node_import_forbidden", "fixture.test/runtimes/go/nodes/alpha"}}},
 		{"trigger adapter boundaries", "bad-trigger", [][2]string{

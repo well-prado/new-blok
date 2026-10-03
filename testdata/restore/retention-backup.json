@@ -1,0 +1,12 @@
+{
+  "name": "retention-backup-restore",
+  "synthetic": true,
+  "expected": {
+    "completedRunCompacted": true,
+    "activeRunRetained": true,
+    "auditRecordRetained": true,
+    "backupIntegrityChecked": true,
+    "restoreIntegrityChecked": true,
+    "existingDestinationOverwritten": false
+  }
+}
