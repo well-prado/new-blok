@@ -32,6 +32,9 @@ import (
 	"github.com/well-prado/new-blok/trigger/worker"
 )
 
+// initialize is a raw MCP initialize request, for checking refusals.
+const initialize = `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"late","version":"1"}}}`
+
 // TestNineTriggersShareOneApplication drives one real request through each
 // of the nine triggers in one application, follows the SSE result live,
 // offers every durable source a duplicate, stops the application, requires
@@ -129,8 +132,10 @@ func TestNineTriggersShareOneApplication(t *testing.T) {
 	}
 	n.broker.publish(t, "m-1", []byte(order))
 	n.broker.settled(t)
-	// A repeated occurrence reaches the port as the very submission cron
-	// committed: same key, normalized payload and principal.
+	// The port deduplicates a repeated occurrence: the very submission cron
+	// committed (same key, normalized payload and principal) is a duplicate.
+	// That cron itself never repeats one is proven by the restart in
+	// TestHostShutdownOrderAndRestart.
 	committed, err := n.queue.Get(ctx, keys["cron"])
 	if err != nil {
 		t.Fatal(err)
@@ -163,7 +168,6 @@ func TestNineTriggersShareOneApplication(t *testing.T) {
 	record("webhook", code, retry)
 	code, retry, _ = n.sseStart("alice", "order-2")
 	record("sse", code, retry)
-	initialize := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"late","version":"1"}}}`
 	headers := auth("alice")
 	headers["Accept"] = "application/json, text/event-stream"
 	code, retry, _ = n.post("/mcp", headers, initialize)
@@ -178,7 +182,7 @@ func TestNineTriggersShareOneApplication(t *testing.T) {
 		if !ok || got[0] != "503" {
 			t.Errorf("%s: a stopped application answered %v, want 503", via, got)
 		}
-		if via != "http" && got[1] != "1" {
+		if got[1] != "1" {
 			t.Errorf("%s: refusal without Retry-After: %v", via, got)
 		}
 	}
@@ -230,7 +234,7 @@ func TestNineTriggersShareOneApplication(t *testing.T) {
 		t.Errorf("a repeat after restart was accepted: %+v %v", enqueued, err)
 	}
 	ran := ""
-	if processed, err := queue.ProcessOnce(ctx, func(_ context.Context, _ *sql.Tx, job worker.Job) error { ran = job.RequestKey; return nil }); err != nil || !processed || ran != "worker:after-stop" {
+	if processed, err := queue.ProcessOnce(ctx, func(_ context.Context, _ worker.Tx, job worker.Job) error { ran = job.RequestKey; return nil }); err != nil || !processed || ran != "worker:after-stop" {
 		t.Errorf("the pending job after restart: processed=%v ran=%q err=%v", processed, ran, err)
 	}
 	if err := database.Close(); err != nil {
@@ -248,85 +252,31 @@ func TestNineTriggersDrainTogether(t *testing.T) {
 	baseline := goroutineSet()
 	n := newNine(t, 1)
 	ctx := context.Background()
-	session, err := n.mcpSession(ctx, "alice")
-	if err != nil {
-		t.Fatal(err)
+	c := n.clients(ctx)
+	defer c.close()
+	points := slices.Collect(maps.Values(gated))
+	n.gate.holding(points...)
+	outcomes := map[string]<-chan error{}
+	for via := range gated {
+		outcomes[via] = n.request(ctx, c, via, "held")
 	}
-	defer session.Close()
-	socket, _, err := n.dialWS(ctx, "alice")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer socket.CloseNow()
-	n.gate.holding("http", "grpc", "websocket", "mcp", "submit:webhook", "submit:sse")
-	type outcome struct {
-		via string
-		err error
-	}
-	outcomes := make(chan outcome, 6)
-	expect := func(via string, err error) { outcomes <- outcome{via, err} }
-	go func() {
-		status, _, body := n.post("/quotes", auth("alice"), order)
-		if status != http.StatusOK {
-			expect("http", fmt.Errorf("%d %s", status, body))
-			return
-		}
-		expect("http", nil)
-	}()
-	go func() {
-		reply, err := n.callGRPC(ctx, "alice")
-		if err == nil && n.grpcCents(reply) != wantCents {
-			err = fmt.Errorf("totalCents %d", n.grpcCents(reply))
-		}
-		expect("grpc", err)
-	}()
-	go func() { _, err := wsQuote(ctx, socket, "held"); expect("websocket", err) }()
-	go func() { _, err := mcpQuote(ctx, session); expect("mcp", err) }()
-	go func() {
-		status, _, body := n.post("/webhooks/shop", n.signed("evt-held"), order)
-		if status != http.StatusAccepted {
-			expect("webhook", fmt.Errorf("%d %s", status, body))
-			return
-		}
-		expect("webhook", nil)
-	}()
-	go func() {
-		status, _, body := n.sseStart("alice", "held")
-		if status != http.StatusAccepted {
-			expect("sse", fmt.Errorf("%d %s", status, body))
-			return
-		}
-		expect("sse", nil)
-	}()
-	held := map[string]bool{}
-	for len(held) < 6 {
-		select {
-		case via := <-n.gate.entered:
-			held[via] = true
-		case <-time.After(10 * time.Second):
-			t.Fatalf("only %v reached their hold", held)
-		}
-	}
+	n.waitEntered(points...)
 	drained := make(chan error, 1)
 	go func() { drained <- n.app.Shutdown(context.Background()) }()
-	deadline := time.Now().Add(5 * time.Second)
-	for n.app.State() == app.ReadyState {
-		if time.Now().After(deadline) {
-			t.Fatal("the application never began draining")
-		}
-		time.Sleep(time.Millisecond)
+	n.waitDraining()
+	if status, retry, _ := n.post("/quotes", auth("bob"), order); status != http.StatusServiceUnavailable || retry != "1" {
+		t.Errorf("http while draining: %d Retry-After %q", status, retry)
 	}
-	if status, _, _ := n.post("/quotes", auth("bob"), order); status != http.StatusServiceUnavailable {
-		t.Errorf("http while draining: %d", status)
+	if status, retry, _ := n.post("/webhooks/shop", n.signed("evt-late"), order); status != http.StatusServiceUnavailable || retry != "1" {
+		t.Errorf("webhook while draining: %d Retry-After %q", status, retry)
 	}
-	if status, _, _ := n.post("/webhooks/shop", n.signed("evt-late"), order); status != http.StatusServiceUnavailable {
-		t.Errorf("webhook while draining: %d", status)
+	if status, retry, _ := n.sseStart("bob", "late"); status != http.StatusServiceUnavailable || retry != "1" {
+		t.Errorf("sse while draining: %d Retry-After %q", status, retry)
 	}
-	if status, _, _ := n.sseStart("bob", "late"); status != http.StatusServiceUnavailable {
-		t.Errorf("sse while draining: %d", status)
-	}
-	if _, err := n.mcpSession(ctx, "bob"); err == nil {
-		t.Error("mcp: a draining application opened a session")
+	headers := auth("bob")
+	headers["Accept"] = "application/json, text/event-stream"
+	if status, retry, body := n.post("/mcp", headers, initialize); status != http.StatusServiceUnavailable || retry != "1" || strings.TrimSpace(string(body)) != "unavailable" {
+		t.Errorf("mcp while draining: %d Retry-After %q %s", status, retry, body)
 	}
 	if _, response, err := n.dialWS(ctx, "bob"); err == nil || response == nil || response.StatusCode != http.StatusServiceUnavailable {
 		t.Errorf("websocket while draining: %v %v", response, err)
@@ -338,27 +288,210 @@ func TestNineTriggersDrainTogether(t *testing.T) {
 		t.Fatalf("the application is %s with six requests in flight; want draining", state)
 	}
 	close(n.gate.release)
-	for range 6 {
+	for via, outcome := range outcomes {
 		select {
-		case o := <-outcomes:
-			if o.err != nil {
-				t.Errorf("%s did not complete: %v", o.via, o.err)
+		case err := <-outcome:
+			if err != nil {
+				t.Errorf("%s did not complete: %v", via, err)
 			}
 		case <-time.After(10 * time.Second):
-			t.Fatal("a held request never completed")
+			t.Fatalf("%s never completed", via)
 		}
 	}
 	if err := <-drained; err != nil {
 		t.Fatalf("drain: %v", err)
 	}
-	for via, key := range map[string]string{"webhook": webhook.SubmissionKey("shop", "evt-held"), "sse": sse.SubmissionKey("orders", trigger.Principal{ID: "alice"}, "held")} {
+	for via, key := range map[string]string{"webhook": webhook.SubmissionKey("shop", "held"), "sse": sse.SubmissionKey("orders", trigger.Principal{ID: "alice"}, "held")} {
 		if _, err := n.queue.Get(ctx, key); err != nil {
 			t.Errorf("%s was answered but not committed: %v", via, err)
 		}
 	}
-	_ = session.Close()
-	socket.CloseNow()
+	if errs := n.workerErrs.Load(); errs != 0 {
+		t.Fatalf("the worker pool saw %d errors; first %v", errs, n.firstErr.Load())
+	}
+	c.close()
 	n.stop()
+	noLeaks(t, baseline)
+}
+
+// TestEachTriggerAloneHoldsTheApplication holds work on one gated trigger
+// at a time: that work alone must keep the application draining until it
+// completes. Holding all six at once cannot show this, because any one of
+// them keeps the application open for the rest.
+func TestEachTriggerAloneHoldsTheApplication(t *testing.T) {
+	for _, via := range slices.Sorted(maps.Keys(gated)) {
+		t.Run(via, func(t *testing.T) {
+			n := newNine(t, 1)
+			ctx := context.Background()
+			c := n.clients(ctx)
+			defer c.close()
+			n.gate.holding(gated[via])
+			outcome := n.request(ctx, c, via, "alone")
+			n.waitEntered(gated[via])
+			drained := make(chan error, 1)
+			go func() { drained <- n.app.Shutdown(context.Background()) }()
+			n.waitDraining()
+			time.Sleep(100 * time.Millisecond)
+			if state := n.app.State(); state != app.DrainingState {
+				t.Fatalf("with only %s in flight the application is %s; want draining", via, state)
+			}
+			close(n.gate.release)
+			if err := <-outcome; err != nil {
+				t.Fatalf("%s did not complete: %v", via, err)
+			}
+			if err := <-drained; err != nil {
+				t.Fatalf("drain: %v", err)
+			}
+		})
+	}
+}
+
+// TestHostShutdownOrderAndRestart shuts a host down in the order ADR 0005
+// documents, with work in flight, then restarts it over the same store:
+//   - step 1 (the adapters): held HTTP, gRPC, MCP, webhook and SSE work
+//     completes and is answered while the application stays ready, and the
+//     long-lived WebSocket connection is closed as going away;
+//   - step 2 (the application): a worker job in flight is canceled with its
+//     consumer, rolled back and left pending without spending an attempt;
+//   - after the restart, that job runs exactly once, repeats of committed
+//     webhook and SSE work are duplicates, a recreated stream of settled
+//     work expires, and cron does not fire an occurrence it already fired.
+func TestHostShutdownOrderAndRestart(t *testing.T) {
+	baseline := goroutineSet()
+	n := newNine(t, 1)
+	ctx := context.Background()
+	close(n.begin)
+
+	// Cron fires its occurrence and the job completes.
+	n.clock.set(occurrence)
+	select {
+	case results := <-n.cronRuns:
+		if len(results) != 1 || len(results[0].Submitted) != 1 {
+			t.Fatalf("cron: %+v", results)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("cron never fired its occurrence")
+	}
+	n.waitSettled(cron.SubmissionKey("nightly-quote", occurrence))
+
+	// Step 1 with HTTP, gRPC, MCP, webhook and SSE work held.
+	c := n.clients(ctx)
+	defer c.close()
+	held := []string{"http", "grpc", "mcp", "webhook", "sse"}
+	points := make([]string, 0, len(held))
+	outcomes := map[string]<-chan error{}
+	for _, via := range held {
+		points = append(points, gated[via])
+	}
+	n.gate.holding(points...)
+	for _, via := range held {
+		outcomes[via] = n.request(ctx, c, via, "in-flight")
+	}
+	n.waitEntered(points...)
+	// The WebSocket client reads, as a real one does, so it answers the
+	// server's closing handshake.
+	wsClosed := make(chan error, 1)
+	go func() {
+		_, _, err := c.socket.Read(ctx)
+		wsClosed <- err
+	}()
+	adapters := make(chan struct{})
+	go func() { defer close(adapters); n.stopAdapters() }()
+	time.Sleep(100 * time.Millisecond)
+	select {
+	case <-adapters:
+		t.Fatal("the adapters stopped with work still held")
+	default:
+	}
+	if state := n.app.State(); state != app.ReadyState {
+		t.Fatalf("the application is %s while the adapters finish their work; want ready", state)
+	}
+	close(n.gate.release)
+	for via, outcome := range outcomes {
+		select {
+		case err := <-outcome:
+			if err != nil {
+				t.Errorf("%s did not complete: %v", via, err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("%s never completed", via)
+		}
+	}
+	select {
+	case <-adapters:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the adapters never stopped")
+	}
+	var closing websocket.CloseError
+	if err := <-wsClosed; !errors.As(err, &closing) || closing.Code != websocket.StatusGoingAway {
+		t.Errorf("the WebSocket connection ended with %v; want 1001 going away", err)
+	}
+	webhookKey := webhook.SubmissionKey("shop", "in-flight")
+	sseKey := sse.SubmissionKey("orders", trigger.Principal{ID: "alice"}, "in-flight")
+	n.waitSettled(webhookKey, sseKey)
+
+	// Step 2 with a worker job in flight.
+	n.gate.holdingUntilCanceled("worker")
+	if enqueued, err := n.queue.Enqueue(ctx, worker.EnqueueRequest{RequestKey: "worker:in-flight", Kind: "quote.worker", Payload: []byte(order), MaxAttempts: 3}); err != nil || !enqueued.Accepted {
+		t.Fatalf("worker: %+v %v", enqueued, err)
+	}
+	n.waitEntered("worker")
+	n.stopped = true
+	n.stopApplication()
+	once := map[string]int{"cron": 1, "http": 1, "grpc": 1, "mcp": 1, "webhook": 1, "sse": 1}
+	if got := n.flow.counts(); !maps.Equal(got, once) {
+		t.Fatalf("workflow runs by trigger %v, want %v (the worker job must not have run)", got, once)
+	}
+
+	// Restart over the same store.
+	r := newNineAt(t, 1, n.path)
+	job, err := r.queue.Get(ctx, "worker:in-flight")
+	if err != nil || job.State != worker.StatePending || job.Attempt != 0 || job.Deferrals != 1 {
+		t.Fatalf("the job in flight at shutdown: %+v %v; want pending at attempt 0 with one deferral", job, err)
+	}
+	if status, _, body := r.post("/webhooks/shop", r.signed("in-flight"), order); status != http.StatusOK {
+		t.Errorf("webhook repeat after restart: %d %s", status, body)
+	}
+	code, _, body := r.sseStart("alice", "in-flight")
+	if code != http.StatusOK || !strings.Contains(string(body), `"duplicate":true`) {
+		t.Errorf("sse repeat after restart: %d %s", code, body)
+	}
+	if event := r.finalEvent(ctx, "alice", sse.StreamID(sseKey)); event != sse.TypeExpired {
+		t.Errorf("the recreated stream of settled work ended with %q; want %s", event, sse.TypeExpired)
+	}
+	// The job deferred at shutdown is redelivered after its backoff; make
+	// it due now.
+	if err := r.database.WithTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE worker_jobs SET available_at = 0 WHERE state = ?`, worker.StatePending)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	r.clock.set(occurrence)
+	close(r.begin)
+	r.waitSettled("worker:in-flight")
+	// Cron's cursor is past the occurrence it fired before the restart.
+	time.Sleep(200 * time.Millisecond)
+	for drained := false; !drained; {
+		select {
+		case results := <-r.cronRuns:
+			for _, result := range results {
+				if len(result.Submitted) != 0 {
+					t.Errorf("cron fired again after the restart: %+v", result)
+				}
+			}
+		default:
+			drained = true
+		}
+	}
+	if got, want := r.flow.counts(), map[string]int{"worker": 1}; !maps.Equal(got, want) {
+		t.Fatalf("workflow runs after the restart %v, want %v", got, want)
+	}
+	if errs := n.workerErrs.Load() + r.workerErrs.Load(); errs != 0 {
+		t.Fatalf("the worker pools saw %d errors; first %v %v", errs, n.firstErr.Load(), r.firstErr.Load())
+	}
+	c.close()
+	r.stop()
 	noLeaks(t, baseline)
 }
 
@@ -540,11 +673,12 @@ func TestAdaptersAreIndependentlyRemovable(t *testing.T) {
 	}
 	declared := map[string][]string{"pubsub/natsjs": {"pubsub"}}
 	store := map[string]bool{"worker": true, "cron": true}
-	for _, goos := range []string{"linux", "darwin", "windows"} {
+	for _, platform := range [][2]string{{"linux", "amd64"}, {"linux", "arm64"}, {"darwin", "arm64"}, {"windows", "amd64"}} {
+		goos, goarch := platform[0], platform[1]
 		footprint := map[string]int{}
 		for _, adapter := range adapters {
 			command := exec.Command(goTool(t), "list", "-deps", "-f", "{{.ImportPath}} {{with .Module}}{{.Path}}{{end}}", module+"/trigger/"+adapter)
-			command.Env = append(os.Environ(), "GOOS="+goos, "GOARCH=amd64", "CGO_ENABLED=0")
+			command.Env = append(os.Environ(), "GOOS="+goos, "GOARCH="+goarch, "CGO_ENABLED=0")
 			output, err := command.CombinedOutput()
 			if err != nil {
 				t.Fatalf("go list %s (%s): %v\n%s", adapter, goos, err, output)
@@ -555,6 +689,9 @@ func TestAdaptersAreIndependentlyRemovable(t *testing.T) {
 				path, mod, _ := strings.Cut(line, " ")
 				if rel, ok := strings.CutPrefix(path, module+"/trigger/"); ok && rel != adapter && !slices.Contains(strings.Split(rel, "/"), "internal") && !slices.Contains(declared[adapter], rel) {
 					t.Errorf("%s: trigger/%s links trigger/%s", goos, adapter, rel)
+				}
+				if path == module+"/contract/conformance" {
+					t.Errorf("%s/%s: trigger/%s links the conformance harness, which is for tests only", goos, goarch, adapter)
 				}
 				if (path == "database/sql" || path == module+"/store" || strings.HasPrefix(path, module+"/store/")) && !store[adapter] {
 					t.Errorf("%s: trigger/%s links %s; only worker and cron own durable state", goos, adapter, path)
@@ -576,6 +713,6 @@ func TestAdaptersAreIndependentlyRemovable(t *testing.T) {
 		for _, name := range names {
 			report = append(report, fmt.Sprintf("%s=%d", name, footprint[name]))
 		}
-		t.Logf("%s packages linked per adapter: %s", goos, strings.Join(report, " "))
+		t.Logf("%s/%s packages linked per adapter: %s", goos, goarch, strings.Join(report, " "))
 	}
 }

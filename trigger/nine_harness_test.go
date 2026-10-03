@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -86,15 +85,27 @@ func bearer(request *http.Request) (trigger.Principal, error) {
 }
 
 // gate holds work at a point until released, and reports what reached it.
+// A point held until canceled ignores the release: its work only stops when
+// its context ends.
 type gate struct {
-	mu      sync.Mutex
-	hold    map[string]bool
-	entered chan string
-	release chan struct{}
+	mu       sync.Mutex
+	hold     map[string]bool
+	canceled map[string]bool
+	entered  chan string
+	release  chan struct{}
 }
 
 func newGate() *gate {
-	return &gate{hold: map[string]bool{}, entered: make(chan string, 64), release: make(chan struct{})}
+	return &gate{hold: map[string]bool{}, canceled: map[string]bool{}, entered: make(chan string, 64), release: make(chan struct{})}
+}
+
+func (g *gate) holdingUntilCanceled(names ...string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for _, name := range names {
+		g.hold[name] = true
+		g.canceled[name] = true
+	}
 }
 
 func (g *gate) holding(names ...string) {
@@ -107,12 +118,16 @@ func (g *gate) holding(names ...string) {
 
 func (g *gate) pass(ctx context.Context, name string) error {
 	g.mu.Lock()
-	held := g.hold[name]
+	held, untilCanceled := g.hold[name], g.canceled[name]
 	g.mu.Unlock()
 	if !held {
 		return nil
 	}
 	g.entered <- name
+	if untilCanceled {
+		<-ctx.Done()
+		return ctx.Err()
+	}
 	select {
 	case <-g.release:
 		return nil
@@ -515,11 +530,18 @@ type nine struct {
 
 func newNine(t *testing.T, workers int) *nine {
 	t.Helper()
+	return newNineAt(t, workers, filepath.Join(t.TempDir(), "nine.db"))
+}
+
+// newNineAt is newNine over the store at path: a second one over the same
+// path is the same application restarted.
+func newNineAt(t *testing.T, workers int, path string) *nine {
+	t.Helper()
 	runner, err := quote.New()
 	if err != nil {
 		t.Fatal(err)
 	}
-	n := &nine{t: t, path: filepath.Join(t.TempDir(), "nine.db"), gate: newGate(), clock: &cronClock{now: occurrence.Add(-time.Minute)}, cronRuns: make(chan []cron.Result, 16), begin: make(chan struct{})}
+	n := &nine{t: t, path: path, gate: newGate(), clock: &cronClock{now: occurrence.Add(-time.Minute)}, cronRuns: make(chan []cron.Result, 16), begin: make(chan struct{})}
 	n.flow = &workflow{runner: runner, gate: n.gate, runs: map[string]int{}}
 	ctx := context.Background()
 	if n.database, err = (sqlite.Backend{}).Open(ctx, n.path); err != nil {
@@ -673,7 +695,7 @@ func (n *nine) work(ctx context.Context) {
 	for ctx.Err() == nil {
 		var key, via string
 		var output json.RawMessage
-		processed, err := n.queue.ProcessOnce(ctx, func(ctx context.Context, _ *sql.Tx, job worker.Job) error {
+		processed, err := n.queue.ProcessOnce(ctx, func(ctx context.Context, _ worker.Tx, job worker.Job) error {
 			via = strings.TrimPrefix(job.Kind, "quote.")
 			out, err := n.flow.run(ctx, via, job.Payload)
 			key, output = job.RequestKey, out
@@ -862,13 +884,49 @@ func (n *nine) output(key string) []byte {
 	return value.(json.RawMessage)
 }
 
-// stop shuts every adapter, the servers and the store down. Clients go
-// first, so no half-open client connection holds a server's shutdown.
+// stop shuts the host down in the order ADR 0005 documents:
+//  1. the long-lived adapters stop admitting and end their streams and
+//     sessions (SSE, WebSocket, MCP), the gRPC server finishes the calls
+//     in flight, and the HTTP server finishes its requests;
+//  2. the application drains what is left, then stops the queued sources
+//     it owns as dependencies (cron, pubsub, the worker pool);
+//  3. the broker connection and the store close last.
+//
+// The test's own idle HTTP connections go first, so none holds the
+// server's shutdown open; its gRPC client goes once the server has
+// finished the calls in flight.
 func (n *nine) stop() {
 	if n.stopped {
 		return
 	}
 	n.stopped = true
+	n.stopAdapters()
+	n.stopApplication()
+}
+
+// stopAdapters is step 1 of stop.
+func (n *nine) stopAdapters() {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	n.transport.CloseIdleConnections()
+	if err := errors.Join(n.streams.Shutdown(ctx), n.sockets.Shutdown(ctx), n.tools.Shutdown(ctx)); err != nil {
+		n.t.Errorf("adapter shutdown: %v", err)
+	}
+	n.grpc.GracefulStop()
+	_ = n.conn.Close()
+	if err := n.server.Shutdown(ctx); err != nil {
+		n.t.Errorf("http server shutdown: %v", err)
+	}
+	if err := <-n.served; !errors.Is(err, http.ErrServerClosed) {
+		n.t.Errorf("http serve: %v", err)
+	}
+	if err := <-n.grpcDone; err != nil {
+		n.t.Errorf("grpc serve: %v", err)
+	}
+}
+
+// stopApplication is steps 2 and 3 of stop.
+func (n *nine) stopApplication() {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if n.app.State() == app.ReadyState {
@@ -876,23 +934,130 @@ func (n *nine) stop() {
 			n.t.Errorf("application shutdown: %v", err)
 		}
 	}
-	_ = n.conn.Close()
-	n.transport.CloseIdleConnections()
-	if err := errors.Join(n.streams.Shutdown(ctx), n.sockets.Shutdown(ctx), n.tools.Shutdown(ctx), n.server.Shutdown(ctx)); err != nil {
-		n.t.Errorf("adapter shutdown: %v", err)
-	}
-	n.grpc.GracefulStop()
-	if err := <-n.served; !errors.Is(err, http.ErrServerClosed) {
-		n.t.Errorf("http serve: %v", err)
-	}
-	if err := <-n.grpcDone; err != nil {
-		n.t.Errorf("grpc serve: %v", err)
-	}
 	n.transport.CloseIdleConnections()
 	n.broker.close()
 	if err := n.database.Close(); err != nil {
 		n.t.Errorf("store close: %v", err)
 	}
+}
+
+// gated names the six triggers whose work holds the application open, and
+// the gate point each one's held work reaches.
+var gated = map[string]string{"http": "http", "grpc": "grpc", "websocket": "websocket", "mcp": "mcp", "webhook": "submit:webhook", "sse": "submit:sse"}
+
+// clients are the long-lived client connections a held request needs.
+type clients struct {
+	session *sdk.ClientSession
+	socket  *websocket.Conn
+}
+
+func (n *nine) clients(ctx context.Context) clients {
+	n.t.Helper()
+	session, err := n.mcpSession(ctx, "alice")
+	if err != nil {
+		n.t.Fatal(err)
+	}
+	socket, _, err := n.dialWS(ctx, "alice")
+	if err != nil {
+		n.t.Fatal(err)
+	}
+	return clients{session: session, socket: socket}
+}
+
+func (c clients) close() {
+	_ = c.session.Close()
+	c.socket.CloseNow()
+}
+
+// request sends one request through a gated trigger in the background; id
+// names its WebSocket message, webhook event or SSE key.
+func (n *nine) request(ctx context.Context, c clients, via, id string) <-chan error {
+	done := make(chan error, 1)
+	go func() { done <- n.requestNow(ctx, c, via, id) }()
+	return done
+}
+
+func (n *nine) requestNow(ctx context.Context, c clients, via, id string) error {
+	switch via {
+	case "http":
+		if status, _, body := n.post("/quotes", auth("alice"), order); status != http.StatusOK {
+			return fmt.Errorf("%d %s", status, body)
+		}
+	case "grpc":
+		reply, err := n.callGRPC(ctx, "alice")
+		if err == nil && n.grpcCents(reply) != wantCents {
+			err = fmt.Errorf("totalCents %d", n.grpcCents(reply))
+		}
+		return err
+	case "websocket":
+		_, err := wsQuote(ctx, c.socket, id)
+		return err
+	case "mcp":
+		_, err := mcpQuote(ctx, c.session)
+		return err
+	case "webhook":
+		if status, _, body := n.post("/webhooks/shop", n.signed(id), order); status != http.StatusAccepted {
+			return fmt.Errorf("%d %s", status, body)
+		}
+	case "sse":
+		if status, _, body := n.sseStart("alice", id); status != http.StatusAccepted {
+			return fmt.Errorf("%d %s", status, body)
+		}
+	default:
+		return fmt.Errorf("no trigger %s", via)
+	}
+	return nil
+}
+
+// waitEntered waits until each named gate point holds work.
+func (n *nine) waitEntered(points ...string) {
+	n.t.Helper()
+	held := map[string]bool{}
+	for len(held) < len(points) {
+		select {
+		case point := <-n.gate.entered:
+			held[point] = true
+		case <-time.After(10 * time.Second):
+			n.t.Fatalf("only %v of %v reached their hold", held, points)
+		}
+	}
+}
+
+// waitDraining waits until the application has begun to drain.
+func (n *nine) waitDraining() {
+	n.t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for n.app.State() == app.ReadyState {
+		if time.Now().After(deadline) {
+			n.t.Fatal("the application never began draining")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// finalEvent follows an SSE stream to its first result, expired or error
+// event and returns its type.
+func (n *nine) finalEvent(ctx context.Context, principal, stream string) string {
+	n.t.Helper()
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, n.base+"/orders/"+stream, nil)
+	if err != nil {
+		n.t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+token(principal))
+	response, err := n.client.Do(request)
+	if err != nil || response.StatusCode != http.StatusOK {
+		n.t.Fatalf("subscribe: %v %v", response, err)
+	}
+	defer response.Body.Close()
+	lines := bufio.NewScanner(response.Body)
+	for lines.Scan() {
+		if event, ok := strings.CutPrefix(lines.Text(), "event: "); ok && event != "progress" {
+			return event
+		}
+	}
+	return ""
 }
 
 // goroutineSet returns the live goroutines by id, each with its stack.
