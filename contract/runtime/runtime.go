@@ -149,6 +149,7 @@ func (h Hello) validate() error {
 	return nil
 }
 
+// Validate checks a hello before it is sent to a peer.
 func (h Hello) Validate() error { return h.validate() }
 
 func containsAll(have, want []Capability) bool {
