@@ -129,6 +129,14 @@
       "status": "implemented",
       "decision": "A start is a durable submission keyed by caller and idempotency key; its progress is best-effort, bounded and in memory, with epoch-qualified event ids, explicit retention/restart gaps, disconnect of slow subscribers, authorization before any stream byte, and a separate synchronous audit path (ADR 0010).",
       "evidence": ["sse-stream-fixture", "sse-wire-framing", "sse-heartbeat", "sse-reconnect-last-event-id", "sse-cursor-gaps", "sse-incarnation-gap", "sse-repeated-start-expired", "sse-authorization-isolation", "sse-slow-subscriber", "sse-write-timeout", "sse-interrupted-write", "sse-replay-not-copied", "sse-owner-quota", "sse-audit-versus-drop", "sse-start-order", "sse-concurrent-start-settle", "sse-detached-submission", "sse-eviction-order", "sse-leak-bounds", "sse-trigger-conformance"]
+    },
+    {
+      "id": "grpc-method-mapping",
+      "question": "How does a unary gRPC method map to a workflow, its errors and its bounds, and how does it share a server with the worker runtime?",
+      "owner": "E09-T05",
+      "status": "implemented",
+      "decision": "Generated method descriptors map to domain values by protojson, proven against the binding and workflow schemas at startup; calls are authenticated from metadata, authorized per method on the server, bounded in time, size and concurrency, answered with status codes carrying stable codes only; application services refuse the worker runtime's package and any name already registered (ADR 0013).",
+      "evidence": ["grpc-mapping-fixture", "grpc-generated-round-trip", "grpc-deadlines-cancellation", "grpc-capacity-size", "grpc-server-message-limit", "grpc-shutdown", "grpc-tls-listeners", "grpc-worker-collision", "grpc-no-leak", "grpc-wire-bounds", "grpc-json-value-limit", "grpc-panic-contained", "grpc-interceptor-request", "grpc-default-expansion", "grpc-nesting-bound", "grpc-protobuf-encoding-only", "grpc-trigger-conformance"]
     }
   ]
 }
