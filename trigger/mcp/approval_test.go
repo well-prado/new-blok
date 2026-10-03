@@ -21,6 +21,7 @@ import (
 	"github.com/well-prado/new-blok/internal/journal"
 	"github.com/well-prado/new-blok/node"
 	"github.com/well-prado/new-blok/store/sqlite"
+	"github.com/well-prado/new-blok/trigger"
 	tmcp "github.com/well-prado/new-blok/trigger/mcp"
 )
 
@@ -51,14 +52,18 @@ type receipt struct {
 
 // gateCatalog is how an application adapts the reviewed catalog (#144) to
 // the MCP port: every call is one invocation of an admitted run, and the
-// approval the caller names is only a name the gate looks up.
+// approval the caller names is only a name the gate looks up. The
+// invocation identity a reviewer approves binds the calling principal, the
+// tool and the exact input, so a decision cannot be used by another
+// principal or for another input, and an approved call runs at most once.
 type gateCatalog struct {
 	gate  *policy.CatalogGate
 	runID string
 }
 
-func invocation(runID, name, version string, input []byte, approvalID string) policy.Invocation {
-	return policy.Invocation{RunID: runID, InvocationPath: "mcp/" + name + "@" + version, IterationPath: "root", ApprovalID: approvalID, Input: input}
+func invocation(runID string, principal tool.Principal, name, version string, input []byte, approvalID string) policy.Invocation {
+	path := "mcp/" + principal.ID + "/" + name + "@" + version + "/" + approval.BytesDigest(input)
+	return policy.Invocation{RunID: runID, InvocationPath: path, IterationPath: "root", ApprovalID: approvalID, Input: input}
 }
 
 func (c gateCatalog) List(_ context.Context, principal tool.Principal) ([]tmcp.Tool, error) {
@@ -70,14 +75,22 @@ func (c gateCatalog) List(_ context.Context, principal tool.Principal) ([]tmcp.T
 }
 
 func (c gateCatalog) Invoke(ctx context.Context, principal tool.Principal, call tmcp.Call) (json.RawMessage, error) {
-	out, err := c.gate.Invoke(ctx, principal, call.Name, call.Version, invocation(c.runID, call.Name, call.Version, call.Input, call.Approval), call.Budget)
+	out, err := c.gate.Invoke(ctx, principal, call.Name, call.Version, invocation(c.runID, principal, call.Name, call.Version, call.Input, call.Approval), call.Budget)
 	switch {
-	case errors.Is(err, agent.ErrDenied), errors.Is(err, agent.ErrNotAgentSafe):
-		return nil, approval.ErrDenied
-	case errors.Is(err, agent.ErrCapacity):
-		return nil, approval.ErrCapacity
+	case err == nil:
+		return out, nil
+	case errors.Is(err, approval.ErrStale):
+		return nil, tmcp.ErrApprovalStale
+	case errors.Is(err, approval.ErrEvidence):
+		return nil, tmcp.ErrEvidenceRequired
+	case errors.Is(err, approval.ErrConflict):
+		return nil, tmcp.ErrConflict
+	case errors.Is(err, approval.ErrDenied), errors.Is(err, agent.ErrDenied), errors.Is(err, agent.ErrNotAgentSafe):
+		return nil, tmcp.ErrDenied
+	case errors.Is(err, approval.ErrCapacity), errors.Is(err, agent.ErrCapacity):
+		return nil, trigger.ErrSaturated
 	}
-	return out, err
+	return nil, err
 }
 
 type approvalRig struct {
@@ -88,6 +101,9 @@ type approvalRig struct {
 	clock     time.Time
 	effects   atomic.Int64
 	session   *sdk.ClientSession
+	// other holds the same capabilities as principal.
+	other        tool.Principal
+	otherSession *sdk.ClientSession
 }
 
 // newApprovalRig builds the real #144 stack — sqlite, the journal, the
@@ -102,7 +118,7 @@ func newApprovalRig(t *testing.T) *approvalRig {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
-	r := &approvalRig{principal: tool.Principal{ID: "agent-1", Capabilities: []string{"payment:write"}, MaxDepth: 4}, clock: time.Now()}
+	r := &approvalRig{principal: tool.Principal{ID: "agent-1", Capabilities: []string{"payment:write"}, MaxDepth: 4}, other: tool.Principal{ID: "agent-2", Capabilities: []string{"payment:write"}, MaxDepth: 4}, clock: time.Now()}
 	j, err := journal.New(ctx, db, journal.Config{})
 	if err != nil {
 		t.Fatal(err)
@@ -135,7 +151,7 @@ func newApprovalRig(t *testing.T) *approvalRig {
 		t.Fatal(err)
 	}
 	if err := r.gate.Bind("native/charge", "1.0.0", []string{"payment:write"}, verifier(func(_ context.Context, _ approval.Proposal, out []byte, claims []approval.Assertion) error {
-		if string(out) != `{"id":"synthetic-receipt"}` || r.effects.Load() != 1 || len(claims) != 0 {
+		if string(out) != `{"id":"synthetic-receipt"}` || r.effects.Load() == 0 || len(claims) != 0 {
 			return approval.ErrEvidence
 		}
 		return nil
@@ -153,10 +169,13 @@ func newApprovalRig(t *testing.T) *approvalRig {
 		t.Fatal(err)
 	}
 	adapter, err := tmcp.New(application, tmcp.Config{Name: "approval", Version: "1.0.0", Catalog: gateCatalog{gate: r.gate, runID: r.runID}, Authenticate: func(_ context.Context, token string, _ *http.Request) (tool.Principal, error) {
-		if token != "agent-token" {
-			return tool.Principal{}, errors.New("unknown token")
+		switch token {
+		case "agent-token":
+			return r.principal, nil
+		case "other-token":
+			return r.other, nil
 		}
-		return r.principal, nil
+		return tool.Principal{}, errors.New("unknown token")
 	}, Expose: []string{"native/charge@1.0.0"}, Budget: tool.Budget{MaxDepth: 4, MaxInputBytes: 1024, MaxOutputBytes: 1024, MaxTokens: 100, MaxCalls: 8}})
 	if err != nil {
 		t.Fatal(err)
@@ -174,8 +193,12 @@ func newApprovalRig(t *testing.T) *approvalRig {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if r.otherSession, err = connect(ctx, "http://"+listener.Addr().String(), "other-token"); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() {
 		_ = r.session.Close()
+		_ = r.otherSession.Close()
 		stop, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = adapter.Shutdown(stop)
@@ -188,7 +211,7 @@ func newApprovalRig(t *testing.T) *approvalRig {
 // decide records a reviewer's decision for exactly this call's proposal.
 func (r *approvalRig) decide(t *testing.T, id string, input []byte, approved bool) {
 	t.Helper()
-	proposal, err := r.gate.Prepare(context.Background(), r.principal, "native/charge", "1.0.0", invocation(r.runID, "native/charge", "1.0.0", input, id))
+	proposal, err := r.gate.Prepare(context.Background(), r.principal, "native/charge", "1.0.0", invocation(r.runID, r.principal, "native/charge", "1.0.0", input, id))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,13 +220,13 @@ func (r *approvalRig) decide(t *testing.T, id string, input []byte, approved boo
 	}
 }
 
-func (r *approvalRig) charge(t *testing.T, arguments map[string]any, approvalID string) (*sdk.CallToolResult, error) {
+func (r *approvalRig) charge(t *testing.T, session *sdk.ClientSession, arguments map[string]any, approvalID string) (*sdk.CallToolResult, error) {
 	t.Helper()
 	var meta sdk.Meta
 	if approvalID != "" {
 		meta = sdk.Meta{tmcp.ApprovalMeta: approvalID}
 	}
-	return call(r.session, tmcp.ToolName("native/charge", "1.0.0"), arguments, meta)
+	return call(session, tmcp.ToolName("native/charge", "1.0.0"), arguments, meta)
 }
 
 // TestEffectStaysBlockedUntilAScopedDecision drives the reviewed catalog
@@ -215,27 +238,39 @@ func TestEffectStaysBlockedUntilAScopedDecision(t *testing.T) {
 		t.Fatalf("tools %v", got)
 	}
 	one := map[string]any{"account": "synthetic-account", "amountCents": 1}
+	two := map[string]any{"account": "synthetic-account", "amountCents": 2}
 	oneBytes := []byte(`{"account":"synthetic-account","amountCents":1}`)
 	twoBytes := []byte(`{"account":"synthetic-account","amountCents":2}`)
 	steps := []struct {
-		name     string
-		before   func()
-		approval string
-		code     string
-		effects  int64
+		name      string
+		before    func()
+		session   *sdk.ClientSession
+		arguments map[string]any
+		approval  string
+		code      string
+		effects   int64
 	}{
 		{name: "no decision named", code: "denied"},
 		{name: "a decision that does not exist", approval: "review-missing", code: "approval_stale"},
 		{name: "a decision for a different input", before: func() { r.decide(t, "review-other", twoBytes, true) }, approval: "review-other", code: "approval_stale"},
 		{name: "a rejected decision", before: func() { r.decide(t, "review-rejected", oneBytes, false) }, approval: "review-rejected", code: "approval_stale"},
-		{name: "the decision for this call", before: func() { r.decide(t, "review-1", oneBytes, true) }, approval: "review-1", effects: 1},
+		{name: "another principal naming this call's decision", before: func() { r.decide(t, "review-1", oneBytes, true) }, session: r.otherSession, approval: "review-1", code: "approval_stale"},
+		{name: "the decision for this call", approval: "review-1", effects: 1},
 		{name: "the same decision again", approval: "review-1", code: "internal", effects: 1},
+		{name: "a decision for a second input runs its own effect", arguments: two, approval: "review-other", effects: 2},
 	}
 	for _, step := range steps {
 		if step.before != nil {
 			step.before()
 		}
-		result, err := r.charge(t, one, step.approval)
+		session, arguments := r.session, one
+		if step.session != nil {
+			session = step.session
+		}
+		if step.arguments != nil {
+			arguments = step.arguments
+		}
+		result, err := r.charge(t, session, arguments, step.approval)
 		if err != nil {
 			t.Fatalf("%s: %v", step.name, err)
 		}

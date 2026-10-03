@@ -12,10 +12,10 @@ import (
 
 	"github.com/well-prado/new-blok/agent"
 	"github.com/well-prado/new-blok/app"
-	"github.com/well-prado/new-blok/contract/approval"
 	"github.com/well-prado/new-blok/contract/tool"
 	"github.com/well-prado/new-blok/flow"
 	"github.com/well-prado/new-blok/node"
+	"github.com/well-prado/new-blok/trigger"
 	tmcp "github.com/well-prado/new-blok/trigger/mcp"
 )
 
@@ -39,10 +39,15 @@ func (c agentCatalog) List(_ context.Context, principal tool.Principal) ([]tmcp.
 
 func (c agentCatalog) Invoke(ctx context.Context, principal tool.Principal, call tmcp.Call) (json.RawMessage, error) {
 	out, err := c.catalog.Invoke(ctx, principal, call.Name, call.Version, call.Input, call.Budget)
-	if errors.Is(err, agent.ErrDenied) || errors.Is(err, agent.ErrNotAgentSafe) {
-		return nil, approval.ErrDenied
+	switch {
+	case err == nil:
+		return out, nil
+	case errors.Is(err, agent.ErrDenied), errors.Is(err, agent.ErrNotAgentSafe):
+		return nil, tmcp.ErrDenied
+	case errors.Is(err, agent.ErrCapacity):
+		return nil, trigger.ErrSaturated
 	}
-	return out, err
+	return nil, err
 }
 
 // TestWorkflowIsExposedAsAComposedTool registers two nodes and a workflow
@@ -129,6 +134,10 @@ func TestWorkflowIsExposedAsAComposedTool(t *testing.T) {
 	}
 	if output, _ := json.Marshal(result.StructuredContent); string(output) != `{"value":8}` || runs.Load() != 2 {
 		t.Fatalf("output=%s runs=%d; want (3+1)*2 from both nodes", output, runs.Load())
+	}
+	invalid, err := call(reader, "workflow.increment-double_v1.0.0", map[string]any{"value": "three"}, nil)
+	if err != nil || !invalid.IsError || toolCode(invalid) != "invalid_input" || runs.Load() != 2 {
+		t.Fatalf("invalid workflow input: result=%+v err=%v runs=%d", invalid, err, runs.Load())
 	}
 	if _, err := call(reader, "native.increment_v1.0.0", map[string]any{"value": 3}, nil); err == nil {
 		t.Fatal("an unexposed node was callable")

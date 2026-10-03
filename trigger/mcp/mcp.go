@@ -12,8 +12,9 @@
 // policy. The adapter never dispatches an effect itself. An effect that needs
 // a reviewed decision stays blocked until the catalog finds one; the caller
 // can only name a decision (in the call's _meta), never grant one. Tool
-// failures reach the client as error results that carry a stable code, and
-// a client that cancels a call cancels its work.
+// failures reach the client as error results that carry a stable code. A
+// client that cancels a call, drops the request that carries it, or ends its
+// session cancels its work.
 package mcp
 
 import (
@@ -35,7 +36,6 @@ import (
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/well-prado/new-blok/app"
-	"github.com/well-prado/new-blok/contract/approval"
 	"github.com/well-prado/new-blok/contract/schema"
 	"github.com/well-prado/new-blok/contract/tool"
 	"github.com/well-prado/new-blok/trigger"
@@ -53,14 +53,32 @@ const (
 	DefaultMaxRequestBytes = 256 << 10
 	// MaxRequestBytesLimit is the domain value limit: a larger request
 	// cannot carry arguments a tool accepts.
-	MaxRequestBytesLimit  = schema.MaxPayloadBytes
-	DefaultSessionTimeout = 10 * time.Minute
-	DefaultMaxPrincipals  = 1024
-	MaxPrincipalsLimit    = 1 << 16
+	MaxRequestBytesLimit = schema.MaxPayloadBytes
+	// DefaultMaxCallsPerPrincipal bounds one principal's calls in flight,
+	// so one caller cannot take every slot.
+	DefaultMaxCallsPerPrincipal    = 8
+	DefaultMaxSessions             = 256
+	DefaultMaxSessionsPerPrincipal = 16
+	MaxSessionsLimit               = 1 << 16
+	DefaultSessionTimeout          = 10 * time.Minute
+	DefaultMaxPrincipals           = 1024
+	MaxPrincipalsLimit             = 1 << 16
 	// ApprovalMeta is the _meta key under which a call names the reviewed
 	// decision it relies on. Naming a decision grants nothing: the catalog
-	// checks that a decision with that id exists for this exact call.
+	// looks it up and checks it against the call.
 	ApprovalMeta = "newblok.dev/approval"
+
+	sessionHeader = "Mcp-Session-Id"
+)
+
+// The refusals a Catalog reports. An application maps its catalog's errors
+// onto these, onto trigger.ErrSaturated or tool.ErrBudget, or returns a
+// trigger.Classified error; anything else reaches the client as "internal".
+var (
+	ErrDenied           = errors.New("mcp: denied")
+	ErrApprovalStale    = errors.New("mcp: approval missing, rejected, expired or for another call")
+	ErrEvidenceRequired = errors.New("mcp: trusted evidence required")
+	ErrConflict         = errors.New("mcp: conflicting decision")
 )
 
 // Tool is one catalog tool as the adapter sees it.
@@ -85,14 +103,17 @@ type Call struct {
 // Catalog is the application's admission. An application implements it
 // over agent.Catalog, or over a policy.CatalogGate when effects need a
 // reviewed decision; either applies the principal's capabilities, the
-// budget and the policy on every call.
+// budget and the policy on every call. Binding a reviewed decision to the
+// calling principal is the application's: it chooses the invocation
+// identity a decision is recorded for.
 type Catalog interface {
 	List(context.Context, tool.Principal) ([]Tool, error)
 	Invoke(context.Context, tool.Principal, Call) (json.RawMessage, error)
 }
 
 // Authenticator resolves a request's bearer token to a principal: its id,
-// the capabilities it was granted and its maximum call depth.
+// the capabilities it was granted and its maximum call depth. Any error,
+// whatever its cause, refuses the request with 401.
 type Authenticator func(ctx context.Context, token string, request *http.Request) (tool.Principal, error)
 
 // Config describes one MCP endpoint.
@@ -105,14 +126,19 @@ type Config struct {
 	// tool the catalog lists but Expose does not name is never visible.
 	Expose []string
 	// Budget is the budget of every call; its deadline is set per call
-	// from Timeout.
+	// from Timeout, and its MaxOutputBytes bounds every result.
 	Budget tool.Budget
 	// Timeout bounds a call.
 	Timeout time.Duration
 	// MaxConcurrency bounds the calls in flight; more are refused.
 	MaxConcurrency int
+	// MaxCallsPerPrincipal bounds one principal's calls in flight.
+	MaxCallsPerPrincipal int
 	// MaxRequestBytes bounds an HTTP request body.
 	MaxRequestBytes int64
+	// MaxSessions and MaxSessionsPerPrincipal bound the open sessions; a
+	// session beyond them is refused with 503.
+	MaxSessions, MaxSessionsPerPrincipal int
 	// SessionTimeout closes a session idle for that long.
 	SessionTimeout time.Duration
 	// MaxPrincipals bounds the per-principal views kept in memory.
@@ -134,16 +160,19 @@ type Server struct {
 	retired []*view
 	calls   sync.WaitGroup
 	closing bool
+	// running counts each principal's calls in flight.
+	running map[string]int
+	// opened counts each principal's sessions, including those being
+	// opened; owners maps a live session to its principal.
+	opened   map[string]int
+	sessions int
+	owners   map[string]string
+	watchers sync.WaitGroup
 	// inflight holds the calls in flight by session id, so a session its
-	// owner ends cancels its calls.
-	inflight map[string]*sessionCalls
-}
-
-// sessionCalls are one session's calls in flight and the principal that
-// owns the session.
-type sessionCalls struct {
-	owner   string
-	cancels map[*context.CancelFunc]struct{}
+	// owner ends cancels its calls; ended marks such sessions until they
+	// close, so a call that starts late is canceled at once.
+	inflight map[string]map[*context.CancelFunc]struct{}
+	ended    map[string]bool
 }
 
 // view is the MCP server one principal sees.
@@ -176,8 +205,17 @@ func New(application *app.Application, config Config) (*Server, error) {
 	if config.MaxConcurrency <= 0 {
 		config.MaxConcurrency = DefaultMaxConcurrency
 	}
+	if config.MaxCallsPerPrincipal <= 0 {
+		config.MaxCallsPerPrincipal = min(DefaultMaxCallsPerPrincipal, config.MaxConcurrency)
+	}
 	if config.MaxRequestBytes <= 0 {
 		config.MaxRequestBytes = DefaultMaxRequestBytes
+	}
+	if config.MaxSessions <= 0 {
+		config.MaxSessions = DefaultMaxSessions
+	}
+	if config.MaxSessionsPerPrincipal <= 0 {
+		config.MaxSessionsPerPrincipal = min(DefaultMaxSessionsPerPrincipal, config.MaxSessions)
 	}
 	if config.SessionTimeout <= 0 {
 		config.SessionTimeout = DefaultSessionTimeout
@@ -185,15 +223,18 @@ func New(application *app.Application, config Config) (*Server, error) {
 	if config.MaxPrincipals <= 0 {
 		config.MaxPrincipals = DefaultMaxPrincipals
 	}
-	if config.Timeout > MaxTimeout || config.MaxConcurrency > MaxConcurrencyLimit || config.MaxRequestBytes > MaxRequestBytesLimit || config.MaxPrincipals > MaxPrincipalsLimit {
-		return nil, errors.New("mcp: timeout, concurrency, request size or principal count exceeds its limit")
+	if config.Timeout > MaxTimeout || config.MaxConcurrency > MaxConcurrencyLimit || config.MaxCallsPerPrincipal > config.MaxConcurrency ||
+		config.MaxRequestBytes > MaxRequestBytesLimit || config.MaxSessions > MaxSessionsLimit || config.MaxSessionsPerPrincipal > config.MaxSessions ||
+		config.MaxPrincipals > MaxPrincipalsLimit {
+		return nil, errors.New("mcp: a timeout, concurrency, request size, session or principal bound exceeds its limit")
 	}
 	probe := config.Budget
 	probe.Deadline = time.Now().Add(config.Timeout)
 	if err := probe.Validate(); err != nil {
 		return nil, fmt.Errorf("mcp: budget: %w", err)
 	}
-	s := &Server{application: application, config: config, exposed: map[string]bool{}, slots: make(chan struct{}, config.MaxConcurrency), views: map[string]*view{}, inflight: map[string]*sessionCalls{}}
+	s := &Server{application: application, config: config, exposed: map[string]bool{}, slots: make(chan struct{}, config.MaxConcurrency), views: map[string]*view{},
+		running: map[string]int{}, opened: map[string]int{}, owners: map[string]string{}, inflight: map[string]map[*context.CancelFunc]struct{}{}, ended: map[string]bool{}}
 	names := map[string]string{}
 	for _, ref := range config.Expose {
 		if !toolRef.MatchString(ref) || s.exposed[ref] {
@@ -214,15 +255,19 @@ func New(application *app.Application, config Config) (*Server, error) {
 		SessionTimeout:      config.SessionTimeout,
 		MaxRequestBodyBytes: config.MaxRequestBytes,
 	})
-	// The transport answers a DELETE only after the session's calls return,
-	// so a session its owner ends cancels its calls first.
-	ending := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if request.Method == http.MethodDelete {
+	route := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch {
+		case request.Method == http.MethodDelete:
+			// The transport answers a DELETE only after the session's calls
+			// return, so a session its owner ends cancels its calls first.
 			s.endSession(request)
+		case request.Method == http.MethodPost && request.Header.Get(sessionHeader) == "":
+			s.open(writer, request, streamable)
+			return
 		}
 		streamable.ServeHTTP(writer, request)
 	})
-	s.transport = auth.RequireBearerToken(s.verify, nil)(ending)
+	s.transport = auth.RequireBearerToken(s.verify, nil)(route)
 	return s, nil
 }
 
@@ -237,8 +282,8 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	// A GET is the session's standing stream and lasts as long as the
-	// session, so it is admitted but does not hold the application open;
-	// calls arrive as POSTs and do.
+	// session, so it is admitted but does not hold the application open.
+	// Each call holds its own lease while it runs.
 	if request.Method == http.MethodGet {
 		lease.Release()
 	} else {
@@ -255,25 +300,151 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	s.transport.ServeHTTP(writer, request)
 }
 
-// track registers a call's cancel function under its session and owner;
-// the returned function unregisters it.
-func (s *Server) track(session, owner string, cancel context.CancelFunc) func() {
+// open admits a request that opens a session within the session bounds, and
+// keeps the session counted until it closes. The count settles as the
+// response starts, before the client can see it and send its next request.
+func (s *Server) open(writer http.ResponseWriter, request *http.Request, transport http.Handler) {
+	principal := principalOf(auth.TokenInfoFromContext(request.Context()))
+	if principal.ID == "" {
+		http.Error(writer, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	owner := principal.ID
+	s.mu.Lock()
+	if s.closing || s.sessions >= s.config.MaxSessions || s.opened[owner] >= s.config.MaxSessionsPerPrincipal {
+		s.mu.Unlock()
+		writer.Header().Set("Retry-After", "1")
+		http.Error(writer, "saturated", http.StatusServiceUnavailable)
+		return
+	}
+	s.sessions++
+	s.opened[owner]++
+	s.mu.Unlock()
+	opening := &openingWriter{ResponseWriter: writer, settle: func(id string) { s.settle(principal, id) }}
+	transport.ServeHTTP(opening, request)
+	opening.settled()
+}
+
+// settle keeps a session the transport opened counted until it closes, and
+// releases the place of a request that opened none.
+func (s *Server) settle(principal tool.Principal, id string) {
+	owner := principal.ID
+	session := s.findSession(principal, id)
+	if session == nil {
+		s.closed(owner, "")
+		return
+	}
+	s.mu.Lock()
+	if s.closing {
+		// Shutdown may already be past the sessions it closes.
+		s.mu.Unlock()
+		_ = session.Close()
+		s.closed(owner, "")
+		return
+	}
+	s.owners[id] = owner
+	s.watchers.Add(1)
+	s.mu.Unlock()
+	go func() {
+		defer s.watchers.Done()
+		_ = session.Wait()
+		s.closed(owner, id)
+	}()
+}
+
+// openingWriter settles a session opening once, when the response starts or
+// the handler returns without one.
+type openingWriter struct {
+	http.ResponseWriter
+	settle func(id string)
+	done   bool
+}
+
+func (w *openingWriter) settled() {
+	if !w.done {
+		w.done = true
+		w.settle(w.Header().Get(sessionHeader))
+	}
+}
+
+func (w *openingWriter) WriteHeader(status int) {
+	w.settled()
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *openingWriter) Write(data []byte) (int, error) {
+	w.settled()
+	return w.ResponseWriter.Write(data)
+}
+
+func (w *openingWriter) Flush() {
+	w.settled()
+	_ = http.NewResponseController(w.ResponseWriter).Flush()
+}
+
+func (w *openingWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// findSession returns the open session id of principal's view, if any.
+func (s *Server) findSession(principal tool.Principal, id string) *sdk.ServerSession {
+	if id == "" {
+		return nil
+	}
+	s.mu.Lock()
+	var servers []*sdk.Server
+	if v, ok := s.views[viewKey(principal)]; ok {
+		servers = append(servers, v.server)
+	}
+	for _, v := range s.retired {
+		servers = append(servers, v.server)
+	}
+	s.mu.Unlock()
+	for _, server := range servers {
+		for session := range server.Sessions() {
+			if session.ID() == id {
+				return session
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Server) closed(owner, id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sessions--
+	if s.opened[owner]--; s.opened[owner] <= 0 {
+		delete(s.opened, owner)
+	}
+	if id != "" {
+		delete(s.owners, id)
+		delete(s.ended, id)
+	}
+}
+
+// track registers a call's cancel function under its session; the returned
+// function unregisters it. A call in a session its owner already ended is
+// canceled at once.
+func (s *Server) track(session string, cancel context.CancelFunc) func() {
 	if session == "" {
 		return func() {}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.ended[session] {
+		cancel()
+		return func() {}
+	}
 	calls, ok := s.inflight[session]
 	if !ok {
-		calls = &sessionCalls{owner: owner, cancels: map[*context.CancelFunc]struct{}{}}
+		calls = map[*context.CancelFunc]struct{}{}
 		s.inflight[session] = calls
 	}
-	calls.cancels[&cancel] = struct{}{}
+	calls[&cancel] = struct{}{}
 	return func() {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		delete(calls.cancels, &cancel)
-		if len(calls.cancels) == 0 && s.inflight[session] == calls {
+		delete(calls, &cancel)
+		if len(calls) == 0 && len(s.inflight[session]) == 0 {
 			delete(s.inflight, session)
 		}
 	}
@@ -283,20 +454,21 @@ func (s *Server) track(session, owner string, cancel context.CancelFunc) func() 
 // authenticated caller owns it. Anyone else's DELETE cancels nothing, and
 // the transport refuses it.
 func (s *Server) endSession(request *http.Request) {
-	session := request.Header.Get("Mcp-Session-Id")
+	session := request.Header.Get(sessionHeader)
 	info := auth.TokenInfoFromContext(request.Context())
 	if session == "" || info == nil {
 		return
 	}
 	s.mu.Lock()
-	calls, ok := s.inflight[session]
-	if !ok || calls.owner != info.UserID {
+	if owner, ok := s.owners[session]; !ok || owner != info.UserID {
 		s.mu.Unlock()
 		return
 	}
+	s.ended[session] = true
+	calls := s.inflight[session]
 	delete(s.inflight, session)
-	cancels := make([]*context.CancelFunc, 0, len(calls.cancels))
-	for cancel := range calls.cancels {
+	cancels := make([]*context.CancelFunc, 0, len(calls))
+	for cancel := range calls {
 		cancels = append(cancels, cancel)
 	}
 	s.mu.Unlock()
@@ -307,34 +479,50 @@ func (s *Server) endSession(request *http.Request) {
 
 // verify authenticates the bearer token. The token info's user id binds the
 // session to the principal: a request for that session as anyone else is
-// refused by the transport.
+// refused by the transport. The token info is built per HTTP request, so it
+// also carries the request's context: a call ends with the request that
+// carries it.
 func (s *Server) verify(ctx context.Context, token string, request *http.Request) (*auth.TokenInfo, error) {
 	principal, err := s.config.Authenticate(ctx, token, request)
 	if err != nil || strings.TrimSpace(principal.ID) == "" {
 		return nil, auth.ErrInvalidToken
 	}
 	principal.Capabilities = append([]string(nil), principal.Capabilities...)
-	return &auth.TokenInfo{UserID: principal.ID, Expiration: time.Now().Add(time.Hour), Extra: map[string]any{"principal": principal}}, nil
+	return &auth.TokenInfo{UserID: principal.ID, Expiration: time.Now().Add(time.Hour), Extra: map[string]any{"principal": principal, "request": request.Context()}}, nil
 }
 
-// serverFor returns the MCP server of the request's principal, built once
-// per distinct principal and capability set.
-func (s *Server) serverFor(request *http.Request) *sdk.Server {
-	info := auth.TokenInfoFromContext(request.Context())
+func principalOf(info *auth.TokenInfo) tool.Principal {
 	if info == nil {
-		return nil
+		return tool.Principal{}
 	}
-	principal, ok := info.Extra["principal"].(tool.Principal)
-	if !ok {
+	principal, _ := info.Extra["principal"].(tool.Principal)
+	return principal
+}
+
+// serverFor returns the MCP server of the request's principal. The
+// transport asks on every request; only a request that opens a session
+// builds a view, once per distinct principal and capability set.
+func (s *Server) serverFor(request *http.Request) (server *sdk.Server) {
+	principal := principalOf(auth.TokenInfoFromContext(request.Context()))
+	if principal.ID == "" {
 		return nil
 	}
 	key := viewKey(principal)
 	s.mu.Lock()
-	if v, ok := s.views[key]; ok {
-		s.mu.Unlock()
+	v, ok := s.views[key]
+	closing := s.closing
+	s.mu.Unlock()
+	if ok {
 		return v.server
 	}
-	s.mu.Unlock()
+	if closing || request.Method != http.MethodPost || request.Header.Get(sessionHeader) != "" {
+		return nil
+	}
+	defer func() {
+		if recover() != nil {
+			server = nil
+		}
+	}()
 	ctx, cancel := context.WithTimeout(request.Context(), s.config.Timeout)
 	defer cancel()
 	v, err := s.build(ctx, principal)
@@ -343,6 +531,9 @@ func (s *Server) serverFor(request *http.Request) *sdk.Server {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closing {
+		return nil
+	}
 	if existing, ok := s.views[key]; ok {
 		return existing.server
 	}
@@ -379,8 +570,8 @@ func viewKey(principal tool.Principal) string {
 }
 
 // build lists the principal's tools and keeps those exposed whose schemas
-// an MCP client can use: an object input schema, and an object output
-// schema if any.
+// an MCP client can use: an object input schema, and an output schema that
+// parses, if any.
 func (s *Server) build(ctx context.Context, principal tool.Principal) (*view, error) {
 	listed, err := s.config.Catalog.List(ctx, principal)
 	if err != nil {
@@ -449,11 +640,6 @@ func failure(code string) *sdk.CallToolResult {
 	return &sdk.CallToolResult{IsError: true, Content: []sdk.Content{&sdk.TextContent{Text: string(text)}}}
 }
 
-// invalidParams is the protocol error for arguments a tool cannot accept.
-func invalidParams(code string) error {
-	return &jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: code}
-}
-
 // handler serves one tool of a view. The view is the session's, but each
 // call runs as the principal the call's own request authenticated, so
 // capabilities revoked since the session opened no longer apply.
@@ -465,56 +651,92 @@ func (s *Server) handler(owner tool.Principal, t Tool, input schema.Schema, outp
 			}
 		}()
 		var principal tool.Principal
+		var carrier context.Context
 		if request.Extra != nil && request.Extra.TokenInfo != nil {
-			principal, _ = request.Extra.TokenInfo.Extra["principal"].(tool.Principal)
+			principal = principalOf(request.Extra.TokenInfo)
+			carrier, _ = request.Extra.TokenInfo.Extra["request"].(context.Context)
 		}
 		if principal.ID == "" || principal.ID != owner.ID {
 			return failure("unauthorized"), nil
+		}
+		ctx, cancel := context.WithTimeout(ctx, s.config.Timeout)
+		defer cancel()
+		// The work ends when the client cancels the call, drops the request
+		// that carries it, or ends its session. Without an event store a
+		// dropped response stream cannot be resumed, so its result would be
+		// lost anyway.
+		if carrier != nil {
+			defer context.AfterFunc(carrier, cancel)()
+		}
+		if request.Session != nil {
+			defer s.track(request.Session.ID(), cancel)()
 		}
 		s.mu.Lock()
 		if s.closing {
 			s.mu.Unlock()
 			return failure("unavailable"), nil
 		}
+		if s.running[principal.ID] >= s.config.MaxCallsPerPrincipal {
+			s.mu.Unlock()
+			return failure("saturated"), nil
+		}
+		s.running[principal.ID]++
 		s.calls.Add(1)
 		s.mu.Unlock()
-		defer s.calls.Done()
+		defer func() {
+			s.mu.Lock()
+			if s.running[principal.ID]--; s.running[principal.ID] <= 0 {
+				delete(s.running, principal.ID)
+			}
+			s.mu.Unlock()
+			s.calls.Done()
+		}()
 		select {
 		case s.slots <- struct{}{}:
 			defer func() { <-s.slots }()
 		default:
 			return failure("saturated"), nil
 		}
+		// The call holds the application open while it runs, whatever
+		// happens to the request that carried it.
+		lease, err := s.application.Begin()
+		if err != nil {
+			return failure("unavailable"), nil
+		}
+		defer lease.Release()
 		arguments := request.Params.Arguments
 		if len(arguments) == 0 {
 			arguments = json.RawMessage("{}")
 		}
+		// Arguments the tool cannot accept are the model's to correct: a tool
+		// error, not a protocol error.
 		normalized, err := input.Normalize(arguments)
 		if err != nil {
-			return nil, invalidParams("invalid_input")
+			return failure("invalid_input"), nil
 		}
 		var named string
 		if value, ok := request.Params.Meta[ApprovalMeta]; ok {
+			// _meta is the client's, not the model's: a malformed name is a
+			// protocol error.
 			text, isText := value.(string)
 			if !isText || !reference.MatchString(text) {
-				return nil, invalidParams("invalid_approval")
+				return nil, &jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: "invalid_approval"}
 			}
 			named = text
-		}
-		ctx, cancel := context.WithTimeout(ctx, s.config.Timeout)
-		defer cancel()
-		// A session its client ends cancels its calls.
-		if request.Session != nil {
-			defer s.track(request.Session.ID(), principal.ID, cancel)()
 		}
 		budget := s.config.Budget
 		budget.Deadline, _ = ctx.Deadline()
 		out, err := s.config.Catalog.Invoke(ctx, principal, Call{Name: t.Name, Version: t.Version, Input: normalized, Approval: named, Budget: budget})
 		if err == nil && ctx.Err() != nil {
+			// The catalog returned after the deadline or after the client
+			// left: the call has already failed.
 			err = ctx.Err()
 		}
 		if err != nil {
 			return failure(codeFor(ctx, err)), nil
+		}
+		if len(out) > budget.MaxOutputBytes {
+			return failure("budget_exceeded"), nil
 		}
 		if output != nil {
 			if out, err = output.Normalize(out); err != nil {
@@ -536,15 +758,15 @@ func codeFor(ctx context.Context, err error) string {
 		return "deadline_exceeded"
 	case errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled):
 		return "canceled"
-	case errors.Is(err, trigger.ErrSaturated), errors.Is(err, approval.ErrCapacity):
+	case errors.Is(err, trigger.ErrSaturated):
 		return "saturated"
-	case errors.Is(err, approval.ErrStale):
+	case errors.Is(err, ErrApprovalStale):
 		return "approval_stale"
-	case errors.Is(err, approval.ErrEvidence):
+	case errors.Is(err, ErrEvidenceRequired):
 		return "evidence_required"
-	case errors.Is(err, approval.ErrConflict):
+	case errors.Is(err, ErrConflict):
 		return "conflict"
-	case errors.Is(err, approval.ErrDenied):
+	case errors.Is(err, ErrDenied):
 		return "denied"
 	case errors.Is(err, tool.ErrBudget):
 		return "budget_exceeded"
@@ -555,27 +777,36 @@ func codeFor(ctx context.Context, err error) string {
 	return "internal"
 }
 
-// Shutdown refuses new calls, waits for those in flight, and closes every
-// session.
+// Shutdown refuses new sessions and calls, waits for the calls in flight,
+// closes every session and waits for its bookkeeping to settle.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.mu.Lock()
 	s.closing = true
+	s.mu.Unlock()
+	if err := wait(ctx, &s.calls); err != nil {
+		return err
+	}
+	s.mu.Lock()
 	views := append(make([]*view, 0, len(s.views)+len(s.retired)), s.retired...)
 	for _, v := range s.views {
 		views = append(views, v)
 	}
 	s.mu.Unlock()
-	done := make(chan struct{})
-	go func() { s.calls.Wait(); close(done) }()
-	select {
-	case <-done:
-	case <-ctx.Done():
-		return ctx.Err()
-	}
 	for _, v := range views {
 		for session := range v.server.Sessions() {
 			_ = session.Close()
 		}
 	}
-	return nil
+	return wait(ctx, &s.watchers)
+}
+
+func wait(ctx context.Context, group *sync.WaitGroup) error {
+	done := make(chan struct{})
+	go func() { group.Wait(); close(done) }()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }

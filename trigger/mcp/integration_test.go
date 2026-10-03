@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -25,8 +27,8 @@ import (
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/well-prado/new-blok/app"
-	"github.com/well-prado/new-blok/contract/approval"
 	"github.com/well-prado/new-blok/contract/tool"
+	"github.com/well-prado/new-blok/trigger"
 	tmcp "github.com/well-prado/new-blok/trigger/mcp"
 )
 
@@ -67,6 +69,9 @@ func allows(principal tool.Principal, capability string) bool {
 
 func (c *fakeCatalog) List(_ context.Context, principal tool.Principal) ([]tmcp.Tool, error) {
 	c.lists.Add(1)
+	if principal.ID == "panicky" {
+		panic(secretMarker + ": listing failed")
+	}
 	var listed []tmcp.Tool
 	for _, t := range c.tools {
 		if allows(principal, t.capability) {
@@ -83,7 +88,7 @@ func (c *fakeCatalog) Invoke(ctx context.Context, principal tool.Principal, call
 	c.mu.Unlock()
 	t, ok := c.tools[call.Name+"@"+call.Version]
 	if !ok || !allows(principal, t.capability) {
-		return nil, approval.ErrDenied
+		return nil, tmcp.ErrDenied
 	}
 	return t.run(ctx, call)
 }
@@ -148,16 +153,26 @@ func newCatalog() *fakeCatalog {
 		return json.Marshal(map[string]string{"approval": call.Approval})
 	})
 	add("demo/capacity", "echo", empty, nil, nil, func(context.Context, tmcp.Call) (json.RawMessage, error) {
-		return nil, fmt.Errorf("%s: %w", secretMarker, approval.ErrCapacity)
+		return nil, fmt.Errorf("%s: %w", secretMarker, trigger.ErrSaturated)
 	})
 	add("demo/evidence", "echo", empty, nil, nil, func(context.Context, tmcp.Call) (json.RawMessage, error) {
-		return nil, fmt.Errorf("%s: %w", secretMarker, approval.ErrEvidence)
+		return nil, fmt.Errorf("%s: %w", secretMarker, tmcp.ErrEvidenceRequired)
 	})
 	add("demo/conflict", "echo", empty, nil, nil, func(context.Context, tmcp.Call) (json.RawMessage, error) {
-		return nil, fmt.Errorf("%s: %w", secretMarker, approval.ErrConflict)
+		return nil, fmt.Errorf("%s: %w", secretMarker, tmcp.ErrConflict)
 	})
 	add("demo/badcode", "echo", empty, nil, nil, func(context.Context, tmcp.Call) (json.RawMessage, error) {
 		return nil, classified{code: secretMarker, class: "domain"}
+	})
+	add("demo/big", "echo", empty, nil, nil, func(context.Context, tmcp.Call) (json.RawMessage, error) {
+		return json.Marshal(map[string]string{"blob": strings.Repeat("x", 4096)})
+	})
+	// stubborn ignores its context and runs until the test releases it.
+	add("demo/stubborn", "echo", empty, nil, nil, func(context.Context, tmcp.Call) (json.RawMessage, error) {
+		c.started <- struct{}{}
+		<-c.release
+		c.ended <- nil
+		return json.RawMessage(`{}`), nil
 	})
 	// late ignores its context and succeeds after any short deadline.
 	add("demo/late", "echo", empty, nil, nil, func(context.Context, tmcp.Call) (json.RawMessage, error) {
@@ -227,9 +242,12 @@ type rig struct {
 	server   *http.Server
 	endpoint string
 	wire     *wireLog
-	mu       sync.Mutex
-	tokens   map[string]tool.Principal
-	stopped  bool
+	// serverLog is the HTTP server's error log, where an unrecovered
+	// handler panic would be printed.
+	serverLog *wireLog
+	mu        sync.Mutex
+	tokens    map[string]tool.Principal
+	stopped   bool
 	// A request authenticated as "alice-paused" signals paused and waits
 	// for resume, then proceeds as alice.
 	paused chan struct{}
@@ -238,7 +256,7 @@ type rig struct {
 
 func newRig(t *testing.T, configure func(*tmcp.Config)) *rig {
 	t.Helper()
-	r := &rig{t: t, catalog: newCatalog(), wire: &wireLog{}, paused: make(chan struct{}, 1), resume: make(chan struct{}), tokens: map[string]tool.Principal{
+	r := &rig{t: t, catalog: newCatalog(), wire: &wireLog{}, serverLog: &wireLog{}, paused: make(chan struct{}, 1), resume: make(chan struct{}), tokens: map[string]tool.Principal{
 		"alice":  {ID: "alice", Capabilities: []string{"echo", "write"}, MaxDepth: 4},
 		"bob":    {ID: "bob", Capabilities: []string{"echo"}, MaxDepth: 4},
 		"nobody": {ID: "nobody", MaxDepth: 4},
@@ -263,7 +281,7 @@ func newRig(t *testing.T, configure func(*tmcp.Config)) *rig {
 		t.Fatal(err)
 	}
 	r.app, r.adapter, r.endpoint = application, adapter, "http://"+listener.Addr().String()
-	r.server = &http.Server{Handler: adapter, ReadHeaderTimeout: 5 * time.Second}
+	r.server = &http.Server{Handler: adapter, ReadHeaderTimeout: 5 * time.Second, ErrorLog: log.New(r.serverLog, "", 0)}
 	served := make(chan error, 1)
 	go func() { served <- r.server.Serve(listener) }()
 	t.Cleanup(func() {
@@ -724,11 +742,13 @@ func TestSessionEndCancelsTheWork(t *testing.T) {
 	}
 }
 
+// TestOverloadIsRefusedNotQueued fills the global slots from two principals,
+// each within its own bound, so only the global bound can refuse.
 func TestOverloadIsRefusedNotQueued(t *testing.T) {
 	r := newRig(t, func(c *tmcp.Config) { c.MaxConcurrency = 2 })
-	session := r.connect("alice")
+	alice, bob := r.connect("alice"), r.connect("bob")
 	results := make(chan string, 2)
-	for range 2 {
+	for _, session := range []*sdk.ClientSession{alice, bob} {
 		go func() {
 			result, err := call(session, "demo.block_v1.0.0", map[string]any{}, nil)
 			if err != nil {
@@ -740,7 +760,7 @@ func TestOverloadIsRefusedNotQueued(t *testing.T) {
 	}
 	<-r.catalog.started
 	<-r.catalog.started
-	result, err := call(session, "demo.echo_v1.0.0", map[string]any{"text": "a"}, nil)
+	result, err := call(alice, "demo.echo_v1.0.0", map[string]any{"text": "a"}, nil)
 	if err != nil || !result.IsError || toolCode(result) != "saturated" {
 		t.Fatalf("third call: result=%+v err=%v", result, err)
 	}
@@ -753,7 +773,7 @@ func TestOverloadIsRefusedNotQueued(t *testing.T) {
 			t.Fatalf("an admitted call ended with %q", code)
 		}
 	}
-	if result, err := call(session, "demo.echo_v1.0.0", map[string]any{"text": "a"}, nil); err != nil || result.IsError {
+	if result, err := call(alice, "demo.echo_v1.0.0", map[string]any{"text": "a"}, nil); err != nil || result.IsError {
 		t.Fatalf("a call after the burst: result=%+v err=%v", result, err)
 	}
 }
@@ -865,6 +885,11 @@ func TestNoGoroutinesOutliveTheServer(t *testing.T) {
 	baseline := runtime.NumGoroutine()
 	func() {
 		r := newRig(t, nil)
+		// One session is abandoned with a call dropped mid-flight; Shutdown
+		// must reclaim it.
+		abandoned := r.connect("alice")
+		r.drop("alice", abandoned, "demo.block_v1.0.0")
+		<-r.catalog.ended
 		for range 8 {
 			session, err := r.dial("alice")
 			if err != nil {
@@ -988,4 +1013,197 @@ func TestCallAdmittedBeforeShutdownIsRefused(t *testing.T) {
 		t.Fatalf("the catalog saw %d calls; only the blocked one was admitted before shutdown", n)
 	}
 	close(r.catalog.release)
+}
+
+// drop sends one call as token on session and drops the request once the
+// tool has started, without any cancellation notification.
+func (r *rig) drop(token string, session *sdk.ClientSession, name string) {
+	r.t.Helper()
+	message := map[string]any{"jsonrpc": "2.0", "id": 77, "method": "tools/call", "params": map[string]any{"name": name, "arguments": map[string]any{}}}
+	data, err := json.Marshal(message)
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, r.endpoint, bytes.NewReader(data))
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json, text/event-stream")
+	request.Header.Set("Mcp-Session-Id", session.ID())
+	request.Header.Set("Mcp-Protocol-Version", session.InitializeResult().ProtocolVersion)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		response, err := (&http.Client{Transport: recordingClient{token: token}}).Do(request)
+		if err == nil {
+			_, _ = io.Copy(io.Discard, response.Body)
+			response.Body.Close()
+		}
+	}()
+	<-r.catalog.started
+	cancel()
+	<-done
+}
+
+// TestDroppedRequestCancelsTheWork drops the HTTP request carrying a call:
+// no notification and no DELETE, only the connection going away.
+func TestDroppedRequestCancelsTheWork(t *testing.T) {
+	r := newRig(t, nil)
+	session := r.connect("alice")
+	r.drop("alice", session, "demo.block_v1.0.0")
+	select {
+	case err := <-r.catalog.ended:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("the work ended with %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("dropping the request did not cancel the work")
+	}
+}
+
+// TestCallHoldsTheApplicationOpen: a call whose request was dropped, and
+// whose tool ignores cancellation, still keeps the application from
+// stopping under it.
+func TestCallHoldsTheApplicationOpen(t *testing.T) {
+	r := newRig(t, func(c *tmcp.Config) { c.Expose = []string{"demo/stubborn@1.0.0"} })
+	session := r.connect("alice")
+	r.drop("alice", session, "demo.stubborn_v1.0.0")
+	drained := make(chan error, 1)
+	go func() { drained <- r.app.Shutdown(context.Background()) }()
+	select {
+	case err := <-drained:
+		t.Fatalf("the application stopped under a running call: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(r.catalog.release)
+	if err := <-drained; err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if err := <-r.catalog.ended; err != nil {
+		t.Fatalf("the call ended with %v", err)
+	}
+}
+
+func TestSessionsAreBounded(t *testing.T) {
+	r := newRig(t, func(c *tmcp.Config) {
+		c.MaxSessions = 3
+		c.MaxSessionsPerPrincipal = 2
+	})
+	r.grant("carol", tool.Principal{ID: "carol", Capabilities: []string{"echo"}, MaxDepth: 4})
+	first, err := r.dial("alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = r.connect("alice")
+	if session, err := r.dial("alice"); err == nil {
+		session.Close()
+		t.Fatal("a principal opened more sessions than its bound")
+	}
+	_ = r.connect("bob")
+	if session, err := r.dial("carol"); err == nil {
+		session.Close()
+		t.Fatal("more sessions than the global bound were opened")
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		session, err := r.dial("carol")
+		if err == nil {
+			session.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("a closed session never freed its place: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestOnePrincipalCannotTakeEverySlot(t *testing.T) {
+	r := newRig(t, func(c *tmcp.Config) {
+		c.MaxConcurrency = 4
+		c.MaxCallsPerPrincipal = 2
+	})
+	alice := r.connect("alice")
+	for range 2 {
+		go func() { _, _ = call(alice, "demo.block_v1.0.0", map[string]any{}, nil) }()
+	}
+	<-r.catalog.started
+	<-r.catalog.started
+	if result, err := call(alice, "demo.echo_v1.0.0", map[string]any{"text": "a"}, nil); err != nil || toolCode(result) != "saturated" {
+		t.Fatalf("alice's third call: result=%+v err=%v", result, err)
+	}
+	if result, err := call(r.connect("bob"), "demo.echo_v1.0.0", map[string]any{"text": "a"}, nil); err != nil || result.IsError {
+		t.Fatalf("bob was starved: result=%+v err=%v", result, err)
+	}
+	close(r.catalog.release)
+}
+
+func TestOversizedOutputIsRefused(t *testing.T) {
+	r := newRig(t, func(c *tmcp.Config) {
+		c.Expose = []string{"demo/big@1.0.0"}
+		c.Budget.MaxOutputBytes = 1024
+	})
+	result, err := call(r.connect("alice"), "demo.big_v1.0.0", map[string]any{}, nil)
+	if err != nil || !result.IsError || toolCode(result) != "budget_exceeded" {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+}
+
+func TestPanicWhileListingRefusesOnlyThatSession(t *testing.T) {
+	r := newRig(t, nil)
+	r.grant("panicky", tool.Principal{ID: "panicky", Capabilities: []string{"echo"}, MaxDepth: 4})
+	if session, err := r.dial("panicky"); err == nil {
+		session.Close()
+		t.Fatal("a session opened over a catalog that panicked")
+	}
+	if result, err := call(r.connect("alice"), "demo.echo_v1.0.0", map[string]any{"text": "a"}, nil); err != nil || result.IsError {
+		t.Fatalf("the server stopped serving: result=%+v err=%v", result, err)
+	}
+	if strings.Contains(r.wire.String(), secretMarker) || strings.Contains(r.serverLog.String(), secretMarker) {
+		t.Fatalf("the panic escaped: wire=%t log=%q", strings.Contains(r.wire.String(), secretMarker), r.serverLog.String())
+	}
+}
+
+// TestOnlyOpeningASessionBuildsAView: the transport asks for a server on
+// every request; a call on an open session must not rebuild (or evict) a
+// view.
+func TestOnlyOpeningASessionBuildsAView(t *testing.T) {
+	r := newRig(t, func(c *tmcp.Config) { c.MaxPrincipals = 1 })
+	r.grant("carol", tool.Principal{ID: "carol", Capabilities: []string{"echo"}, MaxDepth: 4})
+	alice := r.connect("alice")
+	_ = r.connect("carol")
+	before := r.catalog.lists.Load()
+	for range 3 {
+		if result, err := call(alice, "demo.echo_v1.0.0", map[string]any{"text": "a"}, nil); err != nil || result.IsError {
+			t.Fatalf("result=%+v err=%v", result, err)
+		}
+	}
+	if n := r.catalog.lists.Load() - before; n != 0 {
+		t.Fatalf("calls on an open session listed the catalog %d times", n)
+	}
+}
+
+// TestAdapterLinksNoStoreOrAgent: an adapter may not import a store, the
+// engine, the journal or the agent packages, even transitively.
+func TestAdapterLinksNoStoreOrAgent(t *testing.T) {
+	goTool, err := exec.LookPath("go")
+	if err != nil {
+		goTool = filepath.Join(runtime.GOROOT(), "bin", "go")
+	}
+	output, err := exec.Command(goTool, "list", "-deps", ".").CombinedOutput()
+	if err != nil {
+		t.Fatalf("go list: %v\n%s", err, output)
+	}
+	for _, dependency := range strings.Fields(string(output)) {
+		for _, forbidden := range []string{"database/sql", "github.com/well-prado/new-blok/store", "github.com/well-prado/new-blok/agent", "github.com/well-prado/new-blok/internal/journal", "github.com/well-prado/new-blok/internal/engine", "github.com/well-prado/new-blok/contract/approval"} {
+			if dependency == forbidden || strings.HasPrefix(dependency, forbidden+"/") {
+				t.Errorf("trigger/mcp links %s", dependency)
+			}
+		}
+	}
 }

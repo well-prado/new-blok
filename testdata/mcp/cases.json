@@ -10,9 +10,9 @@
   ],
   "calls": [
     {"name": "valid input reaches the tool once", "token": "bob", "tool": "demo.echo_v1.0.0", "arguments": {"text": "hi"}, "expect": {"kind": "result", "output": {"echo": "hi"}, "invocations": 1, "effects": 0}},
-    {"name": "input of the wrong type is refused before dispatch", "token": "bob", "tool": "demo.echo_v1.0.0", "arguments": {"text": 5}, "expect": {"kind": "protocol", "rpcCode": -32602, "message": "invalid_input", "invocations": 0, "effects": 0}},
-    {"name": "missing required input is refused before dispatch", "token": "bob", "tool": "demo.echo_v1.0.0", "arguments": {}, "expect": {"kind": "protocol", "rpcCode": -32602, "message": "invalid_input", "invocations": 0, "effects": 0}},
-    {"name": "unknown input field is refused before dispatch", "token": "bob", "tool": "demo.echo_v1.0.0", "arguments": {"text": "hi", "admin": true}, "expect": {"kind": "protocol", "rpcCode": -32602, "message": "invalid_input", "invocations": 0, "effects": 0}},
+    {"name": "input of the wrong type is a tool error the model can correct, before dispatch", "token": "bob", "tool": "demo.echo_v1.0.0", "arguments": {"text": 5}, "expect": {"kind": "toolError", "code": "invalid_input", "invocations": 0, "effects": 0}},
+    {"name": "missing required input is refused before dispatch", "token": "bob", "tool": "demo.echo_v1.0.0", "arguments": {}, "expect": {"kind": "toolError", "code": "invalid_input", "invocations": 0, "effects": 0}},
+    {"name": "unknown input field is refused before dispatch", "token": "bob", "tool": "demo.echo_v1.0.0", "arguments": {"text": "hi", "admin": true}, "expect": {"kind": "toolError", "code": "invalid_input", "invocations": 0, "effects": 0}},
     {"name": "unknown tool is a protocol error", "token": "alice", "tool": "demo.nope_v1.0.0", "arguments": {}, "expect": {"kind": "protocol", "rpcCode": -32602, "invocations": 0, "effects": 0}},
     {"name": "unknown version is a protocol error", "token": "alice", "tool": "demo.echo_v2.0.0", "arguments": {"text": "hi"}, "expect": {"kind": "protocol", "rpcCode": -32602, "invocations": 0, "effects": 0}},
     {"name": "a listed tool that is not exposed is invisible", "token": "alice", "tool": "demo.hidden_v1.0.0", "arguments": {}, "expect": {"kind": "protocol", "rpcCode": -32602, "invocations": 0, "effects": 0}},
