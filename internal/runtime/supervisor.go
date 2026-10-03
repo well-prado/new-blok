@@ -176,6 +176,13 @@ func (s *Supervisor) Call(ctx context.Context, call contract.Call) (contract.Res
 }
 
 func (s *Supervisor) Shutdown(ctx context.Context) error {
+	// Respect the application's explicit drain deadline. Only an unbounded
+	// context needs a default budget so Background cannot wait forever.
+	if _, bounded := ctx.Deadline(); !bounded {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, cleanupTimeout)
+		defer cancel()
+	}
 	s.mu.Lock()
 	if s.state == stateStopped {
 		s.mu.Unlock()
