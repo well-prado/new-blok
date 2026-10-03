@@ -14,17 +14,22 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/signal"
 	"path/filepath"
 	goruntime "runtime"
 	"strconv"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
 
-type testWorker struct{ wire.UnimplementedWorkerServer }
+type testWorker struct {
+	wire.UnimplementedWorkerServer
+	onCall func(string)
+}
 
-func (testWorker) Connect(stream wire.Worker_ConnectServer) error {
+func (w testWorker) Connect(stream wire.Worker_ConnectServer) error {
 	md, _ := metadata.FromIncomingContext(stream.Context())
 	if len(md.Get("authorization")) != 1 || md.Get("authorization")[0] != "Bearer synthetic-test-token" || len(md.Get("x-blok-principal")) != 1 || md.Get("x-blok-principal")[0] != "app-1" {
 		return status.Error(codes.Unauthenticated, "denied")
@@ -74,6 +79,9 @@ func (testWorker) Connect(stream wire.Worker_ConnectServer) error {
 		switch v := frame.Body.(type) {
 		case *wire.Frame_Call:
 			c := v.Call
+			if w.onCall != nil {
+				w.onCall(c.CallId)
+			}
 			if c.Principal != "app-1" {
 				return status.Error(codes.PermissionDenied, "principal mismatch")
 			}
@@ -92,6 +100,14 @@ func (testWorker) Connect(stream wire.Worker_ConnectServer) error {
 				if c.Node == "slow" {
 					select {
 					case <-time.After(time.Second):
+					case <-ctx.Done():
+						return
+					}
+				}
+				if c.Node == "drain-budget" {
+					_ = os.WriteFile(os.Getenv("WORKER_EFFECT_MARK"), []byte("started"), 0600)
+					select {
+					case <-time.After(1250 * time.Millisecond):
 					case <-ctx.Done():
 						return
 					}
@@ -191,6 +207,9 @@ func TestMissingSelectedRuntimePreventsApplicationReadiness(t *testing.T) {
 func TestWorkerSubprocess(t *testing.T) {
 	if os.Getenv("WORKER_CHILD") != "1" {
 		return
+	}
+	if os.Getenv("WORKER_IGNORE_TERM") == "1" {
+		signal.Ignore(syscall.SIGTERM)
 	}
 	listener, err := net.Listen("tcp", os.Getenv("WORKER_TEST_ADDRESS"))
 	if err != nil {

@@ -87,7 +87,9 @@ and the authenticator; the driver must reach them through the real protocol.
 
 It checks, in order: a valid declaration; the corpus; required capabilities
 (durable adapters: `Restarter` and `EffectLedger`; redeliver adapters:
-`Recoverer`); no goroutine or listener created by construction; per case the
+`Recoverer`; trusted-producer adapters with a configured principal:
+`PrincipalSource`, added by [ADR 0007](0007-pubsub-delivery-transfer.md));
+no goroutine or listener created by construction; per case the
 outcomes, stable codes, absence of internal error text, in-band output for
 memory completion, verified principal on every dispatch (none for trusted
 producers), dispatched input equal to a delivered payload, cancellation as

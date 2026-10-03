@@ -2,6 +2,8 @@ package runtime
 
 import (
 	"github.com/well-prado/new-blok/contract/runtime/wire"
+	"google.golang.org/protobuf/proto"
+	"strings"
 	"time"
 )
 
@@ -27,15 +29,31 @@ func HelloFromWire(h *wire.Hello) Hello {
 	return out
 }
 func CallWire(c Call) *wire.Call {
+	return callWire(c, true)
+}
+func callWire(c Call, copyPayload bool) *wire.Call {
 	caps := make([]string, len(c.Capabilities))
 	for i, v := range c.Capabilities {
 		caps[i] = string(v)
 	}
-	out := &wire.Call{CallId: c.CallID, AttemptId: c.AttemptID, Generation: c.Generation, Node: c.Node, NodeVersion: c.NodeVersion, IdempotencyKey: c.IdempotencyKey, DeadlineUnixNanos: c.Deadline.UnixNano(), Input: append([]byte(nil), c.Input...), Principal: c.Principal, Capabilities: caps}
+	input := c.Input
+	if copyPayload {
+		input = append([]byte(nil), input...)
+	}
+	out := &wire.Call{CallId: c.CallID, AttemptId: c.AttemptID, Generation: c.Generation, Node: c.Node, NodeVersion: c.NodeVersion, IdempotencyKey: c.IdempotencyKey, DeadlineUnixNanos: c.Deadline.UnixNano(), Input: input, Principal: c.Principal, Capabilities: caps}
 	for _, b := range c.Blobs {
 		out.Blobs = append(out.Blobs, &wire.BlobRef{Digest: b.Digest, Size: uint64(b.Size)})
 	}
 	return out
+}
+
+// EncodedCallBytes measures the complete protobuf envelope without copying the
+// payload. Empty principal reserves the maximum adapter-authenticated identity.
+func EncodedCallBytes(c Call) int {
+	if c.Principal == "" {
+		c.Principal = strings.Repeat("x", 128)
+	}
+	return proto.Size(&wire.Frame{Body: &wire.Frame_Call{Call: callWire(c, false)}})
 }
 func CallFromWire(c *wire.Call) Call {
 	if c == nil {

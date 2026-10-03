@@ -210,6 +210,13 @@ func (c Call) Validate(limits Limits, generation uint64) error {
 	if c.Principal != "" && !identityPattern.MatchString(c.Principal) {
 		return ErrCapabilityDenied
 	}
+	seen := map[Capability]bool{}
+	for _, cap := range c.Capabilities {
+		if seen[cap] || !identityPattern.MatchString(string(cap)) || strings.Contains(string(cap), "orchestrate") {
+			return ErrCapabilityDenied
+		}
+		seen[cap] = true
+	}
 	totalBlobBytes := 0
 	for _, blob := range c.Blobs {
 		if blob.Size < 0 || blob.Size > limits.MaxBlobBytes || !digestPattern.MatchString(blob.Digest) {
@@ -219,6 +226,9 @@ func (c Call) Validate(limits Limits, generation uint64) error {
 		if totalBlobBytes > limits.MaxBlobBytes {
 			return ErrLimitExceeded
 		}
+	}
+	if EncodedCallBytes(c) > limits.MaxFrameBytes {
+		return fmt.Errorf("%w: complete frame", ErrLimitExceeded)
 	}
 	return nil
 }

@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "roadmap": "E09-T04",
+  "inputSchema": {"type":"object","properties":{"sku":{"type":"string"},"quantity":{"type":"integer","minimum":1,"maximum":100}},"required":["sku","quantity"]},
+  "maxMessageBytes": 256,
+  "maxDeliver": 5,
+  "cases": [
+    {"name":"valid message","id":"m-valid","data":"{\"sku\":\"coffee\",\"quantity\":2}","result":"accepted","acked":1,"termed":0,"naks":0,"deadLetters":0,"submissions":1},
+    {"name":"redelivery of an admitted message","id":"m-valid","data":"{\"sku\":\"coffee\",\"quantity\":2}","result":"duplicate","acked":1,"termed":0,"naks":0,"deadLetters":0,"submissions":0},
+    {"name":"oversized message","id":"m-large","data":"LARGE","result":"dead_lettered","reason":"too_large","acked":0,"termed":1,"naks":0,"deadLetters":1,"submissions":0},
+    {"name":"malformed JSON","id":"m-json","data":"{\"sku\":","result":"dead_lettered","reason":"invalid_input","acked":0,"termed":1,"naks":0,"deadLetters":1,"submissions":0},
+    {"name":"wrong-typed field","id":"m-type","data":"{\"sku\":\"coffee\",\"quantity\":\"two\"}","result":"dead_lettered","reason":"invalid_input","acked":0,"termed":1,"naks":0,"deadLetters":1,"submissions":0},
+    {"name":"empty body","id":"m-empty","data":"","result":"dead_lettered","reason":"invalid_input","acked":0,"termed":1,"naks":0,"deadLetters":1,"submissions":0},
+    {"name":"unusable message id","id":"m bad id","data":"{\"sku\":\"coffee\",\"quantity\":2}","result":"dead_lettered","reason":"invalid_message_id","acked":0,"termed":1,"naks":0,"deadLetters":1,"submissions":0},
+    {"name":"reused id with another payload","id":"m-valid","data":"{\"sku\":\"coffee\",\"quantity\":9}","result":"dead_lettered","reason":"conflict","acked":0,"termed":1,"naks":0,"deadLetters":1,"submissions":0},
+    {"name":"store saturated","id":"m-saturated","data":"{\"sku\":\"coffee\",\"quantity\":1}","store":"saturated","result":"deferred","acked":0,"termed":0,"naks":1,"deadLetters":0,"submissions":0},
+    {"name":"saturated far past the budget is still only backpressure","id":"m-saturated-late","data":"{\"sku\":\"coffee\",\"quantity\":1}","store":"saturated","attempt":9,"result":"deferred","acked":0,"termed":0,"naks":1,"deadLetters":0,"submissions":0},
+    {"name":"store unavailable within the budget","id":"m-store-down","data":"{\"sku\":\"coffee\",\"quantity\":1}","store":"unavailable","attempt":4,"result":"deferred","acked":0,"termed":0,"naks":1,"deadLetters":0,"submissions":0},
+    {"name":"store unavailable on the last budgeted delivery","id":"m-budget","data":"{\"sku\":\"coffee\",\"quantity\":1}","store":"unavailable","attempt":5,"result":"dead_lettered","reason":"delivery_budget_exhausted","acked":0,"termed":1,"naks":0,"deadLetters":1,"submissions":0},
+    {"name":"redelivered past the budget but already committed","id":"m-valid","data":"{\"sku\":\"coffee\",\"quantity\":2}","attempt":9,"result":"duplicate","acked":1,"termed":0,"naks":0,"deadLetters":0,"submissions":0},
+    {"name":"dead-letter destination unavailable","id":"m-poison-dlq-down","data":"{\"sku\":","deadLetter":"unavailable","result":"dead_letter_failed","reason":"invalid_input","acked":0,"termed":0,"naks":1,"deadLetters":0,"submissions":0},
+    {"name":"ack lost after commit","id":"m-ack-lost","data":"{\"sku\":\"coffee\",\"quantity\":3}","ack":"fail","result":"ack_failed","acked":0,"termed":0,"naks":0,"deadLetters":0,"submissions":1}
+  ],
+  "expected": {"accepted": 1, "duplicates": 2, "deadLettered": 7, "deferred": 3, "deadLetterFailed": 1, "ackFailed": 1, "submissions": 2},
+  "limits": [
+    "A message is terminated only after its dead-letter record is durable; if that fails it is nak'ed and retried.",
+    "A lost ack after a committed submission is recovered by broker redelivery, which deduplicates.",
+    "The delivery budget is checked only after a failed submission, so a committed message is acknowledged however many deliveries it took; saturation never spends the budget."
+  ]
+}

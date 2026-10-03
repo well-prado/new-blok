@@ -1,4 +1,4 @@
-# ADR 0007: Catalog null normalization and template expansion bounds
+# ADR 0012: Catalog null normalization and template expansion bounds
 
 - Status: implemented in the #61 correction branch; integration pending
 - Date: 2026-10-02
