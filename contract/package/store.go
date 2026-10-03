@@ -2,19 +2,74 @@ package packagecontract
 
 import "sync"
 
-// Store is an in-memory, offline package source useful to local consumers and
-// conformance adapters. It never executes package contents.
-type Store struct {
-	mu       sync.RWMutex
-	packages map[string]Bundle
+const (
+	DefaultStoreMaxPackages      = 256
+	DefaultStoreMaxArtifactBytes = 128 << 20
+	HardStoreMaxPackages         = 4096
+	HardStoreMaxArtifactBytes    = 1 << 30
+)
+
+// StoreLimits bounds retained package count and aggregate artifact bytes. Zero
+// selects that field's default. Configured values cannot exceed the hard caps.
+type StoreLimits struct {
+	MaxPackages      int
+	MaxArtifactBytes int64
 }
 
-func NewStore() *Store { return &Store{packages: make(map[string]Bundle)} }
+// Store is an in-memory, offline package source useful to local consumers and
+// conformance adapters. It never executes package contents and bounds retained
+// entries and artifact bytes.
+type Store struct {
+	mu            sync.RWMutex
+	packages      map[string]Bundle
+	artifactBytes int64
+	limits        StoreLimits
+}
+
+func NewStore() *Store {
+	store, _ := NewStoreWithLimits(StoreLimits{})
+	return store
+}
+
+func NewStoreWithLimits(limits StoreLimits) (*Store, error) {
+	if limits.MaxPackages == 0 {
+		limits.MaxPackages = DefaultStoreMaxPackages
+	}
+	if limits.MaxArtifactBytes == 0 {
+		limits.MaxArtifactBytes = DefaultStoreMaxArtifactBytes
+	}
+	if limits.MaxPackages < 1 || limits.MaxPackages > HardStoreMaxPackages || limits.MaxArtifactBytes < 1 || limits.MaxArtifactBytes > HardStoreMaxArtifactBytes {
+		return nil, &Error{Code: "invalid_store_limits", Message: "store limits must be positive and within the 4096 package and 1 GiB hard caps"}
+	}
+	return &Store{packages: make(map[string]Bundle), limits: limits}, nil
+}
+
+func (s *Store) Limits() StoreLimits {
+	if s == nil {
+		return StoreLimits{}
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.limits
+}
+
+func (s *Store) Usage() (packages int, artifactBytes int64) {
+	if s == nil {
+		return 0, 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.packages), s.artifactBytes
+}
 
 func (s *Store) Publish(bundle Bundle, policy TrustPolicy, env Environment) (Verified, error) {
 	if s == nil {
 		return Verified{}, &Error{Code: "invalid_manifest", Message: "package store is nil"}
 	}
+	if err := validateArtifactSize(bundle.Artifact); err != nil {
+		return Verified{}, err
+	}
+	bundle = cloneBundle(bundle)
 	verified, err := bundle.Verify(policy, env)
 	if err != nil {
 		return Verified{}, err
@@ -29,7 +84,15 @@ func (s *Store) Publish(bundle Bundle, policy TrustPolicy, env Environment) (Ver
 		}
 		return verified, nil
 	}
+	if len(s.packages) >= s.limits.MaxPackages {
+		return Verified{}, &Error{Code: "store_capacity_exceeded", Path: "store", Message: "local package count limit reached"}
+	}
+	artifactSize := int64(len(bundle.Artifact))
+	if artifactSize > s.limits.MaxArtifactBytes-s.artifactBytes {
+		return Verified{}, &Error{Code: "store_capacity_exceeded", Path: "store", Message: "local retained artifact byte limit reached"}
+	}
 	s.packages[key] = cloneBundle(bundle)
+	s.artifactBytes += artifactSize
 	return verified, nil
 }
 

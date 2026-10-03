@@ -32,19 +32,20 @@ signature, and artifact bytes (base64 in JSON). The manifest binds:
 The canonical manifest is compact UTF-8 JSON with struct fields in the order
 shown above, omitted `omitempty` fields absent, dependencies sorted by package
 name, and runtime-map keys sorted lexicographically. Strings use Go
-`encoding/json` escaping, including lowercase `\\u003c`, `\\u003e`, and
-`\\u0026` for `<`, `>`, and `&`; no insignificant whitespace or trailing
+`encoding/json` escaping, including lowercase `\u003c`, `\u003e`, and
+`\u0026` for `<`, `>`, and `&`; no insignificant whitespace or trailing
 newline is included. The golden digest in `local-node-v1.json` pins this byte
 profile for non-Go consumers. The manifest digest is SHA-256 of those bytes.
-The signature is Ed25519 over the same canonical bytes; it therefore binds identity,
-compatibility, license, provenance, dependencies, and artifact digest. The
+The signature is Ed25519 over the same canonical bytes; it therefore binds
+identity, compatibility, license, provenance, dependencies, and artifact digest. The
 artifact digest separately checks the exact artifact bytes. A signature is an
 attestation, not proof that a build was reproducible or that source is safe.
 
 Compatibility and dependency constraints use this portable subset of semantic
 version expressions: whitespace-separated exact or comparator clauses, for
 example `>=1.2.0 <2.0.0`. OR expressions, wildcards, and prerelease versions are
-not supported and fail closed. Consumers check engine, schema, every declared
+not supported, whitespace-only ranges are invalid, and numeric components must
+fit unsigned 64-bit values. Consumers check engine, schema, every declared
 runtime, and package dependencies during resolution. This contract verifies
 compatibility inputs; graph resolution, lock generation, cycle diagnostics,
 cache management, and atomic project edits belong to E13-T02/#71 and later
@@ -63,6 +64,12 @@ offline contract; it does not provide durable filesystem caching or the CLI
 install/remove/update commands. Consumers must supply the target engine, schema,
 and runtime versions when checking a bundle.
 
+The in-memory store defaults to 256 packages and 128 MiB of aggregate artifact
+bytes. Hard ceilings are 4096 packages and 1 GiB; callers may select lower
+limits with `NewStoreWithLimits`. At capacity, an identical existing publish
+still succeeds. New publishes fail with `store_capacity_exceeded`, checking
+package count before aggregate bytes for deterministic saturation behavior.
+
 ## Trust
 
 There are two results, deliberately distinct:
@@ -73,6 +80,8 @@ There are two results, deliberately distinct:
 | `trusted` | Valid Ed25519 signature over canonical manifest and key ID present in the caller's trusted-key set | Manifest integrity and possession of the configured signing key |
 
 Missing signatures fail by default. Unknown keys and bad signatures always fail.
+Signer key IDs are limited to 128 allowed ASCII characters, and the encoded
+Ed25519 signature must be exactly 88 bytes before decoding.
 The caller is responsible for trusted-key distribution, rotation, revocation,
 and deciding which local sources qualify for unsigned use. Registry TLS and
 service authentication are separate from package publisher signatures and from
@@ -94,8 +103,11 @@ Base path: `/v1/packages/{namespace}/{name}/{version}`.
 | `PUT` | `201` created; `200` identical existing content | `409` immutable-version conflict | Sends and returns the JSON bundle |
 
 Requests and responses are bounded to the base64 encoding of an 8 MiB artifact
-plus 64 KiB of manifest/signature JSON overhead. The client rejects unsupported
-URL schemes, URL credentials, unknown response fields, trailing JSON, oversized documents, incompatible packages,
+plus 64 KiB of manifest/signature JSON overhead. A successful `PUT` response
+must verify to the exact submitted manifest digest, artifact digest, signature,
+and identity; a registry cannot acknowledge a substituted but otherwise valid
+package. The client rejects unsupported URL schemes, URL credentials, unknown
+response fields, trailing JSON, oversized documents, incompatible packages,
 and invalid integrity or trust evidence. Registry authentication, transport
 policy, namespace authorization, ownership verification, moderation, search,
 billing, quotas, and audit implementation are owned by the separate hosted
@@ -106,8 +118,9 @@ The checked-in `testdata/packages/protocol-fixtures.json` is consumed by tests
 running the actual package client against an in-process mock registry backed by
 the same immutable store contract. It specifies successful fetch, explicit
 unsigned trust, incompatibility, not-found, idempotent publish, version
-conflict, and tampered artifact outcomes. Expected package execution count is
-zero: installation and inspection never execute package contents.
+conflict, substituted publish response, and tampered artifact outcomes. Expected
+package execution count is zero: installation and inspection never execute
+package contents.
 
 ## Compatibility and evidence
 
@@ -140,3 +153,12 @@ standard seed length. After integrating `origin/main` at
 passed, including the contention and SSE suites; this makes the first SSE
 failure a reproduced flake rather than a persistent failure. No GitHub Actions
 workflow was enabled or dispatched.
+
+After the independent package review regressions were added, Go 1.27.1 on
+Linux passed bounded `go vet -p=3 ./...`, `go build -p=3 ./...`, and
+`go test -race -p=3 ./...` with `GOMAXPROCS=3`. The subsequent change that
+checks the artifact-size limit before copying caller-provided bytes passed
+`GOMAXPROCS=3 go test -p=3 -race ./contract/package -count=10`,
+`GOMAXPROCS=3 go vet -p=3 ./contract/package`, `go test ./contract/package`,
+and `git diff --check`. The parent’s serialized combined platform gates remain
+pending; these local runs do not substitute for their final result.

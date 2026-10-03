@@ -48,6 +48,14 @@
       "expectedError": "version_conflict"
     },
     {
+      "name": "publish-substituted-content",
+      "method": "PUT",
+      "path": "/v1/packages/shop/quote-node/1.0.0",
+      "responseVariant": "substituted-content",
+      "expectedStatus": 201,
+      "expectedError": "published_content_mismatch"
+    },
+    {
       "name": "fetch-tampered-artifact",
       "method": "GET",
       "path": "/v1/packages/shop/quote-node/1.0.0",

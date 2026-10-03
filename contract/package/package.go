@@ -24,18 +24,22 @@ const (
 	MaxManifestBytes       = 64 << 10
 	MaxDependencies        = 256
 	MaxRuntimeRequirements = 32
+	MaxSignatureKeyIDBytes = 128
+	MaxSignatureValueBytes = 88
 )
 
 var (
-	ErrInvalid           = errors.New("package: invalid package")
-	ErrIncompatible      = errors.New("package: incompatible package")
-	ErrDigestMismatch    = errors.New("package: digest mismatch")
-	ErrSignatureRequired = errors.New("package: trusted signature required")
-	ErrUnknownSigner     = errors.New("package: signer is not trusted")
-	ErrBadSignature      = errors.New("package: invalid signature")
-	ErrVersionConflict   = errors.New("package: immutable version conflict")
-	ErrNotFound          = errors.New("package: not found")
-	ErrProtocol          = errors.New("package: registry protocol error")
+	ErrInvalid                  = errors.New("package: invalid package")
+	ErrIncompatible             = errors.New("package: incompatible package")
+	ErrDigestMismatch           = errors.New("package: digest mismatch")
+	ErrSignatureRequired        = errors.New("package: trusted signature required")
+	ErrUnknownSigner            = errors.New("package: signer is not trusted")
+	ErrBadSignature             = errors.New("package: invalid signature")
+	ErrVersionConflict          = errors.New("package: immutable version conflict")
+	ErrNotFound                 = errors.New("package: not found")
+	ErrProtocol                 = errors.New("package: registry protocol error")
+	ErrStoreFull                = errors.New("package: local store capacity exceeded")
+	ErrPublishedContentMismatch = errors.New("package: registry returned different published content")
 )
 
 type Error struct {
@@ -53,7 +57,7 @@ func (e *Error) Error() string {
 
 func (e *Error) Unwrap() error {
 	switch e.Code {
-	case "invalid_manifest", "invalid_identity", "invalid_compatibility", "invalid_provenance", "invalid_license":
+	case "invalid_manifest", "invalid_identity", "invalid_compatibility", "invalid_provenance", "invalid_license", "invalid_store_limits":
 		return ErrInvalid
 	case "incompatible_runtime", "incompatible_engine", "incompatible_schema", "incompatible_dependency":
 		return ErrIncompatible
@@ -67,6 +71,10 @@ func (e *Error) Unwrap() error {
 		return ErrBadSignature
 	case "version_conflict":
 		return ErrVersionConflict
+	case "store_capacity_exceeded":
+		return ErrStoreFull
+	case "published_content_mismatch":
+		return ErrPublishedContentMismatch
 	case "package_not_found":
 		return ErrNotFound
 	default:
@@ -150,11 +158,12 @@ type Verified struct {
 }
 
 var (
-	namePart   = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
-	semverRE   = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
-	digestRE   = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
-	licenseRE  = regexp.MustCompile(`^(LicenseRef-[A-Za-z0-9.-]+|[A-Za-z0-9][A-Za-z0-9.-]*)$`)
-	revisionRE = regexp.MustCompile(`^[0-9a-fA-F]{7,64}$`)
+	namePart         = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
+	semverRE         = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
+	digestRE         = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+	licenseRE        = regexp.MustCompile(`^(LicenseRef-[A-Za-z0-9.-]+|[A-Za-z0-9][A-Za-z0-9.-]*)$`)
+	revisionRE       = regexp.MustCompile(`^[0-9a-fA-F]{7,64}$`)
+	signatureKeyIDRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$`)
 )
 
 func (id Identity) Validate() error {
@@ -164,6 +173,12 @@ func (id Identity) Validate() error {
 	}
 	if !semverRE.MatchString(id.Version) {
 		return &Error{Code: "invalid_identity", Path: "identity.version", Message: "version must be stable major.minor.patch semantic version"}
+	}
+	if len(id.Version) > 62 {
+		return &Error{Code: "invalid_identity", Path: "identity.version", Message: "version components must fit unsigned 64-bit values"}
+	}
+	if _, ok := parseVersion(id.Version); !ok {
+		return &Error{Code: "invalid_identity", Path: "identity.version", Message: "version components must fit unsigned 64-bit values"}
 	}
 	return nil
 }
@@ -278,8 +293,8 @@ func digestBytes(data []byte) string {
 }
 
 func (b Bundle) Verify(policy TrustPolicy, environment Environment) (Verified, error) {
-	if len(b.Artifact) == 0 || len(b.Artifact) > MaxArtifactBytes {
-		return Verified{}, &Error{Code: "invalid_manifest", Path: "artifact", Message: "artifact must be nonempty and at most 8 MiB"}
+	if err := validateArtifactSize(b.Artifact); err != nil {
+		return Verified{}, err
 	}
 	if err := b.Manifest.Validate(); err != nil {
 		return Verified{}, err
@@ -301,8 +316,8 @@ func (b Bundle) Verify(policy TrustPolicy, environment Environment) (Verified, e
 		}
 		return Verified{Identity: b.Manifest.Identity, ManifestDigest: manifestDigest, ArtifactDigest: artifactDigest, Trust: TrustUnsignedLocal}, nil
 	}
-	if b.Signature.Algorithm != "ed25519" || b.Signature.KeyID == "" {
-		return Verified{}, &Error{Code: "bad_signature", Path: "signature", Message: "only identified ed25519 signatures are supported"}
+	if b.Signature.Algorithm != "ed25519" || len(b.Signature.KeyID) > MaxSignatureKeyIDBytes || !signatureKeyIDRE.MatchString(b.Signature.KeyID) || len(b.Signature.Value) != MaxSignatureValueBytes {
+		return Verified{}, &Error{Code: "bad_signature", Path: "signature", Message: "signature must use ed25519 with a bounded key id and 64-byte base64 signature"}
 	}
 	key, ok := policy.TrustedKeys[b.Signature.KeyID]
 	if !ok || len(key) != ed25519.PublicKeySize {
@@ -316,9 +331,16 @@ func (b Bundle) Verify(policy TrustPolicy, environment Environment) (Verified, e
 	return Verified{Identity: b.Manifest.Identity, ManifestDigest: manifestDigest, ArtifactDigest: artifactDigest, Trust: TrustTrusted}, nil
 }
 
+func validateArtifactSize(artifact []byte) error {
+	if len(artifact) == 0 || len(artifact) > MaxArtifactBytes {
+		return &Error{Code: "invalid_manifest", Path: "artifact", Message: "artifact must be nonempty and at most 8 MiB"}
+	}
+	return nil
+}
+
 func Sign(m Manifest, keyID string, privateKey ed25519.PrivateKey) (*Signature, error) {
-	if keyID == "" || len(privateKey) != ed25519.PrivateKeySize {
-		return nil, &Error{Code: "invalid_manifest", Path: "signature", Message: "key id and Ed25519 private key are required"}
+	if len(keyID) > MaxSignatureKeyIDBytes || !signatureKeyIDRE.MatchString(keyID) || len(privateKey) != ed25519.PrivateKeySize {
+		return nil, &Error{Code: "invalid_manifest", Path: "signature", Message: "a bounded key id and Ed25519 private key are required"}
 	}
 	b, err := m.Canonical()
 	if err != nil {
@@ -350,7 +372,11 @@ func validateRange(expression string) error {
 	if expression == "" || len(expression) > 256 {
 		return ErrInvalid
 	}
-	for _, clause := range strings.Fields(expression) {
+	clauses := strings.Fields(expression)
+	if len(clauses) == 0 {
+		return ErrInvalid
+	}
+	for _, clause := range clauses {
 		for _, operator := range []string{">=", "<=", ">", "<", "="} {
 			if strings.HasPrefix(clause, operator) {
 				clause = strings.TrimPrefix(clause, operator)

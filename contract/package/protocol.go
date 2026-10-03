@@ -35,22 +35,33 @@ func (c Client) Fetch(ctx context.Context, id Identity, policy TrustPolicy, env 
 // this package digest. The service must validate the bundle and return the
 // accepted canonical bundle; 409 means the version already has other content.
 func (c Client) Publish(ctx context.Context, bundle Bundle, policy TrustPolicy, env Environment) (Verified, error) {
-	if _, err := bundle.Verify(policy, env); err != nil {
+	if err := validateArtifactSize(bundle.Artifact); err != nil {
 		return Verified{}, err
 	}
-	body, err := json.Marshal(bundle)
+	submitted := cloneBundle(bundle)
+	expected, err := submitted.Verify(policy, env)
+	if err != nil {
+		return Verified{}, err
+	}
+	body, err := json.Marshal(submitted)
 	if err != nil {
 		return Verified{}, err
 	}
 	if len(body) > MaxBundleBytes {
 		return Verified{}, &Error{Code: "invalid_manifest", Path: "bundle", Message: "encoded package exceeds protocol limit"}
 	}
-	req, err := c.request(ctx, http.MethodPut, bundle.Manifest.Identity, bytes.NewReader(body))
+	req, err := c.request(ctx, http.MethodPut, submitted.Manifest.Identity, bytes.NewReader(body))
 	if err != nil {
 		return Verified{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	_, verified, err := c.exchange(req, bundle.Manifest.Identity, policy, env, true)
+	response, verified, err := c.exchange(req, submitted.Manifest.Identity, policy, env, true)
+	if err != nil {
+		return Verified{}, err
+	}
+	if verified.ManifestDigest != expected.ManifestDigest || verified.ArtifactDigest != expected.ArtifactDigest || !sameSignature(response.Signature, submitted.Signature) {
+		return Verified{}, &Error{Code: "published_content_mismatch", Path: "response", Message: "registry returned different content or signature from the submitted package"}
+	}
 	return verified, err
 }
 

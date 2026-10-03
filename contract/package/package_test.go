@@ -99,6 +99,37 @@ func TestTrustAndCompatibilityFailClosed(t *testing.T) {
 	}
 }
 
+func TestRejectsWhitespaceOnlyRangesEverywhere(t *testing.T) {
+	base := fixtureBundle(t).Manifest
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Manifest)
+	}{
+		{"engine", func(m *Manifest) { m.Compatibility.Engine = " \t " }},
+		{"schema", func(m *Manifest) { m.Compatibility.Schema = "\n" }},
+		{"runtime", func(m *Manifest) { m.Compatibility.Runtimes["nodejs"] = " \t " }},
+		{"dependency", func(m *Manifest) { m.Dependencies[0].Version = " \t " }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manifest := base
+			manifest.Dependencies = append([]Dependency(nil), base.Dependencies...)
+			manifest.Compatibility.Runtimes = map[string]string{"nodejs": ">=20.0.0 <25.0.0"}
+			tc.mutate(&manifest)
+			if err := manifest.Validate(); err == nil {
+				t.Fatal("whitespace-only range accepted")
+			}
+		})
+	}
+}
+
+func TestIdentityVersionUsesRangeNumericBounds(t *testing.T) {
+	id := fixtureBundle(t).Manifest.Identity
+	id.Version = "18446744073709551616.0.0"
+	if err := id.Validate(); err == nil {
+		t.Fatal("version component over uint64 was accepted")
+	}
+}
+
 func TestSignatureVerificationUsesCanonicalManifest(t *testing.T) {
 	bundle := fixtureBundle(t)
 	// Fixed synthetic key seed keeps signature fixtures deterministic and is
@@ -132,6 +163,31 @@ func TestSignatureVerificationUsesCanonicalManifest(t *testing.T) {
 	bundle.Signature.Value = strings.Repeat("A", 88)
 	if _, err := bundle.Verify(policy, fixtureEnvironment()); !errors.Is(err, ErrBadSignature) {
 		t.Fatalf("bad signature: got %v", err)
+	}
+}
+
+func TestSignatureInputLengthsAreBounded(t *testing.T) {
+	bundle := fixtureBundle(t)
+	publicKey := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x43}, ed25519.SeedSize)).Public().(ed25519.PublicKey)
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Signature)
+	}{
+		{"key-id", func(s *Signature) { s.KeyID = strings.Repeat("k", MaxSignatureKeyIDBytes+1) }},
+		{"signature", func(s *Signature) { s.Value = strings.Repeat("A", MaxSignatureValueBytes+1) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bundle.Signature = &Signature{Algorithm: "ed25519", KeyID: "fixture-key", Value: strings.Repeat("A", MaxSignatureValueBytes)}
+			tc.mutate(bundle.Signature)
+			_, err := bundle.Verify(TrustPolicy{TrustedKeys: map[string]ed25519.PublicKey{"fixture-key": publicKey}}, fixtureEnvironment())
+			var contractErr *Error
+			if !errors.As(err, &contractErr) || contractErr.Code != "bad_signature" {
+				t.Fatalf("got %v, want bounded bad signature", err)
+			}
+		})
+	}
+	if _, err := Sign(fixtureBundle(t).Manifest, strings.Repeat("k", MaxSignatureKeyIDBytes+1), make(ed25519.PrivateKey, ed25519.PrivateKeySize)); err == nil {
+		t.Fatal("oversized signer key id accepted")
 	}
 }
 
@@ -182,6 +238,8 @@ func TestInvalidManifestGoldenFixtures(t *testing.T) {
 				manifest.Identity.Name = "../quote"
 			case "prerelease-version":
 				manifest.Identity.Version = "1.0.0-rc.1"
+			case "overflowing-identity-version":
+				manifest.Identity.Version = "18446744073709551616.0.0"
 			case "missing-license":
 				manifest.License = ""
 			case "missing-provenance":
@@ -192,6 +250,14 @@ func TestInvalidManifestGoldenFixtures(t *testing.T) {
 				manifest.Compatibility.Engine = ">=18446744073709551616.0.0"
 			case "invalid-dependency-range":
 				manifest.Dependencies[0].Version = "^1.0.0"
+			case "whitespace-engine-range":
+				manifest.Compatibility.Engine = " \t "
+			case "whitespace-schema-range":
+				manifest.Compatibility.Schema = "\n"
+			case "whitespace-runtime-range":
+				manifest.Compatibility.Runtimes["nodejs"] = " \t "
+			case "whitespace-dependency-range":
+				manifest.Dependencies[0].Version = " \t "
 			default:
 				t.Fatalf("unknown fixture mutation %q", tc.Mutation)
 			}
@@ -235,6 +301,139 @@ func TestStoreBindsImmutableVersionsAndReturnsCopies(t *testing.T) {
 	}
 }
 
+func TestStoreCapacityIsBoundedAndIdempotenceSurvivesSaturation(t *testing.T) {
+	bundle := fixtureBundle(t)
+	policy, env := TrustPolicy{AllowUnsignedLocal: true}, fixtureEnvironment()
+	store, err := NewStoreWithLimits(StoreLimits{MaxPackages: 1, MaxArtifactBytes: int64(len(bundle.Artifact))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Publish(bundle, policy, env); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Publish(bundle, policy, env); err != nil {
+		t.Fatalf("identical publish at capacity should succeed: %v", err)
+	}
+
+	countLimit := cloneBundle(bundle)
+	countLimit.Manifest.Identity.Version = "1.0.1"
+	if _, err := store.Publish(countLimit, policy, env); !errors.Is(err, ErrStoreFull) || storeErrorCode(err) != "store_capacity_exceeded" {
+		t.Fatalf("package count saturation returned %v", err)
+	}
+	if packages, bytes := store.Usage(); packages != 1 || bytes != int64(len(bundle.Artifact)) {
+		t.Fatalf("usage changed after rejected package: packages=%d bytes=%d", packages, bytes)
+	}
+
+	byteLimited, err := NewStoreWithLimits(StoreLimits{MaxPackages: 2, MaxArtifactBytes: int64(len(bundle.Artifact))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := byteLimited.Publish(bundle, policy, env); err != nil {
+		t.Fatal(err)
+	}
+	countLimit.Manifest.Identity.Version = "1.0.2"
+	if _, err := byteLimited.Publish(countLimit, policy, env); !errors.Is(err, ErrStoreFull) || storeErrorCode(err) != "store_capacity_exceeded" {
+		t.Fatalf("artifact-byte saturation returned %v", err)
+	}
+	if packages, bytes := byteLimited.Usage(); packages != 1 || bytes != int64(len(bundle.Artifact)) {
+		t.Fatalf("usage changed after byte-limit rejection: packages=%d bytes=%d", packages, bytes)
+	}
+}
+
+func TestStoreHasFiniteDefaultsAndRejectsOverlargeConfiguration(t *testing.T) {
+	store := NewStore()
+	if limits := store.Limits(); limits.MaxPackages != DefaultStoreMaxPackages || limits.MaxArtifactBytes != DefaultStoreMaxArtifactBytes {
+		t.Fatalf("unexpected defaults: %+v", limits)
+	}
+	if _, err := NewStoreWithLimits(StoreLimits{MaxPackages: HardStoreMaxPackages + 1}); err == nil {
+		t.Fatal("configuration exceeded the hard package-count cap")
+	}
+}
+
+func TestStoreCapacityFixtures(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "testdata", "packages", "store-capacity-fixtures.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		FormatVersion             int         `json:"formatVersion"`
+		ExpectedPackageExecutions int         `json:"expectedPackageExecutions"`
+		Defaults                  StoreLimits `json:"defaults"`
+		HardLimits                StoreLimits `json:"hardLimits"`
+		Cases                     []struct {
+			Name                  string `json:"name"`
+			MaxPackages           int    `json:"maxPackages"`
+			MaxArtifactBytes      int64  `json:"maxArtifactBytes"`
+			SeedPackage           bool   `json:"seedPackage"`
+			Operation             string `json:"operation"`
+			ExpectedError         string `json:"expectedError"`
+			ExpectedPackages      int    `json:"expectedPackages"`
+			ExpectedArtifactBytes int64  `json:"expectedArtifactBytes"`
+		} `json:"cases"`
+	}
+	if err := json.Unmarshal(data, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	if fixture.FormatVersion != 1 {
+		t.Fatalf("unsupported fixture format %d", fixture.FormatVersion)
+	}
+	defaults := NewStore().Limits()
+	if defaults != fixture.Defaults {
+		t.Fatalf("default store limits=%+v, want %+v", defaults, fixture.Defaults)
+	}
+	if fixture.HardLimits.MaxPackages != HardStoreMaxPackages || fixture.HardLimits.MaxArtifactBytes != HardStoreMaxArtifactBytes {
+		t.Fatalf("hard store limits=%+v", fixture.HardLimits)
+	}
+	bundle := fixtureBundle(t)
+	if int64(len(bundle.Artifact)) != fixture.Cases[0].MaxArtifactBytes {
+		t.Fatal("capacity fixture no longer matches golden artifact size")
+	}
+	policy, env := TrustPolicy{AllowUnsignedLocal: true}, fixtureEnvironment()
+	for _, tc := range fixture.Cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			store, err := NewStoreWithLimits(StoreLimits{MaxPackages: tc.MaxPackages, MaxArtifactBytes: tc.MaxArtifactBytes})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.SeedPackage {
+				if _, err := store.Publish(bundle, policy, env); err != nil {
+					t.Fatalf("seed package: %v", err)
+				}
+			}
+			candidate := cloneBundle(bundle)
+			switch tc.Operation {
+			case "publish-same":
+			case "publish-new-version":
+				candidate.Manifest.Identity.Version = "1.0.1"
+			default:
+				t.Fatalf("unknown capacity operation %q", tc.Operation)
+			}
+			_, err = store.Publish(candidate, policy, env)
+			if tc.ExpectedError == "" && err != nil {
+				t.Fatalf("unexpected publish error: %v", err)
+			}
+			if tc.ExpectedError != "" && storeErrorCode(err) != tc.ExpectedError {
+				t.Fatalf("publish error=%v, want %s", err, tc.ExpectedError)
+			}
+			packages, artifactBytes := store.Usage()
+			if packages != tc.ExpectedPackages || artifactBytes != tc.ExpectedArtifactBytes {
+				t.Fatalf("usage=(%d,%d), want (%d,%d)", packages, artifactBytes, tc.ExpectedPackages, tc.ExpectedArtifactBytes)
+			}
+		})
+	}
+	if fixture.ExpectedPackageExecutions != 0 {
+		t.Fatalf("fixture package executions=%d, want 0", fixture.ExpectedPackageExecutions)
+	}
+}
+
+func storeErrorCode(err error) string {
+	var contractErr *Error
+	if errors.As(err, &contractErr) {
+		return contractErr.Code
+	}
+	return ""
+}
+
 type protocolFixture struct {
 	FormatVersion             int `json:"formatVersion"`
 	ExpectedPackageExecutions int `json:"expectedPackageExecutions"`
@@ -271,6 +470,7 @@ func TestRegistryProtocolFixtureAgainstLocalMock(t *testing.T) {
 	var requests atomic.Int32
 	var executions atomic.Int32
 	var tamperNext atomic.Bool
+	var substituteNext atomic.Bool
 	var lastStatus atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
@@ -316,10 +516,16 @@ func TestRegistryProtocolFixtureAgainstLocalMock(t *testing.T) {
 			if verified.ManifestDigest == mustManifestDigest(t, bundle.Manifest) {
 				status = http.StatusOK
 			}
+			responseBundle := incoming
+			if substituteNext.Swap(false) {
+				responseBundle.Artifact = []byte("different valid artifact, same immutable identity")
+				responseBundle.Manifest.ArtifactDigest = ArtifactDigest(responseBundle.Artifact)
+				status = http.StatusCreated
+			}
 			lastStatus.Store(int32(status))
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(status)
-			_ = json.NewEncoder(w).Encode(incoming)
+			_ = json.NewEncoder(w).Encode(responseBundle)
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
@@ -337,6 +543,9 @@ func TestRegistryProtocolFixtureAgainstLocalMock(t *testing.T) {
 			if tc.ResponseVariant == "tampered-artifact" {
 				tamperNext.Store(true)
 			}
+			if tc.ResponseVariant == "substituted-content" {
+				substituteNext.Store(true)
+			}
 			var gotErr error
 			var verified Verified
 			switch tc.Name {
@@ -348,7 +557,7 @@ func TestRegistryProtocolFixtureAgainstLocalMock(t *testing.T) {
 					env.EngineVersion = "2.0.0"
 				}
 				_, verified, gotErr = client.Fetch(context.Background(), id, policy, env)
-			case "publish-identical", "publish-version-conflict":
+			case "publish-identical", "publish-version-conflict", "publish-substituted-content":
 				toPublish := cloneBundle(bundle)
 				if tc.Name == "publish-version-conflict" {
 					toPublish.Artifact = []byte("different immutable content")
@@ -429,5 +638,31 @@ func TestClientRejectsResponseForDifferentPackageIdentity(t *testing.T) {
 	_, _, err := client.Fetch(context.Background(), fixtureBundle(t).Manifest.Identity, TrustPolicy{AllowUnsignedLocal: true}, fixtureEnvironment())
 	if !errors.Is(err, ErrProtocol) {
 		t.Fatalf("got %v, want protocol identity mismatch", err)
+	}
+}
+
+func TestReviewPublishRejectsSubstitutedContent(t *testing.T) {
+	original := fixtureBundle(t)
+	substitute := cloneBundle(original)
+	substitute.Artifact = []byte("different artifact, same immutable version")
+	substitute.Manifest.ArtifactDigest = ArtifactDigest(substitute.Artifact)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		if err := json.NewEncoder(w).Encode(substitute); err != nil {
+			t.Error(err)
+		}
+	}))
+	defer server.Close()
+	verified, err := (Client{BaseURL: server.URL, HTTPClient: server.Client()}).Publish(context.Background(), original, TrustPolicy{AllowUnsignedLocal: true}, fixtureEnvironment())
+	if err == nil {
+		t.Fatalf("accepted substitution: uploaded=%s returned=%s", original.Manifest.ArtifactDigest, verified.ArtifactDigest)
+	}
+}
+
+func TestReviewRejectsWhitespaceOnlyCompatibilityRange(t *testing.T) {
+	bundle := fixtureBundle(t)
+	bundle.Manifest.Compatibility.Engine = " \t "
+	if err := bundle.Manifest.Validate(); err == nil {
+		t.Fatal("blank compatibility constraint accepted")
 	}
 }
