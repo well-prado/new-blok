@@ -2,6 +2,7 @@ package workerbench
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -144,87 +145,130 @@ func TestActualNodeEquivalentOrderFailureAndIdempotency(t *testing.T) {
 func TestActualNodeKillBeforeAndAfterProviderEffect(t *testing.T) {
 	for _, phase := range []string{"delay", "late"} {
 		t.Run(phase, func(t *testing.T) {
-			p := NewProvider()
-			defer p.Close()
-			nodes, _, pid, _ := selectedWorker(t, p)
-			w, err := NewWorkflow(nodes)
-			if err != nil {
-				t.Fatal(err)
-			}
-			done := make(chan error, 1)
-			go func() {
-				result, err := w.Run(context.Background(), Order{phase, "coffee", 2, phase})
-				if result.Output != nil {
-					done <- errors.New("killed worker published receipt")
-					return
-				}
-				done <- err
-			}()
-			if phase == "late" {
-				select {
-				case <-p.Committed():
-				case <-time.After(2 * time.Second):
-					t.Fatal("effect not committed")
-				}
-			} else {
-				deadline := time.Now().Add(2 * time.Second)
-				for {
-					requests, _ := p.Counts()
-					if requests > 0 {
-						break
-					}
-					if time.Now().After(deadline) {
-						t.Fatal("read not dispatched")
-					}
-					time.Sleep(time.Millisecond)
-				}
-			}
-			process, err := os.FindProcess(pid)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := process.Kill(); err != nil {
-				t.Fatal(err)
-			}
-			select {
-			case err := <-done:
-				var failure *engine.Error
-				if !errors.As(err, &failure) || failure.Class != "uncertain" {
-					t.Fatalf("lost worker effect not uncertain: %v", err)
-				}
-			case <-time.After(2 * time.Second):
-				t.Fatal("lost worker call hung")
-			}
-			requests, effects := p.Counts()
-			want := 0
-			if phase == "late" {
-				want = 1
-			}
-			if requests != 1 || effects != want {
-				t.Fatalf("automatic retry or unexpected effect: %d/%d", requests, effects)
-			}
-			native, err := NewWorkflow(NativeNodes(p.Server.URL))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err := native.Run(context.Background(), Order{"surviving-native", "coffee", 2, "ok"}); err != nil {
-				t.Fatalf("worker crash affected native engine: %v", err)
-			}
+			_ = observeWorkerCrash(t, phase)
 		})
 	}
 }
 
+type faultSample struct {
+	Phase, ObservedAtUTC, ErrorClass                                         string
+	StartupNanoseconds, KillToTerminalNanoseconds, NativeSurvivalNanoseconds int64
+	Requests, Effects, PublishedReceipts                                     int
+}
+
+// Reuse the predeclared crash fixtures; timing does not change their outcome
+// or effect expectations. The native survival probe is outside the crash count.
+func observeWorkerCrash(t *testing.T, phase string) faultSample {
+	t.Helper()
+	p := NewProvider()
+	defer p.Close()
+	nodes, _, pid, startup := selectedWorker(t, p)
+	w, err := NewWorkflow(nodes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		result, err := w.Run(context.Background(), Order{phase, "coffee", 2, phase})
+		if result.Output != nil {
+			done <- errors.New("killed worker published receipt")
+			return
+		}
+		done <- err
+	}()
+	if phase == "late" {
+		select {
+		case <-p.Committed():
+		case <-time.After(2 * time.Second):
+			t.Fatal("effect not committed")
+		}
+	} else {
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			requests, _ := p.Counts()
+			if requests > 0 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("read not dispatched")
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	killed := time.Now()
+	if err := process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	var failure *engine.Error
+	select {
+	case err := <-done:
+		if !errors.As(err, &failure) || failure.Class != "uncertain" {
+			t.Fatalf("lost worker effect not uncertain: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("lost worker call hung")
+	}
+	s := faultSample{Phase: phase, ObservedAtUTC: time.Now().UTC().Format(time.RFC3339Nano), ErrorClass: failure.Class, StartupNanoseconds: startup.Nanoseconds(), KillToTerminalNanoseconds: time.Since(killed).Nanoseconds()}
+	s.Requests, s.Effects = p.Counts()
+	want := 0
+	if phase == "late" {
+		want = 1
+	}
+	if s.Requests != 1 || s.Effects != want {
+		t.Fatalf("automatic retry or unexpected effect: %d/%d", s.Requests, s.Effects)
+	}
+	native, err := NewWorkflow(NativeNodes(p.Server.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	result, err := native.Run(context.Background(), Order{"surviving-native", "coffee", 2, "ok"})
+	s.NativeSurvivalNanoseconds = time.Since(start).Nanoseconds()
+	if err != nil || result.Output != (Receipt{"surviving-native", 3000, "receipt-surviving-native", "paid"}) {
+		t.Fatalf("worker crash affected native engine: %+v %v", result, err)
+	}
+	return s
+}
+
 type sample struct {
-	Mode              string  `json:"mode"`
-	Nanoseconds       []int64 `json:"nanoseconds"`
-	Requests, Effects int
+	Mode                    string  `json:"mode"`
+	Nanoseconds             []int64 `json:"nanoseconds"`
+	Requests, Effects       int
+	ObservedAtUTC           string
+	GoHarnessRSSSnapshotKiB int
+	WorkerRSSSnapshotKiB    *int `json:",omitempty"`
+}
+type startupSample struct {
+	ObservedAtUTC                                 string
+	StartupNanoseconds                            int64
+	WorkerRSSSnapshotKiB, GoHarnessRSSSnapshotKiB int
 }
 type report struct {
-	Go, Node, OS, Arch, Guarantees string
-	Warmup, Concurrency            int
-	StartupNanoseconds             int64
-	WorkerRSSKiB                   int
-	Samples                        []sample
+	Go, Node, OS, Arch, Guarantees                                string
+	SourceRevision, StartedAtUTC, FinishedAtUTC, Topology, Kernel string
+	Workload, OrderSequence, RSSMethod, StartupMethod             string
+	SchemaVersion, CPUsVisible, GoMaxProcs                        int
+	Warmup, Concurrency                                           int
+	StartupSamples                                                []startupSample
+	FaultSamples                                                  []faultSample
+	Samples                                                       []sample
+}
+
+func rssSnapshot(t *testing.T, pid int) int {
+	t.Helper()
+	raw, err := exec.Command("ps", "-o", "rss=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		t.Fatalf("RSS snapshot unavailable for pid %d: %v", pid, err)
+	}
+	rss, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || rss <= 0 {
+		t.Fatalf("invalid RSS snapshot %q: %v", raw, err)
+	}
+	return rss
 }
 
 func TestControlledEquivalentOrderSamples(t *testing.T) {
@@ -235,21 +279,38 @@ func TestControlledEquivalentOrderSamples(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := report{Go: runtime.Version(), Node: strings.TrimSpace(string(version)), OS: runtime.GOOS, Arch: runtime.GOARCH, Warmup: 20, Concurrency: 1, Guarantees: "memory-mode real engine, same compiled structural order, input/output normalization and immutable copies, same actual loopback HTTP idempotent provider; no durable throughput claim"}
+	revision := os.Getenv("BLOK_BENCH_SOURCE_REVISION")
+	if decoded, err := hex.DecodeString(revision); err != nil || len(decoded) != 20 {
+		t.Fatal("BLOK_BENCH_SOURCE_REVISION must identify the committed measured source")
+	}
+	topology := os.Getenv("BLOK_BENCH_TOPOLOGY")
+	if topology == "" {
+		t.Fatal("BLOK_BENCH_TOPOLOGY must describe host/container and CPU constraints")
+	}
+	kernel, err := exec.Command("uname", "-srv").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := report{SchemaVersion: 2, SourceRevision: revision, StartedAtUTC: time.Now().UTC().Format(time.RFC3339Nano), Topology: topology, Kernel: strings.TrimSpace(string(kernel)), CPUsVisible: runtime.NumCPU(), GoMaxProcs: runtime.GOMAXPROCS(0), Go: runtime.Version(), Node: strings.TrimSpace(string(version)), OS: runtime.GOOS, Arch: runtime.GOARCH, Warmup: 20, Concurrency: 1, Workload: "issue53-order-v1: price -> HTTP payment -> receipt -> response", OrderSequence: "deterministic <mode>-1 through <mode>-270; no randomized seed", RSSMethod: "ps -o rss= -p PID: separate instantaneous resident KiB snapshots for Node child and Go harness; not peak or isolated native-node memory", StartupMethod: "five fresh Node processes, sequential on warm filesystem caches; process launch through authenticated negotiated readiness; fifth process reused for measured load", Guarantees: "memory-mode real engine, equivalent schemas and immutable engine copies, same actual loopback HTTP idempotent provider and 2-second provider timeout; Node additionally normalizes via SDK and crosses token/principal-authenticated gRPC; native nodes are trusted in-process; no durable or equivalent-cost claim"}
 	for _, mode := range []string{"native", "node"} {
 		p := NewProvider()
+		t.Cleanup(p.Close)
 		var nodes map[string]node.Any
 		var close func()
+		pid := 0
 		if mode == "native" {
 			nodes = NativeNodes(p.Server.URL)
 		} else {
-			var pid int
-			var startup time.Duration
-			nodes, close, pid, startup = selectedWorker(t, p)
-			r.StartupNanoseconds = startup.Nanoseconds()
-			rss, err := exec.Command("ps", "-o", "rss=", "-p", strconv.Itoa(pid)).Output()
-			if err == nil {
-				r.WorkerRSSKiB, _ = strconv.Atoi(strings.TrimSpace(string(rss)))
+			for i := 0; i < 5; i++ {
+				var startup time.Duration
+				nodes, close, pid, startup = selectedWorker(t, p)
+				r.StartupSamples = append(r.StartupSamples, startupSample{ObservedAtUTC: time.Now().UTC().Format(time.RFC3339Nano), StartupNanoseconds: startup.Nanoseconds(), WorkerRSSSnapshotKiB: rssSnapshot(t, pid), GoHarnessRSSSnapshotKiB: rssSnapshot(t, os.Getpid())})
+				if requests, effects := p.Counts(); requests != 0 || effects != 0 {
+					t.Fatal("startup probe executed business effects")
+				}
+				if i < 4 {
+					close()
+				}
 			}
 		}
 		w, err := NewWorkflow(nodes)
@@ -276,6 +337,12 @@ func TestControlledEquivalentOrderSamples(t *testing.T) {
 				s.Nanoseconds = append(s.Nanoseconds, run())
 			}
 			s.Requests, s.Effects = p.Counts()
+			s.ObservedAtUTC = time.Now().UTC().Format(time.RFC3339Nano)
+			s.GoHarnessRSSSnapshotKiB = rssSnapshot(t, os.Getpid())
+			if pid != 0 {
+				rss := rssSnapshot(t, pid)
+				s.WorkerRSSSnapshotKiB = &rss
+			}
 			r.Samples = append(r.Samples, s)
 		}
 		requests, effects := p.Counts()
@@ -287,6 +354,17 @@ func TestControlledEquivalentOrderSamples(t *testing.T) {
 		}
 		p.Close()
 	}
+	// Fault timing is separate from throughput, with unchanged 1/0 and 1/1
+	// request/effect expectations and no receipt publication in either phase.
+	for i := 0; i < 5; i++ {
+		for _, phase := range []string{"delay", "late"} {
+			t.Run(fmt.Sprintf("crash-%d-%s", i, phase), func(t *testing.T) { r.FaultSamples = append(r.FaultSamples, observeWorkerCrash(t, phase)) })
+		}
+	}
+	if t.Failed() {
+		t.Fatal("refusing to publish measured evidence after a failed fault fixture")
+	}
+	r.FinishedAtUTC = time.Now().UTC().Format(time.RFC3339Nano)
 	raw, err := json.MarshalIndent(r, "", "  ")
 	if err != nil {
 		t.Fatal(err)
