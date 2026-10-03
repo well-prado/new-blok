@@ -186,7 +186,8 @@ func afterEffect(failure error, effected string) error {
 }
 
 // effectCommitted is a step failure that follows a committed effect. It
-// deliberately has no Unwrap: nothing in the chain may read as saturation.
+// matches whatever the failure matches except saturation; it has no Unwrap,
+// which would expose saturation further down the chain.
 type effectCommitted struct {
 	err  error
 	step string
@@ -195,6 +196,12 @@ type effectCommitted struct {
 func (e effectCommitted) Error() string {
 	return fmt.Sprintf("%v (after step %q committed its effects)", e.err, e.step)
 }
+
+func (e effectCommitted) Is(target error) bool {
+	return target != capacity.ErrSaturated && errors.Is(e.err, target)
+}
+
+func (e effectCommitted) As(target any) bool { return errors.As(e.err, target) }
 
 func resolveCallInput(state map[string]any, instruction contract.InternalInstruction, input any) (any, error) {
 	if len(instruction.References) == 0 {

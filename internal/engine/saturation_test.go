@@ -38,6 +38,7 @@ func TestSaturationIsHiddenAfterACommittedEffect(t *testing.T) {
 		"test/write": define("test/write", nil, node.Effects("database:write")),
 		"test/read":  define("test/read", nil),
 		"test/busy":  define("test/busy", fmt.Errorf("store busy: %w", capacity.ErrSaturated), node.Effects("database:write")),
+		"test/late":  define("test/late", fmt.Errorf("store busy: %w: %w", capacity.ErrSaturated, context.DeadlineExceeded), node.Effects("database:write")),
 	}
 	program := func(steps ...string) contract.InternalProgram {
 		instructions := make([]contract.InternalInstruction, len(steps))
@@ -69,5 +70,11 @@ func TestSaturationIsHiddenAfterACommittedEffect(t *testing.T) {
 				t.Fatalf("error %q does not name the committed step", err)
 			}
 		})
+	}
+	// Only saturation is hidden: a deadline the failure also carries still
+	// matches, so the trigger answers it as a timeout.
+	_, err := engine.New(nodes).Run(context.Background(), program("test/write", "test/late"), item{ID: "a"})
+	if errors.Is(err, capacity.ErrSaturated) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("after an effect, a busy store past its deadline: saturated=%v deadline=%v; want false, true", errors.Is(err, capacity.ErrSaturated), errors.Is(err, context.DeadlineExceeded))
 	}
 }

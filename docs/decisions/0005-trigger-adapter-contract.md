@@ -50,7 +50,8 @@ dependency. It defines:
   protocol backpressure and never retry it themselves. An error that
   matches both `ErrSaturated` and a context deadline may be answered as
   either (HTTP and WebSocket check saturation first, gRPC and MCP the
-  deadline); both answers are retryable.
+  deadline); both answers are retryable. Once the engine hides
+  saturation, the error matches the deadline alone, if it carries one.
 - `Classified` / `Classify`: a stable public `ErrorCode()`/`ErrorClass()` pair.
   `internal/engine.Error` and `node.DomainError` implement it, so adapters map
   domain errors without importing the engine. Codes are source-visible, so
@@ -154,7 +155,8 @@ not applicable with a reason, never as passed. Failures are
 | Worker consumer loss returns `ErrConsumerLost` after a synchronous rollback | behavioral (fix) | the claim was aborted by `database/sql` in the background; an immediate redelivery hit `SQLITE_BUSY` in 7 of 400 contended conformance runs (0 of 400 after the fix) |
 | Worker dead-letter text may be a classified error code | behavioral | only codes `Classify` accepts as stable identifiers; never arbitrary error text |
 | `trigger.ErrSaturated` is `capacity.ErrSaturated`; `store.ErrBusy` matches it (#190) | behavioral | a busy store's error, reaching an in-band trigger, is answered as saturation instead of an internal error. Code that read `errors.Is(err, ErrSaturated)` as "refused before admission, nothing happened" now also sees "a store transaction committed nothing" |
-| The engine hides saturation after an earlier step's declared effect (#190) | behavioral | such a failure keeps its code and text but no longer matches `ErrSaturated`; it is answered as a failure, never as a retryable refusal |
+| The engine hides saturation after an earlier step's declared effect (#190) | behavioral | such a failure keeps its code and matches everything else it carried, but no longer `ErrSaturated`; its text gains `(after step "<id>" committed its effects)`. It is answered as a failure, never as a retryable refusal. A worker hosting such a workflow fails or dead-letters the job instead of deferring it |
+| Agent catalog workflow tools' dispatch steps declare their child's effects (#190) | behavioral | lets the engine hide saturation after a child's effect; dispatch steps are internal, so nothing else observes it |
 | `store.ErrBusy` text is `store: busy` | behavioral | log text only; match it with `errors.Is` |
 
 ## Limits
