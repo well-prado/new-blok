@@ -139,6 +139,12 @@ SQLite busy timeouts bound statement execution. Worker cancellation/transaction
 ownership acceptance therefore remains pending the independently reviewed
 upstream fix and its integration evidence.
 
+The current recipe handler accepts the existing `*sql.Tx` callback ABI; the
+proposed #180 `worker.Tx` ABI will require an explicit recipe migration once
+the authoritative fix is reviewed and merged. No concurrent handler-SQL
+serialization guarantee is inferred from the proposed wrapper or from this
+recipe's tests.
+
 The typed workflow here validates the command and prepares the stable event;
 the application handlers own the record and outbox SQL transaction. This is a
 deliberate example boundary, not a claim that persistence is an engine node.
