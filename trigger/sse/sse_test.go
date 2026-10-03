@@ -137,6 +137,10 @@ type fixture struct {
 }
 
 func newFixture(t *testing.T, config sse.HubConfig, configure func(*sse.Endpoint)) *fixture {
+	return newFixtureWithListener(t, config, configure, nil)
+}
+
+func newFixtureWithListener(t *testing.T, config sse.HubConfig, configure func(*sse.Endpoint), listener net.Listener) *fixture {
 	t.Helper()
 	hub, err := sse.NewHub(config)
 	if err != nil {
@@ -158,7 +162,11 @@ func newFixture(t *testing.T, config sse.HubConfig, configure func(*sse.Endpoint
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.http = httptest.NewServer(f.server)
+	f.http = httptest.NewUnstartedServer(f.server)
+	if listener != nil {
+		f.http.Listener = listener
+	}
+	f.http.Start()
 	f.client = &http.Client{Transport: &http.Transport{}}
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -540,27 +548,21 @@ func TestSlowSubscriberIsDisconnectedNotBuffered(t *testing.T) {
 // TestBlockedWriteTimesOut: a subscriber whose socket stops draining is
 // disconnected by the write deadline even while its queue has room.
 func TestBlockedWriteTimesOut(t *testing.T) {
-	f := newFixture(t, sse.HubConfig{RetainBytes: 1 << 20, MaxEventBytes: 64 << 10}, func(e *sse.Endpoint) {
+	transport, err := newWriteGateListener()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newFixtureWithListener(t, sse.HubConfig{RetainBytes: 1 << 20, MaxEventBytes: 64 << 10}, func(e *sse.Endpoint) {
 		e.QueueDepth = 256
 		e.WriteTimeout = 100 * time.Millisecond
-	})
+	}, transport)
 	stream := f.started(t, "alice", "k1")
-	conn := stalled(t, f, stream)
+	conn := blockedSubscription(t, f, stream, transport)
 	defer conn.Close()
-	// Small events the socket absorbs, for longer than one write timeout:
-	// each write gets its own deadline, so none of them times out.
-	for i := 0; i < 10; i++ {
-		publish(t, f.hub, stream, 1, "progress")
-		time.Sleep(30 * time.Millisecond)
+	if _, err := f.hub.Publish(stream, sse.Event{Type: "progress", Data: json.RawMessage(`{"step":1}`)}); err != nil {
+		t.Fatal(err)
 	}
-	f.closed.mu.Lock()
-	early := append([]string(nil), f.closed.reasons...)
-	f.closed.mu.Unlock()
-	if len(early) != 0 {
-		t.Fatalf("a draining subscription was closed: %v", early)
-	}
-	// More than the socket absorbs, fewer than it absorbs plus the queue.
-	flood(t, f.hub, stream, 280)
+	transport.waitBlocked(t)
 	f.closed.wait(t, sse.ReasonWriteTimeout)
 	if stats := f.hub.Stats(); stats.SlowSubscribers != 0 {
 		t.Fatalf("closed by the queue, not the write deadline: %+v", stats)
@@ -846,15 +848,21 @@ func TestLongStreamsDoNotLeak(t *testing.T) {
 // socket that stopped draining is ended by Shutdown at once, not after its
 // write deadline.
 func TestShutdownInterruptsABlockedWrite(t *testing.T) {
-	f := newFixture(t, sse.HubConfig{RetainBytes: 1 << 20, MaxEventBytes: 64 << 10}, func(e *sse.Endpoint) {
+	transport, err := newWriteGateListener()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newFixtureWithListener(t, sse.HubConfig{RetainBytes: 1 << 20, MaxEventBytes: 64 << 10}, func(e *sse.Endpoint) {
 		e.QueueDepth = 256
 		e.WriteTimeout = time.Minute
-	})
+	}, transport)
 	stream := f.started(t, "alice", "k1")
-	conn := stalled(t, f, stream)
+	conn := blockedSubscription(t, f, stream, transport)
 	defer conn.Close()
-	flood(t, f.hub, stream, 280)
-	time.Sleep(50 * time.Millisecond)
+	if _, err := f.hub.Publish(stream, sse.Event{Type: "progress", Data: json.RawMessage(`{"step":1}`)}); err != nil {
+		t.Fatal(err)
+	}
+	transport.waitBlocked(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	began := time.Now()
