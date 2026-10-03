@@ -131,9 +131,16 @@ type Server struct {
 	order       []string
 	calls       sync.WaitGroup
 	closing     bool
-	// inflight holds the cancel functions of the calls in flight, by
-	// session id, so a session the client ends cancels its calls.
-	inflight map[string]map[*context.CancelFunc]struct{}
+	// inflight holds the calls in flight by session id, so a session its
+	// owner ends cancels its calls.
+	inflight map[string]*sessionCalls
+}
+
+// sessionCalls are one session's calls in flight and the principal that
+// owns the session.
+type sessionCalls struct {
+	owner   string
+	cancels map[*context.CancelFunc]struct{}
 }
 
 // view is the MCP server one principal sees.
@@ -183,7 +190,7 @@ func New(application *app.Application, config Config) (*Server, error) {
 	if err := probe.Validate(); err != nil {
 		return nil, fmt.Errorf("mcp: budget: %w", err)
 	}
-	s := &Server{application: application, config: config, exposed: map[string]bool{}, slots: make(chan struct{}, config.MaxConcurrency), views: map[string]*view{}, inflight: map[string]map[*context.CancelFunc]struct{}{}}
+	s := &Server{application: application, config: config, exposed: map[string]bool{}, slots: make(chan struct{}, config.MaxConcurrency), views: map[string]*view{}, inflight: map[string]*sessionCalls{}}
 	names := map[string]string{}
 	for _, ref := range config.Expose {
 		if !toolRef.MatchString(ref) || s.exposed[ref] {
@@ -204,7 +211,15 @@ func New(application *app.Application, config Config) (*Server, error) {
 		SessionTimeout:      config.SessionTimeout,
 		MaxRequestBodyBytes: config.MaxRequestBytes,
 	})
-	s.transport = auth.RequireBearerToken(s.verify, nil)(streamable)
+	// The transport answers a DELETE only after the session's calls return,
+	// so a session its owner ends cancels its calls first.
+	ending := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodDelete {
+			s.endSession(request)
+		}
+		streamable.ServeHTTP(writer, request)
+	})
+	s.transport = auth.RequireBearerToken(s.verify, nil)(ending)
 	return s, nil
 }
 
@@ -227,34 +242,12 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		http.Error(writer, "unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	if request.Method != http.MethodDelete {
-		s.transport.ServeHTTP(writer, request)
-		return
-	}
-	// A client ending its session cancels the session's calls, once the
-	// transport has accepted the request as that session's own.
-	recorder := &statusRecorder{ResponseWriter: writer, status: http.StatusOK}
-	s.transport.ServeHTTP(recorder, request)
-	if session := request.Header.Get("Mcp-Session-Id"); session != "" && recorder.status < 300 {
-		s.cancelSession(session)
-	}
+	s.transport.ServeHTTP(writer, request)
 }
 
-type statusRecorder struct {
-	http.ResponseWriter
-	status int
-}
-
-func (r *statusRecorder) WriteHeader(status int) {
-	r.status = status
-	r.ResponseWriter.WriteHeader(status)
-}
-
-func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
-
-// track registers a call's cancel function under its session; the returned
-// function unregisters it.
-func (s *Server) track(session string, cancel context.CancelFunc) func() {
+// track registers a call's cancel function under its session and owner;
+// the returned function unregisters it.
+func (s *Server) track(session, owner string, cancel context.CancelFunc) func() {
 	if session == "" {
 		return func() {}
 	}
@@ -262,26 +255,42 @@ func (s *Server) track(session string, cancel context.CancelFunc) func() {
 	defer s.mu.Unlock()
 	calls, ok := s.inflight[session]
 	if !ok {
-		calls = map[*context.CancelFunc]struct{}{}
+		calls = &sessionCalls{owner: owner, cancels: map[*context.CancelFunc]struct{}{}}
 		s.inflight[session] = calls
 	}
-	calls[&cancel] = struct{}{}
+	calls.cancels[&cancel] = struct{}{}
 	return func() {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		delete(calls, &cancel)
-		if len(calls) == 0 {
+		delete(calls.cancels, &cancel)
+		if len(calls.cancels) == 0 && s.inflight[session] == calls {
 			delete(s.inflight, session)
 		}
 	}
 }
 
-func (s *Server) cancelSession(session string) {
+// endSession cancels the calls of the session a DELETE names, if the
+// authenticated caller owns it. Anyone else's DELETE cancels nothing, and
+// the transport refuses it.
+func (s *Server) endSession(request *http.Request) {
+	session := request.Header.Get("Mcp-Session-Id")
+	info := auth.TokenInfoFromContext(request.Context())
+	if session == "" || info == nil {
+		return
+	}
 	s.mu.Lock()
-	calls := s.inflight[session]
+	calls, ok := s.inflight[session]
+	if !ok || calls.owner != info.UserID {
+		s.mu.Unlock()
+		return
+	}
 	delete(s.inflight, session)
+	cancels := make([]*context.CancelFunc, 0, len(calls.cancels))
+	for cancel := range calls.cancels {
+		cancels = append(cancels, cancel)
+	}
 	s.mu.Unlock()
-	for cancel := range calls {
+	for _, cancel := range cancels {
 		(*cancel)()
 	}
 }
@@ -449,7 +458,7 @@ func (s *Server) handler(principal tool.Principal, t Tool, input schema.Schema, 
 		defer cancel()
 		// A session its client ends cancels its calls.
 		if request.Session != nil {
-			defer s.track(request.Session.ID(), cancel)()
+			defer s.track(request.Session.ID(), principal.ID, cancel)()
 		}
 		budget := s.config.Budget
 		budget.Deadline, _ = ctx.Deadline()
