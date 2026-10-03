@@ -873,6 +873,33 @@ func TestShutdownInterruptsABlockedWrite(t *testing.T) {
 	t.Logf("shutdown ended a blocked subscriber in %v", time.Since(began))
 }
 
+// TestClosingTransportUnblocksABlockedWrite verifies that force-closing the
+// server-side connection also releases the transport gate, as test cleanup
+// and client disconnect handling may do independently of a write deadline.
+func TestClosingTransportUnblocksABlockedWrite(t *testing.T) {
+	transport, err := newWriteGateListener()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newFixtureWithListener(t, sse.HubConfig{RetainBytes: 1 << 20, MaxEventBytes: 64 << 10}, func(e *sse.Endpoint) {
+		e.QueueDepth = 256
+		e.WriteTimeout = time.Minute
+	}, transport)
+	stream := f.started(t, "alice", "k1")
+	conn := blockedSubscription(t, f, stream, transport)
+	defer conn.Close()
+	if _, err := f.hub.Publish(stream, sse.Event{Type: "progress", Data: json.RawMessage(`{"step":1}`)}); err != nil {
+		t.Fatal(err)
+	}
+	transport.waitBlocked(t)
+
+	f.http.CloseClientConnections()
+	if err := transport.waitWriteExit(t); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("closing the server connection ended the blocked write with %v, want %v", err, net.ErrClosed)
+	}
+	f.closed.wait(t, sse.ReasonClientClosed)
+}
+
 // TestEndpointBoundsAreRefused: New refuses endpoints past their bounds,
 // including a subscriber queue that could hold more than MaxQueueBytes.
 func TestEndpointBoundsAreRefused(t *testing.T) {

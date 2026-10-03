@@ -19,9 +19,11 @@ import (
 // blocked, independent of the host's TCP send-buffer size.
 type writeGateListener struct {
 	net.Listener
-	armed   atomic.Bool
-	entered chan struct{}
-	once    sync.Once
+	armed     atomic.Bool
+	entered   chan struct{}
+	exited    chan error
+	enterOnce sync.Once
+	exitOnce  sync.Once
 }
 
 func newWriteGateListener() (*writeGateListener, error) {
@@ -29,7 +31,7 @@ func newWriteGateListener() (*writeGateListener, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &writeGateListener{Listener: listener, entered: make(chan struct{})}, nil
+	return &writeGateListener{Listener: listener, entered: make(chan struct{}), exited: make(chan error, 1)}, nil
 }
 
 func (l *writeGateListener) Accept() (net.Conn, error) {
@@ -37,7 +39,7 @@ func (l *writeGateListener) Accept() (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &writeGateConn{Conn: conn, gate: l, changed: make(chan struct{})}, nil
+	return &writeGateConn{Conn: conn, gate: l, changed: make(chan struct{}), closed: make(chan struct{})}, nil
 }
 
 func (l *writeGateListener) arm() { l.armed.Store(true) }
@@ -51,12 +53,34 @@ func (l *writeGateListener) waitBlocked(t *testing.T) {
 	}
 }
 
+func (l *writeGateListener) waitWriteExit(t *testing.T) error {
+	t.Helper()
+	select {
+	case err := <-l.exited:
+		return err
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocked HTTP transport write did not exit")
+		return nil
+	}
+}
+
 type writeGateConn struct {
 	net.Conn
-	gate    *writeGateListener
-	mu      sync.Mutex
-	writeAt time.Time
-	changed chan struct{}
+	gate     *writeGateListener
+	mu       sync.Mutex
+	writeAt  time.Time
+	changed  chan struct{}
+	closed   chan struct{}
+	close    sync.Once
+	closeErr error
+}
+
+func (c *writeGateConn) Close() error {
+	c.close.Do(func() {
+		close(c.closed)
+		c.closeErr = c.Conn.Close()
+	})
+	return c.closeErr
 }
 
 func (c *writeGateConn) SetWriteDeadline(deadline time.Time) error {
@@ -75,18 +99,26 @@ func (c *writeGateConn) Write(p []byte) (int, error) {
 	if !c.gate.armed.Load() {
 		return c.Conn.Write(p)
 	}
-	c.gate.once.Do(func() { close(c.gate.entered) })
+	c.gate.enterOnce.Do(func() { close(c.gate.entered) })
+	finish := func(err error) (int, error) {
+		c.gate.exitOnce.Do(func() { c.gate.exited <- err })
+		return 0, err
+	}
 	for {
 		c.mu.Lock()
 		deadline, changed := c.writeAt, c.changed
 		c.mu.Unlock()
 		if deadline.IsZero() {
-			<-changed
-			continue
+			select {
+			case <-changed:
+				continue
+			case <-c.closed:
+				return finish(net.ErrClosed)
+			}
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			return 0, os.ErrDeadlineExceeded
+			return finish(os.ErrDeadlineExceeded)
 		}
 		timer := time.NewTimer(remaining)
 		select {
@@ -95,7 +127,7 @@ func (c *writeGateConn) Write(p []byte) (int, error) {
 			expired := !c.writeAt.IsZero() && !time.Now().Before(c.writeAt)
 			c.mu.Unlock()
 			if expired {
-				return 0, os.ErrDeadlineExceeded
+				return finish(os.ErrDeadlineExceeded)
 			}
 		case <-changed:
 			if !timer.Stop() {
@@ -104,6 +136,14 @@ func (c *writeGateConn) Write(p []byte) (int, error) {
 				default:
 				}
 			}
+		case <-c.closed:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return finish(net.ErrClosed)
 		}
 	}
 }
