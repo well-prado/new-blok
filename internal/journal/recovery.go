@@ -195,6 +195,12 @@ func (j *Journal) Recover(ctx context.Context, runID, artifactDigest, checkpoint
 		if recovery.Checkpoint.ArtifactDigest != artifactDigest || recovery.Checkpoint.CheckpointDigest != checkpointDigest {
 			return ErrArtifactMismatch
 		}
+		var registeredDigest string
+		if err := tx.QueryRowContext(ctx, `SELECT digest FROM journal_artifacts WHERE digest = ?`, artifactDigest).Scan(&registeredDigest); errors.Is(err, sql.ErrNoRows) {
+			return ErrArtifactMissing
+		} else if err != nil {
+			return err
+		}
 		rows, err := tx.QueryContext(ctx, `SELECT run_id, path, kind, parent_path, state, output_json, error_text FROM journal_scopes WHERE run_id = ? ORDER BY path`, runID)
 		if err != nil {
 			return err
