@@ -137,6 +137,14 @@
       "status": "implemented",
       "decision": "Generated method descriptors map to domain values by protojson, proven against the binding and workflow schemas at startup; calls are authenticated from metadata, authorized per method on the server, bounded in time, size and concurrency, answered with status codes carrying stable codes only; application services refuse the worker runtime's package and any name already registered (ADR 0013).",
       "evidence": ["grpc-mapping-fixture", "grpc-generated-round-trip", "grpc-deadlines-cancellation", "grpc-capacity-size", "grpc-server-message-limit", "grpc-shutdown", "grpc-tls-listeners", "grpc-worker-collision", "grpc-no-leak", "grpc-wire-bounds", "grpc-json-value-limit", "grpc-panic-contained", "grpc-interceptor-request", "grpc-default-expansion", "grpc-nesting-bound", "grpc-protobuf-encoding-only", "grpc-trigger-conformance"]
+    },
+    {
+      "id": "mcp-tool-exposure",
+      "question": "Which catalog tools can an MCP client see and call, as whom, and what stops an unreviewed effect, a hijacked session or abandoned work?",
+      "owner": "E09-T08",
+      "status": "implemented",
+      "decision": "Only tools the endpoint exposes by name@version, the catalog lists for the caller and whose schemas MCP can carry are visible; each call runs as the principal its own request authenticated, is schema-validated, bounded in concurrency and time, and dispatched through the catalog, where a named approval is only looked up; errors reach the model as stable codes; sessions and calls are bounded globally and per principal; a client cancel, a dropped request or the owner ending its session cancels the work (ADR 0014).",
+      "evidence": ["mcp-fixture-cases", "mcp-discovery-and-resources", "mcp-unauthenticated", "mcp-revocation-mid-session", "mcp-session-hijack", "mcp-protocol-versions", "mcp-deadline", "mcp-client-cancel", "mcp-dropped-request-cancel", "mcp-session-end-cancel", "mcp-late-queued-call", "mcp-overload", "mcp-principal-slots", "mcp-session-bounds", "mcp-output-bound", "mcp-draining", "mcp-call-lease", "mcp-shutdown", "mcp-evicted-views", "mcp-view-building", "mcp-listing-panic", "mcp-goroutine-bounds", "mcp-approval-evidence", "mcp-workflow-tool", "mcp-dependency-rule", "mcp-selection-footprint", "mcp-trigger-conformance"]
     }
   ]
 }
