@@ -423,28 +423,24 @@ func (q *Queue) Get(ctx context.Context, requestKey string) (Job, error) {
 	return job, err
 }
 
+// claim leases the next available job. Its first statement writes: a
+// transaction that reads before writing cannot wait for a concurrent
+// writer and fails with SQLITE_BUSY once that writer commits; one that
+// writes first waits under the busy timeout (as cron's cursor writes do).
 func (q *Queue) claim(ctx context.Context, tx *sql.Tx) (Job, error) {
-	var job Job
-	row := tx.QueryRowContext(ctx, `SELECT job_id, request_key, kind, payload_json, attempt, max_attempts, deferrals, principal_json, state, error_text FROM worker_jobs
-		WHERE (state = ? OR (state = ? AND lease_until <= ?)) AND available_at <= ? ORDER BY created_at, job_id LIMIT 1`, StatePending, StateProcessing, q.now(), q.now())
-	if scanned, err := scanJob(row); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return Job{}, ErrNotFound
-		}
-		return Job{}, err
-	} else {
-		job = scanned
+	now := q.now()
+	leaseUntil := time.Unix(0, now).Add(30 * time.Second).UnixNano()
+	job, err := scanJob(tx.QueryRowContext(ctx, `UPDATE worker_jobs SET state = ?, attempt = attempt + 1, lease_until = ?, updated_at = ?
+		WHERE job_id = (SELECT job_id FROM worker_jobs
+			WHERE (state = ? OR (state = ? AND lease_until <= ?)) AND available_at <= ? ORDER BY created_at, job_id LIMIT 1)
+		RETURNING job_id, request_key, kind, payload_json, attempt, max_attempts, deferrals, principal_json, state, error_text`,
+		StateProcessing, leaseUntil, now, StatePending, StateProcessing, now, now))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Job{}, ErrNotFound
 	}
-	leaseUntil := time.Unix(0, q.now()).Add(30 * time.Second).UnixNano()
-	result, err := tx.ExecContext(ctx, `UPDATE worker_jobs SET state = ?, attempt = attempt + 1, lease_until = ?, updated_at = ? WHERE job_id = ? AND (state = ? OR (state = ? AND lease_until <= ?))`, StateProcessing, leaseUntil, q.now(), job.ID, StatePending, StateProcessing, q.now())
 	if err != nil {
 		return Job{}, err
 	}
-	if changed, _ := result.RowsAffected(); changed != 1 {
-		return Job{}, ErrNotFound
-	}
-	job.Attempt++
-	job.State = StateProcessing
 	return job, nil
 }
 

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -445,5 +446,83 @@ func TestPrincipalIsPersistedAndPartOfRequestIdentity(t *testing.T) {
 	}
 	if seen.ID != owner.ID || len(seen.Roles) != 1 || seen.Roles[0] != "orders" {
 		t.Fatalf("handler principal=%+v, want %+v", seen, owner)
+	}
+}
+
+// TestConcurrentWorkersNeverFailBusy: several workers and concurrent
+// submitters on one store. Every job runs exactly once and no worker sees
+// SQLITE_BUSY: a claim writes first, so a contending worker waits under the
+// busy timeout instead of failing on a stale read (#176).
+func TestConcurrentWorkersNeverFailBusy(t *testing.T) {
+	ctx := context.Background()
+	database, err := (sqlite.Backend{}).Open(ctx, filepath.Join(t.TempDir(), "busy.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	queue, err := New(ctx, database, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.RegisterKind("busy", []byte(`{"type":"object"}`)); err != nil {
+		t.Fatal(err)
+	}
+	const jobs, workers = 200, 4
+	var submitters sync.WaitGroup
+	submitErrs := make(chan error, jobs)
+	for i := range jobs {
+		submitters.Add(1)
+		go func() {
+			defer submitters.Done()
+			if _, err := queue.Submit(ctx, trigger.Submission{Key: fmt.Sprintf("busy-%d", i), Kind: "busy", Payload: []byte(`{}`)}); err != nil {
+				submitErrs <- err
+			}
+		}()
+	}
+	var mu sync.Mutex
+	runs := map[string]int{}
+	var failures []error
+	var group sync.WaitGroup
+	deadline := time.Now().Add(30 * time.Second)
+	for range workers {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			for time.Now().Before(deadline) {
+				mu.Lock()
+				done := len(runs) == jobs
+				mu.Unlock()
+				if done {
+					return
+				}
+				if _, err := queue.ProcessOnce(ctx, func(_ context.Context, _ *sql.Tx, job Job) error {
+					mu.Lock()
+					runs[job.RequestKey]++
+					mu.Unlock()
+					return nil
+				}); err != nil {
+					mu.Lock()
+					failures = append(failures, err)
+					mu.Unlock()
+				}
+			}
+		}()
+	}
+	submitters.Wait()
+	close(submitErrs)
+	group.Wait()
+	for err := range submitErrs {
+		t.Errorf("submit: %v", err)
+	}
+	if len(failures) != 0 {
+		t.Fatalf("%d ProcessOnce calls failed; first: %v", len(failures), failures[0])
+	}
+	if len(runs) != jobs {
+		t.Fatalf("%d of %d jobs ran", len(runs), jobs)
+	}
+	for key, n := range runs {
+		if n != 1 {
+			t.Fatalf("job %s ran %d times", key, n)
+		}
 	}
 }

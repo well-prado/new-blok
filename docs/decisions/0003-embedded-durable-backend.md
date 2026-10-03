@@ -20,6 +20,16 @@ callers may acknowledge accepted work only after that return. This is a local
 filesystem durability guarantee subject to the operating system and storage
 device honoring flushes; it is not disk-loss survival or multi-host failover.
 
+Transactions start deferred, so reads stay concurrent with a writer under WAL.
+The busy timeout only helps a transaction that has not read yet: one that
+reads and then writes fails at once with `SQLITE_BUSY` if another writer
+committed after its read began, because waiting cannot make that read
+current. A transaction that may write under contention therefore writes
+first: the worker's job claim is one `UPDATE … RETURNING` (#176), and cron
+inserts its cursor before reading it (#169). With 4 workers and 200 jobs,
+the claim went from 2,720–7,516 busy errors per run to none, at comparable
+elapsed time (161–368 ms before, 190–344 ms after; 5 samples each).
+
 ## Alternatives considered
 
 The executable spike compares SQLite with `go.etcd.io/bbolt` v1.5.0. bbolt is
