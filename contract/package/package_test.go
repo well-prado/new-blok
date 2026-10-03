@@ -236,14 +236,20 @@ func TestInvalidManifestGoldenFixtures(t *testing.T) {
 			switch tc.Mutation {
 			case "invalid-name":
 				manifest.Identity.Name = "../quote"
+			case "overlong-name":
+				manifest.Identity.Name = strings.Repeat("n", 258)
 			case "prerelease-version":
 				manifest.Identity.Version = "1.0.0-rc.1"
 			case "overflowing-identity-version":
 				manifest.Identity.Version = "18446744073709551616.0.0"
 			case "missing-license":
 				manifest.License = ""
+			case "overlong-license":
+				manifest.License = strings.Repeat("L", MaxLicenseBytes+1)
 			case "missing-provenance":
 				manifest.Provenance.Source = ""
+			case "oversized-provenance-source":
+				manifest.Provenance.Source = "https://example.test/" + strings.Repeat("x", 2048)
 			case "invalid-engine-range":
 				manifest.Compatibility.Engine = "latest"
 			case "overflowing-engine-range":
@@ -471,6 +477,7 @@ func TestRegistryProtocolFixtureAgainstLocalMock(t *testing.T) {
 	var executions atomic.Int32
 	var tamperNext atomic.Bool
 	var substituteNext atomic.Bool
+	var denyNext atomic.Int32
 	var lastStatus atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
@@ -495,6 +502,11 @@ func TestRegistryProtocolFixtureAgainstLocalMock(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(found)
 		case http.MethodPut:
+			if deniedStatus := denyNext.Swap(0); deniedStatus != 0 {
+				lastStatus.Store(deniedStatus)
+				http.Error(w, http.StatusText(int(deniedStatus)), int(deniedStatus))
+				return
+			}
 			var incoming Bundle
 			dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, MaxBundleBytes))
 			dec.DisallowUnknownFields()
@@ -546,6 +558,13 @@ func TestRegistryProtocolFixtureAgainstLocalMock(t *testing.T) {
 			if tc.ResponseVariant == "substituted-content" {
 				substituteNext.Store(true)
 			}
+			if tc.ResponseVariant == "unauthenticated-publisher" {
+				denyNext.Store(http.StatusUnauthorized)
+			}
+			if tc.ResponseVariant == "unauthorized-namespace" {
+				denyNext.Store(http.StatusForbidden)
+			}
+			packagesBefore, bytesBefore := store.Usage()
 			var gotErr error
 			var verified Verified
 			switch tc.Name {
@@ -557,7 +576,7 @@ func TestRegistryProtocolFixtureAgainstLocalMock(t *testing.T) {
 					env.EngineVersion = "2.0.0"
 				}
 				_, verified, gotErr = client.Fetch(context.Background(), id, policy, env)
-			case "publish-identical", "publish-version-conflict", "publish-substituted-content":
+			case "publish-identical", "publish-version-conflict", "publish-substituted-content", "publish-unauthenticated", "publish-namespace-forbidden":
 				toPublish := cloneBundle(bundle)
 				if tc.Name == "publish-version-conflict" {
 					toPublish.Artifact = []byte("different immutable content")
@@ -569,6 +588,12 @@ func TestRegistryProtocolFixtureAgainstLocalMock(t *testing.T) {
 			}
 			if got, want := int(lastStatus.Load()), tc.ExpectedStatus; got != want {
 				t.Fatalf("mock registry status=%d, want %d", got, want)
+			}
+			if tc.ExpectedStatus == http.StatusUnauthorized || tc.ExpectedStatus == http.StatusForbidden {
+				packagesAfter, bytesAfter := store.Usage()
+				if packagesAfter != packagesBefore || bytesAfter != bytesBefore {
+					t.Fatalf("denied publish changed local store usage from (%d, %d) to (%d, %d)", packagesBefore, bytesBefore, packagesAfter, bytesAfter)
+				}
 			}
 			if tc.ExpectedError == "" {
 				if gotErr != nil {
@@ -586,6 +611,9 @@ func TestRegistryProtocolFixtureAgainstLocalMock(t *testing.T) {
 				return
 			}
 			if tc.ExpectedError == "version_conflict" && errors.Is(gotErr, ErrVersionConflict) {
+				return
+			}
+			if tc.ExpectedError == "protocol_error" && errors.Is(gotErr, ErrProtocol) {
 				return
 			}
 			var contractErr *Error
@@ -615,6 +643,10 @@ func TestClientRejectsRegistryURLCredentialsAndBoundedResponse(t *testing.T) {
 	client := Client{BaseURL: "https://user:secret@example.test"}
 	if _, _, err := client.Fetch(context.Background(), fixtureBundle(t).Manifest.Identity, TrustPolicy{AllowUnsignedLocal: true}, fixtureEnvironment()); err == nil {
 		t.Fatal("credential-bearing registry URL accepted")
+	}
+	client.BaseURL = "https://example.test/" + strings.Repeat("x", MaxRegistryURLBytes)
+	if _, _, err := client.Fetch(context.Background(), fixtureBundle(t).Manifest.Identity, TrustPolicy{AllowUnsignedLocal: true}, fixtureEnvironment()); err == nil {
+		t.Fatal("overlong registry URL accepted")
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = fmt.Fprint(w, strings.Repeat("x", MaxBundleBytes+10))

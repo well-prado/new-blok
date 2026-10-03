@@ -69,6 +69,9 @@ func (s *Store) Publish(bundle Bundle, policy TrustPolicy, env Environment) (Ver
 	if err := validateArtifactSize(bundle.Artifact); err != nil {
 		return Verified{}, err
 	}
+	if err := bundle.Manifest.Validate(); err != nil {
+		return Verified{}, err
+	}
 	bundle = cloneBundle(bundle)
 	verified, err := bundle.Verify(policy, env)
 	if err != nil {

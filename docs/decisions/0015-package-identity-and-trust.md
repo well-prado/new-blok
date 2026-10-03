@@ -26,7 +26,8 @@ signature, and artifact bytes (base64 in JSON). The manifest binds:
 - zero or more unique namespaced dependencies, each with a version range and
   optional required manifest digest;
 - engine and schema version ranges, plus optional named runtime ranges;
-- a required SPDX license identifier (or an explicitly named `LicenseRef`); and
+- a required SPDX license identifier (or an explicitly named `LicenseRef`),
+  bounded to 256 bytes; and
 - source URL, hexadecimal source revision, and bounded builder identity.
 
 The canonical manifest is compact UTF-8 JSON with struct fields in the order
@@ -37,9 +38,10 @@ name, and runtime-map keys sorted lexicographically. Strings use Go
 newline is included. The golden digest in `local-node-v1.json` pins this byte
 profile for non-Go consumers. The manifest digest is SHA-256 of those bytes.
 The signature is Ed25519 over the same canonical bytes; it therefore binds
-identity, compatibility, license, provenance, dependencies, and artifact digest. The
-artifact digest separately checks the exact artifact bytes. A signature is an
-attestation, not proof that a build was reproducible or that source is safe.
+identity, compatibility, license, provenance, dependencies, and artifact
+digest. The artifact digest separately checks the exact artifact bytes. A
+signature is an attestation, not proof that a build was reproducible or that
+source is safe.
 
 Compatibility and dependency constraints use this portable subset of semantic
 version expressions: whitespace-separated exact or comparator clauses, for
@@ -87,6 +89,46 @@ and deciding which local sources qualify for unsigned use. Registry TLS and
 service authentication are separate from package publisher signatures and from
 runtime sandboxing. Native package code remains application-trusted code.
 
+## Publisher ownership and authorization
+
+Every hosted publishing request must authenticate a publisher principal using
+the service's account or workload credentials, independently of the package
+signature. The service authorizes that principal against an explicit namespace
+grant and an active signing-key binding for that namespace. A valid Ed25519
+signature proves possession of its key and integrity of the manifest; it does
+not establish namespace ownership, grant publish rights, or replace service
+authentication. A service must not infer ownership from the first signed
+package it receives.
+
+Namespace creation/claim must establish an owner through the registry's
+authenticated account or organization verification process before accepting
+publishes. Only the owner or a principal the owner explicitly grants publish
+authority may publish there. An ownership transfer requires an authenticated,
+audited transfer approved by the current owner and accepted by the new owner;
+it changes future authorization only and never rewrites historical package
+ownership metadata or immutable package bytes. Key rotation is an explicit
+owner-authorized key-binding change: the owner registers the new key before
+use and may overlap old and new active keys during a transition. A retired key
+ceases to authorize new publishes when retirement takes effect; revocation
+immediately blocks future publishes signed by that key. Retired or revoked
+keys and their historical signatures remain recorded; rotation or revocation
+does not re-sign, replace, or delete an existing `(identity, version)`. A
+different signature for an existing version is an immutable-version conflict;
+publish rotated signatures as a new package version. Consumers relying on
+current revocation state must obtain fresh authenticated registry trust data;
+offline signature verification alone cannot establish that a key remains
+unrevoked.
+
+Publishing returns `401` when service credentials are missing or invalid and
+`403` when the authenticated principal lacks the namespace grant or its key
+binding is inactive/revoked. Both are terminal failures: consumers and
+automation must not retry as unsigned, fall back to a different namespace, or
+interpret either response as a successful publish. Private mirrors that accept
+publishes inherit these authentication, grant, key-binding, and immutability
+rules; mirroring content does not confer publish entitlement. The local
+`unsigned-local` policy is only a consumer decision for an established local
+source and never grants or implies hosted-publish authorization.
+
 License and provenance fields are mandatory and syntax-checked. The current
 contract does not include the full SPDX license list or verify claims about
 source repositories, revisions, builders, or build attestations. Review policy
@@ -100,27 +142,31 @@ Base path: `/v1/packages/{namespace}/{name}/{version}`.
 | Method | Success | Other defined response | Request/response |
 | --- | --- | --- | --- |
 | `GET` | `200` | `404` not found | Returns the JSON bundle |
-| `PUT` | `201` created; `200` identical existing content | `409` immutable-version conflict | Sends and returns the JSON bundle |
+| `PUT` | `201` created; `200` identical existing content | `401` unauthenticated; `403` not authorized; `409` immutable-version conflict | Sends and returns the JSON bundle |
 
 Requests and responses are bounded to the base64 encoding of an 8 MiB artifact
-plus 64 KiB of manifest/signature JSON overhead. A successful `PUT` response
-must verify to the exact submitted manifest digest, artifact digest, signature,
-and identity; a registry cannot acknowledge a substituted but otherwise valid
-package. The client rejects unsupported URL schemes, URL credentials, unknown
-response fields, trailing JSON, oversized documents, incompatible packages,
-and invalid integrity or trust evidence. Registry authentication, transport
-policy, namespace authorization, ownership verification, moderation, search,
-billing, quotas, and audit implementation are owned by the separate hosted
-registry product. The registry must preserve immutable identity semantics and
-must not treat a successful HTTP response as signature verification by itself.
+plus 64 KiB of manifest/signature JSON overhead. Registry base URLs are limited
+to 2048 bytes. A successful `PUT` response must verify to the exact submitted
+manifest digest, artifact digest, signature, and identity; a registry cannot
+acknowledge a substituted but otherwise valid package. The client rejects
+unsupported URL schemes, URL credentials, unknown response fields, trailing
+JSON, oversized documents, incompatible packages, and invalid integrity or
+trust evidence. The status and ownership rules above are framework
+service-contract requirements; their implementation, transport
+policy, moderation, search, billing, quotas, and audit storage are owned by the
+separate hosted registry product. The registry must preserve immutable
+identity semantics and must not treat a successful HTTP response as signature
+verification by itself.
 
 The checked-in `testdata/packages/protocol-fixtures.json` is consumed by tests
 running the actual package client against an in-process mock registry backed by
 the same immutable store contract. It specifies successful fetch, explicit
 unsigned trust, incompatibility, not-found, idempotent publish, version
-conflict, substituted publish response, and tampered artifact outcomes. Expected
-package execution count is zero: installation and inspection never execute
-package contents.
+conflict, substituted publish response, authentication and namespace
+authorization denials, and tampered artifact outcomes. Expected package
+execution count is zero: installation and inspection never execute package
+contents. The mock service is a protocol fixture, not an implementation of
+hosted authentication or ownership verification.
 
 ## Compatibility and evidence
 
@@ -162,3 +208,8 @@ checks the artifact-size limit before copying caller-provided bytes passed
 `GOMAXPROCS=3 go vet -p=3 ./contract/package`, `go test ./contract/package`,
 and `git diff --check`. The parent’s serialized combined platform gates remain
 pending; these local runs do not substitute for their final result.
+
+After adding the publisher-authorization policy and `401`/`403` denial
+fixtures, Go 1.27.1 on Darwin arm64 passed
+`GOMAXPROCS=3 go test -p=3 -race ./contract/package -count=3`,
+`GOMAXPROCS=3 go vet -p=3 ./contract/package`, and `git diff --check`.

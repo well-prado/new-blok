@@ -14,6 +14,7 @@ import (
 
 const protocolPrefix = "/v1/packages/"
 const MaxBundleBytes = ((MaxArtifactBytes+2)/3*4 + (64 << 10))
+const MaxRegistryURLBytes = 2048
 
 // Client implements the framework-owned package consumer wire protocol. The
 // endpoint may be an offline/private mirror; this package does not provide or
@@ -36,6 +37,9 @@ func (c Client) Fetch(ctx context.Context, id Identity, policy TrustPolicy, env 
 // accepted canonical bundle; 409 means the version already has other content.
 func (c Client) Publish(ctx context.Context, bundle Bundle, policy TrustPolicy, env Environment) (Verified, error) {
 	if err := validateArtifactSize(bundle.Artifact); err != nil {
+		return Verified{}, err
+	}
+	if err := bundle.Manifest.Validate(); err != nil {
 		return Verified{}, err
 	}
 	submitted := cloneBundle(bundle)
@@ -68,6 +72,9 @@ func (c Client) Publish(ctx context.Context, bundle Bundle, policy TrustPolicy, 
 func (c Client) request(ctx context.Context, method string, id Identity, body io.Reader) (*http.Request, error) {
 	if err := id.Validate(); err != nil {
 		return nil, err
+	}
+	if len(c.BaseURL) == 0 || len(c.BaseURL) > MaxRegistryURLBytes {
+		return nil, &Error{Code: "invalid_registry_url", Path: "baseUrl", Message: "registry URL must be nonempty and at most 2048 bytes"}
 	}
 	u, err := url.Parse(c.BaseURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {

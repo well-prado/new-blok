@@ -26,6 +26,7 @@ const (
 	MaxRuntimeRequirements = 32
 	MaxSignatureKeyIDBytes = 128
 	MaxSignatureValueBytes = 88
+	MaxLicenseBytes        = 256
 )
 
 var (
@@ -167,15 +168,18 @@ var (
 )
 
 func (id Identity) Validate() error {
+	if len(id.Name) > 257 {
+		return &Error{Code: "invalid_identity", Path: "identity.name", Message: "name must be namespace/name using lowercase ASCII letters, digits, dot, underscore, or hyphen"}
+	}
+	if len(id.Version) > 62 {
+		return &Error{Code: "invalid_identity", Path: "identity.version", Message: "version components must fit unsigned 64-bit values"}
+	}
 	parts := strings.Split(id.Name, "/")
 	if len(parts) != 2 || !namePart.MatchString(parts[0]) || !namePart.MatchString(parts[1]) {
 		return &Error{Code: "invalid_identity", Path: "identity.name", Message: "name must be namespace/name using lowercase ASCII letters, digits, dot, underscore, or hyphen"}
 	}
 	if !semverRE.MatchString(id.Version) {
 		return &Error{Code: "invalid_identity", Path: "identity.version", Message: "version must be stable major.minor.patch semantic version"}
-	}
-	if len(id.Version) > 62 {
-		return &Error{Code: "invalid_identity", Path: "identity.version", Message: "version components must fit unsigned 64-bit values"}
 	}
 	if _, ok := parseVersion(id.Version); !ok {
 		return &Error{Code: "invalid_identity", Path: "identity.version", Message: "version components must fit unsigned 64-bit values"}
@@ -193,10 +197,10 @@ func (m Manifest) Validate() error {
 	if m.Kind != "node" && m.Kind != "workflow" {
 		return &Error{Code: "invalid_manifest", Path: "kind", Message: "kind must be node or workflow"}
 	}
-	if !digestRE.MatchString(m.ArtifactDigest) {
+	if len(m.ArtifactDigest) != len("sha256:")+64 || !digestRE.MatchString(m.ArtifactDigest) {
 		return &Error{Code: "invalid_manifest", Path: "artifactDigest", Message: "artifact digest must use sha256 and 64 lowercase hex characters"}
 	}
-	if !licenseRE.MatchString(m.License) {
+	if len(m.License) > MaxLicenseBytes || !licenseRE.MatchString(m.License) {
 		return &Error{Code: "invalid_license", Path: "license", Message: "license must be an SPDX identifier or LicenseRef identifier"}
 	}
 	if err := validateProvenance(m.Provenance); err != nil {
@@ -241,14 +245,17 @@ func (m Manifest) Validate() error {
 }
 
 func validateProvenance(p Provenance) error {
-	u, err := url.Parse(p.Source)
-	if err != nil || len(p.Source) > 2048 || (u.Scheme != "https" && u.Scheme != "git+https") || u.Host == "" || u.User != nil || u.Fragment != "" {
+	if len(p.Source) == 0 || len(p.Source) > 2048 {
 		return &Error{Code: "invalid_provenance", Path: "provenance.source", Message: "source must be an HTTPS or git+HTTPS URL without credentials or fragment"}
 	}
-	if !revisionRE.MatchString(p.Revision) {
+	u, err := url.Parse(p.Source)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "git+https") || u.Host == "" || u.User != nil || u.Fragment != "" {
+		return &Error{Code: "invalid_provenance", Path: "provenance.source", Message: "source must be an HTTPS or git+HTTPS URL without credentials or fragment"}
+	}
+	if len(p.Revision) < 7 || len(p.Revision) > 64 || !revisionRE.MatchString(p.Revision) {
 		return &Error{Code: "invalid_provenance", Path: "provenance.revision", Message: "revision must be a hexadecimal source commit"}
 	}
-	if strings.TrimSpace(p.Builder) == "" || len(p.Builder) > 256 || strings.ContainsAny(p.Builder, "\x00\r\n") {
+	if len(p.Builder) > 256 || strings.TrimSpace(p.Builder) == "" || strings.ContainsAny(p.Builder, "\x00\r\n") {
 		return &Error{Code: "invalid_provenance", Path: "provenance.builder", Message: "builder identity is required and bounded"}
 	}
 	return nil

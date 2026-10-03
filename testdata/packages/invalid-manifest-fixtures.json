@@ -3,10 +3,13 @@
   "expectedPackageExecutions": 0,
   "cases": [
     { "name": "path-like-package-name", "mutation": "invalid-name", "expectedError": "invalid_identity" },
+    { "name": "overlong-package-name", "mutation": "overlong-name", "expectedError": "invalid_identity" },
     { "name": "prerelease-package-version", "mutation": "prerelease-version", "expectedError": "invalid_identity" },
     { "name": "overflowing-package-version-component", "mutation": "overflowing-identity-version", "expectedError": "invalid_identity" },
     { "name": "missing-license", "mutation": "missing-license", "expectedError": "invalid_license" },
+    { "name": "overlong-license", "mutation": "overlong-license", "expectedError": "invalid_license" },
     { "name": "missing-source-provenance", "mutation": "missing-provenance", "expectedError": "invalid_provenance" },
+    { "name": "oversized-source-provenance", "mutation": "oversized-provenance-source", "expectedError": "invalid_provenance" },
     { "name": "unsupported-engine-range", "mutation": "invalid-engine-range", "expectedError": "invalid_compatibility" },
     { "name": "out-of-range-semver-in-engine-range", "mutation": "overflowing-engine-range", "expectedError": "invalid_compatibility" },
     { "name": "unsupported-dependency-range", "mutation": "invalid-dependency-range", "expectedError": "invalid_manifest" },
