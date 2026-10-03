@@ -3,8 +3,12 @@ package main
 import (
 	"bytes"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/well-prado/new-blok/internal/scaffold"
 )
 
 func TestCommands(t *testing.T) {
@@ -27,6 +31,57 @@ func TestCommands(t *testing.T) {
 				t.Fatalf("output %q does not contain %q", out.String(), tt.want)
 			}
 		})
+	}
+}
+
+func TestNewCreatesConventionalApplicationAndIsNonInteractive(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "quote-app")
+	var out bytes.Buffer
+	if err := run([]string{"new", directory, "--module", "example.com/quote", "--name", "quote"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"go.mod", "blok.json", "cmd/quote/main.go", "cmd/quote/main_test.go", "internal/app/types.go"} {
+		if _, err := os.Stat(filepath.Join(directory, name)); err != nil {
+			t.Fatalf("missing %s: %v", name, err)
+		}
+	}
+	if err := run([]string{"new", directory, "--non-interactive"}, &out); err == nil || !strings.Contains(err.Error(), "not empty") {
+		t.Fatalf("expected non-empty refusal, got %v", err)
+	}
+}
+
+func TestNewInteractiveCancellation(t *testing.T) {
+	var out bytes.Buffer
+	if err := runWithIO([]string{"new", "--interactive"}, &out, strings.NewReader("")); !errors.Is(err, scaffold.ErrCancelled) {
+		t.Fatalf("got %v, want cancellation", err)
+	}
+}
+
+func TestGenerateIsStableAndDoesNotExecuteSource(t *testing.T) {
+	directory := t.TempDir()
+	input := filepath.Join(directory, "types.go")
+	output := filepath.Join(directory, "bindings_gen.go")
+	source := []byte("package example\nfunc init() { panic(\"must not execute\") }\ntype Item struct { ID string }\n")
+	if err := os.WriteFile(input, source, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := run([]string{"generate", "--input", input, "--output", output}, &out); err != nil {
+		t.Fatal(err)
+	}
+	first, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"generate", "--input", input, "--output", output, "--check"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	second, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(first, second) {
+		t.Fatal("generated output changed on repeat")
 	}
 }
 
