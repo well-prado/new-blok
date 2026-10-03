@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/well-prado/new-blok/store"
 	"github.com/well-prado/new-blok/store/sqlite"
 	"github.com/well-prado/new-blok/trigger"
 )
@@ -702,5 +703,53 @@ func TestMeasureClaimContention(t *testing.T) {
 		group.Wait()
 		t.Logf("sample=%d jobs=%d busy_errors=%d elapsed=%s", sample, runs, busy, time.Since(begin).Round(time.Millisecond))
 		_ = database.Close()
+	}
+}
+
+// TestBusyStoreSubmissionIsSaturation: a submission that cannot get the
+// store's write lock within the busy timeout is saturation, retryable, and
+// commits nothing.
+func TestBusyStoreSubmissionIsSaturation(t *testing.T) {
+	ctx := context.Background()
+	database, err := (sqlite.Backend{}).Open(ctx, filepath.Join(t.TempDir(), "saturated.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	queue, err := New(ctx, database, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.RegisterKind("busy", []byte(`{"type":"object"}`)); err != nil {
+		t.Fatal(err)
+	}
+	holding, release, held := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+	go func() {
+		held <- database.WithTx(ctx, func(tx *sql.Tx) error {
+			if _, err := tx.ExecContext(ctx, `UPDATE worker_jobs SET updated_at = updated_at`); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS hold (x INTEGER)`); err != nil {
+				return err
+			}
+			close(holding)
+			<-release
+			return nil
+		})
+	}()
+	<-holding
+	_, err = queue.Submit(ctx, trigger.Submission{Key: "busy-1", Kind: "busy", Payload: []byte(`{}`)})
+	close(release)
+	if !errors.Is(err, trigger.ErrSaturated) || !errors.Is(err, store.ErrBusy) {
+		t.Fatalf("a submission to a busy store returned %v; want saturation", err)
+	}
+	if err := <-held; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queue.Get(ctx, "busy-1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("a saturated submission was committed: %v", err)
+	}
+	if accepted, err := queue.Submit(ctx, trigger.Submission{Key: "busy-1", Kind: "busy", Payload: []byte(`{}`)}); err != nil || !accepted {
+		t.Fatalf("the retry: accepted=%v err=%v", accepted, err)
 	}
 }

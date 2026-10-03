@@ -26,7 +26,11 @@ returns only after the submission is committed. `accepted=false` means the key
 was already committed with the same kind, payload and principal (a duplicate).
 `trigger.ErrConflict` means the key was reused with different content, which is
 never silently deduplicated. `trigger.ErrInvalidInput` and
-`trigger.ErrSaturated` refuse the submission before acceptance.
+`trigger.ErrSaturated` refuse the submission before acceptance. A store too
+busy to take the submission within its busy timeout (`store.ErrBusy`) is
+reported as `trigger.ErrSaturated` (#184): each trigger answers with its
+saturation response (503 `saturated` with `Retry-After`, a delayed nak) and
+nothing is committed.
 
 `worker.Queue` implements the port. It persists the principal established by the
 trusted producer (`EnqueueRequest.Principal`, `Job.Principal`) and makes it part

@@ -261,6 +261,10 @@ func (q *Queue) Enqueue(ctx context.Context, request EnqueueRequest) (EnqueueRes
 		return nil
 	})
 	if err != nil {
+		if errors.Is(err, store.ErrBusy) {
+			// A busy store is saturation: the submission may be retried.
+			return EnqueueResult{}, fmt.Errorf("worker: enqueue: %w: %w", trigger.ErrSaturated, err)
+		}
 		return EnqueueResult{}, fmt.Errorf("worker: enqueue: %w", err)
 	}
 	return result, nil

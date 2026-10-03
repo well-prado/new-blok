@@ -640,3 +640,57 @@ func TestSlowBodyIsBoundedByReadTimeout(t *testing.T) {
 		t.Fatalf("status=%d after %v jobs=%d", response.StatusCode, time.Since(started), e.jobs(t))
 	}
 }
+
+// TestBusyStoreAnswersSaturated: a delivery whose submission cannot get the
+// store's write lock within the busy timeout is answered 503 saturated with
+// Retry-After, never 500, and nothing is committed; the provider's retry
+// then succeeds.
+func TestBusyStoreAnswersSaturated(t *testing.T) {
+	f := loadFixture(t)
+	key := secret(t, "k1")
+	e := newEnv(t, f, []webhook.Key{{ID: "k1", Secret: key}}, nil)
+	holding, release, held := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+	go func() {
+		held <- e.database.WithTx(context.Background(), func(tx *sql.Tx) error {
+			if _, err := tx.ExecContext(context.Background(), `UPDATE worker_jobs SET updated_at = updated_at`); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(context.Background(), `CREATE TABLE IF NOT EXISTS hold (x INTEGER)`); err != nil {
+				return err
+			}
+			close(holding)
+			<-release
+			return nil
+		})
+	}()
+	<-holding
+	r := sign(key, "evt_busy", t0, []byte(f.Body))
+	request, err := http.NewRequest(r.method, e.server.URL+r.path, bytes.NewReader(r.body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("webhook-id", r.id)
+	request.Header.Set("webhook-timestamp", r.timestamp)
+	request.Header.Set("webhook-signature", r.signature)
+	response, err := e.server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var answer map[string]string
+	_ = json.NewDecoder(response.Body).Decode(&answer)
+	response.Body.Close()
+	close(release)
+	if err := <-held; err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusServiceUnavailable || answer["error"] != "saturated" || response.Header.Get("Retry-After") != "1" {
+		t.Fatalf("a busy store answered %d %v Retry-After=%q; want 503 saturated", response.StatusCode, answer, response.Header.Get("Retry-After"))
+	}
+	if n := e.jobs(t); n != 0 {
+		t.Fatalf("a saturated delivery committed %d jobs", n)
+	}
+	if status, code := e.send(t, r); status != http.StatusAccepted {
+		t.Fatalf("the provider's retry: %d %s", status, code)
+	}
+}
