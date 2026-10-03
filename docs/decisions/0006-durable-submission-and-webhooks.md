@@ -39,6 +39,24 @@ example by submitting to the same store), and deferring would repeat the
 deadlock. This also treats a busy *other* store as a failure; telling the
 two apart is tracked separately.
 
+A worker handler writes through `worker.Tx`, the claim's own transaction,
+so its writes commit exactly when the job is acknowledged. SQLite can end
+that transaction under the handler: it rolls the whole transaction back
+when a statement is interrupted (the consumer was lost and the statement
+observed the canceled context) or fails for want of space, memory or I/O.
+`database/sql` cannot see that, and every later statement would then
+commit on its own, outside the claim, and again on redelivery (#180).
+`Tx` therefore fails closed. When a statement fails, it checks, outside
+the transaction, that the job is still `processing` under this claim's
+lease; once it is not, that statement and every later one return
+`worker.ErrClaimLost` and run nothing. Statements still run under the
+handler's context, so cancellation and deadlines keep working.
+`ProcessOnce` routes its own post-claim statements through the same
+check. A claim lost to consumer cancellation is deferred as before. A
+claim lost any other way is charged as a failed attempt in a fresh
+transaction: the job is retried after a backoff, or dead-lettered once
+`MaxAttempts` is spent, with error `claim transaction ended`.
+
 `worker.Queue` implements the port. It persists the principal established by the
 trusted producer (`EnqueueRequest.Principal`, `Job.Principal`) and makes it part
 of request identity. `worker.New` migrates existing queues in place by adding a

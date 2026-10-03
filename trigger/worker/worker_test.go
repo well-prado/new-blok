@@ -59,7 +59,7 @@ func TestProcessRetriesThenDeadLettersAndSuccessAcknowledges(t *testing.T) {
 	}
 	called := 0
 	for i := 0; i < 2; i++ {
-		processed, err := queue.ProcessOnce(context.Background(), func(_ context.Context, _ *sql.Tx, _ Job) error {
+		processed, err := queue.ProcessOnce(context.Background(), func(_ context.Context, _ Tx, _ Job) error {
 			called++
 			return &HandlerError{Retryable: true, Message: "provider timeout"}
 		})
@@ -94,7 +94,7 @@ func TestHandlerFailureRollsBackBusinessWritesBeforeRetryState(t *testing.T) {
 	if _, err := queue.Enqueue(context.Background(), EnqueueRequest{RequestKey: "partial", Kind: "test", Payload: []byte(`{}`), MaxAttempts: 2}); err != nil {
 		t.Fatal(err)
 	}
-	processed, err := queue.ProcessOnce(context.Background(), func(ctx context.Context, tx *sql.Tx, _ Job) error {
+	processed, err := queue.ProcessOnce(context.Background(), func(ctx context.Context, tx Tx, _ Job) error {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO handler_writes (id) VALUES (1)`); err != nil {
 			return err
 		}
@@ -171,7 +171,7 @@ func TestProcessKillRollsBackBusinessWriteAndAcknowledgment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	processed, err := queue.ProcessOnce(context.Background(), func(ctx context.Context, tx *sql.Tx, job Job) error {
+	processed, err := queue.ProcessOnce(context.Background(), func(ctx context.Context, tx Tx, job Job) error {
 		_, err := tx.ExecContext(ctx, `INSERT INTO worker_effects (id, request_key) VALUES (?, ?)`, 1, job.RequestKey)
 		return err
 	})
@@ -203,7 +203,7 @@ func runWorkerCrashChild() {
 	if err != nil {
 		panic(err)
 	}
-	if _, err := queue.ProcessOnce(context.Background(), func(ctx context.Context, tx *sql.Tx, job Job) error {
+	if _, err := queue.ProcessOnce(context.Background(), func(ctx context.Context, tx Tx, job Job) error {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO worker_effects (id, request_key) VALUES (?, ?)`, 1, job.RequestKey); err != nil {
 			return err
 		}
@@ -251,7 +251,7 @@ func TestConsumerLossRedeliversWithoutConsumingAttempt(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	insert := func(ctx context.Context, tx *sql.Tx, job Job) error {
+	insert := func(ctx context.Context, tx Tx, job Job) error {
 		_, err := tx.ExecContext(ctx, `INSERT INTO effects (request_key) VALUES (?)`, job.RequestKey)
 		return err
 	}
@@ -261,7 +261,7 @@ func TestConsumerLossRedeliversWithoutConsumingAttempt(t *testing.T) {
 			t.Fatal(err)
 		}
 		consumer, cancel := context.WithCancel(context.Background())
-		_, err := queue.ProcessOnce(consumer, func(ctx context.Context, tx *sql.Tx, job Job) error {
+		_, err := queue.ProcessOnce(consumer, func(ctx context.Context, tx Tx, job Job) error {
 			if err := insert(ctx, tx, job); err != nil {
 				return err
 			}
@@ -305,12 +305,12 @@ func TestDeferralsAreBounded(t *testing.T) {
 		consume func(*Queue) error
 	}{
 		{"always saturated", func(q *Queue) error {
-			_, err := q.ProcessOnce(context.Background(), func(context.Context, *sql.Tx, Job) error { return trigger.ErrSaturated })
+			_, err := q.ProcessOnce(context.Background(), func(context.Context, Tx, Job) error { return trigger.ErrSaturated })
 			return err
 		}},
 		{"consumer always lost", func(q *Queue) error {
 			consumer, cancel := context.WithCancel(context.Background())
-			_, err := q.ProcessOnce(consumer, func(ctx context.Context, _ *sql.Tx, _ Job) error { cancel(); return ctx.Err() })
+			_, err := q.ProcessOnce(consumer, func(ctx context.Context, _ Tx, _ Job) error { cancel(); return ctx.Err() })
 			if !errors.Is(err, ErrConsumerLost) {
 				return fmt.Errorf("want ErrConsumerLost, got %v", err)
 			}
@@ -384,7 +384,7 @@ func TestQueueMigratesPreDeferralSchema(t *testing.T) {
 	if _, err := New(context.Background(), database, nil); err != nil {
 		t.Fatalf("second open after migration: %v", err)
 	}
-	processed, err := queue.ProcessOnce(context.Background(), func(context.Context, *sql.Tx, Job) error { return nil })
+	processed, err := queue.ProcessOnce(context.Background(), func(context.Context, Tx, Job) error { return nil })
 	if err != nil || !processed {
 		t.Fatalf("legacy job processed=%v err=%v", processed, err)
 	}
@@ -442,7 +442,7 @@ func TestPrincipalIsPersistedAndPartOfRequestIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	var seen trigger.Principal
-	if _, err := queue.ProcessOnce(context.Background(), func(_ context.Context, _ *sql.Tx, job Job) error { seen = job.Principal; return nil }); err != nil {
+	if _, err := queue.ProcessOnce(context.Background(), func(_ context.Context, _ Tx, job Job) error { seen = job.Principal; return nil }); err != nil {
 		t.Fatal(err)
 	}
 	if seen.ID != owner.ID || len(seen.Roles) != 1 || seen.Roles[0] != "orders" {
@@ -504,7 +504,7 @@ func TestConcurrentWorkersNeverFailBusy(t *testing.T) {
 				if done {
 					return
 				}
-				if _, err := queue.ProcessOnce(ctx, func(_ context.Context, _ *sql.Tx, job Job) error {
+				if _, err := queue.ProcessOnce(ctx, func(_ context.Context, _ Tx, job Job) error {
 					mu.Lock()
 					runs[job.RequestKey]++
 					mu.Unlock()
@@ -583,7 +583,7 @@ func TestClaimPredicateAndOrder(t *testing.T) {
 	}
 	var claimed []string
 	for {
-		processed, err := queue.ProcessOnce(ctx, func(_ context.Context, _ *sql.Tx, job Job) error {
+		processed, err := queue.ProcessOnce(ctx, func(_ context.Context, _ Tx, job Job) error {
 			claimed = append(claimed, job.RequestKey)
 			return nil
 		})
@@ -626,7 +626,7 @@ func TestCanceledClaimWaitReportsConsumerLost(t *testing.T) {
 	holding, release := make(chan struct{}), make(chan struct{})
 	first := make(chan error, 1)
 	go func() {
-		_, err := queue.ProcessOnce(ctx, func(context.Context, *sql.Tx, Job) error {
+		_, err := queue.ProcessOnce(ctx, func(context.Context, Tx, Job) error {
 			close(holding)
 			<-release
 			return nil
@@ -637,7 +637,7 @@ func TestCanceledClaimWaitReportsConsumerLost(t *testing.T) {
 	consumer, cancel := context.WithCancel(ctx)
 	time.AfterFunc(100*time.Millisecond, cancel)
 	begin := time.Now()
-	_, err = queue.ProcessOnce(consumer, func(context.Context, *sql.Tx, Job) error { return nil })
+	_, err = queue.ProcessOnce(consumer, func(context.Context, Tx, Job) error { return nil })
 	elapsed := time.Since(begin)
 	close(release)
 	if !errors.Is(err, ErrConsumerLost) || elapsed > 7*time.Second {
@@ -692,7 +692,7 @@ func TestMeasureClaimContention(t *testing.T) {
 					if done {
 						return
 					}
-					_, err := queue.ProcessOnce(ctx, func(context.Context, *sql.Tx, Job) error {
+					_, err := queue.ProcessOnce(ctx, func(context.Context, Tx, Job) error {
 						mu.Lock()
 						runs++
 						mu.Unlock()
@@ -782,7 +782,7 @@ func TestHandlerSubmittingToItsOwnStoreFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	var nested error
-	processed, err := queue.ProcessOnce(ctx, func(ctx context.Context, _ *sql.Tx, _ Job) error {
+	processed, err := queue.ProcessOnce(ctx, func(ctx context.Context, _ Tx, _ Job) error {
 		_, nested = queue.Submit(ctx, trigger.Submission{Key: "inner", Kind: "self", Payload: []byte(`{}`)})
 		return nested
 	})
@@ -798,5 +798,160 @@ func TestHandlerSubmittingToItsOwnStoreFails(t *testing.T) {
 	}
 	if job.Deferrals != 0 || job.State != StateDead {
 		t.Fatalf("the self-deadlocked job is %s with %d deferrals; want dead with none", job.State, job.Deferrals)
+	}
+}
+
+// TestHandlerWritesNeverEscapeTheClaim: a consumer is canceled while its
+// handler's statement runs, and the handler, carelessly, ignores that
+// statement's error and writes again. SQLite rolls the whole transaction
+// back when a statement in it is interrupted, so if the cancellation
+// reached the statement, the second write would commit on its own, outside
+// the claim, and the redelivery would write it again (#180). Through Tx the
+// statement is never interrupted: the lost claim rolls back whole, and each
+// job's rows commit exactly once, on the attempt that completes.
+func TestHandlerWritesNeverEscapeTheClaim(t *testing.T) {
+	ctx := context.Background()
+	database, err := (sqlite.Backend{}).Open(ctx, filepath.Join(t.TempDir(), "escape.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	queue, err := New(ctx, database, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.RegisterKind("escape", []byte(`{"type":"object"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.WithTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `CREATE TABLE business (request_key TEXT NOT NULL)`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	const jobs = 3
+	for i := range jobs {
+		if _, err := queue.Enqueue(ctx, EnqueueRequest{RequestKey: fmt.Sprintf("e-%d", i), Kind: "escape", Payload: []byte(`{}`)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// slowInsert counts a million rows before it inserts one, so a
+	// cancellation 20 ms in lands while it runs.
+	const slowInsert = `INSERT INTO business (request_key) SELECT ? WHERE (WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 1000000) SELECT count(*) FROM c) > 0`
+	attempts := map[string]int{}
+	lost := 0
+	for round := 0; round < 4*jobs; round++ {
+		consumer, cancel := context.WithCancel(ctx)
+		processed, err := queue.ProcessOnce(consumer, func(consumer context.Context, tx Tx, job Job) error {
+			attempts[job.RequestKey]++
+			if attempts[job.RequestKey] == 1 {
+				time.AfterFunc(20*time.Millisecond, cancel)
+			}
+			_, _ = tx.ExecContext(consumer, slowInsert, job.RequestKey)
+			_, err := tx.ExecContext(context.Background(), `INSERT INTO business (request_key) VALUES (?)`, job.RequestKey+"#2")
+			return err
+		})
+		cancel()
+		if errors.Is(err, ErrConsumerLost) {
+			lost++
+			if err := database.WithTx(ctx, func(tx *sql.Tx) error {
+				_, err := tx.ExecContext(ctx, `UPDATE worker_jobs SET available_at = 0 WHERE state = ?`, StatePending)
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !processed {
+			break
+		}
+	}
+	if lost != jobs {
+		t.Fatalf("%d first attempts were lost; want %d (one per job)", lost, jobs)
+	}
+	var rows, distinct, completed int
+	if err := database.WithTx(ctx, func(tx *sql.Tx) error {
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*), COUNT(DISTINCT request_key) FROM business`).Scan(&rows, &distinct); err != nil {
+			return err
+		}
+		return tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_jobs WHERE state = ?`, StateCompleted).Scan(&completed)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if completed != jobs || rows != 2*jobs || distinct != 2*jobs {
+		t.Fatalf("completed=%d business rows=%d distinct=%d; want %d jobs and %d rows, each once", completed, rows, distinct, jobs, 2*jobs)
+	}
+}
+
+// TestLostClaimRefusesWritesAndCountsTheAttempt: a handler statement fails
+// because the store is full, and SQLite rolls the whole transaction back.
+// The handler, carelessly, ignores that and writes again: the write is
+// refused with ErrClaimLost, nothing is committed, and the lost claim is
+// counted as a failed attempt instead of being redelivered at once, forever
+// (#180).
+func TestLostClaimRefusesWritesAndCountsTheAttempt(t *testing.T) {
+	ctx := context.Background()
+	database, err := (sqlite.Backend{}).Open(ctx, filepath.Join(t.TempDir(), "full.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	queue, err := New(ctx, database, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.RegisterKind("full", []byte(`{"type":"object"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.WithTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `CREATE TABLE business (request_key TEXT NOT NULL, data BLOB)`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queue.Enqueue(ctx, EnqueueRequest{RequestKey: "full-1", Kind: "full", Payload: []byte(`{}`), MaxAttempts: 1}); err != nil {
+		t.Fatal(err)
+	}
+	var full, refused error
+	processed, err := queue.ProcessOnce(ctx, func(ctx context.Context, tx Tx, job Job) error {
+		var pages int64
+		if err := tx.QueryRowContext(ctx, `PRAGMA page_count`).Scan(&pages); err != nil {
+			return err
+		}
+		// The store may not grow: the next large write fails as full.
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`PRAGMA max_page_count = %d`, pages)); err != nil {
+			return err
+		}
+		_, full = tx.ExecContext(ctx, `INSERT INTO business VALUES (?, zeroblob(1048576))`, job.RequestKey)
+		_, refused = tx.ExecContext(ctx, `INSERT INTO business VALUES (?, NULL)`, job.RequestKey+"#2")
+		return nil
+	})
+	if err != nil || !processed {
+		t.Fatalf("processed=%v err=%v", processed, err)
+	}
+	if full == nil {
+		t.Fatal("the large write did not fail as full")
+	}
+	if !errors.Is(refused, ErrClaimLost) {
+		t.Fatalf("a write after the claim's transaction ended returned %v; want ErrClaimLost", refused)
+	}
+	var rows int
+	if err := database.WithTx(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM business`).Scan(&rows)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 0 {
+		t.Fatalf("%d business rows committed outside the lost claim", rows)
+	}
+	job, err := queue.Get(ctx, "full-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.State != StateDead || job.Attempt != 1 {
+		t.Fatalf("the lost claim left the job %s at attempt %d; want dead at attempt 1", job.State, job.Attempt)
 	}
 }
