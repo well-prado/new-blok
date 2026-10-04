@@ -151,6 +151,10 @@ func (a *Application) InspectionObserver() inspection.Observer {
 	return a.config.Inspection
 }
 
+// AbortGrace returns the configured bound for canceled work to release its
+// leases before Shutdown closes dependencies.
+func (a *Application) AbortGrace() time.Duration { return a.config.AbortGrace }
+
 type Lease struct {
 	app  *Application
 	once sync.Once
