@@ -132,6 +132,8 @@ Deployment manifests bind workflow document, native binary, worker artifacts, sc
 
 Retention, compaction, backup, corruption checks and restore must preserve verified checkpoints and audit obligations. The current SQLite backup contract uses `VACUUM INTO` to create a new, transaction-consistent snapshot; it never overwrites an existing destination. Restore first runs `PRAGMA integrity_check`, copies into a temporary file, syncs it, and renames it into a new destination before checking the restored database again. These guarantees cover one local filesystem only: they do not provide disk-loss survival, replication, or multi-host failover. Business tables remain application-owned; the journal is not an ORM or a substitute for domain persistence.
 
+Distributed ownership remains an evaluation spike, not an available backend. [ADR 0017](decisions/0017-distributed-persistence-ownership.md) records an isolated etcd v3.6.5 fencing prototype, the incarnation-plus-revision fence needed across snapshot restore, the S3 blob acknowledgment boundary, and the limits of its one-host failure experiments. No app or engine code imports the prototype, and the spike does not select a production backend.
+
 ## 8. Workers and runtime coverage
 
 Go runs natively. Node.js is the first external worker over persistent authenticated gRPC, with reusable channels and explicit topology. Protocol negotiation defines catalog digests, call/attempt/generation identity, deadlines, cancellation, capacity, frame direction, reconnect, errors, payload/blob bounds and idempotency. Lost transport can leave an effect uncertain. No fresh process per step.
@@ -158,7 +160,7 @@ Node/workflow packages have namespaced immutable identities, schemas, capability
 
 App-owned binaries support health/readiness/metrics, bounded admission, signal-driven drain, graceful worker shutdown and durable-volume configuration. Cloud consumes reproducible deployment manifests, artifacts, readiness and operational APIs; framework self-hosting remains first-class. No proprietary service is required for core operation.
 
-Millions of requests per second is a fleet-scale design target, not a bootstrap claim. Partition ownership, fencing, replicated persistence, timers, blobs, load balancing, fairness and resharding require independent failure and capacity tests. Distinguish accepted requests, completed workflows, steps and external calls. Model retention and audit/telemetry cost per event.
+Millions of requests per second is a fleet-scale design target, not a bootstrap claim. Partition ownership, fencing, replicated persistence, timers, blobs, load balancing, fairness and resharding require independent failure and capacity tests. Distinguish accepted requests, completed workflows, steps and external calls. Model retention and audit/telemetry cost per event. ADR 0017 covers only one-host Docker failure and load experiments; those measurements are not fleet RPS or multi-region capacity. A replicated journal must fence each state commit in the same authoritative storage transaction; an ownership log alone is not failover.
 
 Benchmarks include useful native quote HTTP, journaled orders, bounded parallel work, worker equivalents, suspended runs, mixed tenants, slow clients, invalid/large payloads and overload. Publish hardware/topology/configuration, tool versions, warmup, repeated distributions, throughput, p50/p95/p99, CPU, RSS, allocations, queue depth, errors and crash recovery. Use controlled runners/noise policy for regressions. Optimization requires profiles.
 
