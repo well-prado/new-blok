@@ -75,9 +75,13 @@ blocking connection is itself waiting for an unlock. A claim waiting for its
 handler is not, so an undetected self-submit on `:memory:` blocked forever
 (#207). memdb locks report `SQLITE_BUSY` and honor the busy timeout like a
 file, so the same submission fails after one wait. The trade-off is ordinary
-locking: while a writer holds the memory database, readers on other
-connections also wait under the busy timeout, and each connection refreshes
-its schema at the start of a transaction rather than sharing one cache.
+locking without WAL: while a write transaction is open (a worker claim holds
+one for its whole handler), no other connection can even start a read; it
+waits out the busy timeout and fails with `store.ErrBusy` (measured: 5.05 s,
+where shared cache answered an unrelated read in 0.3 ms). Each connection
+also refreshes its schema at the start of a transaction rather than sharing
+one cache, and memdb caps the database at 1 GiB. `:memory:` is a test store;
+deployments open a file.
 
 A worker handler writes through `worker.Tx`, the claim's own transaction,
 so its writes commit only if the job is acknowledged. SQLite can end that

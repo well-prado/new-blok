@@ -38,8 +38,7 @@ const (
 	busyTimeout = 5000
 )
 
-// dsn opens every :memory: path as one named database on SQLite's memdb VFS,
-// so each handle shares the database and participates in one writer domain.
+// sharedMemoryWriteDomain is the one writer domain of every :memory: handle.
 var sharedMemoryWriteDomain = store.NewWriteDomain()
 
 // Backend opens SQLite databases with the durability settings required by the
@@ -94,6 +93,8 @@ func configure(ctx context.Context, database *sql.DB) error {
 	return nil
 }
 
+// dsn opens every :memory: path as one named database on SQLite's memdb VFS,
+// so each handle shares the database and participates in one writer domain.
 func dsn(path string) string {
 	if path == ":memory:" {
 		return "file:/new-blok-memory?vfs=memdb&_busy_timeout=5000&_journal_mode=MEMORY&_synchronous=FULL&_foreign_keys=ON"
