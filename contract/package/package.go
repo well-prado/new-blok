@@ -16,6 +16,12 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/well-prado/new-blok/contract"
+	artifactcontract "github.com/well-prado/new-blok/contract/artifact"
+	"github.com/well-prado/new-blok/contract/schema"
+	"github.com/well-prado/new-blok/contract/tool"
+	"github.com/well-prado/new-blok/node"
 )
 
 const (
@@ -27,6 +33,15 @@ const (
 	MaxSignatureKeyIDBytes = 128
 	MaxSignatureValueBytes = 88
 	MaxLicenseBytes        = 256
+)
+
+const (
+	maxPackageWorkflowNodes        = 256
+	maxPackageWorkflowBindings     = 256
+	maxPackageWorkflowInstructions = 1024
+	maxPackageWorkflowReferences   = 4096
+	maxPackageReferencePath        = 64
+	maxPackageNodeEffects          = 256
 )
 
 var (
@@ -58,7 +73,7 @@ func (e *Error) Error() string {
 
 func (e *Error) Unwrap() error {
 	switch e.Code {
-	case "invalid_manifest", "invalid_identity", "invalid_compatibility", "invalid_provenance", "invalid_license", "invalid_store_limits":
+	case "invalid_manifest", "invalid_metadata", "invalid_identity", "invalid_compatibility", "invalid_provenance", "invalid_license", "invalid_store_limits":
 		return ErrInvalid
 	case "incompatible_runtime", "incompatible_engine", "incompatible_schema", "incompatible_dependency":
 		return ErrIncompatible
@@ -106,6 +121,15 @@ type Provenance struct {
 	Builder  string `json:"builder"`
 }
 
+// Metadata embeds the existing node/workflow descriptors, portable schemas,
+// and capability policy. It defines no parallel schema or capability format.
+// Exactly one of NodeDescriptor and WorkflowDocument is present by package kind.
+type Metadata struct {
+	NodeDescriptor     *node.Descriptor   `json:"nodeDescriptor,omitempty"`
+	WorkflowDocument   *contract.Document `json:"workflowDocument,omitempty"`
+	CapabilityManifest *tool.Manifest     `json:"capabilityManifest,omitempty"`
+}
+
 type Manifest struct {
 	FormatVersion  int           `json:"formatVersion"`
 	Identity       Identity      `json:"identity"`
@@ -115,6 +139,7 @@ type Manifest struct {
 	Compatibility  Compatibility `json:"compatibility"`
 	License        string        `json:"license"`
 	Provenance     Provenance    `json:"provenance"`
+	Metadata       Metadata      `json:"metadata"`
 }
 
 type Signature struct {
@@ -212,6 +237,9 @@ func (m Manifest) Validate() error {
 	if len(m.Compatibility.Runtimes) > MaxRuntimeRequirements {
 		return &Error{Code: "invalid_compatibility", Path: "compatibility.runtimes", Message: "runtime requirement count exceeds the 32 entry limit"}
 	}
+	if _, err := canonicalMetadata(m.Identity, m.Kind, m.Metadata); err != nil {
+		return err
+	}
 	if err := validateRange(m.Compatibility.Engine); err != nil || m.Compatibility.Engine == "" {
 		return &Error{Code: "invalid_compatibility", Path: "compatibility.engine", Message: "engine must declare a supported semantic version range"}
 	}
@@ -244,6 +272,227 @@ func (m Manifest) Validate() error {
 	return nil
 }
 
+func canonicalMetadata(identity Identity, kind string, metadata Metadata) (Metadata, error) {
+	invalid := func(path, message string) (Metadata, error) {
+		return Metadata{}, &Error{Code: "invalid_metadata", Path: path, Message: message}
+	}
+	if err := preflightMetadata(kind, metadata); err != nil {
+		return invalid("metadata", err.Error())
+	}
+	var capability *tool.Manifest
+	if metadata.CapabilityManifest != nil {
+		value := *metadata.CapabilityManifest
+		if err := value.Validate(); err != nil {
+			return invalid("metadata.capabilityManifest", "declared agent capability manifest is invalid: "+err.Error())
+		}
+		value.Effects = sortedCopy(value.Effects)
+		value.Capabilities = sortedCopy(value.Capabilities)
+		value.SecretRefs = sortedCopy(value.SecretRefs)
+		capability = &value
+		metadata.CapabilityManifest = capability
+	}
+
+	switch kind {
+	case "node":
+		if metadata.NodeDescriptor == nil || metadata.WorkflowDocument != nil {
+			return invalid("metadata", "node packages require exactly one node descriptor")
+		}
+		descriptor := *metadata.NodeDescriptor
+		descriptor.Effects = sortedCopy(descriptor.Effects)
+		descriptor.RequiredCapabilities = sortedCopy(descriptor.RequiredCapabilities)
+		if err := node.ValidateDescriptor(descriptor); err != nil {
+			return invalid("metadata.nodeDescriptor", "node descriptor is invalid: "+err.Error())
+		}
+		if descriptor.Name != identity.Name || descriptor.Version != identity.Version {
+			return invalid("metadata.nodeDescriptor", "node descriptor identity must equal package identity")
+		}
+		if capability != nil && (!sameStrings(descriptor.Effects, capability.Effects) || !sameStrings(descriptor.RequiredCapabilities, capability.Capabilities) || descriptor.Deterministic != capability.Deterministic) {
+			return invalid("metadata.capabilityManifest", "declared agent policy effects, capabilities, and determinism must match the node descriptor")
+		}
+		var err error
+		if descriptor.InputSchema, err = canonicalSchema(descriptor.InputSchema); err != nil {
+			return invalid("metadata.nodeDescriptor.inputSchema", err.Error())
+		}
+		if descriptor.OutputSchema, err = canonicalSchema(descriptor.OutputSchema); err != nil {
+			return invalid("metadata.nodeDescriptor.outputSchema", err.Error())
+		}
+		metadata.NodeDescriptor = &descriptor
+	case "workflow":
+		if metadata.WorkflowDocument == nil || metadata.NodeDescriptor != nil {
+			return invalid("metadata", "workflow packages require exactly one workflow document")
+		}
+		document := *metadata.WorkflowDocument
+		document.Nodes = append([]contract.NodeDescriptor(nil), document.Nodes...)
+		document.Bindings = append([]contract.Binding(nil), document.Bindings...)
+		if err := document.Validate(); err != nil {
+			return invalid("metadata.workflowDocument", "workflow document is invalid: "+err.Error())
+		}
+		if document.Workflow.Name != identity.Name || document.Workflow.Version != identity.Version {
+			return invalid("metadata.workflowDocument", "workflow document identity must equal package identity")
+		}
+		var err error
+		if document.Workflow.InputSchema, err = canonicalSchema(document.Workflow.InputSchema); err != nil {
+			return invalid("metadata.workflowDocument.workflow.inputSchema", err.Error())
+		}
+		if document.Workflow.OutputSchema, err = canonicalSchema(document.Workflow.OutputSchema); err != nil {
+			return invalid("metadata.workflowDocument.workflow.outputSchema", err.Error())
+		}
+		for i := range document.Nodes {
+			if document.Nodes[i].InputSchema, err = canonicalSchema(document.Nodes[i].InputSchema); err != nil {
+				return invalid(fmt.Sprintf("metadata.workflowDocument.nodes[%d].inputSchema", i), err.Error())
+			}
+			if document.Nodes[i].OutputSchema, err = canonicalSchema(document.Nodes[i].OutputSchema); err != nil {
+				return invalid(fmt.Sprintf("metadata.workflowDocument.nodes[%d].outputSchema", i), err.Error())
+			}
+		}
+		for i := range document.Bindings {
+			if len(document.Bindings[i].InputSchema) == 0 {
+				continue
+			}
+			if document.Bindings[i].InputSchema, err = canonicalSchema(document.Bindings[i].InputSchema); err != nil {
+				return invalid(fmt.Sprintf("metadata.workflowDocument.bindings[%d].inputSchema", i), err.Error())
+			}
+		}
+		sort.Slice(document.Nodes, func(i, j int) bool { return document.Nodes[i].ID < document.Nodes[j].ID })
+		sort.Slice(document.Bindings, func(i, j int) bool { return document.Bindings[i].ID < document.Bindings[j].ID })
+		metadata.WorkflowDocument = &document
+	default:
+		return invalid("metadata", "package kind must be node or workflow")
+	}
+	return metadata, nil
+}
+
+// preflightMetadata applies the package's signed-manifest ceiling and bounded
+// collection counts before schema parsing, document validation, or cloning.
+func preflightMetadata(kind string, metadata Metadata) error {
+	if kind == "node" {
+		if metadata.NodeDescriptor == nil || metadata.WorkflowDocument != nil {
+			return errors.New("node packages require exactly one node descriptor")
+		}
+	} else if kind == "workflow" {
+		if metadata.WorkflowDocument == nil || metadata.NodeDescriptor != nil {
+			return errors.New("workflow packages require exactly one workflow document")
+		}
+	} else {
+		return errors.New("package kind must be node or workflow")
+	}
+
+	if metadata.CapabilityManifest != nil && (len(metadata.CapabilityManifest.Effects) > 64 || len(metadata.CapabilityManifest.Capabilities) > 64 || len(metadata.CapabilityManifest.SecretRefs) > 64) {
+		return errors.New("declared capability manifest exceeds the existing 64-entry list limits")
+	}
+	used := 0
+	add := func(size int) bool {
+		const perFieldJSONOverhead = 16
+		if size < 0 || size > MaxManifestBytes-used-perFieldJSONOverhead {
+			return false
+		}
+		used += size + perFieldJSONOverhead
+		return true
+	}
+	addText := func(value string) bool { return add(len(value)) }
+	addRaw := func(value json.RawMessage) bool {
+		return len(value) <= MaxManifestBytes && add(len(value))
+	}
+	addStrings := func(values []string, limit int) bool {
+		if len(values) > limit || !add(len(values)*4) {
+			return false
+		}
+		for _, value := range values {
+			if !addText(value) {
+				return false
+			}
+		}
+		return true
+	}
+
+	if metadata.CapabilityManifest != nil {
+		policy := metadata.CapabilityManifest
+		if !addText(policy.Compatibility) || !addStrings(policy.Effects, 64) || !addStrings(policy.Capabilities, 64) || !addStrings(policy.SecretRefs, 64) {
+			return errors.New("declared capability metadata exceeds the 64 KiB manifest limit")
+		}
+	}
+	if kind == "node" {
+		descriptor := metadata.NodeDescriptor
+		if !addText(descriptor.Name) || !addText(descriptor.Version) || !addText(descriptor.Description) || !addRaw(descriptor.InputSchema) || !addRaw(descriptor.OutputSchema) || !addStrings(descriptor.Effects, maxPackageNodeEffects) || !addStrings(descriptor.RequiredCapabilities, 128) {
+			return errors.New("node descriptor metadata exceeds package limits")
+		}
+		return nil
+	}
+
+	document := metadata.WorkflowDocument
+	if len(document.Nodes) > maxPackageWorkflowNodes || len(document.Bindings) > maxPackageWorkflowBindings || len(document.Workflow.Instructions) > maxPackageWorkflowInstructions {
+		return errors.New("workflow document exceeds package node, binding, or instruction limits")
+	}
+	referenceCount := 0
+	for _, instruction := range document.Workflow.Instructions {
+		if len(instruction.References) > maxPackageWorkflowReferences-referenceCount {
+			return errors.New("workflow document exceeds package reference limit")
+		}
+		referenceCount += len(instruction.References)
+		for _, reference := range instruction.References {
+			if len(reference.Path) > maxPackageReferencePath {
+				return errors.New("workflow reference path exceeds package limit")
+			}
+		}
+	}
+	if !addText(document.Workflow.ID) || !addText(document.Workflow.Name) || !addText(document.Workflow.Version) || !addText(document.Workflow.Digest) || !addRaw(document.Workflow.InputSchema) || !addRaw(document.Workflow.OutputSchema) || !add(len(document.Nodes)*32) || !add(len(document.Bindings)*32) || !add(len(document.Workflow.Instructions)*32) || !add(referenceCount*16) {
+		return errors.New("workflow document metadata exceeds the 64 KiB manifest limit")
+	}
+	for _, descriptor := range document.Nodes {
+		if !addText(descriptor.ID) || !addText(descriptor.Version) || !addText(descriptor.Digest) || !addRaw(descriptor.InputSchema) || !addRaw(descriptor.OutputSchema) {
+			return errors.New("workflow node metadata exceeds the 64 KiB manifest limit")
+		}
+	}
+	for _, binding := range document.Bindings {
+		if !addText(binding.ID) || !addText(binding.Kind) || !addText(binding.Workflow) || !addRaw(binding.InputSchema) || binding.Source != nil && !addText(binding.Source.File) {
+			return errors.New("workflow binding metadata exceeds the 64 KiB manifest limit")
+		}
+	}
+	for _, instruction := range document.Workflow.Instructions {
+		if !addText(instruction.ID) || !addText(instruction.Kind) || !addText(instruction.Node) || !addText(instruction.Output.Value) || instruction.Source != nil && !addText(instruction.Source.File) {
+			return errors.New("workflow instruction metadata exceeds the 64 KiB manifest limit")
+		}
+		for _, reference := range instruction.References {
+			if !addText(reference.Step) || !addStrings(reference.Path, maxPackageReferencePath) {
+				return errors.New("workflow reference metadata exceeds the 64 KiB manifest limit")
+			}
+		}
+	}
+	return nil
+}
+
+func canonicalSchema(raw json.RawMessage) (json.RawMessage, error) {
+	if _, err := schema.Parse(raw); err != nil {
+		return nil, err
+	}
+	canonical, err := artifactcontract.CanonicalJSON(raw)
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(canonical), nil
+}
+
+func sortedCopy(values []string) []string {
+	if values == nil {
+		return nil
+	}
+	copy := append([]string(nil), values...)
+	sort.Strings(copy)
+	return copy
+}
+
+func sameStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func validateProvenance(p Provenance) error {
 	if len(p.Source) == 0 || len(p.Source) > 2048 {
 		return &Error{Code: "invalid_provenance", Path: "provenance.source", Message: "source must be an HTTPS or git+HTTPS URL without credentials or fragment"}
@@ -274,6 +523,11 @@ func (m Manifest) Canonical() ([]byte, error) {
 			c.Compatibility.Runtimes[k] = v
 		}
 	}
+	metadata, err := canonicalMetadata(m.Identity, m.Kind, m.Metadata)
+	if err != nil {
+		return nil, err
+	}
+	c.Metadata = metadata
 	canonical, err := json.Marshal(c)
 	if err != nil {
 		return nil, err

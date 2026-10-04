@@ -1,5 +1,5 @@
 {
-  "expectedManifestDigest": "sha256:e910c4923ad52e9817a99da4541558eb49f49665fffec1758777208fb0122388",
+  "expectedManifestDigest": "sha256:5c12f5e807c942f585a20698d5d50c0437fb49ae438a30e7799eec7aa1b188ba",
   "manifest": {
     "formatVersion": 1,
     "identity": { "name": "shop/quote-node", "version": "1.0.0" },
@@ -18,6 +18,39 @@
       "source": "https://github.com/well-prado/new-blok",
       "revision": "0123456abcdef",
       "builder": "new-blok-package-fixture"
+    },
+    "metadata": {
+      "nodeDescriptor": {
+        "name": "shop/quote-node",
+        "version": "1.0.0",
+        "description": "Calculates a quote from validated inputs",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "sku": { "type": "string" },
+            "quantity": { "type": "integer", "minimum": 1 }
+          },
+          "required": ["sku", "quantity"],
+          "additionalProperties": false
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "totalCents": { "type": "integer", "wire": "int64-string", "minimum": 0 }
+          },
+          "required": ["totalCents"],
+          "additionalProperties": false
+        },
+        "deterministic": true
+      },
+      "capabilityManifest": {
+        "Version": 1,
+        "Compatibility": "agent-compatible",
+        "Effects": [],
+        "Capabilities": [],
+        "SecretRefs": [],
+        "Deterministic": true
+      }
     }
   },
   "artifact": "c3ludGhldGljLW5vZGUtYXJ0aWZhY3QtdjE="

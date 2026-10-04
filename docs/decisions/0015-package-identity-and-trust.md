@@ -23,6 +23,10 @@ signature, and artifact bytes (base64 in JSON). The manifest binds:
   version;
 - `kind` (`node` or `workflow`) and the SHA-256 digest of the exact artifact
   bytes;
+- a required typed metadata block: node packages carry the existing
+  `node.Descriptor`; workflow packages carry the existing
+  `contract.Document`; an existing `tool.Manifest` may be explicitly declared
+  as agent policy;
 - zero or more unique namespaced dependencies, each with a version range and
   optional required manifest digest;
 - engine and schema version ranges, plus optional named runtime ranges;
@@ -30,18 +34,58 @@ signature, and artifact bytes (base64 in JSON). The manifest binds:
   bounded to 256 bytes; and
 - source URL, hexadecimal source revision, and bounded builder identity.
 
+The node descriptor and workflow document are validated by their owning
+contracts. Their input/output schemas (including workflow node and binding
+schemas) must also parse as the existing bounded `contract/schema.Schema`
+subset. Node effect, required-capability, and determinism declarations must
+become the ordinary node package's capability/effect declaration. If a node
+also explicitly declares `tool.Manifest`, its effects, capabilities, and
+determinism must match the node descriptor. A workflow may carry a
+`tool.Manifest` only when explicitly claiming the existing agent-compatible
+policy; the workflow document itself currently has no aggregate capability
+field. Missing policy metadata never implies agent eligibility: the registered
+agent catalog must still fail closed. This package does not invent
+`trusted-legacy`, `denied-to-agents`, or another capability vocabulary.
+Metadata validation and canonicalization do not execute package code. When
+present, `capabilityManifest` uses the existing `tool.Manifest` JSON member
+names and validation (`Version`, `Compatibility`, `Effects`, `Capabilities`,
+`SecretRefs`, `Deterministic`); it is a signed declaration, not agent admission
+or proof of safety. Package signature verification establishes package
+integrity under the caller's key policy only. It does not register a node or
+workflow with `agent.Catalog`, and it does not make an ordinary descriptor
+agent-eligible. That boundary still requires explicit existing tool policy
+and trusted application registration; missing or invalid manifests fail
+closed there. This contract does not reinterpret `trusted-legacy` or
+`denied-to-agents` as valid `tool.Manifest` values.
+
+Before document/schema validation or metadata cloning, the native package API
+applies the 64 KiB canonical-manifest budget and bounded collection limits:
+256 workflow node descriptors, 256 bindings, 1,024 instructions, 4,096 total
+references, 64 path segments per reference, and existing node/tool capability
+list limits. Raw schemas individually cannot exceed the manifest ceiling. The
+final encoded manifest is checked against the exact 64 KiB ceiling as well.
+
 The canonical manifest is compact UTF-8 JSON with struct fields in the order
 shown above, omitted `omitempty` fields absent, dependencies sorted by package
-name, and runtime-map keys sorted lexicographically. Strings use Go
+name, runtime-map keys sorted lexicographically, descriptor capability lists
+sorted, any declared tool-manifest lists sorted, schema object keys
+canonicalized, and workflow node/binding descriptors sorted by ID (instruction
+order remains significant). Strings use Go
 `encoding/json` escaping, including lowercase `\u003c`, `\u003e`, and
 `\u0026` for `<`, `>`, and `&`; no insignificant whitespace or trailing
 newline is included. The golden digest in `local-node-v1.json` pins this byte
 profile for non-Go consumers. The manifest digest is SHA-256 of those bytes.
 The signature is Ed25519 over the same canonical bytes; it therefore binds
-identity, compatibility, license, provenance, dependencies, and artifact
-digest. The artifact digest separately checks the exact artifact bytes. A
-signature is an attestation, not proof that a build was reproducible or that
-source is safe.
+identity, compatibility, license, provenance, dependencies, artifact digest,
+schemas, and capability metadata. The artifact digest separately checks the
+exact artifact bytes. Artifact bytes remain opaque to this contract; the
+synthetic payload in `local-node-v1.json` is only an artifact-digest fixture,
+not typed package evidence. Typed evidence is the separately parsed existing
+descriptor/document, schema, and capability contracts. A signature is an
+attestation, not proof that a build was reproducible or that source is safe.
+The signed manifest co-binds typed metadata with an artifact digest but this
+slice does not extract metadata from an archive or prove that descriptor and
+workflow declarations correspond to executable artifact contents.
 
 Compatibility and dependency constraints use this portable subset of semantic
 version expressions: whitespace-separated exact or comparator clauses, for
@@ -178,11 +222,16 @@ hosted authentication or ownership verification.
 | Replace content under an existing package version | Prohibited | Publish a new version |
 
 Golden and negative cases are in `testdata/packages`. Go tests validate actual
-manifest verification, signature checks, local immutable storage, and the
-consumer protocol against the mock service. These checks establish the
-framework contract only; they do not establish hosted-registry availability,
-durable offline cache behavior, namespace ownership, build reproducibility,
-sandboxing, or CLI integration.
+manifest verification, typed metadata validation and signature binding,
+local immutable storage, and the consumer protocol against the mock service.
+Tests prove missing/invalid metadata rejection, metadata-tampering signature
+failure, canonical schema ordering, and that store reads cannot mutate retained
+typed metadata. The checked-in artifact payload remains opaque test input and
+is not counted as typed or executable package evidence.
+This E13-T01 slice does not establish package resolution, lock generation,
+durable offline cache behavior, atomic project edits, CLI add/remove/update,
+hosted-registry availability, namespace ownership service, build
+reproducibility, sandboxing, or package execution.
 
 ## Verification record
 
@@ -213,3 +262,11 @@ After adding the publisher-authorization policy and `401`/`403` denial
 fixtures, Go 1.27.1 on Darwin arm64 passed
 `GOMAXPROCS=3 go test -p=3 -race ./contract/package -count=3`,
 `GOMAXPROCS=3 go vet -p=3 ./contract/package`, and `git diff --check`.
+
+After binding existing node descriptors, workflow documents, schemas, and
+optional explicit agent manifests, Go 1.27.1 on Darwin arm64 passed focused
+package tests (`GOMAXPROCS=3 go test -p=3 ./contract/package`) including
+metadata omission, schema rejection, canonicalization, signature tampering,
+ordinary-package trust without implicit agent admission, and workflow-document
+cases. Preflight-bound checks are part of this issue branch; resolver/installer
+evidence remains with E13-T02–T04.

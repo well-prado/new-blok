@@ -14,6 +14,9 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/well-prado/new-blok/contract"
+	"github.com/well-prado/new-blok/contract/tool"
 )
 
 func fixtureBundle(t *testing.T) Bundle {
@@ -71,6 +74,161 @@ func TestPackageGoldenIdentityAndCompatibility(t *testing.T) {
 	}
 	if a != b {
 		t.Fatalf("dependency order changed canonical digest: %s != %s", a, b)
+	}
+}
+
+func TestPackageMetadataIsRequiredTypedAndCanonical(t *testing.T) {
+	bundle := fixtureBundle(t)
+	metadata := bundle.Manifest.Metadata
+	if metadata.NodeDescriptor == nil || metadata.WorkflowDocument != nil {
+		t.Fatalf("node package metadata did not resolve to an existing node descriptor: %+v", metadata)
+	}
+	if metadata.CapabilityManifest == nil {
+		t.Fatal("fixture must declare its agent policy explicitly")
+	}
+	if err := metadata.CapabilityManifest.Validate(); err != nil {
+		t.Fatalf("existing capability manifest rejected: %v", err)
+	}
+	first, err := bundle.Manifest.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reordered := bundle.Manifest
+	descriptor := *metadata.NodeDescriptor
+	descriptor.InputSchema = json.RawMessage(`{"required":["sku","quantity"],"properties":{"quantity":{"minimum":1,"type":"integer"},"sku":{"type":"string"}},"additionalProperties":false,"type":"object"}`)
+	reordered.Metadata.NodeDescriptor = &descriptor
+	second, err := reordered.Digest()
+	if err != nil || first != second {
+		t.Fatalf("schema JSON order changed canonical package digest: first=%s second=%s err=%v", first, second, err)
+	}
+
+	missing := bundle.Manifest
+	missing.Metadata = Metadata{}
+	if err := missing.Validate(); storeErrorCode(err) != "invalid_metadata" {
+		t.Fatalf("missing package contract metadata: got %v", err)
+	}
+	ordinaryNode := bundle.Manifest
+	ordinaryNode.Metadata.CapabilityManifest = nil
+	if err := ordinaryNode.Validate(); err != nil {
+		t.Fatalf("ordinary node descriptor should carry its own effect/capability metadata: %v", err)
+	}
+	ordinaryBundle := cloneBundle(bundle)
+	ordinaryBundle.Manifest.Metadata.CapabilityManifest = nil
+	ordinaryPrivateKey := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x46}, ed25519.SeedSize))
+	ordinaryBundle.Signature, err = Sign(ordinaryBundle.Manifest, "ordinary-node", ordinaryPrivateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordinaryPolicy := TrustPolicy{TrustedKeys: map[string]ed25519.PublicKey{"ordinary-node": ordinaryPrivateKey.Public().(ed25519.PublicKey)}}
+	verified, err := ordinaryBundle.Verify(ordinaryPolicy, fixtureEnvironment())
+	if err != nil || verified.Trust != TrustTrusted {
+		t.Fatalf("signed ordinary package without an agent manifest should verify as package trust only: result=%+v err=%v", verified, err)
+	}
+	// Package signature trust is not agent admission: the existing agent policy
+	// contract rejects absent declarations, and admission still requires an
+	// application-registered node/workflow in agent.Catalog.
+	if err := (tool.Manifest{}).Validate(); !errors.Is(err, tool.ErrInvalidManifest) {
+		t.Fatalf("package trust implicitly supplied agent policy: %v", err)
+	}
+	invalidAgentPolicy := bundle.Manifest
+	legacy := tool.Manifest{Version: 1, Compatibility: "trusted-legacy"}
+	invalidAgentPolicy.Metadata.CapabilityManifest = &legacy
+	if err := invalidAgentPolicy.Validate(); storeErrorCode(err) != "invalid_metadata" {
+		t.Fatalf("unsupported declared agent policy accepted: %v", err)
+	}
+	missingSchema := bundle.Manifest
+	missingSchema.Metadata.NodeDescriptor.InputSchema = nil
+	if err := missingSchema.Validate(); storeErrorCode(err) != "invalid_metadata" {
+		t.Fatalf("missing input schema: got %v", err)
+	}
+	invalid := bundle.Manifest
+	badDescriptor := *metadata.NodeDescriptor
+	badDescriptor.InputSchema = json.RawMessage(`{"type":"unsupported"}`)
+	invalid.Metadata.NodeDescriptor = &badDescriptor
+	if err := invalid.Validate(); storeErrorCode(err) != "invalid_metadata" {
+		t.Fatalf("invalid existing schema contract: got %v", err)
+	}
+}
+
+func TestPackageMetadataPreflightBoundsBeforeSchemaValidation(t *testing.T) {
+	oversizedSchema := fixtureBundle(t).Manifest
+	descriptor := *oversizedSchema.Metadata.NodeDescriptor
+	descriptor.InputSchema = bytes.Repeat([]byte{' '}, MaxManifestBytes+1)
+	oversizedSchema.Metadata.NodeDescriptor = &descriptor
+	if err := oversizedSchema.Validate(); storeErrorCode(err) != "invalid_metadata" {
+		t.Fatalf("oversized native schema was not rejected by preflight: %v", err)
+	}
+
+	tooManyInstructions := fixtureBundle(t).Manifest
+	workflow := &contract.Document{
+		Workflow: contract.Workflow{
+			Instructions: make([]contract.Instruction, maxPackageWorkflowInstructions+1),
+			InputSchema:  bytes.Repeat([]byte{' '}, MaxManifestBytes+1),
+		},
+	}
+	tooManyInstructions.Kind = "workflow"
+	tooManyInstructions.Metadata = Metadata{WorkflowDocument: workflow}
+	if err := tooManyInstructions.Validate(); storeErrorCode(err) != "invalid_metadata" {
+		t.Fatalf("workflow count cap did not precede schema parsing: %v", err)
+	}
+}
+
+func TestPackageMetadataTamperingInvalidatesSignature(t *testing.T) {
+	bundle := fixtureBundle(t)
+	privateKey := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x45}, ed25519.SeedSize))
+	publicKey := privateKey.Public().(ed25519.PublicKey)
+	var err error
+	bundle.Signature, err = Sign(bundle.Manifest, "metadata-fixture", privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := TrustPolicy{TrustedKeys: map[string]ed25519.PublicKey{"metadata-fixture": publicKey}}
+	if _, err := bundle.Verify(policy, fixtureEnvironment()); err != nil {
+		t.Fatalf("valid typed metadata signature failed: %v", err)
+	}
+
+	tampered := cloneBundle(bundle)
+	descriptor := *tampered.Manifest.Metadata.NodeDescriptor
+	descriptor.InputSchema = json.RawMessage(`{"type":"object","additionalProperties":false}`)
+	tampered.Manifest.Metadata.NodeDescriptor = &descriptor
+	if _, err := tampered.Verify(policy, fixtureEnvironment()); !errors.Is(err, ErrBadSignature) {
+		t.Fatalf("metadata tampering did not invalidate signature: %v", err)
+	}
+}
+
+func TestWorkflowPackageReusesValidatedContractDocument(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "testdata", "contracts", "valid.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, err := contract.Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle := fixtureBundle(t)
+	bundle.Manifest.Kind = "workflow"
+	bundle.Manifest.Identity = Identity{Name: document.Workflow.Name, Version: document.Workflow.Version}
+	bundle.Manifest.Metadata = Metadata{
+		WorkflowDocument: &document,
+	}
+	bundle.Artifact = append([]byte(nil), data...)
+	bundle.Manifest.ArtifactDigest = ArtifactDigest(bundle.Artifact)
+	if _, err := bundle.Verify(TrustPolicy{AllowUnsignedLocal: true}, fixtureEnvironment()); err != nil {
+		t.Fatalf("ordinary workflow document/schema contract rejected: %v", err)
+	}
+	agentWorkflow := cloneBundle(bundle)
+	agentPolicy := tool.Manifest{Version: 1, Compatibility: "agent-compatible", Deterministic: true}
+	agentWorkflow.Manifest.Metadata.CapabilityManifest = &agentPolicy
+	if _, err := agentWorkflow.Verify(TrustPolicy{AllowUnsignedLocal: true}, fixtureEnvironment()); err != nil {
+		t.Fatalf("explicit existing workflow agent policy rejected: %v", err)
+	}
+
+	invalid := cloneBundle(bundle)
+	invalid.Manifest.Metadata.WorkflowDocument.Workflow.InputSchema = json.RawMessage(`{"type":"not-a-portable-schema"}`)
+	invalid.Manifest.ArtifactDigest = ArtifactDigest(invalid.Artifact)
+	if err := invalid.Manifest.Validate(); storeErrorCode(err) != "invalid_metadata" {
+		t.Fatalf("invalid workflow schema accepted: %v", err)
 	}
 }
 
@@ -298,12 +456,17 @@ func TestStoreBindsImmutableVersionsAndReturnsCopies(t *testing.T) {
 		t.Fatal(err)
 	}
 	fetched.Artifact[0] ^= 0xff
+	fetched.Manifest.Metadata.NodeDescriptor.Description = "caller mutation"
+	fetched.Manifest.Metadata.NodeDescriptor.InputSchema[0] = ' '
 	again, _, err := store.Fetch(bundle.Manifest.Identity, policy, env)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(again.Artifact) != string(bundle.Artifact) {
 		t.Fatal("caller mutation escaped local store ownership")
+	}
+	if again.Manifest.Metadata.NodeDescriptor.Description != bundle.Manifest.Metadata.NodeDescriptor.Description || string(again.Manifest.Metadata.NodeDescriptor.InputSchema) != string(bundle.Manifest.Metadata.NodeDescriptor.InputSchema) {
+		t.Fatal("metadata mutation escaped local store ownership")
 	}
 }
 
@@ -323,6 +486,7 @@ func TestStoreCapacityIsBoundedAndIdempotenceSurvivesSaturation(t *testing.T) {
 
 	countLimit := cloneBundle(bundle)
 	countLimit.Manifest.Identity.Version = "1.0.1"
+	countLimit.Manifest.Metadata.NodeDescriptor.Version = "1.0.1"
 	if _, err := store.Publish(countLimit, policy, env); !errors.Is(err, ErrStoreFull) || storeErrorCode(err) != "store_capacity_exceeded" {
 		t.Fatalf("package count saturation returned %v", err)
 	}
@@ -338,6 +502,7 @@ func TestStoreCapacityIsBoundedAndIdempotenceSurvivesSaturation(t *testing.T) {
 		t.Fatal(err)
 	}
 	countLimit.Manifest.Identity.Version = "1.0.2"
+	countLimit.Manifest.Metadata.NodeDescriptor.Version = "1.0.2"
 	if _, err := byteLimited.Publish(countLimit, policy, env); !errors.Is(err, ErrStoreFull) || storeErrorCode(err) != "store_capacity_exceeded" {
 		t.Fatalf("artifact-byte saturation returned %v", err)
 	}
@@ -411,6 +576,7 @@ func TestStoreCapacityFixtures(t *testing.T) {
 			case "publish-same":
 			case "publish-new-version":
 				candidate.Manifest.Identity.Version = "1.0.1"
+				candidate.Manifest.Metadata.NodeDescriptor.Version = "1.0.1"
 			default:
 				t.Fatalf("unknown capacity operation %q", tc.Operation)
 			}
@@ -661,6 +827,7 @@ func TestClientRejectsRegistryURLCredentialsAndBoundedResponse(t *testing.T) {
 func TestClientRejectsResponseForDifferentPackageIdentity(t *testing.T) {
 	bundle := fixtureBundle(t)
 	bundle.Manifest.Identity = Identity{Name: "other/package", Version: "1.0.0"}
+	bundle.Manifest.Metadata.NodeDescriptor.Name = "other/package"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(bundle)

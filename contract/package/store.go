@@ -1,6 +1,10 @@
 package packagecontract
 
-import "sync"
+import (
+	"sync"
+
+	"github.com/well-prado/new-blok/contract"
+)
 
 const (
 	DefaultStoreMaxPackages      = 256
@@ -136,7 +140,55 @@ func cloneBundle(bundle Bundle) Bundle {
 		}
 		bundle.Manifest.Compatibility.Runtimes = runtimes
 	}
+	metadata := &bundle.Manifest.Metadata
+	if metadata.CapabilityManifest != nil {
+		capability := *metadata.CapabilityManifest
+		capability.Effects = append([]string(nil), capability.Effects...)
+		capability.Capabilities = append([]string(nil), capability.Capabilities...)
+		capability.SecretRefs = append([]string(nil), capability.SecretRefs...)
+		metadata.CapabilityManifest = &capability
+	}
+	if metadata.NodeDescriptor != nil {
+		descriptor := *metadata.NodeDescriptor
+		descriptor.InputSchema = append([]byte(nil), descriptor.InputSchema...)
+		descriptor.OutputSchema = append([]byte(nil), descriptor.OutputSchema...)
+		descriptor.Effects = append([]string(nil), descriptor.Effects...)
+		descriptor.RequiredCapabilities = append([]string(nil), descriptor.RequiredCapabilities...)
+		metadata.NodeDescriptor = &descriptor
+	}
+	if metadata.WorkflowDocument != nil {
+		document := *metadata.WorkflowDocument
+		document.Workflow.InputSchema = append([]byte(nil), document.Workflow.InputSchema...)
+		document.Workflow.OutputSchema = append([]byte(nil), document.Workflow.OutputSchema...)
+		document.Nodes = append([]contract.NodeDescriptor(nil), document.Nodes...)
+		for i := range document.Nodes {
+			document.Nodes[i].InputSchema = append([]byte(nil), document.Nodes[i].InputSchema...)
+			document.Nodes[i].OutputSchema = append([]byte(nil), document.Nodes[i].OutputSchema...)
+		}
+		document.Bindings = append([]contract.Binding(nil), document.Bindings...)
+		for i := range document.Bindings {
+			document.Bindings[i].InputSchema = append([]byte(nil), document.Bindings[i].InputSchema...)
+			document.Bindings[i].Source = cloneSourceSpan(document.Bindings[i].Source)
+		}
+		document.Workflow.Instructions = append([]contract.Instruction(nil), document.Workflow.Instructions...)
+		for i := range document.Workflow.Instructions {
+			document.Workflow.Instructions[i].References = append([]contract.Reference(nil), document.Workflow.Instructions[i].References...)
+			for j := range document.Workflow.Instructions[i].References {
+				document.Workflow.Instructions[i].References[j].Path = append([]string(nil), document.Workflow.Instructions[i].References[j].Path...)
+			}
+			document.Workflow.Instructions[i].Source = cloneSourceSpan(document.Workflow.Instructions[i].Source)
+		}
+		metadata.WorkflowDocument = &document
+	}
 	return bundle
+}
+
+func cloneSourceSpan(span *contract.SourceSpan) *contract.SourceSpan {
+	if span == nil {
+		return nil
+	}
+	copy := *span
+	return &copy
 }
 
 func sameSignature(a, b *Signature) bool {
