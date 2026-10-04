@@ -1,0 +1,92 @@
+{
+  "formatVersion": 1,
+  "endpoint": "/v1/packages/{namespace}/{name}/{version}",
+  "expectedRegistryRequests": 11,
+  "expectedNewPackages": 1,
+  "cases": [
+    {
+      "name": "fetch-valid-local",
+      "method": "GET",
+      "path": "/v1/packages/shop/quote-node/1.0.0",
+      "expectedStatus": 200,
+      "expectedTrust": "unsigned-local",
+      "expectedError": ""
+    },
+    {
+      "name": "fetch-without-local-trust",
+      "method": "GET",
+      "path": "/v1/packages/shop/quote-node/1.0.0",
+      "expectedStatus": 200,
+      "expectedError": "signature_required"
+    },
+    {
+      "name": "fetch-incompatible-engine",
+      "method": "GET",
+      "path": "/v1/packages/shop/quote-node/1.0.0",
+      "expectedStatus": 200,
+      "expectedError": "incompatible_engine"
+    },
+    {
+      "name": "fetch-missing",
+      "method": "GET",
+      "path": "/v1/packages/shop/absent/1.0.0",
+      "expectedStatus": 404,
+      "expectedError": "not_found"
+    },
+    {
+      "name": "publish-identical",
+      "method": "PUT",
+      "path": "/v1/packages/shop/quote-node/1.0.0",
+      "expectedStatus": 200,
+      "expectedTrust": "unsigned-local",
+      "expectedError": ""
+    },
+    {
+      "name": "publish-version-conflict",
+      "method": "PUT",
+      "path": "/v1/packages/shop/quote-node/1.0.0",
+      "expectedStatus": 409,
+      "expectedError": "version_conflict"
+    },
+    {
+      "name": "publish-substituted-content",
+      "method": "PUT",
+      "path": "/v1/packages/shop/quote-node/1.0.0",
+      "responseVariant": "substituted-content",
+      "expectedStatus": 201,
+      "expectedError": "published_content_mismatch"
+    },
+    {
+      "name": "publish-unauthenticated",
+      "method": "PUT",
+      "path": "/v1/packages/shop/quote-node/1.0.0",
+      "responseVariant": "unauthenticated-publisher",
+      "expectedStatus": 401,
+      "expectedError": "protocol_error"
+    },
+    {
+      "name": "publish-namespace-forbidden",
+      "method": "PUT",
+      "path": "/v1/packages/shop/quote-node/1.0.0",
+      "responseVariant": "unauthorized-namespace",
+      "expectedStatus": 403,
+      "expectedError": "protocol_error"
+    },
+    {
+      "name": "fetch-tampered-artifact",
+      "method": "GET",
+      "path": "/v1/packages/shop/quote-node/1.0.0",
+      "responseVariant": "tampered-artifact",
+      "expectedStatus": 200,
+      "expectedError": "artifact_digest_mismatch"
+    },
+    {
+      "name": "publish-new",
+      "method": "PUT",
+      "path": "/v1/packages/shop/quote-node/1.0.1",
+      "expectedStatus": 201,
+      "expectedTrust": "unsigned-local",
+      "expectedError": ""
+    }
+  ]
+}

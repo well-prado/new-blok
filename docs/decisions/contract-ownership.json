@@ -62,9 +62,9 @@
       "id": "registry-trust",
       "question": "How are packages resolved, verified, locked and installed offline?",
       "owner": "E13-T01",
-      "status": "planned",
-      "decision": "Use immutable identities, verified artifacts, deterministic locks, offline cache and atomic changes; do not replace language package managers.",
-      "evidence": ["digest-mismatch-rejected", "offline-lock-resolution", "atomic-install-failure"]
+      "status": "partial",
+      "decision": "E13-T01 defines immutable signed package identity/trust, validates and binds existing node/workflow schemas, carries ordinary node effects/capabilities in node.Descriptor, and accepts the existing tool.Manifest only as an explicit agent-compatible declaration. Missing manifests never imply agent eligibility; workflow documents currently have no aggregate capability field. Offline resolution, lock generation, durable cache, and atomic CLI install/update remain E13-T02–T04; language package managers are not replaced.",
+      "evidence": ["TestPackageMetadataIsRequiredTypedAndCanonical", "TestPackageMetadataTamperingInvalidatesSignature", "TestWorkflowPackageReusesValidatedContractDocument", "TestStoreBindsImmutableVersionsAndReturnsCopies", "TestRegistryProtocolFixtureAgainstLocalMock"]
     },
     {
       "id": "distributed-ownership",
