@@ -276,6 +276,15 @@ func New(application *app.Application, config Config) (*Server, error) {
 	})
 	route := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch {
+		case request.Method != http.MethodPost && request.Method != http.MethodDelete:
+			// The server offers no standalone SSE stream: it never sends a
+			// message outside the request it answers, so a GET has nothing to
+			// carry. The specification lets such a server refuse the GET with
+			// 405, and a client then never sees a stream end at Shutdown and
+			// mistake it for a failed connection (ADR 0014).
+			writer.Header().Set("Allow", "POST, DELETE")
+			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+			return
 		case request.Method == http.MethodDelete:
 			// The transport answers a DELETE only after the session's calls
 			// return, so a session its owner ends cancels its calls first.
@@ -300,18 +309,13 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		http.Error(writer, "unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	// A GET is the session's standing stream and lasts as long as the
-	// session, so it is admitted but does not hold the application open.
-	// Each call holds its own lease while it runs.
-	if request.Method == http.MethodGet {
-		lease.Release()
-	} else {
-		defer lease.Release()
-		// The request's own work (building the session's view) also
-		// stops if the application's drain times out. Only that work is
-		// bound: canceling the request itself would drop its response.
-		request = request.WithContext(context.WithValue(request.Context(), leaseKey{}, lease))
-	}
+	// Every request is answered while it holds its lease; each call also
+	// holds its own lease while it runs.
+	defer lease.Release()
+	// The request's own work (building the session's view) also stops if
+	// the application's drain times out. Only that work is bound: canceling
+	// the request itself would drop its response.
+	request = request.WithContext(context.WithValue(request.Context(), leaseKey{}, lease))
 	// The request's context ends when this handler returns, whatever
 	// server hosts it: a call's answer is written by then.
 	ctx, finish := context.WithCancel(request.Context())
