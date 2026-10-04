@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,18 +24,28 @@ import (
 
 type processingObserver struct {
 	recorder *inspect.Recorder
+	mu       sync.RWMutex
 	runID    string
 	started  chan struct{}
 }
 
 func (o *processingObserver) Observe(event inspectioncontract.Event) {
 	o.recorder.Observe(event)
-	if event.RunID == o.runID && event.Kind == inspectioncontract.StepProcessing {
+	o.mu.RLock()
+	runID := o.runID
+	o.mu.RUnlock()
+	if event.RunID == runID && event.Kind == inspectioncontract.StepProcessing {
 		select {
 		case o.started <- struct{}{}:
 		default:
 		}
 	}
+}
+
+func (o *processingObserver) setRunID(runID string) {
+	o.mu.Lock()
+	o.runID = runID
+	o.mu.Unlock()
 }
 
 func TestActualNodeWorkerRunProducesInspectionProjection(t *testing.T) {
@@ -158,7 +169,7 @@ func TestActualNodeWorkerRunProducesInspectionProjection(t *testing.T) {
 		t.Fatal(err)
 	}
 	runner := execution.NewRunner(application, map[string]node.Any{descriptor.Name: definition.Any(), providerDesc.Name: providerNode.Any(), slowDesc.Name: slowNode.Any()})
-	observer.runID = "node-run-1"
+	observer.setRunID("node-run-1")
 	result, err := runner.Run(context.Background(), program, input{SKU: "coffee", Quantity: 2}, inspectioncontract.Invocation{RunID: "node-run-1", Principal: "app-1", AttemptID: "node-attempt-1"})
 	if err != nil || result.Output != int64(3000) {
 		t.Fatalf("Node result=%+v err=%v", result, err)
@@ -200,7 +211,7 @@ func TestActualNodeWorkerRunProducesInspectionProjection(t *testing.T) {
 		}
 	}
 drained:
-	observer.runID = "node-run-canceled"
+	observer.setRunID("node-run-canceled")
 	ctx, cancel := context.WithCancel(context.Background())
 	cancelDone := make(chan error, 1)
 	go func() {

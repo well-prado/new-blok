@@ -241,3 +241,21 @@ func TestJournalRunFailureIsCanonicalAndSeparateFromAttemptRetry(t *testing.T) {
 		t.Fatalf("canonical terminal failure projection=%+v err=%v", page, err)
 	}
 }
+
+func TestJournalRejectsOversizedRunOutputBeforePersistence(t *testing.T) {
+	db, j := newJournal(t, "oversized-output.db", Config{})
+	defer db.Close()
+	ctx := context.Background()
+	admission, err := j.Admit(ctx, AdmissionRequest{Principal: "alice", RequestKey: "oversized-output", Workflow: "quote", ArtifactDigest: "sha256:output", Input: []byte(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := []byte(`"` + strings.Repeat("x", MaxRunOutputBytes) + `"`)
+	if err := j.CompleteRun(ctx, admission.RunID, output); !errors.Is(err, ErrRunOutputLimit) {
+		t.Fatalf("oversized completed output error=%v, want ErrRunOutputLimit", err)
+	}
+	run, err := j.Run(ctx, admission.RunID)
+	if err != nil || run.State != runAccepted || len(run.Output) != 0 {
+		t.Fatalf("oversized output changed run: run=%+v err=%v", run, err)
+	}
+}
