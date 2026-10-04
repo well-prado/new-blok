@@ -11,6 +11,10 @@
       "expected": {"additionalOwners": 0, "committed": 0, "errors": ["ownership_lost"]}
     },
     {
+      "name": "concurrent-competing-owners",
+      "expected": {"successfulOwners": 1, "rejectedOwners": 11, "committed": 1, "errors": ["ownership_lost"]}
+    },
+    {
       "name": "paused-owner-after-expiry-and-takeover",
       "expected": {"oldOwnerCommitted": 0, "newOwnerCommitted": 1, "errors": ["ownership_lost"]}
     },

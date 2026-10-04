@@ -150,9 +150,12 @@ or an SLA.
 
 ## Evidence and remaining limits
 
-`store/distributed` tests the real etcd API for concurrent acquisition, lease
-expiry/takeover, stale-owner rejection, a voter network partition and catch-up,
-one-member pause/catch-up, and loss of two of three members. A failed
+`store/distributed` tests the real etcd API for twelve simultaneous
+acquisitions on an unowned partition (exactly one owner wins and commits;
+every other result must be `ErrOwnershipLost`), competing acquisition while an
+owner is live, lease expiry/takeover, stale-owner rejection, a voter network
+partition and catch-up, one-member pause/catch-up, and loss of two of three
+members. A failed
 no-quorum acknowledgment is treated as unknown; after recovery the test
 reconciles by the stable event ID and accepts either the already-committed
 matching record or one retry if absent. The S3 test stages and verifies a

@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -36,13 +37,18 @@ func TestDistributedCompetingOwnersAndExpiredOwnerAreFenced(t *testing.T) {
 	})
 
 	var acquired int
+	var rejected int
 	for i := 0; i < 12; i++ {
 		if _, err := store.Acquire(ctx, partition, fmt.Sprintf("competitor-%02d", i), 2*time.Second); err == nil {
 			acquired++
+		} else if errors.Is(err, ErrOwnershipLost) {
+			rejected++
+		} else {
+			t.Fatalf("competing acquisition returned non-fencing error: %v", err)
 		}
 	}
-	if acquired != 0 {
-		t.Fatalf("live owner allowed %d competing owners", acquired)
+	if acquired != 0 || rejected != 12 {
+		t.Fatalf("live owner acquisitions: extra owners=%d fenced rejections=%d, want 0 and 12", acquired, rejected)
 	}
 	assertScenarioFixture(t, "competing-owner-before-expiry", map[string]any{
 		"additionalOwners": acquired, "committed": 0, "errors": []string{"ownership_lost"},
@@ -72,6 +78,61 @@ func TestDistributedCompetingOwnersAndExpiredOwnerAreFenced(t *testing.T) {
 		t.Fatalf("committed value = %s, err=%v", value, err)
 	}
 	_ = client
+}
+
+func TestConcurrentAcquisitionHasExactlyOneFencedWinner(t *testing.T) {
+	store, _ := integrationStore(t, "BLOK_DISTRIBUTED_ENDPOINTS")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	partition := fmt.Sprintf("concurrent-fence-%d", time.Now().UnixNano())
+	const contenders = 12
+	type result struct {
+		owner Owner
+		err   error
+	}
+	start := make(chan struct{})
+	results := make(chan result, contenders)
+	var ready sync.WaitGroup
+	ready.Add(contenders)
+	for i := 0; i < contenders; i++ {
+		go func(index int) {
+			defer ready.Done()
+			<-start
+			owner, err := store.Acquire(ctx, partition, fmt.Sprintf("simultaneous-%02d", index), 20*time.Second)
+			results <- result{owner: owner, err: err}
+		}(i)
+	}
+	close(start)
+	ready.Wait()
+	close(results)
+
+	var winner Owner
+	var winners, rejected int
+	for outcome := range results {
+		if outcome.err == nil {
+			winner = outcome.owner
+			winners++
+			continue
+		}
+		if !errors.Is(outcome.err, ErrOwnershipLost) {
+			t.Fatalf("simultaneous acquisition returned non-fencing error: %v", outcome.err)
+		}
+		rejected++
+	}
+	if winners != 1 || rejected != contenders-1 {
+		t.Fatalf("simultaneous acquisitions: winners=%d fenced rejections=%d, want 1 and %d", winners, rejected, contenders-1)
+	}
+	defer store.cleanupLease(winner.LeaseID)
+	if err := store.Commit(ctx, winner, "race-winner", "state", []byte(`{"winner":true}`)); err != nil {
+		t.Fatalf("only acquired owner commit: %v", err)
+	}
+	if value, err := store.Read(ctx, partition, "race-winner"); err != nil || value == nil {
+		t.Fatalf("winner record missing: value=%s err=%v", value, err)
+	}
+	assertScenarioFixture(t, "concurrent-competing-owners", map[string]any{
+		"successfulOwners": winners, "rejectedOwners": rejected,
+		"committed": 1, "errors": []string{"ownership_lost"},
+	})
 }
 
 func TestReplicaPauseCatchupAndQuorumLoss(t *testing.T) {
