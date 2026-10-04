@@ -19,7 +19,42 @@ const outputShape = {
 	"order": { requestKey: z.string(), sku: z.string(), quantity: z.number().int(), totalCents: z.number().int() },
 	"job-retry": { jobId: z.string(), state: z.string(), totalCents: z.number().int() },
 };
-if (input.mode === "worker-adapter-reset") {
+if (input.mode === "worker-idle-samples") {
+	console.log = () => {};
+	console.info = () => {};
+	console.warn = () => {};
+	console.error = () => {};
+	process.env.BLOK_CRASH_AUTOFLIP_DISABLED = "1";
+	process.env.BLOK_JANITOR_DISABLED = "1";
+	process.env.BLOK_GRACEFUL_SHUTDOWN_DISABLED = "1";
+	const idleNode = defineNode({
+		name: "parity-idle-probe",
+		description: "Registered real worker node; no business jobs are submitted during idle sampling",
+		input: z.object({}),
+		output: z.object({ ok: z.boolean() }),
+		async execute() { return { ok: true }; },
+	});
+	const idleWorkflow = workflow("parity-worker-idle", {
+		version: "1.0.0",
+		trigger: { worker: { queue: "parity-idle", concurrency: 1, retries: 0 } },
+	}, () => step("probe", idleNode, {}));
+	class IdleWorker extends WorkerTrigger {
+		adapter = new InMemoryAdapter();
+		nodes = { [idleNode.name]: idleNode };
+		workflows = { "parity-worker-idle": idleWorkflow };
+	}
+	const worker = new IdleWorker();
+	await worker.listen();
+	const samplesNs = [];
+	for (let i = 0; i < input.samples; i++) {
+		const started = process.hrtime.bigint();
+		const stats = await worker.getQueueStats("parity-idle");
+		samplesNs.push(Number(process.hrtime.bigint() - started));
+		if (stats.waiting !== 0 || stats.active !== 0) throw new Error(`idle queue unexpectedly non-empty: ${JSON.stringify(stats)}`);
+	}
+	await worker.stop();
+	process.stdout.write(`${JSON.stringify({ engine: "blok-runner", version: "2.5.0", adapter: "InMemoryAdapter", probe: "WorkerTrigger.getQueueStats on an empty live queue", samplesNs })}\n`);
+} else if (input.mode === "worker-adapter-reset") {
 	const adapter = new InMemoryAdapter();
 	await adapter.connect();
 	const jobId = await adapter.addJob("orders", input.payload, { jobId: input.payload.jobId });

@@ -651,13 +651,21 @@ func findWorkload(t *testing.T, id string) workload {
 
 func runOldEngine(t *testing.T, providerURL string, tc workload) runResult {
 	t.Helper()
+	result, err := runOldEngineRaw(providerURL, tc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func runOldEngineRaw(providerURL string, tc workload) (runResult, error) {
 	input := map[string]any{"operation": tc.Operation, "payload": tc.Request}
 	if tc.Retry != nil {
 		input["retry"] = tc.Retry
 	}
 	encoded, err := json.Marshal(input)
 	if err != nil {
-		t.Fatal(err)
+		return runResult{}, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -668,13 +676,13 @@ func runOldEngine(t *testing.T, providerURL string, tc workload) runResult {
 	var stdout, stderr bytes.Buffer
 	command.Stdout, command.Stderr = &stdout, &stderr
 	if err := command.Run(); err != nil {
-		t.Fatalf("pinned Blok 2.5.0 runner failed: %v\nstderr: %s\nstdout: %s", err, stderr.String(), stdout.String())
+		return runResult{}, fmt.Errorf("pinned Blok 2.5.0 runner failed: %w\nstderr: %s\nstdout: %s", err, stderr.String(), stdout.String())
 	}
 	var result runResult
 	if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &result); err != nil {
-		t.Fatalf("decode old runner output %q: %v", stdout.String(), err)
+		return runResult{}, fmt.Errorf("decode old runner output %q: %w", stdout.String(), err)
 	}
-	return result
+	return result, nil
 }
 
 func runOldWorkerAdapterReset(t *testing.T, payload map[string]any) json.RawMessage {

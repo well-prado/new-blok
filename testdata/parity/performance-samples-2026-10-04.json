@@ -1,0 +1,109 @@
+{
+  "schemaVersion": 1,
+  "capturedDate": "2026-10-04",
+  "evidenceClass": "bounded-local-synthetic-measurement",
+  "command": "GOMAXPROCS=2 go test -p=1 ./benchmarks/parity -run '^TestPerformanceDistributions$' -count=1 -v",
+  "environment": {
+    "os": "macOS 27.0 arm64",
+    "go": "go1.27.1 darwin/arm64",
+    "node": "v24.21.0",
+    "bun": "1.3.14",
+    "oldBlokTag": "v2.5.0",
+    "oldBlokCommit": "7611e434f716a5a8efbed26613e546893d5bcba7",
+    "oldPublishedPackages": "@blokjs/core,@blokjs/runner,@blokjs/shared,@blokjs/trigger-sse,@blokjs/trigger-webhook,@blokjs/trigger-worker@2.5.0",
+    "newSourceBase": "0baf071a7136e9c1f4371bc9a8b85da41eeedb8e",
+    "gomaxprocs": 2
+  },
+  "topology": {
+    "provider": "one shared httptest loopback HTTP server; synthetic data only; no external calls",
+    "oldExecution": "fresh Node subprocess for each Runner call; idle samples are collected inside a live published WorkerTrigger using InMemoryAdapter",
+    "newExecution": "native engine in the existing Go test process; idle samples call trigger/worker.Queue.Get against a live empty SQLite queue",
+    "load": "three rounds of four concurrent quote calls per engine; old uses four fresh Node subprocesses per round; new shares one in-process Engine per round",
+    "recovery": "old published InMemoryAdapter enqueue/disconnect/recreate loses the waiting job; new SQLite worker database is closed/reopened and ProcessOnce executes the native order workflow before transactional acknowledgment"
+  },
+  "summaryMethod": "min/max; p50 and p95 use nearest-rank over the raw sample arrays",
+  "providerLedger": {
+    "calls": 39,
+    "committedEffects": 39
+  },
+  "limitations": [
+    "Old and new execution/process topologies differ; latency values are not a normalized engine comparison.",
+    "Idle observations time different APIs (old queue statistics versus a new missing-key lookup); they do not measure idle CPU, resident memory, or a production polling loop.",
+    "The old restart observation measures the pinned in-memory adapter reset API and demonstrates loss, not recovery or a production durable broker guarantee.",
+    "These small local samples are not production performance, capacity, throughput, or SLO claims."
+  ],
+  "distributions": [
+    {
+      "name": "cold-process-plus-quote",
+      "engine": "published Blok 2.5.0 Node process + Runner",
+      "samplesNs": [404476083, 254838125, 244919167, 255402209, 256910042],
+      "minNs": 244919167,
+      "p50Ns": 255402209,
+      "p95Ns": 404476083,
+      "maxNs": 404476083
+    },
+    {
+      "name": "engine-construction-plus-quote",
+      "engine": "new native Engine.Run in existing Go process",
+      "samplesNs": [1372291, 647125, 452625, 381167, 534917],
+      "minNs": 381167,
+      "p50Ns": 534917,
+      "p95Ns": 1372291,
+      "maxNs": 1372291
+    },
+    {
+      "name": "idle-queue-inspection",
+      "engine": "published WorkerTrigger.getQueueStats on live empty InMemoryAdapter",
+      "samplesNs": [25667, 2791, 1459, 1333, 2250, 1417, 1292, 1250, 3958, 5000, 2166, 917, 667, 667, 17500, 542, 541, 500, 500, 541],
+      "minNs": 500,
+      "p50Ns": 1292,
+      "p95Ns": 17500,
+      "maxNs": 25667
+    },
+    {
+      "name": "idle-queue-inspection",
+      "engine": "new trigger/worker.Queue.Get missing key on live empty SQLite queue",
+      "samplesNs": [27458, 18709, 24292, 13625, 14958, 30458, 14542, 14500, 11917, 11834, 10292, 9625, 12375, 14667, 11417, 9875, 11292, 13083, 9750, 9209],
+      "minNs": 9209,
+      "p50Ns": 12375,
+      "p95Ns": 27458,
+      "maxNs": 30458
+    },
+    {
+      "name": "concurrent-quote-request",
+      "engine": "published Blok 2.5.0 Runner, fresh Node process per request",
+      "samplesNs": [298004708, 281597083, 289588875, 276486750, 278429333, 286047792, 284362416, 272547625, 317236292, 308470542, 325940375, 318789417],
+      "minNs": 272547625,
+      "p50Ns": 286047792,
+      "p95Ns": 325940375,
+      "maxNs": 325940375
+    },
+    {
+      "name": "concurrent-quote-request",
+      "engine": "new native engine, shared in-process Engine across goroutines",
+      "samplesNs": [1008917, 1009792, 1033834, 954500, 341250, 291292, 306459, 352583, 295375, 384083, 346375, 357000],
+      "minNs": 291292,
+      "p50Ns": 352583,
+      "p95Ns": 1033834,
+      "maxNs": 1033834
+    },
+    {
+      "name": "adapter-restart-recovery",
+      "engine": "published InMemoryAdapter enqueue/disconnect/recreate (job lost)",
+      "samplesNs": [149389459, 145662292, 147858375, 144269666, 141072500],
+      "minNs": 141072500,
+      "p50Ns": 145662292,
+      "p95Ns": 149389459,
+      "maxNs": 149389459
+    },
+    {
+      "name": "sqlite-worker-reopen-and-recover",
+      "engine": "new SQLite queue reopen + real native engine + transactional worker ack",
+      "samplesNs": [3287584, 2788666, 3021916, 3109875, 3164500],
+      "minNs": 2788666,
+      "p50Ns": 3109875,
+      "p95Ns": 3287584,
+      "maxNs": 3287584
+    }
+  ]
+}

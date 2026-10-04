@@ -19,8 +19,8 @@ is involved.
   tree. No old source or manifest was changed; its tracked status remains clean.
 - Local machine for the focused checks: macOS 27.0 arm64, Node `v24.21.0`, Bun
   `1.3.14`, Go `1.27.1 darwin/arm64`; the new-framework source base is
-  `7aae21db6f9815c898660dc95c1df1dd45eecb97`. These are not a production
-  deployment topology.
+  `0baf071a7136e9c1f4371bc9a8b85da41eeedb8e` (current `origin/main`, including
+  #71 package resolution). These are not a production deployment topology.
 - Published old packages: `@blokjs/core`, `@blokjs/runner`, `@blokjs/shared`,
   `@blokjs/trigger-sse`, `@blokjs/trigger-webhook`, and
   `@blokjs/trigger-worker` all exactly `2.5.0`; `hono` `4.11.7`; `zod`
@@ -39,14 +39,17 @@ From the new repository root:
 ```sh
 GOMAXPROCS=2 go test -p=1 ./migration -count=1 -v
 GOMAXPROCS=2 go test -p=1 ./benchmarks/parity -count=1 -v
+GOMAXPROCS=2 go test -p=1 ./benchmarks/parity -run '^TestPerformanceDistributions$' -count=1 -v
 GOMAXPROCS=2 go test -p=1 ./trigger/worker -run '^TestProcessKillRollsBackBusinessWriteAndAcknowledgment$' -count=1 -v
 ```
 
 Do not run the parity/recovery commands while a parent-owned full gate is live;
 coordinate their execution window first. On 2026-10-04, with the gate window
-cleared, the migration test and full focused parity package command above passed
-on the recorded macOS/arm64 toolchain. The worker retry path uses the actual old
-`WorkerTrigger`/`InMemoryAdapter` and new SQLite queue plus real native engine.
+cleared, the migration test, full focused parity package command, and focused
+process-kill worker test and bounded performance-distribution sampler above
+passed on the recorded macOS/arm64 toolchain.
+The worker retry path uses the actual old `WorkerTrigger`/`InMemoryAdapter`
+and new SQLite queue plus real native engine.
 
 The parity command prints raw JSON old/new envelopes, provider calls/effects,
 wall times, and recovery state. The worker command runs the existing worker API
@@ -109,8 +112,19 @@ The `stream-event-and-disconnect` fixture declares those distinctions. The
 Inertia SPA protocol is explicitly out-of-scope for business-workflow parity
 and requires its own client/server contract. No production topology, provider
 throughput, cold-start, idle utilization, or load/recovery SLO is inferred from
-these focused tests. Startup/idle/load sample sets and latency distributions
-are not measured; they must not be filled with synthetic estimates.
+these focused tests. Bounded local distributions are recorded in
+[`performance-samples-2026-10-04.json`](../../testdata/parity/performance-samples-2026-10-04.json).
+The startup measurement includes one old Node process per request but measures
+new engine construction and execution inside an already-running Go test
+process. Idle measurements time different queue inspection APIs, not CPU or
+resident-memory use. Load uses four concurrent requests across three rounds;
+old requests each start a fresh Node process, while new requests share an
+in-process engine. Recovery reopens the actual SQLite worker queue and executes
+the native order workflow; the old InMemoryAdapter restart probe records the
+waiting job being lost. These are raw harness observations with different
+topologies, not normalized engine latency, production performance, capacity,
+throughput, or SLO claims. See the artifact's limitations before interpreting
+the distributions.
 
 The bounded public migration subset, compatibility classification, strict
 source/Export handling, and rejected cases are specified by
@@ -122,11 +136,8 @@ documents whose output/reference/binding semantics would otherwise be dropped.
 ## Current raw sample scope
 
 The focused parity tests emit raw quote/order/job, webhook, SSE, and recovery
-envelopes and call/effect counts. It records wall time only to show harness
-shape; the old sample includes a fresh Node process and a referenced test
-timeout, while new native calls are in-process. Those values are not comparable
-engine latency. Startup-only, steady idle, sustained load, and recovery latency
-distributions have not been collected. Collect them only after the parent-owned
-#76 full gate ends and the parent coordinates the run; record repetitions,
-machine topology, database settings,
-exact commands, and raw samples before making any performance statement.
+envelopes and call/effect counts. The opt-in sampler emits bounded raw
+startup-plus-call, idle queue-inspection, concurrent quote, and recovery
+samples plus nearest-rank p50/p95; it does not measure production topology or
+idle resource utilization. Rerun only after coordinating around parent-owned
+full gates, and retain exact versions, command, topology, and raw samples.
