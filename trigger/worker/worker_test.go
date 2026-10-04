@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -16,6 +17,54 @@ import (
 	"github.com/well-prado/new-blok/store/sqlite"
 	"github.com/well-prado/new-blok/trigger"
 )
+
+type nestedStoreExpectation struct {
+	Name                 string `json:"name"`
+	NestedError          string `json:"nestedError"`
+	ProcessError         string `json:"processError"`
+	State                string `json:"state"`
+	JobError             string `json:"jobError"`
+	Attempt              int    `json:"attempt"`
+	Deferrals            int    `json:"deferrals"`
+	NestedSubmissionRows int    `json:"nestedSubmissionRows"`
+	HandlerEffectRows    int    `json:"handlerEffectRows"`
+}
+
+func nestedStoreExpected(t *testing.T, name string) nestedStoreExpectation {
+	t.Helper()
+	data, err := os.ReadFile("testdata/nested-store.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		SchemaVersion string                   `json:"schemaVersion"`
+		Cases         []nestedStoreExpectation `json:"cases"`
+	}
+	if err := json.Unmarshal(data, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	if fixture.SchemaVersion != "worker-nested-store/v1" {
+		t.Fatalf("unexpected nested-store fixture schema %q", fixture.SchemaVersion)
+	}
+	for _, expected := range fixture.Cases {
+		if expected.Name == name {
+			return expected
+		}
+	}
+	t.Fatalf("nested-store fixture %q is missing", name)
+	return nestedStoreExpectation{}
+}
+
+func nestedSubmissionRows(t *testing.T, database store.Database, requestKey string) int {
+	t.Helper()
+	rows := 0
+	if err := database.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return tx.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM worker_jobs WHERE request_key = ?`, requestKey).Scan(&rows)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return rows
+}
 
 func TestEnqueueDeduplicatesAndConflicts(t *testing.T) {
 	database, err := (sqlite.Backend{}).Open(context.Background(), filepath.Join(t.TempDir(), "worker.db"))
@@ -759,12 +808,11 @@ func TestBusyStoreSubmissionIsSaturation(t *testing.T) {
 	}
 }
 
-// TestHandlerSubmittingToItsOwnStoreFails: a handler that writes to the
-// store outside tx, here by submitting to its own queue, waits on the write
-// lock its own claim holds. That busy store is not saturation: the job
-// fails like any handler error instead of being deferred, again and again,
-// into the same deadlock.
+// TestHandlerSubmittingToItsOwnStoreFails: a handler that submits to another
+// Queue sharing its store is diagnosed before it waits on the claim's write
+// lock, then fails with the actionable worker diagnostic.
 func TestHandlerSubmittingToItsOwnStoreFails(t *testing.T) {
+	expected := nestedStoreExpected(t, "same-store")
 	ctx := context.Background()
 	database, err := (sqlite.Backend{}).Open(ctx, filepath.Join(t.TempDir(), "self.db"))
 	if err != nil {
@@ -778,26 +826,154 @@ func TestHandlerSubmittingToItsOwnStoreFails(t *testing.T) {
 	if err := queue.RegisterKind("self", []byte(`{"type":"object"}`)); err != nil {
 		t.Fatal(err)
 	}
+	// A second Queue over the same Database must share the claim's write
+	// domain; queue identity alone is not enough to catch the deadlock.
+	otherQueue, err := New(ctx, database, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := otherQueue.RegisterKind("self", []byte(`{"type":"object"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.WithTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `CREATE TABLE nested_effects (id TEXT PRIMARY KEY)`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := queue.Enqueue(ctx, EnqueueRequest{RequestKey: "outer", Kind: "self", Payload: []byte(`{}`), MaxAttempts: 1}); err != nil {
 		t.Fatal(err)
 	}
 	var nested error
-	processed, err := queue.ProcessOnce(ctx, func(ctx context.Context, _ Tx, _ Job) error {
-		_, nested = queue.Submit(ctx, trigger.Submission{Key: "inner", Kind: "self", Payload: []byte(`{}`)})
+	started := time.Now()
+	processed, err := queue.ProcessOnce(ctx, func(ctx context.Context, tx Tx, _ Job) error {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO nested_effects VALUES ('rolled-back')`); err != nil {
+			return err
+		}
+		_, nested = otherQueue.Submit(ctx, trigger.Submission{Key: "inner", Kind: "self", Payload: []byte(`{}`)})
 		return nested
 	})
-	if err != nil || !processed {
+	elapsed := time.Since(started)
+	if expected.ProcessError != "none" || err != nil || !processed {
 		t.Fatalf("processed=%v err=%v", processed, err)
 	}
-	if !errors.Is(nested, store.ErrBusy) {
-		t.Fatalf("the nested submission returned %v; want a busy store", nested)
+	if expected.NestedError != "worker.ErrNestedSubmission" || !errors.Is(nested, ErrNestedSubmission) {
+		t.Fatalf("the nested submission returned %v; fixture wants %s", nested, expected.NestedError)
+	}
+	if elapsed >= time.Second {
+		t.Fatalf("same-store submission took %v; want immediate diagnosis", elapsed)
 	}
 	job, err := queue.Get(ctx, "outer")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if job.Deferrals != 0 || job.State != StateDead {
-		t.Fatalf("the self-deadlocked job is %s with %d deferrals; want dead with none", job.State, job.Deferrals)
+	if job.Deferrals != expected.Deferrals || job.Attempt != expected.Attempt || job.State != expected.State || job.Error != expected.JobError {
+		t.Fatalf("the self-submitting job is %+v; fixture wants state=%s attempt=%d deferrals=%d error=%q", job, expected.State, expected.Attempt, expected.Deferrals, expected.JobError)
+	}
+	if _, err := otherQueue.Get(ctx, "inner"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("the rejected nested submission was persisted: %v", err)
+	}
+	var effects int
+	if err := database.WithTx(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM nested_effects`).Scan(&effects)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if submissions := nestedSubmissionRows(t, database, "inner"); submissions != expected.NestedSubmissionRows || effects != expected.HandlerEffectRows {
+		t.Fatalf("nested submissions=%d handler effects=%d; fixture wants %d and %d", submissions, effects, expected.NestedSubmissionRows, expected.HandlerEffectRows)
+	}
+}
+
+// TestHandlerSubmittingToAnotherBusyStoreDefers: an actual write lock on a
+// distinct SQLite database is saturation. It must backpressure the outer job
+// instead of charging an attempt, even though the handler already owns a
+// different database's claim transaction.
+func TestHandlerSubmittingToAnotherBusyStoreDefers(t *testing.T) {
+	expected := nestedStoreExpected(t, "other-store-busy")
+	ctx := context.Background()
+	open := func(name string) store.Database {
+		database, err := (sqlite.Backend{}).Open(ctx, filepath.Join(t.TempDir(), name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = database.Close() })
+		return database
+	}
+	outerDB, otherDB := open("outer.db"), open("other.db")
+	clock := time.Unix(100, 0)
+	outer, err := New(ctx, outerDB, func() time.Time { return clock })
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := New(ctx, otherDB, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := outer.RegisterKind("outer", []byte(`{"type":"object"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := other.RegisterKind("nested", []byte(`{"type":"object"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := outerDB.WithTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `CREATE TABLE nested_effects (id TEXT PRIMARY KEY)`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := outer.Enqueue(ctx, EnqueueRequest{RequestKey: "outer", Kind: "outer", Payload: []byte(`{}`), MaxAttempts: 3}); err != nil {
+		t.Fatal(err)
+	}
+	holding, release, held := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+	go func() {
+		held <- otherDB.WithTx(ctx, func(tx *sql.Tx) error {
+			if _, err := tx.ExecContext(ctx, `UPDATE worker_jobs SET updated_at = updated_at`); err != nil {
+				return err
+			}
+			close(holding)
+			<-release
+			return nil
+		})
+	}()
+	<-holding
+	var released sync.Once
+	t.Cleanup(func() { released.Do(func() { close(release) }) })
+	var nested error
+	processed, err := outer.ProcessOnce(ctx, func(ctx context.Context, tx Tx, _ Job) error {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO nested_effects VALUES ('must-roll-back')`); err != nil {
+			return err
+		}
+		_, nested = other.Submit(ctx, trigger.Submission{Key: "inner", Kind: "nested", Payload: []byte(`{}`)})
+		return nested
+	})
+	released.Do(func() { close(release) })
+	if err := <-held; err != nil {
+		t.Fatal(err)
+	}
+	if expected.ProcessError != "none" || err != nil || !processed {
+		t.Fatalf("processed=%v err=%v", processed, err)
+	}
+	if expected.NestedError != "store.ErrBusy" || !errors.Is(nested, trigger.ErrSaturated) || !errors.Is(nested, store.ErrBusy) {
+		t.Fatalf("other-store submission returned %v; fixture wants %s and saturation", nested, expected.NestedError)
+	}
+	job, err := outer.Get(ctx, "outer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.State != expected.State || job.Attempt != expected.Attempt || job.Deferrals != expected.Deferrals || job.Error != expected.JobError {
+		t.Fatalf("outer job=%+v; fixture wants state=%s attempt=%d deferrals=%d error=%q", job, expected.State, expected.Attempt, expected.Deferrals, expected.JobError)
+	}
+	if _, err := other.Get(ctx, "inner"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("the saturated nested submission was persisted: %v", err)
+	}
+	var effects int
+	if err := outerDB.WithTx(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM nested_effects`).Scan(&effects)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if submissions := nestedSubmissionRows(t, otherDB, "inner"); submissions != expected.NestedSubmissionRows || effects != expected.HandlerEffectRows {
+		t.Fatalf("nested submissions=%d handler effects=%d; fixture wants %d and %d", submissions, effects, expected.NestedSubmissionRows, expected.HandlerEffectRows)
 	}
 }
 

@@ -59,7 +59,16 @@ func (Backend) Open(ctx context.Context, path string) (store.Database, error) {
 		_ = database.Close()
 		return nil, err
 	}
-	return &connection{database: database}, nil
+	writeDomain := store.NewWriteDomain()
+	if path != ":memory:" {
+		file, err := os.Stat(path)
+		if err != nil {
+			_ = database.Close()
+			return nil, fmt.Errorf("sqlite: identify write domain: %w", err)
+		}
+		writeDomain = store.NewFileWriteDomain(file)
+	}
+	return &connection{database: database, writeDomain: writeDomain}, nil
 }
 
 func configure(ctx context.Context, database *sql.DB) error {
@@ -90,9 +99,12 @@ func dsn(path string) string {
 
 type connection struct {
 	database     *sql.DB
+	writeDomain  *store.WriteDomain
 	beforeCommit func()
 	afterCommit  func()
 }
+
+func (c *connection) WriteDomain() *store.WriteDomain { return c.writeDomain }
 
 func (c *connection) WithTx(ctx context.Context, fn func(*sql.Tx) error) error {
 	if fn == nil {

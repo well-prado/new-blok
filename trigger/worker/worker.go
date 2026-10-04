@@ -35,6 +35,9 @@ var (
 	ErrNotFound        = errors.New("worker: job not found")
 	// ErrInvalidPayload rejects a job before durable acceptance.
 	ErrInvalidPayload = fmt.Errorf("worker: payload is invalid for its kind: %w", trigger.ErrInvalidInput)
+	// ErrNestedSubmission reports a handler submission to the write domain
+	// held by its claim. Use the handler's Tx for atomic writes instead.
+	ErrNestedSubmission = errors.New("worker: nested submission targets the store whose claim this handler holds; use the handler Tx for atomic writes")
 )
 
 const (
@@ -104,7 +107,11 @@ func (e *HandlerError) Error() string { return e.Message }
 
 // Handler processes one job. Its writes go through tx, in the same
 // transaction as the job's acknowledgment, so they commit only if the job
-// does. ctx is the consumer's: it is canceled when the consumer is lost.
+// does. ctx is the consumer's: it is canceled when the consumer is lost. The
+// context also carries the claimed write domain when the store exposes one,
+// allowing Queue.Enqueue/Submit to reject a nested write to that same domain.
+// Preserve ctx when submitting; replacing it with context.Background loses
+// that diagnostic context.
 type Handler func(ctx context.Context, tx Tx, job Job) error
 
 // ErrClaimLost reports that the claim's transaction ended while a handler
@@ -314,10 +321,11 @@ func (r *Rows) Err() error {
 func (r *Rows) Close() error { return r.rows.Close() }
 
 type Queue struct {
-	database store.Database
-	clock    func() time.Time
-	mu       sync.RWMutex
-	schemas  map[string]schema.Schema
+	database    store.Database
+	writeDomain *store.WriteDomain
+	clock       func() time.Time
+	mu          sync.RWMutex
+	schemas     map[string]schema.Schema
 }
 
 func New(ctx context.Context, database store.Database, clock func() time.Time) (*Queue, error) {
@@ -327,7 +335,8 @@ func New(ctx context.Context, database store.Database, clock func() time.Time) (
 	if clock == nil {
 		clock = time.Now
 	}
-	queue := &Queue{database: database, clock: clock, schemas: map[string]schema.Schema{}}
+	writeDomain, _ := store.WriteDomainOf(database)
+	queue := &Queue{database: database, writeDomain: writeDomain, clock: clock, schemas: map[string]schema.Schema{}}
 	if err := queue.withTx(ctx, func(tx *sql.Tx) error {
 		if err := createJobs(ctx, tx); err != nil {
 			return err
@@ -415,6 +424,12 @@ func (q *Queue) RegisterKind(kind string, inputSchema []byte) error {
 }
 
 func (q *Queue) Enqueue(ctx context.Context, request EnqueueRequest) (EnqueueResult, error) {
+	if q.writeDomain != nil {
+		claimed, ok := ctx.Value(claimedWriteDomainKey{}).(*store.WriteDomain)
+		if ok && store.SameWriteDomain(claimed, q.writeDomain) {
+			return EnqueueResult{}, ErrNestedSubmission
+		}
+	}
 	if request.RequestKey == "" || request.Kind == "" {
 		return EnqueueResult{}, errors.New("worker: request key and kind are required")
 	}
@@ -493,6 +508,10 @@ func (q *Queue) Enqueue(ctx context.Context, request EnqueueRequest) (EnqueueRes
 // so the job is delivered again without consuming an attempt.
 var ErrConsumerLost = errors.New("worker: consumer lost before acknowledgment")
 
+// claimedWriteDomainKey marks the write domain held by ProcessOnce's claim.
+// The value is attached only to the handler's trusted native context.
+type claimedWriteDomainKey struct{}
+
 // ProcessOnce claims and processes one job. The handler and acknowledgment are
 // in the same transaction, so a crash rolls back both the business write and
 // the delivery acknowledgment. A handler must not perform unknown external
@@ -548,7 +567,11 @@ func (q *Queue) ProcessOnce(ctx context.Context, handler Handler) (bool, error) 
 		if _, err := claimed.exec(txCtx, `SAVEPOINT worker_handler`); err != nil {
 			return ended(err)
 		}
-		handlerErr := handler(ctx, Tx{claim: claimed}, job)
+		handlerCtx := ctx
+		if q.writeDomain != nil {
+			handlerCtx = context.WithValue(ctx, claimedWriteDomainKey{}, q.writeDomain)
+		}
+		handlerErr := handler(handlerCtx, Tx{claim: claimed}, job)
 		if ctx.Err() != nil {
 			// Returning an error discards the claim with the handler's
 			// writes: the delivery was never acknowledged.
@@ -571,11 +594,10 @@ func (q *Queue) ProcessOnce(ctx context.Context, handler Handler) (bool, error) 
 		if _, err := claimed.exec(txCtx, `RELEASE SAVEPOINT worker_handler`); err != nil {
 			return ended(err)
 		}
-		// A busy store seen from inside a handler is not backpressure: the
-		// handler's own claim holds the store's only write lock (it wrote
-		// outside tx, for example by submitting to the same store), and
-		// deferring would only repeat the deadlock. It is a failure.
-		if errors.Is(handlerErr, trigger.ErrSaturated) && !errors.Is(handlerErr, store.ErrBusy) && !errors.Is(handlerErr, context.DeadlineExceeded) {
+		// Store saturation is backpressure. Enqueue diagnoses a submission
+		// to this claim's own write domain as ErrNestedSubmission before it
+		// waits; busy errors and deadlines from other domains defer normally.
+		if errors.Is(handlerErr, trigger.ErrSaturated) && !errors.Is(handlerErr, ErrNestedSubmission) {
 			// Saturation is backpressure, not a handler failure: the job is
 			// deferred without consuming an attempt, within its deferral budget.
 			state, message := StatePending, ""
@@ -754,6 +776,9 @@ func retryable(err error) bool {
 // HandlerError message, a classified error's stable code, or a generic
 // diagnostic. Arbitrary error text never reaches the dead-letter record.
 func safeMessage(err error) string {
+	if errors.Is(err, ErrNestedSubmission) {
+		return "nested submission to claimed store; use worker.Tx for atomic writes"
+	}
 	var target *HandlerError
 	if errors.As(err, &target) && target.Message != "" {
 		return target.Message

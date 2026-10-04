@@ -4,6 +4,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"os"
 
 	"github.com/well-prado/new-blok/contract/capacity"
 )
@@ -36,4 +37,49 @@ type Database interface {
 	Backup(context.Context, string) error
 	Integrity(context.Context) error
 	Close() error
+}
+
+// WriteDomain identifies databases that contend for the same write lock.
+// Its identity is opaque to callers.
+type WriteDomain struct {
+	file os.FileInfo
+}
+
+// NewWriteDomain creates a stable identity token for one write-lock domain.
+// Stores that share a writer lock must return the same token.
+func NewWriteDomain() *WriteDomain { return &WriteDomain{} }
+
+// NewFileWriteDomain identifies a write domain by the underlying file. Stores
+// opened through different handles to the same file therefore share identity.
+func NewFileWriteDomain(file os.FileInfo) *WriteDomain { return &WriteDomain{file: file} }
+
+// SameWriteDomain reports whether two optional domain tokens describe the
+// same lock domain. Tokens without file identity match only themselves.
+func SameWriteDomain(left, right *WriteDomain) bool {
+	if left == nil || right == nil {
+		return false
+	}
+	if left == right {
+		return true
+	}
+	return left.file != nil && right.file != nil && os.SameFile(left.file, right.file)
+}
+
+// WriteDomainProvider is an optional Database capability. A wrapper that
+// shares its underlying database's writer lock should forward WriteDomain.
+// Databases that do not implement this capability cannot participate in
+// same-store nested-submission detection.
+type WriteDomainProvider interface {
+	WriteDomain() *WriteDomain
+}
+
+// WriteDomainOf reports a database's lock domain when it exposes one. It does
+// not infer identity by comparing arbitrary Database implementations.
+func WriteDomainOf(database Database) (*WriteDomain, bool) {
+	provider, ok := database.(WriteDomainProvider)
+	if !ok {
+		return nil, false
+	}
+	domain := provider.WriteDomain()
+	return domain, domain != nil
 }

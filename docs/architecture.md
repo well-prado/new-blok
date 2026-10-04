@@ -111,6 +111,15 @@ One admission path authenticates/authorizes, maps and validates input, deduplica
 
 HTTP and one durable job path ship first. Other adapters pass shared conformance plus actual protocol integration tests. They implement no second interpreter, mapper or retry engine. The shared `trigger` contract, the per-kind completion/disconnect table and the `contract/conformance.RunTrigger` harness are recorded in [ADR 0005](decisions/0005-trigger-adapter-contract.md). Multiple bindings can share a listener where protocols permit; independent TLS/listeners remain selectable. Queue acknowledgment follows an explicit transfer model and stable delivery deduplication.
 
+Worker handlers write durable business state through the handler's `worker.Tx`
+so effects and acknowledgment commit together. The handler context carries the
+claim's write domain when the store exposes it; a nested queue submission to
+that same domain returns an actionable error before waiting on its own writer
+lock. Saturation from another store remains backpressure and defers the job
+without spending an attempt. Stores and wrappers opt into precise detection by
+exposing and forwarding `store.WriteDomainProvider`; opaque wrappers and
+handlers that replace the provided context cannot be inferred safely.
+
 ## 7. Durability, effects and artifacts
 
 Memory mode permits in-flight loss. Journal mode resumes accepted work after process restart with its volume intact; it does not imply disk-loss survival or multi-host failover. Choose one embedded backend through a measured spike (SQLite candidate, Pebble alternative), implement the winner and keep the port replaceable.

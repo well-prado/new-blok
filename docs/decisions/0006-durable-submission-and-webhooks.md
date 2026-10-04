@@ -2,6 +2,7 @@
 
 - Status: accepted
 - Date: 2026-10-02
+- Amended: #188 (worker nested-store diagnostics and saturation)
 - Roadmap: E09-T02 ([#55](https://github.com/well-prado/new-blok/issues/55))
 - Amends: [ADR 0005](0005-trigger-adapter-contract.md) (webhook declaration)
 - Consumers: webhook now; cron (#56) and pubsub (#57) are expected to submit
@@ -32,12 +33,22 @@ was not available before the busy timeout or the submit deadline, is
 reported as `trigger.ErrSaturated` (#184), and nothing is committed: webhook
 and SSE answer 503 `saturated` with `Retry-After`, pubsub naks with a delay
 without spending its delivery budget, and cron keeps the occurrence for its
-next attempt. A worker handler that returns a busy store or a spent submit
-deadline fails rather than deferring: the usual cause is the handler's own
-claim, which holds the write lock it waited for (it wrote outside `tx`, for
-example by submitting to the same store), and deferring would repeat the
-deadlock. This also treats a busy *other* store as a failure; telling the
-two apart is tracked separately.
+next attempt. Worker handlers also treat saturation as backpressure: a busy
+other store or a spent submit deadline defers the job without consuming an
+attempt. Before submitting, `Queue.Enqueue` checks the write domain attached
+to the handler context. If that is the queue's own domain, it immediately
+returns `worker.ErrNestedSubmission`, with guidance to use the handler's `Tx`
+for atomic writes; this is a failed handler result, not saturation to defer.
+
+The optional `store.WriteDomainProvider` capability supplies lock identity.
+SQLite compares file-backed domains using the filesystem's same-file identity,
+including separate handles to the same database file. Wrappers that share a
+write lock must forward the underlying token. When a wrapper hides this
+capability, or trusted handler code discards the supplied context (for example
+by submitting with `context.Background()`), the queue cannot safely infer the
+relationship: that nested write follows the ordinary store busy timeout and
+its saturation behavior. Direct database writes that bypass `Queue.Enqueue`
+are likewise outside this diagnostic; handlers should use `worker.Tx`.
 
 A worker handler writes through `worker.Tx`, the claim's own transaction,
 so its writes commit only if the job is acknowledged. SQLite can end that
@@ -145,6 +156,8 @@ is never parsed before verification.
 | `worker.Queue.Submit`, `EnqueueRequest.Principal`, `Job.Principal` | additive | none |
 | Same request key with a different principal now conflicts | behavioral | producers that passed no principal are unaffected |
 | `worker.ErrInvalidPayload` / `ErrRequestConflict` wrap the trigger sentinels | additive (error chains) | `errors.Is` on the worker sentinels keeps working |
+| `store.WriteDomainProvider` and `worker.ErrNestedSubmission` | additive | Stores/wrappers may expose lock identity; handlers should use `worker.Tx` for same-store atomic writes |
+| Worker handler receives saturation from another store | behavioral | The job is deferred within its existing deferral budget without consuming an attempt |
 | `principal_json` column | schema | added by `worker.New` |
 | New package `trigger/webhook` | additive | none |
 
