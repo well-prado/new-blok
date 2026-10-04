@@ -132,28 +132,14 @@ IDs and rejects changed payloads under a reused ID.
 - Independent consumer module and executable: `external/shopapp/`
 - Expected synthetic outcomes: `shop/fixtures.json`
 
-The worker adapter transaction-ownership issue tracked by #180 is not changed
-here and remains an upstream dependency. In particular, this recipe does not
-replace the handler's cancelable context for transaction SQL or claim that
-SQLite busy timeouts bound statement execution. Worker cancellation/transaction
-ownership acceptance therefore remains pending the independently reviewed
-upstream fix and its integration evidence.
-
-The current recipe handler accepts the existing `*sql.Tx` callback ABI; the
-proposed #180 `worker.Tx` ABI will require an explicit recipe migration once
-the authoritative fix is reviewed and merged. No concurrent handler-SQL
-serialization guarantee is inferred from the proposed wrapper or from this
-recipe's tests.
-
-The earlier parent-reported `SQLITE_FULL` concurrent-statement failure claim
-is retracted: the fixture counted a committed business row without checking
-the acknowledgment state. Adding `Queue.Get` showed the job was completed,
-so that fixture does not establish an effect outside acknowledgment. The
-associated 3/3 failure claim is invalid. Separate parent-reported SQL-batch
-rollback evidence leaves a dead job with a committed business row and remains
-an unresolved boundary defect under #180. A concurrent `RAISE(ROLLBACK)`
-fixture with an acknowledgment-state oracle is still being developed; no
-result is claimed for it. Acceptance awaits independent resolution and review.
+The recipe now uses the independently reviewed `worker.Tx` handler API merged
+in #196 for #180. Handler SQL retains its cancelable context; the worker checks
+transaction ownership after errors and refuses further statements after a lost
+claim. SQL must not hide transaction-control commands inside multi-statement
+strings. These are trusted application statements, not a sandbox boundary.
+The worker's cancellation, rollback, and concurrent-handler regressions remain
+the authoritative adapter evidence; the recipe separately tests its real job
+restart and outbox reconciliation behavior.
 
 The typed workflow here validates the command and prepares the stable event;
 the application handlers own the record and outbox SQL transaction. This is a
@@ -169,8 +155,7 @@ demonstrate the external-delivery boundary and uncertain-outcome reconciliation,
 not an effect node in the two-step workflow. A workflow that composes business
 persistence and provider effects as nodes would need to demonstrate those nodes
 and their transactional/durable acknowledgment boundary explicitly. That is
-not inferred from this recipe's current composition, and worker transaction
-ownership also remains gated on #180.
+not inferred from this recipe's current composition.
 
 Run root-module evidence with `go test ./examples/recipes/...`, and the
 external-consumer evidence separately from `examples/recipes/external/shopapp`

@@ -453,7 +453,7 @@ func (a *Application) ProcessOne(ctx context.Context) (bool, error) {
 	var key string
 	var record Record
 	var handlerErr error
-	processed, err := a.Queue.ProcessOnce(ctx, func(ctx context.Context, tx *sql.Tx, job worker.Job) error {
+	processed, err := a.Queue.ProcessOnce(ctx, func(ctx context.Context, tx worker.Tx, job worker.Job) error {
 		key = job.RequestKey
 		var request jobInput
 		if err := json.Unmarshal(job.Payload, &request); err != nil {
