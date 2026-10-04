@@ -149,6 +149,7 @@ func TestTwoIngressNodesPersistAndExecuteOneIdempotentRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	releaseOwnerOnCleanup(t, storeA, owner)
 	if _, err := first.processOne(ctx, owner); err != nil {
 		t.Fatalf("execute persisted run: %v", err)
 	}
@@ -207,6 +208,7 @@ func TestTakeoverPersistsUncertaintyAndRejectsPausedOwnersResult(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	releaseOwnerOnCleanup(t, store, oldOwner)
 	oldDone := make(chan struct {
 		record RunRecord
 		err    error
@@ -236,6 +238,7 @@ func TestTakeoverPersistsUncertaintyAndRejectsPausedOwnersResult(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	releaseOwnerOnCleanup(t, store, newOwner)
 	if newOwner.Token <= oldOwner.Token {
 		t.Fatalf("fence did not advance: old=%d new=%d", oldOwner.Token, newOwner.Token)
 	}
@@ -353,6 +356,7 @@ func TestFailoverUnderSustainedLoadPreservesFairnessAndEffectCounts(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
+	releaseOwnerOnCleanup(t, store, oldOwner)
 	oldDone := make(chan error, 1)
 	go func() { _, processErr := oldRuntime.processOne(ctx, oldOwner); oldDone <- processErr }()
 	select {
@@ -398,6 +402,7 @@ func TestFailoverUnderSustainedLoadPreservesFairnessAndEffectCounts(t *testing.T
 			t.Fatal(err)
 		}
 	}
+	releaseOwnerOnCleanup(t, store, newOwner)
 	firstRecovered, err := newRuntime.processOne(ctx, newOwner)
 	if err != nil {
 		t.Fatalf("reconcile paused effect: %v", err)
@@ -513,6 +518,7 @@ func TestTimerAndSignalRaceHasOneFencedWinner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	releaseOwnerOnCleanup(t, store, owner)
 	processResult := make(chan error, 1)
 	go func() { _, err := runtime.processOne(ctx, owner); processResult <- err }()
 	select {
@@ -630,6 +636,7 @@ func TestSignalResumesDistributedRunFromCommittedPrefix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	releaseOwnerOnCleanup(t, store, owner)
 	if _, err := runtime.processOne(ctx, owner); !errors.Is(err, ErrNoWork) {
 		t.Fatalf("initial process error=%v, want suspended work yield", err)
 	}
@@ -692,6 +699,7 @@ func TestTimerResumesDistributedRunFromCommittedPrefix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	releaseOwnerOnCleanup(t, store, owner)
 	if _, err := runtime.processOne(ctx, owner); !errors.Is(err, ErrNoWork) {
 		t.Fatalf("initial process error=%v, want suspended work yield", err)
 	}
@@ -732,6 +740,7 @@ func TestPureStepDispatchCanRetryAfterOwnerTakeover(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	releaseOwnerOnCleanup(t, store, firstOwner)
 	runtime := &Runtime{store: store}
 	run := RunRecord{RunID: "run-pure-retry", ArtifactDigest: "sha256:" + strings.Repeat("f", 64)}
 	input := json.RawMessage(`{"value":1}`)
@@ -748,6 +757,7 @@ func TestPureStepDispatchCanRetryAfterOwnerTakeover(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	releaseOwnerOnCleanup(t, store, newOwner)
 	t.Logf("pure-step takeover state: partition=%s run=%s state=step-<sha256:...> oldFence=%d newFence=%d", partition, run.RunID, firstOwner.Token, newOwner.Token)
 	newJournal := &runStepJournal{runtime: runtime, owner: newOwner, record: run}
 	if _, completed, err := newJournal.Load(ctx, identity); err != nil || completed {
@@ -791,6 +801,7 @@ func TestTenantFairCursorSurvivesPartitionOwnerTakeover(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	releaseOwnerOnCleanup(t, store, oldOwner)
 	candidates := make([]RunRecord, 0, len(fixture.CandidateTenants))
 	for index, tenant := range fixture.CandidateTenants {
 		candidates = append(candidates, RunRecord{RunID: fmt.Sprintf("run-%02d", index), Tenant: tenant})
@@ -807,6 +818,7 @@ func TestTenantFairCursorSurvivesPartitionOwnerTakeover(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	releaseOwnerOnCleanup(t, store, newOwner)
 	newRuntime := &Runtime{store: store}
 	second, err := newRuntime.fairCandidate(ctx, newOwner, candidates)
 	t.Logf("fair cursor takeover state: partition=%s priorTenant=%s resumedTenant=%s oldFence=%d newFence=%d", partition, first.Tenant, second.Tenant, oldOwner.Token, newOwner.Token)
@@ -824,6 +836,7 @@ func TestScheduleWaitClassifiesQuorumLossAsUnavailable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	releaseOwnerOnCleanup(t, store, owner)
 	t.Logf("quorum-loss probe state: voters=[blok-distributed-spike-etcd1-1 blok-distributed-spike-etcd2-1 blok-distributed-spike-etcd3-1] paused=[blok-distributed-spike-etcd2-1 blok-distributed-spike-etcd3-1] partition=%s run=absent wait=wait-absent", partition)
 	paused := make([]string, 0, 2)
 	defer func() {
@@ -922,6 +935,7 @@ func TestStepJournalQuorumLossDefersAcceptedRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	releaseOwnerOnCleanup(t, store, owner)
 	t.Logf("quorum journal recovery state: voters=[blok-distributed-spike-etcd1-1 blok-distributed-spike-etcd2-1 blok-distributed-spike-etcd3-1] paused=[blok-distributed-spike-etcd2-1 blok-distributed-spike-etcd3-1] partition=%s run=%s", partition, admission.RunID)
 	type processResult struct {
 		record RunRecord
@@ -985,6 +999,7 @@ func TestStepJournalQuorumLossDefersAcceptedRun(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	releaseOwnerOnCleanup(t, store, newOwner)
 	recovered, err := runtime.processOne(ctx, newOwner)
 	if err != nil || recovered.State != fixture.ExpectedFinalState || string(recovered.Output) != fixture.ExpectedOutput {
 		t.Fatalf("recovered=%+v err=%v; expected %s / %s", recovered, err, fixture.ExpectedFinalState, fixture.ExpectedOutput)
@@ -1074,34 +1089,26 @@ func partitionWithoutPendingRuns(ctx context.Context, store *distributed.Store, 
 		} else if !errors.Is(err, distributed.ErrOwnershipLost) {
 			return "", err
 		}
-		events, err := store.ListEvents(ctx, partition)
+		runs, err := store.ListActiveRunIDs(ctx, partition, maxPartitionAdmissions)
 		if err != nil {
 			return "", err
 		}
-		pending := false
-		for _, event := range events {
-			if event.Kind != "run.accepted" || !strings.HasPrefix(event.ID, "accepted-run-") {
-				continue
-			}
-			runID := strings.TrimPrefix(event.ID, "accepted-")
-			data, _, err := store.ReadState(ctx, partition, runID)
-			if err != nil {
-				return "", err
-			}
-			var run RunRecord
-			if err := json.Unmarshal(data, &run); err != nil {
-				return "", err
-			}
-			if run.State == "accepted" || run.State == "running" {
-				pending = true
-				break
-			}
-		}
-		if !pending {
+		if len(runs) == 0 {
 			return partition, nil
 		}
 	}
 	return "", errors.New("cluster integration: no empty partition available for isolated fixture")
+}
+
+func releaseOwnerOnCleanup(t *testing.T, store *distributed.Store, owner distributed.Owner) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := store.Release(ctx, owner); err != nil && !errors.Is(err, distributed.ErrOwnershipLost) {
+			t.Logf("release integration owner %s/%s: %v", owner.Partition, owner.ID, err)
+		}
+	})
 }
 
 func tenantForEmptyPartition(t *testing.T, ctx context.Context, store *distributed.Store, runtime *Runtime, prefix string) (string, string) {
