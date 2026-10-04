@@ -91,8 +91,11 @@ func TestOwnedProcessStopEndsTheWholeTree(t *testing.T) {
 	}
 	owned.stop()
 	_ = cmd.Wait()
+	// Checked before release: closing the job would end the grandchild too
+	// and hide a stop that reached only the direct child.
+	ended := processEnded(grandchild, 5*time.Second)
 	owned.release()
-	if !processEnded(grandchild, 5*time.Second) {
+	if !ended {
 		t.Fatal("stop left the worker's grandchild running")
 	}
 }
