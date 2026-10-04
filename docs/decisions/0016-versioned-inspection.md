@@ -48,6 +48,8 @@ exposing their underlying value.
 Duplicate projected struct field names truncate before `omitempty` selection;
 capture never exposes a value that standard JSON would discard as ambiguous.
 Invalid standard-library time representations also truncate.
+Raw JSON also uses a bounded token scan for depth and visited items before
+retention; its serialized form does not bypass the structural capture limits.
 
 `inspect.Recorder` is a process-local development projection. It authorizes by
 exact principal, returns the same not-found result for unknown and unauthorized

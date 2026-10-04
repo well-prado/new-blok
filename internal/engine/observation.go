@@ -1,10 +1,12 @@
 package engine
 
 import (
+	"bytes"
 	"encoding"
 	"encoding/base64"
 	"encoding/json"
 	jsonv2 "encoding/json/v2"
+	"io"
 	"reflect"
 	"strings"
 	"time"
@@ -85,6 +87,9 @@ func (b *observationBudget) capture(value reflect.Value, depth int) (any, bool) 
 	}
 	if value.Type() == observationRawType {
 		if value.Len() > b.remaining || !json.Valid(value.Bytes()) {
+			return nil, false
+		}
+		if !b.rawWithinBudget(value.Bytes(), depth) {
 			return nil, false
 		}
 		if !b.charge(value.Len() + 2) {
@@ -240,6 +245,35 @@ func (b *observationBudget) capture(value reflect.Value, depth int) (any, bool) 
 		return fields, true
 	default:
 		return nil, false
+	}
+}
+
+// Raw JSON has already serialized its structure, so reflection cannot see its
+// depth or collection cardinality. Scan tokens under the same remaining budget
+// before retaining it; never decode the complete value into an unbounded tree.
+func (b *observationBudget) rawWithinBudget(raw []byte, depth int) bool {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	for {
+		token, err := decoder.Token()
+		if err == io.EOF {
+			return true // json.Valid has already established a single value.
+		}
+		if err != nil || b.nodes <= 0 {
+			return false
+		}
+		b.nodes--
+		if delimiter, ok := token.(json.Delim); ok {
+			switch delimiter {
+			case '[', '{':
+				depth++
+				if depth > maxObservationDepth {
+					return false
+				}
+			case ']', '}':
+				depth--
+			}
+		}
 	}
 }
 

@@ -88,6 +88,23 @@ func TestMarshalObservationRejectsInvalidStandardTime(t *testing.T) {
 	}
 }
 
+func TestMarshalObservationRawJSONUsesDepthAndItemBudgets(t *testing.T) {
+	for _, raw := range []json.RawMessage{
+		json.RawMessage(strings.Repeat("[", 40) + "0" + strings.Repeat("]", 40)),
+		json.RawMessage("[" + strings.Repeat("0,", 9000) + "0]"),
+	} {
+		if !json.Valid(raw) || len(raw) > maxObservedPayloadBytes {
+			t.Fatal("fixture must be valid and inside byte budget")
+		}
+		if captured := marshalObservation(raw); string(captured) != `{"$truncated":true}` {
+			t.Fatalf("raw JSON escaped structural bounds: %s", captured)
+		}
+	}
+	if captured := marshalObservation(json.RawMessage(`{"value":9007199254740993}`)); string(captured) != `{"value":9007199254740993}` {
+		t.Fatalf("small raw JSON lost exact numeric value: %s", captured)
+	}
+}
+
 type observationNamedByte byte
 type observationPrivateText string
 
