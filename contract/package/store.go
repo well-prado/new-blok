@@ -1,6 +1,8 @@
 package packagecontract
 
 import (
+	"context"
+	"sort"
 	"sync"
 
 	"github.com/well-prado/new-blok/contract"
@@ -122,6 +124,42 @@ func (s *Store) Fetch(id Identity, policy TrustPolicy, env Environment) (Bundle,
 		return Bundle{}, Verified{}, err
 	}
 	return bundle, verified, nil
+}
+
+// Versions exposes immutable identities to the deterministic resolver without
+// weakening Fetch's verification boundary. Results are stable and bounded.
+func (s *Store) Versions(_ context.Context, name string) ([]Identity, error) {
+	if s == nil {
+		return nil, ErrNotFound
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ids := make([]Identity, 0)
+	for _, bundle := range s.packages {
+		if bundle.Manifest.Identity.Name == name {
+			ids = append(ids, bundle.Manifest.Identity)
+		}
+	}
+	sort.Slice(ids, func(i, j int) bool { return compareVersionString(ids[i].Version, ids[j].Version) > 0 })
+	return ids, nil
+}
+
+// Get returns a copy of one exact bundle. The resolver verifies every returned
+// bundle against its active trust policy and compatibility environment.
+func (s *Store) Get(_ context.Context, id Identity) (Bundle, error) {
+	if s == nil {
+		return Bundle{}, ErrNotFound
+	}
+	if err := id.Validate(); err != nil {
+		return Bundle{}, err
+	}
+	s.mu.RLock()
+	bundle, ok := s.packages[packageKey(id)]
+	s.mu.RUnlock()
+	if !ok {
+		return Bundle{}, ErrNotFound
+	}
+	return cloneBundle(bundle), nil
 }
 
 func packageKey(id Identity) string { return id.Name + "@" + id.Version }

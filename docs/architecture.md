@@ -156,7 +156,7 @@ Dev inspection streams bounded per-step input, started/processing events, output
 
 ## 10. Registry, deployment and scale
 
-Node/workflow packages have namespaced immutable identities, schemas, capability manifests, artifacts, dependency bounds and integrity digests. CLI add/remove/update/verify works offline from locked/cache data, rejects traversal/signature/digest/cycle/version conflicts, stages atomic changes and never executes install hooks without explicit policy. Go packages remain normal modules; foreign dependencies retain native lockfiles. Hosted publishing, ownership/moderation/search infrastructure and billing belong to the separate registry product.
+Node/workflow packages have namespaced immutable identities, schemas, capability manifests, artifacts, dependency bounds and integrity digests. E13-T02 implements deterministic dependency resolution, exact execution-relevant locks, and a bounded verified offline cache; see [ADR 0018](decisions/0018-deterministic-package-resolution.md). E13-T03 owns the later CLI add/remove/update/verify operations and atomic project-file changes. Go and npm remain authoritative for their own dependency graphs; Blok captures their exact native locks and execution context without acting as a universal installer. Hosted publishing, ownership/moderation/search infrastructure and billing belong to the separate registry product.
 
 App-owned binaries support health/readiness/metrics, bounded admission, signal-driven drain, graceful worker shutdown and durable-volume configuration. Cloud consumes reproducible deployment manifests, artifacts, readiness and operational APIs; framework self-hosting remains first-class. No proprietary service is required for core operation.
 

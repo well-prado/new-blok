@@ -1,0 +1,54 @@
+{
+  "formatVersion": 1,
+  "expectedPackageExecutions": 0,
+  "expectedExternalEffects": 0,
+  "cases": [
+    {
+      "name": "transitive-highest-compatible-and-repeatable",
+      "roots": [{"name": "shop/root", "version": ">=1.0.0 <2.0.0"}],
+      "packages": [
+        {"name": "shop/root", "version": "1.0.0", "dependencies": [{"name": "shop/lib", "version": ">=1.0.0 <3.0.0"}]},
+        {"name": "shop/lib", "version": "1.0.0"},
+        {"name": "shop/lib", "version": "2.1.0"}
+      ],
+      "expectedPackages": 2,
+      "expectedSourceGets": 2,
+      "expectedError": ""
+    },
+    {
+      "name": "incompatible-transitive-ranges",
+      "roots": [
+        {"name": "shop/a", "version": "1.0.0"},
+        {"name": "shop/b", "version": "1.0.0"}
+      ],
+      "packages": [
+        {"name": "shop/a", "version": "1.0.0", "dependencies": [{"name": "shop/shared", "version": ">=1.0.0 <2.0.0"}]},
+        {"name": "shop/b", "version": "1.0.0", "dependencies": [{"name": "shop/shared", "version": ">=2.0.0 <3.0.0"}]},
+        {"name": "shop/shared", "version": "1.5.0"},
+        {"name": "shop/shared", "version": "2.5.0"}
+      ],
+      "expectedPackages": 0,
+      "expectedSourceGets": 2,
+      "expectedError": "resolution_conflict"
+    },
+    {
+      "name": "dependency-cycle",
+      "roots": [{"name": "shop/a", "version": "1.0.0"}],
+      "packages": [
+        {"name": "shop/a", "version": "1.0.0", "dependencies": [{"name": "shop/b", "version": "1.0.0"}]},
+        {"name": "shop/b", "version": "1.0.0", "dependencies": [{"name": "shop/a", "version": "1.0.0"}]}
+      ],
+      "expectedPackages": 0,
+      "expectedSourceGets": 2,
+      "expectedError": "resolution_cycle"
+    },
+    {
+      "name": "unsupported-range-syntax",
+      "roots": [{"name": "shop/a", "version": "^1.0.0"}],
+      "packages": [],
+      "expectedPackages": 0,
+      "expectedSourceGets": 0,
+      "expectedError": "unsupported_version_range"
+    }
+  ]
+}
