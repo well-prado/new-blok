@@ -44,9 +44,14 @@ intended network. The durable endpoints require `BLOK_DEPLOY_TOKEN`.
 Operational settings: `BLOK_LISTEN` (literal IP and port), `BLOK_EXTERNAL`
 (explicit external-bind opt-in), `BLOK_MAX_ADMISSION` (Node default 2, maximum
 32), and `BLOK_DRAIN_TIMEOUT` (default 5s). Saturation rejects immediately with
-503. On SIGTERM the executable drains HTTP before closing dependencies; drain
-expiry cancels active handlers and reports a nonzero exit. Probes bypass
-admission and show readiness, active work, draining state and rejection count.
+503. On SIGTERM the executable drains HTTP before closing dependencies. If the
+HTTP drain expires, it cancels active handlers with `application_drain_timeout`
+and allows the application's configured `AbortGrace` (1s by default) for
+cooperative cleanup. The total handler-drain bound is the HTTP drain timeout
+plus that grace. Trusted handler code that ignores cancellation can still be
+running when dependencies close after the grace, and the process reports a
+nonzero exit. Probes bypass admission and show readiness, active work, draining
+state and rejection count.
 Probe RPCs have a 250ms context; repeated probes consume the worker's bounded
 identity budget (8192 Node replay entries, two per RPC), so schedule container
 recycling and avoid excessive probing.
