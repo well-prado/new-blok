@@ -3,16 +3,46 @@
 package runtime
 
 import (
+	"os"
 	"os/exec"
+	"sync"
 	"syscall"
 )
 
-// ownedProcess is the worker process the supervisor started. On POSIX
+// processOwner is the worker process the supervisor started. On POSIX
 // systems stop asks it to exit with SIGTERM and kill ends it outright.
-type ownedProcess struct{ cmd *exec.Cmd }
+type processOwner struct {
+	mu      sync.Mutex
+	process *os.Process
+}
 
-func ownProcess(cmd *exec.Cmd) (ownedProcess, error) { return ownedProcess{cmd: cmd}, nil }
+func newProcessOwner() (*processOwner, error) { return &processOwner{}, nil }
 
-func (o ownedProcess) stop()    { _ = o.cmd.Process.Signal(syscall.SIGTERM) }
-func (o ownedProcess) kill()    { _ = o.cmd.Process.Kill() }
-func (o ownedProcess) release() {}
+// isolateWorker has nothing to do on POSIX: signals reach only the process
+// they are sent to.
+func isolateWorker(*exec.Cmd) {}
+
+func (o *processOwner) adopt(cmd *exec.Cmd) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.process = cmd.Process
+	return nil
+}
+
+func (o *processOwner) stop() { o.signal(syscall.SIGTERM) }
+func (o *processOwner) kill() { o.signal(syscall.SIGKILL) }
+
+func (o *processOwner) signal(s os.Signal) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.process != nil {
+		_ = o.process.Signal(s)
+	}
+}
+
+// release forgets the process once it has been reaped.
+func (o *processOwner) release() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.process = nil
+}
