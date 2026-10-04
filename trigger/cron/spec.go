@@ -464,33 +464,113 @@ func (o Occurrences) shifted(at time.Time) (Occurrence, bool) {
 // once it is reached the scan jumps close to until instead of enumerating
 // every remaining firing.
 func (o Occurrences) Between(after, until time.Time, limit, countLimit int) ([]Occurrence, int) {
-	var window []Occurrence
+	var window occurrenceWindow
 	skipped := 0
 	capped := false
+	hadOccurrence := false
 	cursor := after
 	for {
 		next, ok := o.Next(cursor)
 		if !ok || next.Instant.After(until) {
-			return window, skipped
+			return window.result(hadOccurrence), skipped
 		}
-		window = append(window, next)
+		hadOccurrence = true
 		cursor = next.Instant
-		if len(window) <= limit {
+		if limit > 0 && window.size < limit {
+			window.push(next, limit)
 			continue
 		}
-		window = window[1:]
 		if capped {
+			window.push(next, limit)
 			continue
 		}
+		window.push(next, limit)
 		skipped++
 		if skipped < countLimit {
 			continue
 		}
 		capped = true
 		if start, ok := o.jumpBack(until, limit); ok && start.After(cursor) {
-			cursor, window = start, nil
+			cursor = start
+			window.reset()
+			hadOccurrence = false
 		}
 	}
+}
+
+// occurrenceWindow keeps only the newest limit occurrences. Its storage
+// grows with observed output, never from the caller-provided limit, and once
+// full it reuses the oldest slot instead of shifting the window on every
+// missed firing.
+type occurrenceWindow struct {
+	values []Occurrence
+	head   int
+	size   int
+}
+
+func (w *occurrenceWindow) push(occurrence Occurrence, limit int) {
+	if limit <= 0 {
+		return
+	}
+	if w.size < limit && w.size == len(w.values) {
+		capacity := 4
+		if len(w.values) > 0 {
+			if len(w.values) > int(^uint(0)>>1)/2 {
+				capacity = limit
+			} else {
+				capacity = len(w.values) * 2
+			}
+		}
+		if capacity > limit {
+			capacity = limit
+		}
+		values := make([]Occurrence, capacity)
+		if w.size > 0 {
+			first := w.size
+			if remaining := len(w.values) - w.head; first > remaining {
+				first = remaining
+			}
+			copy(values, w.values[w.head:w.head+first])
+			copy(values[first:], w.values[:w.size-first])
+		}
+		w.values, w.head = values, 0
+	}
+	if w.size < limit {
+		index := w.head + w.size
+		if index >= len(w.values) {
+			index -= len(w.values)
+		}
+		w.values[index] = occurrence
+		w.size++
+		return
+	}
+	w.values[w.head] = occurrence
+	w.head++
+	if w.head == len(w.values) {
+		w.head = 0
+	}
+}
+
+func (w *occurrenceWindow) reset() {
+	clear(w.values)
+	w.head, w.size = 0, 0
+}
+
+func (w *occurrenceWindow) result(hadOccurrence bool) []Occurrence {
+	if w.size == 0 {
+		if hadOccurrence {
+			return []Occurrence{}
+		}
+		return nil
+	}
+	result := make([]Occurrence, w.size)
+	first := w.size
+	if remaining := len(w.values) - w.head; first > remaining {
+		first = remaining
+	}
+	copy(result, w.values[w.head:w.head+first])
+	copy(result[first:], w.values[:w.size-first])
+	return result
 }
 
 // jumpBack finds an instant before until with more than limit firings
