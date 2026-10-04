@@ -13,6 +13,10 @@ func TestMarshalObservationPreservesJSONShapeOrExplicitlyTruncates(t *testing.T)
 		ID string `json:"id"`
 	}
 	values := []any{
+		[2]byte{1, 2},
+		[]byte{1, 2},
+		[]observationNamedByte{1, 2},
+		observationPrivateText("synthetic-private-value"),
 		struct {
 			Nil   []string `json:"nil"`
 			Empty []string `json:"empty,omitempty"`
@@ -46,6 +50,11 @@ func TestMarshalObservationPreservesJSONShapeOrExplicitlyTruncates(t *testing.T)
 		}
 	}
 }
+
+type observationNamedByte byte
+type observationPrivateText string
+
+func (observationPrivateText) MarshalText() ([]byte, error) { return []byte("redacted"), nil }
 
 func TestMarshalObservationBoundsLargePayloadBeforeSerialization(t *testing.T) {
 	large := make([]byte, 32<<20)

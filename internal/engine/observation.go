@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"encoding"
 	"encoding/base64"
 	"encoding/json"
 	"reflect"
@@ -19,10 +20,12 @@ const (
 )
 
 var (
-	observationTimeType      = reflect.TypeOf(time.Time{})
-	observationNumberType    = reflect.TypeOf(json.Number(""))
-	observationRawType       = reflect.TypeOf(json.RawMessage(nil))
-	observationMarshalerType = reflect.TypeOf((*json.Marshaler)(nil)).Elem()
+	observationTimeType          = reflect.TypeOf(time.Time{})
+	observationNumberType        = reflect.TypeOf(json.Number(""))
+	observationRawType           = reflect.TypeOf(json.RawMessage(nil))
+	observationMarshalerType     = reflect.TypeOf((*json.Marshaler)(nil)).Elem()
+	observationTextMarshalerType = reflect.TypeOf((*encoding.TextMarshaler)(nil)).Elem()
+	observationByteType          = reflect.TypeOf(byte(0))
 )
 
 type observationBudget struct {
@@ -81,7 +84,8 @@ func (b *observationBudget) capture(value reflect.Value, depth int) (any, bool) 
 	}
 	// Custom JSON representations cannot be reconstructed without invoking
 	// application code. Mark them explicitly instead of inventing a shape.
-	if value.Type().Implements(observationMarshalerType) || reflect.PointerTo(value.Type()).Implements(observationMarshalerType) {
+	if value.Type().Implements(observationMarshalerType) || reflect.PointerTo(value.Type()).Implements(observationMarshalerType) ||
+		value.Type().Implements(observationTextMarshalerType) || reflect.PointerTo(value.Type()).Implements(observationTextMarshalerType) {
 		return nil, false
 	}
 
@@ -112,7 +116,10 @@ func (b *observationBudget) capture(value reflect.Value, depth int) (any, bool) 
 		if value.Kind() == reflect.Slice && value.IsNil() {
 			return nil, b.charge(4)
 		}
-		if value.Type().Elem().Kind() == reflect.Uint8 {
+		if value.Kind() == reflect.Slice && value.Type().Elem().Kind() == reflect.Uint8 {
+			if value.Type().Elem() != observationByteType {
+				return nil, false
+			}
 			if value.Len() > b.remaining/2 {
 				return nil, false
 			}
