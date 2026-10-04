@@ -18,6 +18,11 @@ type ProcessFactory struct {
 	Capabilities              []contract.Capability
 	StartupTimeout            time.Duration
 }
+
+// errProcessOwnership reports a worker that started but could not be owned.
+// It was ended before it ran.
+var errProcessOwnership = errors.New("worker process ownership failed")
+
 type processConnection struct {
 	Connection
 	cmd    *exec.Cmd
@@ -39,24 +44,20 @@ func (f ProcessFactory) Connect(ctx context.Context, h contract.Hello) (Connecti
 	}
 	startup, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	// The owner exists before the process starts, so the window between
-	// start and adoption is as short as the platform allows.
 	owned, err := newProcessOwner()
 	if err != nil {
 		return nil, contract.Ready{}, errors.New("worker process ownership failed")
 	}
 	cmd := workerCommand(f.Command, f.Args, f.Dir, f.Env)
-	if err := cmd.Start(); err != nil {
+	// start owns the worker before any of its code runs. Without ownership
+	// the supervisor could not end the worker's descendants, so start ends a
+	// worker it could not own instead of running it.
+	if err := owned.start(cmd); err != nil {
 		owned.release()
+		if errors.Is(err, errProcessOwnership) {
+			return nil, contract.Ready{}, errors.New("worker process ownership failed")
+		}
 		return nil, contract.Ready{}, errors.New("worker process startup failed")
-	}
-	if err := owned.adopt(cmd); err != nil {
-		// Without ownership the supervisor could not end the worker's
-		// descendants, so it does not run one it cannot fully stop.
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		owned.release()
-		return nil, contract.Ready{}, errors.New("worker process ownership failed")
 	}
 	p := &processConnection{cmd: cmd, owned: owned, exited: make(chan struct{})}
 	// exited closes only after the process has been reaped and, where the
