@@ -62,6 +62,7 @@ type Error struct {
 	Code    string `json:"code"`
 	Path    string `json:"path,omitempty"`
 	Message string `json:"message"`
+	cause   error
 }
 
 func (e *Error) Error() string {
@@ -72,8 +73,11 @@ func (e *Error) Error() string {
 }
 
 func (e *Error) Unwrap() error {
+	if e.cause != nil {
+		return e.cause
+	}
 	switch e.Code {
-	case "invalid_manifest", "invalid_metadata", "invalid_identity", "invalid_compatibility", "invalid_provenance", "invalid_license", "invalid_store_limits":
+	case "invalid_manifest", "invalid_metadata", "invalid_identity", "invalid_compatibility", "invalid_provenance", "invalid_license", "invalid_store_limits", "invalid_lock":
 		return ErrInvalid
 	case "incompatible_runtime", "incompatible_engine", "incompatible_schema", "incompatible_dependency":
 		return ErrIncompatible
@@ -93,6 +97,14 @@ func (e *Error) Unwrap() error {
 		return ErrPublishedContentMismatch
 	case "package_not_found":
 		return ErrNotFound
+	case "offline_package_missing":
+		return ErrOfflineMissing
+	case "unsupported_version_range":
+		return ErrUnsupportedRange
+	case "resolution_conflict":
+		return ErrResolutionConflict
+	case "resolution_cycle":
+		return ErrResolutionCycle
 	default:
 		return nil
 	}
