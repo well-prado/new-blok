@@ -93,8 +93,19 @@ expected selected-package, source-read, package-execution, and external-effect
 counts for deterministic selection and conflict/cycle/unsupported-range
 failures. Cache tests cover exact replay, offline missing, corruption,
 immutable identity conflict, trust-policy scoping, concurrent capacity and
-lock writes, and context cancellation. Native integration tests invoke the
-actual Go and npm tools and verify lock files remain unchanged; a Go local
-replacement test proves source-content changes alter the recorded digest and
-external replacements fail. Final exact Go versions, full gate commands,
-results, and any environmental limitations are recorded with PR #71.
+lock writes, malformed lock bounds, and context cancellation. Native
+integration tests invoke the actual Go and npm tools and verify lock files
+remain unchanged; a Go local-replacement test proves source-content changes
+alter the recorded digest and external replacements fail.
+
+On final implementation commit `37c40bd753eabf238144d0270cafcc59fd8ac894`,
+after refreshing `origin/main` to `8a3a0c470cd3c23ee6744956b430fa4fb736a379`,
+Go 1.27.1 on Darwin arm64 passed `go mod verify`, `gofmt` cleanliness,
+`git diff --check`, `GOMAXPROCS=3 go vet -p=3 ./...`,
+`GOMAXPROCS=3 go test -race -p=3 ./...`, and
+`GOMAXPROCS=3 go build -p=3 ./...`. The changed package tests also passed
+`GOMAXPROCS=3 go test -p=3 ./contract/package ./internal/package` and a
+three-count focused race run before the final context/strict-lock hardening;
+the full race run above includes that final hardening. The internal package
+test binary cross-compiled for `GOOS=windows GOARCH=amd64`; this is not native
+Windows execution evidence. No GitHub Actions workflow was dispatched.
