@@ -4,15 +4,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	contract "github.com/well-prado/new-blok/contract/runtime"
 	"github.com/well-prado/new-blok/contract/runtime/wire"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func recordingConnection(t *testing.T) (*grpcConnection, <-chan string) {
@@ -35,6 +40,167 @@ func recordingConnection(t *testing.T) (*grpcConnection, <-chan string) {
 	c := conn.(*grpcConnection)
 	t.Cleanup(c.fail)
 	return c, received
+}
+
+type delayedLogWorker struct {
+	wire.UnimplementedWorkerServer
+	canceledCall  chan struct{}
+	healthyCall   chan struct{}
+	releaseFrames chan struct{}
+	sendErrors    chan error
+}
+
+func (w *delayedLogWorker) Connect(stream wire.Worker_ConnectServer) error {
+	first, err := stream.Recv()
+	if err != nil {
+		return err
+	}
+	h := contract.HelloFromWire(first.GetHello())
+	peer := hello()
+	if _, err := contract.Negotiate(h, peer); err != nil {
+		return err
+	}
+	if err := stream.Send(&wire.Frame{Body: &wire.Frame_Ready{Ready: &wire.Ready{Contract: contract.HelloWire(peer)}}}); err != nil {
+		return err
+	}
+	var canceled *wire.Call
+	var sendMu sync.Mutex
+	for {
+		frame, err := stream.Recv()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		switch body := frame.Body.(type) {
+		case *wire.Frame_Call:
+			if body.Call.Node == "cancel-me" {
+				canceled = body.Call
+				close(w.canceledCall)
+				continue
+			}
+			if body.Call.Node != "healthy" || canceled == nil {
+				return status.Error(codes.InvalidArgument, "unexpected test call")
+			}
+			close(w.healthyCall)
+			call := body.Call
+			go func() {
+				<-w.releaseFrames
+				send := func(frame *wire.Frame) error {
+					sendMu.Lock()
+					defer sendMu.Unlock()
+					return stream.Send(frame)
+				}
+				late := &wire.Log{CallId: canceled.CallId, AttemptId: canceled.AttemptId, Generation: canceled.Generation, Level: "INFO", Message: "late-after-cancel"}
+				if err := send(&wire.Frame{Body: &wire.Frame_Log{Log: late}}); err != nil {
+					w.sendErrors <- err
+					return
+				}
+				current := &wire.Log{CallId: call.CallId, AttemptId: call.AttemptId, Generation: call.Generation, Level: "INFO", Message: "healthy-log"}
+				if err := send(&wire.Frame{Body: &wire.Frame_Log{Log: current}}); err != nil {
+					w.sendErrors <- err
+					return
+				}
+				w.sendErrors <- send(&wire.Frame{Body: &wire.Frame_Result{Result: &wire.Result{CallId: call.CallId, AttemptId: call.AttemptId, Generation: call.Generation, Output: call.Input}}})
+			}()
+		case *wire.Frame_Cancel:
+			if canceled == nil || body.Cancel.CallId != canceled.CallId || body.Cancel.AttemptId != canceled.AttemptId {
+				return status.Error(codes.InvalidArgument, "unexpected cancellation")
+			}
+			// Keep the log queued until the healthy sibling is active, then send
+			// it before that sibling's own log and result on the same stream.
+		case *wire.Frame_Drain:
+			return nil
+		default:
+			return status.Error(codes.InvalidArgument, "unexpected frame")
+		}
+	}
+}
+
+func TestLateCanceledLogDoesNotPoisonHealthySiblingOrBlockResultReader(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := &delayedLogWorker{canceledCall: make(chan struct{}), healthyCall: make(chan struct{}), releaseFrames: make(chan struct{}), sendErrors: make(chan error, 1)}
+	server := grpc.NewServer()
+	wire.RegisterWorkerServer(server, worker)
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(server.Stop)
+	connectCtx, stopConnect := context.WithTimeout(context.Background(), 3*time.Second)
+	defer stopConnect()
+	conn, _, err := (GRPCFactory{Address: listener.Addr().String(), Token: "synthetic-test-token", Principal: "app-1"}).Connect(connectCtx, hello())
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := conn.(*grpcConnection)
+	t.Cleanup(connection.fail)
+
+	late := call("cancelled-log")
+	late.Node = "cancel-me"
+	late.Deadline = time.Now().Add(100 * time.Millisecond)
+	var lateCallback atomic.Int32
+	late.OnLog = func(contract.Log) { lateCallback.Add(1) }
+	if _, err := conn.Call(context.Background(), late); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("cancelled invocation: %v", err)
+	}
+	select {
+	case <-worker.canceledCall:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not receive canceled invocation")
+	}
+
+	callbackStarted := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	defer close(releaseCallback)
+	healthy := call("healthy-sibling")
+	healthy.Node = "healthy"
+	healthy.Deadline = time.Now().Add(2 * time.Second)
+	healthy.OnLog = func(entry contract.Log) {
+		if entry.Message == "healthy-log" {
+			close(callbackStarted)
+			<-releaseCallback
+		}
+	}
+	done := make(chan error, 1)
+	go func() {
+		result, err := conn.Call(context.Background(), healthy)
+		if err == nil && (result.CallID != healthy.CallID || string(result.Output) != string(healthy.Input)) {
+			err = errors.New("healthy sibling received the wrong result")
+		}
+		done <- err
+	}()
+	select {
+	case <-worker.healthyCall:
+	case <-time.After(time.Second):
+		t.Fatal("healthy sibling did not reach worker")
+	}
+	close(worker.releaseFrames)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("healthy sibling was poisoned by late log: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("synchronous log callback blocked the shared result reader")
+	}
+	select {
+	case <-callbackStarted:
+	case <-time.After(time.Second):
+		t.Fatal("healthy log callback was not dispatched")
+	}
+	select {
+	case err := <-worker.sendErrors:
+		if err != nil {
+			t.Fatalf("test worker send: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("test worker did not send sibling frames")
+	}
+	if got := lateCallback.Load(); got != 0 {
+		t.Fatalf("late canceled log delivered to callback %d times", got)
+	}
 }
 
 func TestAlreadyCanceledCallsNeverReachGRPCHandler(t *testing.T) {

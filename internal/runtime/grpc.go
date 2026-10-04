@@ -3,16 +3,19 @@ package runtime
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"sync"
+	"unicode/utf8"
+
 	contract "github.com/well-prado/new-blok/contract/runtime"
 	"github.com/well-prado/new-blok/contract/runtime/wire"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
-	"net"
-	"sync"
 )
 
 // GRPCFactory reuses one authenticated stream. Plaintext bearer transport is
@@ -31,12 +34,28 @@ type queuedFrame struct {
 	ack   chan error
 	ctx   context.Context
 }
+type logRoute struct {
+	attempt    string
+	generation uint64
+	callback   func(contract.Log)
+	count      int
+	bytes      int
+}
+type logDelivery struct {
+	callback func(contract.Log)
+	entry    contract.Log
+}
+
+const maxQueuedLogCallbacks = 256
+
 type grpcConnection struct {
 	client    *grpc.ClientConn
 	stream    wire.Worker_ConnectClient
 	cancel    context.CancelFunc
 	mu        sync.Mutex
 	pending   map[string]chan outcome
+	loggers   map[string]logRoute
+	logQueue  chan logDelivery
 	send      chan queuedFrame
 	done      chan struct{}
 	once      sync.Once
@@ -74,7 +93,7 @@ func (f GRPCFactory) Connect(ctx context.Context, h contract.Hello) (Connection,
 	}
 	life, cancel := context.WithCancel(context.Background())
 	life = metadata.NewOutgoingContext(life, metadata.Pairs("authorization", "Bearer "+f.Token, "x-blok-principal", f.Principal))
-	conn := &grpcConnection{client: client, cancel: cancel, pending: map[string]chan outcome{}, send: make(chan queuedFrame, h.Limits.MaxConcurrentCalls+2), done: make(chan struct{}), principal: f.Principal, caps: append([]contract.Capability(nil), f.Capabilities...)}
+	conn := &grpcConnection{client: client, cancel: cancel, pending: map[string]chan outcome{}, loggers: map[string]logRoute{}, logQueue: make(chan logDelivery, maxQueuedLogCallbacks), send: make(chan queuedFrame, h.Limits.MaxConcurrentCalls+2), done: make(chan struct{}), principal: f.Principal, caps: append([]contract.Capability(nil), f.Capabilities...)}
 	handshake := make(chan error, 1)
 	go func() {
 		stream, err := wire.NewWorkerClient(client).Connect(life)
@@ -117,6 +136,7 @@ func (f GRPCFactory) Connect(ctx context.Context, h contract.Hello) (Connection,
 	}
 	go conn.writeLoop()
 	go conn.readLoop()
+	go conn.logLoop()
 	return conn, conn.ready, nil
 }
 func capSubset(a, b []contract.Capability) bool {
@@ -186,25 +206,97 @@ func (c *grpcConnection) readLoop() {
 			c.fail()
 			return
 		}
-		raw := frame.GetResult()
-		if raw == nil {
-			c.fail()
-			return
-		}
-		r := contract.ResultFromWire(raw)
-		c.mu.Lock()
-		ch := c.pending[r.CallID]
-		c.mu.Unlock()
-		if ch != nil {
-			select {
-			case ch <- outcome{result: r}:
-			default:
+		switch body := frame.GetBody().(type) {
+		case *wire.Frame_Log:
+			if body.Log == nil || body.Log.CallId == "" || body.Log.AttemptId == "" {
 				c.fail()
 				return
 			}
+			if body.Log.Generation != c.ready.Generation {
+				c.fail()
+				return
+			}
+			if !utf8.ValidString(body.Log.Level) || !utf8.ValidString(body.Log.Message) || body.Log.Level != "DEBUG" && body.Log.Level != "INFO" && body.Log.Level != "WARN" && body.Log.Level != "ERROR" || len(body.Log.Message) > contract.MaxLogMessageBytes || len(body.Log.AttrsJson) > contract.MaxLogAttrsBytes || !validLogAttrs(body.Log.AttrsJson) {
+				c.fail()
+				return
+			}
+			c.mu.Lock()
+			route, ok := c.loggers[body.Log.CallId]
+			if !ok || route.attempt != body.Log.AttemptId || route.generation != body.Log.Generation {
+				c.mu.Unlock()
+				// A late log for a completed/canceled attempt is stale optional
+				// data. Never poison the shared stream or attribute it to a reused ID.
+				continue
+			}
+			if route.count <= contract.MaxCallLogs {
+				route.count++
+			}
+			if route.bytes <= contract.MaxCallLogBytes {
+				route.bytes += len(body.Log.Message) + len(body.Log.AttrsJson)
+				if route.bytes > contract.MaxCallLogBytes {
+					route.bytes = contract.MaxCallLogBytes + 1
+				}
+			}
+			dropped := route.count > contract.MaxCallLogs || route.bytes > contract.MaxCallLogBytes
+			c.loggers[body.Log.CallId] = route
+			callback := route.callback
+			c.mu.Unlock()
+			if callback != nil && !dropped {
+				entry := contract.Log{Level: body.Log.Level, Message: body.Log.Message, Attrs: append([]byte(nil), body.Log.AttrsJson...)}
+				select {
+				case c.logQueue <- logDelivery{callback: callback, entry: entry}:
+				default: // Best-effort logs never backpressure the result stream.
+				}
+			}
+		case *wire.Frame_Result:
+			if body.Result == nil {
+				c.fail()
+				return
+			}
+			r := contract.ResultFromWire(body.Result)
+			c.mu.Lock()
+			ch := c.pending[r.CallID]
+			c.mu.Unlock()
+			if ch != nil {
+				select {
+				case ch <- outcome{result: r}:
+				default:
+					c.fail()
+					return
+				}
+			}
+		default:
+			c.fail()
+			return
 		}
 	}
 }
+
+// logLoop isolates application logging from gRPC result progress. The queue is
+// bounded and best-effort; callbacks should return promptly, since a blocked
+// callback can delay later logs (but never call results) until the queue fills.
+func (c *grpcConnection) logLoop() {
+	for {
+		select {
+		case delivery := <-c.logQueue:
+			func() {
+				defer func() { _ = recover() }()
+				delivery.callback(delivery.entry)
+			}()
+		case <-c.done:
+			return
+		}
+	}
+}
+
+func validLogAttrs(raw []byte) bool {
+	if len(raw) == 0 {
+		return true
+	}
+	var attrs map[string]json.RawMessage
+	return json.Unmarshal(raw, &attrs) == nil && attrs != nil
+}
+
 func (c *grpcConnection) Call(ctx context.Context, call contract.Call) (contract.Result, error) {
 	callCtx, cancel := context.WithDeadline(ctx, call.Deadline)
 	defer cancel()
@@ -236,8 +328,9 @@ func (c *grpcConnection) Call(ctx context.Context, call contract.Call) (contract
 		return contract.Result{}, ErrCallActive
 	}
 	c.pending[call.CallID] = ch
+	c.loggers[call.CallID] = logRoute{attempt: call.AttemptID, generation: call.Generation, callback: call.OnLog}
 	c.mu.Unlock()
-	defer func() { c.mu.Lock(); delete(c.pending, call.CallID); c.mu.Unlock() }()
+	defer func() { c.mu.Lock(); delete(c.pending, call.CallID); delete(c.loggers, call.CallID); c.mu.Unlock() }()
 	ack := make(chan error, 1)
 	q := queuedFrame{frame: &wire.Frame{Body: &wire.Frame_Call{Call: contract.CallWire(call)}}, ack: ack, ctx: callCtx}
 	if err := callCtx.Err(); err != nil {

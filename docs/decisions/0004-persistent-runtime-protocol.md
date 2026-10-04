@@ -17,6 +17,13 @@ wire converters. The engine does not import that transport. Protocol major versi
 are backward-compatible only when the worker advertises at least the client's
 minor version.
 
+Protocol 1.1 adds the optional `Frame.Log` message for structured, per-call
+worker logs. It is tagged with the active call, attempt, and generation; it
+cannot change execution results. A 1.0 client can connect to a 1.1 worker, which
+suppresses log frames for that negotiated session. A 1.1 client rejects a 1.0
+worker until the worker is rebuilt. Log message/attribute limits and redaction
+are defined by E15-T01 (#76) and the inspection projection decision.
+
 ## Identity and retry rules
 
 Every connection binds an artifact digest, canonical catalog digest, authenticated

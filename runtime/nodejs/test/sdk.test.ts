@@ -6,7 +6,7 @@ import { resolve } from "node:path";
 import { repositoryRoot } from "../protocol.js";
 import { quote, echo, panic, nodes } from "../../../testdata/worker/nodejs/nodes.js";
 
-const ctx = (): Parameters<typeof quote.invoke>[0] => ({ signal: new AbortController().signal, principal:"app-1", capabilities:[], callId:"call",attemptId:"attempt",idempotencyKey:"operation" });
+const ctx = (): Parameters<typeof quote.invoke>[0] => ({ signal: new AbortController().signal, principal:"app-1", capabilities:[], callId:"call",attemptId:"attempt",idempotencyKey:"operation",logger:{debug(){},info(){},warn(){},error(){}} });
 test("predeclared synthetic fixtures execute with exact output/error counts",async()=>{
  const fixtures=JSON.parse(readFileSync(resolve(repositoryRoot(),"testdata/worker/nodejs/fixtures.json"),"utf8")) as {id:string;node:string;input:unknown;output?:unknown;expectedOutputs:number;expectedErrors:number;expectedEffects:number}[];
  for(const f of fixtures){const node=nodes.find(n=>n.descriptor.name===f.node);assert.ok(node,f.id);let outputs=0,errors=0;try{const result=await node.invokeJSON({...ctx(),capabilities:["http:synthetic"]},canonicalJSON(f.input));outputs++;assert.equal(result,canonicalJSON(f.output),f.id);}catch(error){errors++;if(f.expectedErrors===0)throw error;}assert.equal(outputs,f.expectedOutputs,f.id);assert.equal(errors,f.expectedErrors,f.id);assert.equal(f.expectedEffects,0,"fixture dependencies never perform external effects");}

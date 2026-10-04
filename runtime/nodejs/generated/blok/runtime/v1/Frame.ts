@@ -7,6 +7,7 @@ import type { Call as _blok_runtime_v1_Call, Call__Output as _blok_runtime_v1_Ca
 import type { Result as _blok_runtime_v1_Result, Result__Output as _blok_runtime_v1_Result__Output } from '../../../blok/runtime/v1/Result.js';
 import type { Cancel as _blok_runtime_v1_Cancel, Cancel__Output as _blok_runtime_v1_Cancel__Output } from '../../../blok/runtime/v1/Cancel.js';
 import type { Drain as _blok_runtime_v1_Drain, Drain__Output as _blok_runtime_v1_Drain__Output } from '../../../blok/runtime/v1/Drain.js';
+import type { Log as _blok_runtime_v1_Log, Log__Output as _blok_runtime_v1_Log__Output } from '../../../blok/runtime/v1/Log.js';
 
 export interface Frame {
   'hello'?: (_blok_runtime_v1_Hello | null);
@@ -15,7 +16,8 @@ export interface Frame {
   'result'?: (_blok_runtime_v1_Result | null);
   'cancel'?: (_blok_runtime_v1_Cancel | null);
   'drain'?: (_blok_runtime_v1_Drain | null);
-  'body'?: "hello"|"ready"|"call"|"result"|"cancel"|"drain";
+  'log'?: (_blok_runtime_v1_Log | null);
+  'body'?: "hello"|"ready"|"call"|"result"|"cancel"|"drain"|"log";
 }
 
 export interface Frame__Output {
@@ -25,5 +27,6 @@ export interface Frame__Output {
   'result'?: (_blok_runtime_v1_Result__Output | null);
   'cancel'?: (_blok_runtime_v1_Cancel__Output | null);
   'drain'?: (_blok_runtime_v1_Drain__Output | null);
-  'body'?: "hello"|"ready"|"call"|"result"|"cancel"|"drain";
+  'log'?: (_blok_runtime_v1_Log__Output | null);
+  'body'?: "hello"|"ready"|"call"|"result"|"cancel"|"drain"|"log";
 }

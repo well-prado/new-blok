@@ -8,7 +8,7 @@ export const quote = defineNode<{ sku: string; quantity: number }, { totalCents:
   input: { type: "object", properties: { sku: { type: "string" }, quantity: { type: "integer", minimum: 1, maximum: 100 } }, required: ["sku", "quantity"] },
   output: { type: "object", properties: { totalCents: { type: "integer", wire: "int64-string" } }, required: ["totalCents"] },
   dependencies: { price: 1500n },
-  execute(_ctx, input, deps) { if (input.sku !== "coffee") throw new DomainError("unknown_sku"); return { totalCents: (BigInt(input.quantity) * deps.price).toString() }; },
+  execute(ctx, input, deps) { ctx.logger.info("quote calculated", { sku: input.sku, api_token: "synthetic-token-value" }); if (input.sku !== "coffee") throw new DomainError("unknown_sku"); return { totalCents: (BigInt(input.quantity) * deps.price).toString() }; },
 });
 const echoSchema = { type: "object", properties: { value: { type: "integer", wire: "int64-string" } }, required: ["value"] } as const;
 export const echo = defineNode<{ value: string }, { value: string }, null>({ name: "fixture/echo", version: "1.0.0", description: "Synthetic int64 echo", input: echoSchema, output: echoSchema, deterministic: true, dependencies: null, execute: (_ctx, input) => input });
