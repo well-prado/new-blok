@@ -331,7 +331,7 @@ func afterEffect(failure error, effected string) error {
 	if effected == "" || !errors.Is(failure, capacity.ErrSaturated) || !errors.As(failure, &classified) {
 		return failure
 	}
-	return &Error{Code: classified.Code, Class: classified.Class, Step: classified.Step, Err: effectCommitted{err: classified.Err, step: effected}}
+	return &Error{Code: classified.Code, Class: classified.Class, Step: classified.Step, Uncertain: classified.Uncertain, Err: effectCommitted{err: classified.Err, step: effected}}
 }
 
 // effectCommitted is a step failure that follows a committed effect. It

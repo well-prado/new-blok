@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 
@@ -14,6 +15,7 @@ import (
 )
 
 var ErrNotFound = errors.New("inspection: run not found")
+var sensitiveLogText = regexp.MustCompile(`(?i)(\b(password|passwd|secret|token|authorization|credential|api[_-]?key|private[_-]?key)\b\s*[:=]\s*\S+|\bbearer\s+\S+|\bAKIA[0-9A-Z]{16}\b|\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b)`)
 
 type runRecord struct {
 	owner     string
@@ -87,7 +89,7 @@ func (r *Recorder) Observe(event inspection.Event) {
 	event.ErrorCode = safeLabel(event.ErrorCode, 64)
 	event.ErrorClass = safeLabel(event.ErrorClass, 64)
 	event.LogLevel = safeLabel(event.LogLevel, 16)
-	event.LogMessage = boundedText(event.LogMessage, 1024)
+	event.LogMessage = redactLogMessage(boundedText(event.LogMessage, 1024))
 	if len(event.Input) > r.limits.MaxEventBytes/2 {
 		event.Input = json.RawMessage(`{"$truncated":true}`)
 	}
@@ -230,6 +232,13 @@ func boundedText(value string, max int) string {
 		return value[:max]
 	}
 	return value
+}
+
+func redactLogMessage(message string) string {
+	if sensitiveLogText.MatchString(message) {
+		return "[redacted: sensitive-looking log message]"
+	}
+	return message
 }
 
 func safeLabel(value string, max int) string {

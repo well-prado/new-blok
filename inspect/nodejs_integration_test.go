@@ -83,7 +83,7 @@ func TestActualNodeWorkerRunProducesInspectionProjection(t *testing.T) {
 	artifact := runtimecontract.CanonicalDigest([]byte("synthetic-inspection-node-artifact"))
 	token := "synthetic-inspection-token-0000000001"
 	caps := []runtimecontract.Capability{"http:synthetic"}
-	hello := runtimecontract.Hello{Protocol: runtimecontract.ProtocolName, Major: 1, Minor: 0, ArtifactDigest: artifact, CatalogDigest: digest, Generation: 1, Capabilities: caps, Limits: runtimecontract.DefaultLimits()}
+	hello := runtimecontract.Hello{Protocol: runtimecontract.ProtocolName, Major: 1, Minor: runtimecontract.ProtocolMinor, ArtifactDigest: artifact, CatalogDigest: digest, Generation: 1, Capabilities: caps, Limits: runtimecontract.DefaultLimits()}
 	factory := worker.ProcessFactory{
 		Command:        nodePath,
 		Args:           []string{main, module},
@@ -166,6 +166,12 @@ func TestActualNodeWorkerRunProducesInspectionProjection(t *testing.T) {
 	page, err := recorder.Inspect("app-1", fullPolicy(), inspectioncontract.Query{Version: inspectioncontract.Version, RunID: "node-run-1"})
 	if err != nil || page.Run.Status != inspectioncontract.StatusCompleted || len(page.Steps) != 2 || page.Steps[0].Output == nil {
 		t.Fatalf("Node inspection page=%+v err=%v", page, err)
+	}
+	logPolicy := fullPolicy()
+	logPolicy.Fields[inspectioncontract.FieldLogs] = true
+	logged, err := recorder.Inspect("app-1", logPolicy, inspectioncontract.Query{Version: inspectioncontract.Version, RunID: "node-run-1"})
+	if err != nil || len(logged.Steps[0].Logs) != 1 || logged.Steps[0].Logs[0].Message != "quote calculated" || strings.Contains(string(logged.Steps[0].Logs[0].Attrs), "synthetic-token-value") || !strings.Contains(string(logged.Steps[0].Logs[0].Attrs), "redacted") {
+		t.Fatalf("actual Node log inspection=%+v err=%v", logged, err)
 	}
 	failedProgram := contract.InternalProgram{WorkflowID: "integration/node-quote", Instructions: []contract.InternalInstruction{{Index: 0, ID: "quote", Kind: "call", Node: descriptor.Name}}}
 	_, err = runner.Run(context.Background(), failedProgram, input{SKU: "bad-sku", Quantity: 1}, inspectioncontract.Invocation{RunID: "node-run-failed", Principal: "app-1"})

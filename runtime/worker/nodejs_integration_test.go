@@ -53,7 +53,7 @@ func TestActualNodeWorkerThroughTypedWorkflow(t *testing.T) {
 	artifact := contract.CanonicalDigest([]byte("synthetic-node-artifact"))
 	token := "synthetic-integration-token-0000000001"
 	caps := []contract.Capability{"http:synthetic"}
-	hello := contract.Hello{Protocol: contract.ProtocolName, Major: 1, Minor: 0, ArtifactDigest: artifact, CatalogDigest: digest, Generation: 1, Capabilities: caps, Limits: contract.DefaultLimits()}
+	hello := contract.Hello{Protocol: contract.ProtocolName, Major: 1, Minor: contract.ProtocolMinor, ArtifactDigest: artifact, CatalogDigest: digest, Generation: 1, Capabilities: caps, Limits: contract.DefaultLimits()}
 	factory := ProcessFactory{Command: nodePath, Args: []string{main, module}, Address: address, Token: token, Principal: "app-1", Capabilities: caps, StartupTimeout: 3 * time.Second, Env: []string{"BLOK_WORKER_ADDRESS=" + address, "BLOK_WORKER_TOKEN=" + token, "BLOK_WORKER_PRINCIPAL=app-1", "BLOK_WORKER_ARTIFACT=" + artifact, "BLOK_WORKER_GENERATION=1", `BLOK_WORKER_CAPABILITIES=["http:synthetic"]`}}
 	supervisor, err := New(Config{Hello: hello, Factory: factory, Capacity: 2})
 	if err != nil {

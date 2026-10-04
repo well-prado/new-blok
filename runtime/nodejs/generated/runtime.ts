@@ -9,6 +9,7 @@ import type { Drain as _blok_runtime_v1_Drain, Drain__Output as _blok_runtime_v1
 import type { Frame as _blok_runtime_v1_Frame, Frame__Output as _blok_runtime_v1_Frame__Output } from './blok/runtime/v1/Frame.js';
 import type { Hello as _blok_runtime_v1_Hello, Hello__Output as _blok_runtime_v1_Hello__Output } from './blok/runtime/v1/Hello.js';
 import type { Limits as _blok_runtime_v1_Limits, Limits__Output as _blok_runtime_v1_Limits__Output } from './blok/runtime/v1/Limits.js';
+import type { Log as _blok_runtime_v1_Log, Log__Output as _blok_runtime_v1_Log__Output } from './blok/runtime/v1/Log.js';
 import type { Ready as _blok_runtime_v1_Ready, Ready__Output as _blok_runtime_v1_Ready__Output } from './blok/runtime/v1/Ready.js';
 import type { RemoteError as _blok_runtime_v1_RemoteError, RemoteError__Output as _blok_runtime_v1_RemoteError__Output } from './blok/runtime/v1/RemoteError.js';
 import type { Result as _blok_runtime_v1_Result, Result__Output as _blok_runtime_v1_Result__Output } from './blok/runtime/v1/Result.js';
@@ -30,6 +31,7 @@ export interface ProtoGrpcType {
         Frame: MessageTypeDefinition<_blok_runtime_v1_Frame, _blok_runtime_v1_Frame__Output>
         Hello: MessageTypeDefinition<_blok_runtime_v1_Hello, _blok_runtime_v1_Hello__Output>
         Limits: MessageTypeDefinition<_blok_runtime_v1_Limits, _blok_runtime_v1_Limits__Output>
+        Log: MessageTypeDefinition<_blok_runtime_v1_Log, _blok_runtime_v1_Log__Output>
         Ready: MessageTypeDefinition<_blok_runtime_v1_Ready, _blok_runtime_v1_Ready__Output>
         RemoteError: MessageTypeDefinition<_blok_runtime_v1_RemoteError, _blok_runtime_v1_RemoteError__Output>
         Result: MessageTypeDefinition<_blok_runtime_v1_Result, _blok_runtime_v1_Result__Output>

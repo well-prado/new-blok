@@ -59,11 +59,17 @@ The contract is additive. Unsupported versions and malformed/cross-query
 cursors fail closed. Returned byte slices are independent snapshots. The
 journal source is an inspection view of the existing journal facts, not a new
 general-purpose event store or promise that every workflow transition is
-durable. The current Node.js worker produces real success, failure,
-cancellation, and uncertain outcome inspection evidence through public
-application composition, but its wire protocol does not carry Node-side log
-records; only native Go node logs are currently projected. There is no
-concrete-trigger integration or universal API server in this decision.
+durable. Node.js SDK logging uses an explicit call-scoped logger and optional
+protocol 1.1 log frames tagged with call, attempt, and generation; process-wide
+stdout/stderr are never attributed to a run. Protocol 1.0 clients can use a
+1.1 worker without logs. A 1.1 client rejects a 1.0 worker and requires its
+upgrade. Logs have per-record and per-call bounds, use the same field selection
+and attribute-key redaction as Go logs, and redact common credential-shaped
+free-form text. Pattern matching cannot identify arbitrary secrets embedded in
+ordinary prose, so applications must keep free-form log messages free of
+credentials/customer payloads and put sensitive values only in structured
+attributes. There is no concrete-trigger integration or universal API server
+in this decision.
 
 ## Evidence
 
@@ -71,7 +77,8 @@ Executable scenarios run the real Go engine and real Node worker; compare an
 actual engine projection with a checked-in golden response; exercise
 two-principal isolation, redaction, immutable projections, pagination,
 unsupported versions, recorder saturation, and bounded authenticated blob
-retrieval; and read real SQLite journal wait/resume, uncertain-attempt, and
-child-lineage facts. Node integration requires `BLOK_NODE_INTEGRATION_ROOT`
-and the built runtime worker. This evidence does not imply durable retention
-for recorder data or Node-side log transport.
+retrieval; read real SQLite journal wait/resume, uncertain-attempt, and
+child-lineage facts; and assert an actual Node worker log appears in an
+authorized projection with its synthetic token attribute redacted. Node
+integration requires `BLOK_NODE_INTEGRATION_ROOT` and the built runtime worker.
+This evidence does not imply durable retention for recorder data.

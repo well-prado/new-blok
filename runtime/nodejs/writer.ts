@@ -16,10 +16,17 @@ export class BoundedWriter {
   }
   private drain = (): void => { this.blocked = false; if (this.timer) clearTimeout(this.timer); this.timer = undefined; this.flush(); };
   send(frame: Frame): void {
-    if (this.closed) return;
+    this.enqueue(frame, 0, true);
+  }
+  trySend(frame: Frame, reserveBytes = 0): boolean {
+    return this.enqueue(frame, reserveBytes, false);
+  }
+  private enqueue(frame: Frame, reserveBytes: number, failOnCapacity: boolean): boolean {
+    if (this.closed) return false;
     const bytes = this.size(frame);
-    if (this.count + 1 > this.maxCount || this.bytes + bytes > this.maxBytes) { this.fail(); return; }
+    if (this.count + 1 > this.maxCount - (failOnCapacity ? 0 : 1) || this.bytes + bytes + reserveBytes > this.maxBytes) { if (failOnCapacity) this.fail(); return false; }
     this.count++; this.bytes += bytes; this.queue.push({ frame, bytes }); this.flush();
+    return true;
   }
   private flush(): void {
     while (!this.closed && !this.blocked && this.queue.length) {

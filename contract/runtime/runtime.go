@@ -22,10 +22,14 @@ import (
 const (
 	ProtocolName       = "blok.runtime"
 	ProtocolMajor      = 1
-	ProtocolMinor      = 0
+	ProtocolMinor      = 1
 	MaxFrameBytes      = 1 << 20
 	MaxBlobBytes       = 8 << 20
 	MaxConcurrentCalls = 64
+	MaxCallLogs        = 100
+	MaxCallLogBytes    = 64 << 10
+	MaxLogMessageBytes = 1024
+	MaxLogAttrsBytes   = 4096
 )
 
 var (
@@ -190,6 +194,15 @@ type Call struct {
 	Blobs          []BlobRef    `json:"blobs,omitempty"`
 	Principal      string       `json:"principal"`
 	Capabilities   []Capability `json:"capabilities,omitempty"`
+	OnLog          func(Log)    `json:"-"`
+}
+
+// Log is a bounded, call-scoped worker record. OnLog is an invocation-local
+// callback and is never encoded on the wire.
+type Log struct {
+	Level   string
+	Message string
+	Attrs   []byte
 }
 
 func (c Call) Validate(limits Limits, generation uint64) error {
@@ -281,11 +294,12 @@ const (
 	FrameResult FrameKind = "result"
 	FrameCancel FrameKind = "cancel"
 	FrameDrain  FrameKind = "drain"
+	FrameLog    FrameKind = "log"
 )
 
 func (k FrameKind) Valid() bool {
 	switch k {
-	case FrameHello, FrameReady, FrameCall, FrameResult, FrameCancel, FrameDrain:
+	case FrameHello, FrameReady, FrameCall, FrameResult, FrameCancel, FrameDrain, FrameLog:
 		return true
 	default:
 		return false
