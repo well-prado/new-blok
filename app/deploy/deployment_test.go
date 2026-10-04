@@ -826,3 +826,30 @@ type closeObserver struct {
 }
 
 func (c *closeObserver) Close() error { c.closed(); return c.Conn.Close() }
+
+// #156: a shutdown request that arrives while Run is still starting is a
+// shutdown, not a readiness failure. Run's startup probe used the caller's
+// context, so a cancellation in that window failed every check and Run
+// reported ErrNotReady. Windows' slower startup exposed the race.
+func TestRunTreatsCancellationDuringStartupAsShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a, err := app.New(app.Config{Dependencies: []app.Dependency{{
+		Name:  "store",
+		Start: func(context.Context) error { cancel(); return nil },
+		Close: func(context.Context) error { return nil },
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := NewDeployment(a, deployment.Config{ListenerAddress: "127.0.0.1:0", MaxAdmission: 1, DrainTimeout: time.Second}, DeploymentChecks{Artifact: func(ctx context.Context) error { return ctx.Err() }}, http.NotFoundHandler())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Run(ctx, nil); err != nil {
+		t.Fatalf("Run error=%v, want a clean shutdown", err)
+	}
+	if a.Ready() {
+		t.Fatal("application still ready after Run returned")
+	}
+}
