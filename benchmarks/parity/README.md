@@ -18,9 +18,10 @@ is involved.
   `--no-save --no-package-lock` repaired only that worktree's ignored dependency
   tree. No old source or manifest was changed; its tracked status remains clean.
 - Local machine for the focused checks: macOS 27.0 arm64, Node `v24.21.0`, Bun
-  `1.3.14`, Go `1.27.1 darwin/arm64`; the new-framework source base is
-  `0baf071a7136e9c1f4371bc9a8b85da41eeedb8e` (current `origin/main`, including
-  #71 package resolution). These are not a production deployment topology.
+  `1.3.14`, Go `1.27.1 darwin/arm64`; the new-framework mainline baseline is
+  `f20a20d6015fdf13e8b0374e130fc8a206bdf48a` (including #71 package
+  resolution). Current issue-source revisions are embedded in sampler output.
+  These are not a production deployment topology.
 - Published old packages: `@blokjs/core`, `@blokjs/runner`, `@blokjs/shared`,
   `@blokjs/trigger-sse`, `@blokjs/trigger-webhook`, and
   `@blokjs/trigger-worker` all exactly `2.5.0`; transitive `@blokjs/helper`
