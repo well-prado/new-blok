@@ -105,14 +105,15 @@ detector, verifies an actionable error, and confirms its lifecycle marker is
 not created. Shrinkwrap, pnpm, and workspace inputs have explicit negative
 coverage; Go-only capture is retained by the real repository integration test.
 
-On final implementation commit `37c40bd753eabf238144d0270cafcc59fd8ac894`,
-after refreshing `origin/main` to `8a3a0c470cd3c23ee6744956b430fa4fb736a379`,
-Go 1.27.1 on Darwin arm64 passed `go mod verify`, `gofmt` cleanliness,
-`git diff --check`, `GOMAXPROCS=3 go vet -p=3 ./...`,
-`GOMAXPROCS=3 go test -race -p=3 ./...`, and
-`GOMAXPROCS=3 go build -p=3 ./...`. The changed package tests also passed
-`GOMAXPROCS=3 go test -p=3 ./contract/package ./internal/package` and a
-three-count focused race run before the final context/strict-lock hardening;
-the full race run above includes that final hardening. The internal package
-test binary cross-compiled for `GOOS=windows GOARCH=amd64`; this is not native
-Windows execution evidence. No GitHub Actions workflow was dispatched.
+After the missing-lock review fix, implementation commit
+`523455edef7ddaf3cdd772e44921e96c2c4e54f5` was validated against refreshed
+`origin/main` `3fee58ec85fc41efbc9eacff876cb8182d11c0a2` using Go 1.27.1 on
+Darwin arm64. `go mod verify`, `gofmt` cleanliness, `git diff --check`,
+`GOMAXPROCS=3 go vet -p=3 ./...`, `GOMAXPROCS=3 go test -race -p=3 ./...`,
+and `GOMAXPROCS=3 go build -p=3 ./...` all passed. The focused contract/cache/
+native suite passed; the missing/unsupported npm-lock negative suite passed
+three times under `-race`. The independent reviewer's RED probe reproduced
+the omission 3/3 at the prior head; this fix now fails closed with actionable
+diagnostics and lifecycle-marker evidence. No GitHub Actions workflow was
+dispatched. No native Windows execution is claimed; Windows validation remains
+with #157.
