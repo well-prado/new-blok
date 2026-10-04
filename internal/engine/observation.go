@@ -4,9 +4,11 @@ import (
 	"encoding"
 	"encoding/base64"
 	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"reflect"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // Observation snapshots deliberately trade fidelity for a hard memory bound.
@@ -25,6 +27,8 @@ var (
 	observationRawType           = reflect.TypeOf(json.RawMessage(nil))
 	observationMarshalerType     = reflect.TypeOf((*json.Marshaler)(nil)).Elem()
 	observationTextMarshalerType = reflect.TypeOf((*encoding.TextMarshaler)(nil)).Elem()
+	observationTextAppenderType  = reflect.TypeOf((*encoding.TextAppender)(nil)).Elem()
+	observationJSONToType        = reflect.TypeOf((*jsonv2.MarshalerTo)(nil)).Elem()
 	observationByteType          = reflect.TypeOf(byte(0))
 )
 
@@ -85,7 +89,9 @@ func (b *observationBudget) capture(value reflect.Value, depth int) (any, bool) 
 	// Custom JSON representations cannot be reconstructed without invoking
 	// application code. Mark them explicitly instead of inventing a shape.
 	if value.Type().Implements(observationMarshalerType) || reflect.PointerTo(value.Type()).Implements(observationMarshalerType) ||
-		value.Type().Implements(observationTextMarshalerType) || reflect.PointerTo(value.Type()).Implements(observationTextMarshalerType) {
+		value.Type().Implements(observationTextMarshalerType) || reflect.PointerTo(value.Type()).Implements(observationTextMarshalerType) ||
+		value.Type().Implements(observationTextAppenderType) || reflect.PointerTo(value.Type()).Implements(observationTextAppenderType) ||
+		value.Type().Implements(observationJSONToType) || reflect.PointerTo(value.Type()).Implements(observationJSONToType) {
 		return nil, false
 	}
 
@@ -182,12 +188,21 @@ func (b *observationBudget) capture(value reflect.Value, depth int) (any, bool) 
 			if field.PkgPath != "" {
 				continue
 			}
-			name, options, _ := strings.Cut(field.Tag.Get("json"), ",")
+			tag := field.Tag.Get("json")
+			if strings.HasPrefix(tag, "'") {
+				return nil, false
+			}
+			name, options, _ := strings.Cut(tag, ",")
 			if name == "-" {
 				continue
 			}
 			if name == "" {
 				name = field.Name
+			}
+			for _, char := range name {
+				if !unicode.IsLetter(char) && !unicode.IsDigit(char) && !strings.ContainsRune("!#$%&()*+-./:;<=>?@[]^_{|}~ ", char) {
+					return nil, false
+				}
 			}
 			optionSet := "," + options + ","
 			if strings.Contains(optionSet, ",string,") || strings.Contains(optionSet, ",omitzero,") {

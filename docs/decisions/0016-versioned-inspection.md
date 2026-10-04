@@ -41,6 +41,9 @@ Custom JSON/text marshalers, named-byte slices, anonymous embedded fields, and `
 are explicitly truncated rather than approximated. Ordinary nil slices retain
 JSON null and `omitempty` retains standard empty-collection semantics. These
 capture limits affect diagnostic snapshots only, never business values.
+Go 1.27 custom `MarshalJSONTo` and `AppendText` representations and unsupported
+quoted/invalid JSON field tags likewise truncate without invoking application
+methods. String-kind map keys follow the standard JSON rule of direct key use.
 
 `inspect.Recorder` is a process-local development projection. It authorizes by
 exact principal, returns the same not-found result for unknown and unauthorized

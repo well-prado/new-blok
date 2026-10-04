@@ -2,6 +2,7 @@ package engine
 
 import (
 	"encoding/json"
+	"encoding/json/jsontext"
 	"reflect"
 	"runtime"
 	"strings"
@@ -13,6 +14,12 @@ func TestMarshalObservationPreservesJSONShapeOrExplicitlyTruncates(t *testing.T)
 		ID string `json:"id"`
 	}
 	values := []any{
+		observationPrivateAppender("synthetic-private-value"),
+		observationPrivateJSONTo("synthetic-private-value"),
+		map[observationPrivateText]int{"synthetic-key": 1},
+		struct {
+			Value int `json:"'a,b'"`
+		}{Value: 1},
 		[2]byte{1, 2},
 		[]byte{1, 2},
 		[]observationNamedByte{1, 2},
@@ -55,6 +62,18 @@ type observationNamedByte byte
 type observationPrivateText string
 
 func (observationPrivateText) MarshalText() ([]byte, error) { return []byte("redacted"), nil }
+
+type observationPrivateAppender string
+
+func (observationPrivateAppender) AppendText(b []byte) ([]byte, error) {
+	return append(b, "redacted"...), nil
+}
+
+type observationPrivateJSONTo string
+
+func (observationPrivateJSONTo) MarshalJSONTo(encoder *jsontext.Encoder) error {
+	return encoder.WriteToken(jsontext.String("redacted"))
+}
 
 func TestMarshalObservationBoundsLargePayloadBeforeSerialization(t *testing.T) {
 	large := make([]byte, 32<<20)
