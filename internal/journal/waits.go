@@ -11,12 +11,12 @@ import (
 )
 
 const (
-	waitWaiting  = "waiting"
-	waitResumed  = "resumed"
-	waitCanceled = "canceled"
-	signalStored = "stored"
+	waitWaiting   = "waiting"
+	waitResumed   = "resumed"
+	waitCanceled  = "canceled"
+	signalStored  = "stored"
 	signalPending = "pending"
-	signalLate   = "late"
+	signalLate    = "late"
 )
 
 var (
