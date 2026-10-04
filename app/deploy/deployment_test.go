@@ -14,7 +14,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -43,7 +42,7 @@ func TestDeploymentSignalHelper(t *testing.T) {
 		os.Exit(3)
 	}
 	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, syscall.SIGTERM)
+	signal.Notify(signals, shutdownSignal)
 	err = d.Run(context.Background(), signals)
 	if os.Getenv("BLOK_TEST_TIMEOUT") == "1" {
 		if !errors.Is(err, app.ErrDrainTimeout) {
@@ -72,6 +71,7 @@ func TestDeploymentSIGTERMDrain(t *testing.T) {
 			stdout, _ := cmd.StdoutPipe()
 			var stderr strings.Builder
 			cmd.Stderr = &stderr
+			prepareShutdownChild(cmd)
 			if err := cmd.Start(); err != nil {
 				t.Fatal(err)
 			}
@@ -108,7 +108,7 @@ func TestDeploymentSIGTERMDrain(t *testing.T) {
 				t.Fatalf("entry: %s %v", marker, err)
 			}
 			start := time.Now()
-			if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+			if err := requestShutdown(cmd); err != nil {
 				t.Fatal(err)
 			}
 			closed, _ := io.ReadAll(stdout)
