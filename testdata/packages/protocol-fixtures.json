@@ -1,7 +1,8 @@
 {
   "formatVersion": 1,
   "endpoint": "/v1/packages/{namespace}/{name}/{version}",
-  "expectedPackageExecutions": 0,
+  "expectedRegistryRequests": 11,
+  "expectedNewPackages": 1,
   "cases": [
     {
       "name": "fetch-valid-local",
@@ -78,6 +79,14 @@
       "responseVariant": "tampered-artifact",
       "expectedStatus": 200,
       "expectedError": "artifact_digest_mismatch"
+    },
+    {
+      "name": "publish-new",
+      "method": "PUT",
+      "path": "/v1/packages/shop/quote-node/1.0.1",
+      "expectedStatus": 201,
+      "expectedTrust": "unsigned-local",
+      "expectedError": ""
     }
   ]
 }

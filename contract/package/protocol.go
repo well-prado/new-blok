@@ -13,7 +13,11 @@ import (
 )
 
 const protocolPrefix = "/v1/packages/"
-const MaxBundleBytes = ((MaxArtifactBytes+2)/3*4 + (64 << 10))
+
+// The canonical manifest and encoded artifact have separate ceilings. Reserve
+// additional bounded space for the envelope, signature fields and JSON newline.
+const MaxBundleEnvelopeBytes = MaxSignatureKeyIDBytes + MaxSignatureValueBytes + 512
+const MaxBundleBytes = ((MaxArtifactBytes+2)/3*4 + MaxManifestBytes + MaxBundleEnvelopeBytes)
 const MaxRegistryURLBytes = 2048
 
 // Client implements the framework-owned package consumer wire protocol. The

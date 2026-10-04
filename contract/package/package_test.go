@@ -607,9 +607,10 @@ func storeErrorCode(err error) string {
 }
 
 type protocolFixture struct {
-	FormatVersion             int `json:"formatVersion"`
-	ExpectedPackageExecutions int `json:"expectedPackageExecutions"`
-	Cases                     []struct {
+	FormatVersion            int `json:"formatVersion"`
+	ExpectedRegistryRequests int `json:"expectedRegistryRequests"`
+	ExpectedNewPackages      int `json:"expectedNewPackages"`
+	Cases                    []struct {
 		Name            string `json:"name"`
 		Method          string `json:"method"`
 		Path            string `json:"path"`
@@ -639,14 +640,16 @@ func TestRegistryProtocolFixtureAgainstLocalMock(t *testing.T) {
 	if _, err := store.Publish(bundle, localTrust, fixtureEnvironment()); err != nil {
 		t.Fatal(err)
 	}
+	initialPackages, _ := store.Usage()
 	var requests atomic.Int32
-	var executions atomic.Int32
+	var lastRequest atomic.Value
 	var tamperNext atomic.Bool
 	var substituteNext atomic.Bool
 	var denyNext atomic.Int32
 	var lastStatus atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
+		lastRequest.Store([2]string{r.Method, r.URL.Path})
 		parts := strings.Split(strings.TrimPrefix(r.URL.Path, protocolPrefix), "/")
 		if len(parts) != 3 {
 			http.Error(w, "bad package path", http.StatusBadRequest)
@@ -742,8 +745,12 @@ func TestRegistryProtocolFixtureAgainstLocalMock(t *testing.T) {
 					env.EngineVersion = "2.0.0"
 				}
 				_, verified, gotErr = client.Fetch(context.Background(), id, policy, env)
-			case "publish-identical", "publish-version-conflict", "publish-substituted-content", "publish-unauthenticated", "publish-namespace-forbidden":
+			case "publish-identical", "publish-version-conflict", "publish-substituted-content", "publish-unauthenticated", "publish-namespace-forbidden", "publish-new":
 				toPublish := cloneBundle(bundle)
+				if tc.Name == "publish-new" {
+					toPublish.Manifest.Identity.Version = "1.0.1"
+					toPublish.Manifest.Metadata.NodeDescriptor.Version = "1.0.1"
+				}
 				if tc.Name == "publish-version-conflict" {
 					toPublish.Artifact = []byte("different immutable content")
 					toPublish.Manifest.ArtifactDigest = ArtifactDigest(toPublish.Artifact)
@@ -754,6 +761,9 @@ func TestRegistryProtocolFixtureAgainstLocalMock(t *testing.T) {
 			}
 			if got, want := int(lastStatus.Load()), tc.ExpectedStatus; got != want {
 				t.Fatalf("mock registry status=%d, want %d", got, want)
+			}
+			if got := lastRequest.Load(); got == nil || got.([2]string) != [2]string{tc.Method, tc.Path} {
+				t.Fatalf("registry request=%v, want method=%s path=%s", got, tc.Method, tc.Path)
 			}
 			if tc.ExpectedStatus == http.StatusUnauthorized || tc.ExpectedStatus == http.StatusForbidden {
 				packagesAfter, bytesAfter := store.Usage()
@@ -788,11 +798,12 @@ func TestRegistryProtocolFixtureAgainstLocalMock(t *testing.T) {
 			}
 		})
 	}
-	if got, want := int(requests.Load()), len(fixture.Cases); got != want {
+	if got, want := int(requests.Load()), fixture.ExpectedRegistryRequests; got != want {
 		t.Fatalf("mock requests=%d, want %d", got, want)
 	}
-	if got := executions.Load(); got != int32(fixture.ExpectedPackageExecutions) {
-		t.Fatalf("package executions=%d, want %d", got, fixture.ExpectedPackageExecutions)
+	finalPackages, _ := store.Usage()
+	if got := finalPackages - initialPackages; got != fixture.ExpectedNewPackages {
+		t.Fatalf("new immutable packages=%d, want %d", got, fixture.ExpectedNewPackages)
 	}
 }
 

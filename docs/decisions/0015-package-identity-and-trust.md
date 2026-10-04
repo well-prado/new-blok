@@ -189,7 +189,12 @@ Base path: `/v1/packages/{namespace}/{name}/{version}`.
 | `PUT` | `201` created; `200` identical existing content | `401` unauthenticated; `403` not authorized; `409` immutable-version conflict | Sends and returns the JSON bundle |
 
 Requests and responses are bounded to the base64 encoding of an 8 MiB artifact
-plus 64 KiB of manifest/signature JSON overhead. Registry base URLs are limited
+plus the independently bounded 64 KiB canonical manifest and 728 bytes for the
+signature/envelope/newline. The fixed envelope reserve covers the 128-byte key
+ID, 88-byte encoded signature and 512 bytes for their JSON fields and wrappers.
+An actual signed maximum-artifact/maximum-manifest round trip is checked by
+`protocol-boundary.json`; neither ceiling consumes the other's allowance.
+Registry base URLs are limited
 to 2048 bytes. A successful `PUT` response must verify to the exact submitted
 manifest digest, artifact digest, signature, and identity; a registry cannot
 acknowledge a substituted but otherwise valid package. The client rejects
@@ -207,10 +212,13 @@ running the actual package client against an in-process mock registry backed by
 the same immutable store contract. It specifies successful fetch, explicit
 unsigned trust, incompatibility, not-found, idempotent publish, version
 conflict, substituted publish response, authentication and namespace
-authorization denials, and tampered artifact outcomes. Expected package
-execution count is zero: installation and inspection never execute package
-contents. The mock service is a protocol fixture, not an implementation of
-hosted authentication or ownership verification.
+authorization denials, tampered artifacts and creation of a new immutable
+version. Its predeclared effect counts measure actual registry requests and
+new retained package identities, not an uninstrumented execution counter.
+Package operations have no artifact execution API; these fixtures do not
+experimentally certify execution safety or a sandbox. The mock service is a
+protocol fixture, not an implementation of hosted authentication or ownership
+verification.
 
 ## Compatibility and evidence
 

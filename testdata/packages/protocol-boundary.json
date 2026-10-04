@@ -1,0 +1,8 @@
+{
+  "formatVersion": 1,
+  "artifactBytes": 8388608,
+  "canonicalManifestBytes": 65536,
+  "signatureKeyIdBytes": 128,
+  "expectedRegistryRequests": 1,
+  "expectedTrust": "trusted"
+}
