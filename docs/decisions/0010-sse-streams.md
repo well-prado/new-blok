@@ -29,7 +29,10 @@ Its steps run in a fixed order:
 2. application admission (503). The start holds its application lease
    until it has answered, so `app.Shutdown` waits for its durable submission
    below, up to `DrainTimeout` (#175); a start that arrives while the
-   application drains is refused with `Retry-After`. Authentication and the
+   application drains is refused with `Retry-After`. If the drain times out
+   first, the submission is canceled and the start answers 503
+   `unavailable` with `Retry-After`; a retry with the same key is
+   deduplicated if it did commit (ADR 0005, #177). Authentication and the
    bounded body read also run under the lease;
 3. authentication (401), before the body is read;
 4. the key, 1–256 printable ASCII characters (400 `invalid_key`);
@@ -87,8 +90,10 @@ subscriptions until its own deadline.
 ### Subscribe: `GET <path>/<stream>`, the EventSource protocol
 
 Everything is decided before the response status, in this order:
-admission (a subscription is long-lived, so it is admitted but does not hold
-the application open); authentication (401); the stream id format; whether the writer
+admission (the lease is held until the status is decided, the tracker's
+store read included, and a drain timeout cancels that read (#177); it is
+released before the stream is followed, so a long-lived subscription does
+not hold the application open); authentication (401); the stream id format; whether the writer
 supports write deadlines (500 if not, because writes must be bounded and
 interruptible; the small JSON refusals before this point are written
 without one); subscriber limits; the `Last-Event-ID` cursor (400

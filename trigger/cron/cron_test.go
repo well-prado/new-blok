@@ -243,7 +243,7 @@ func TestOverlapPolicies(t *testing.T) {
 			}
 			// Once the 11:00 work settles, the newest held occurrence is
 			// submitted, and only it.
-			if _, err := queue.ProcessOnce(context.Background(), func(context.Context, *sql.Tx, worker.Job) error { return nil }); err != nil {
+			if _, err := queue.ProcessOnce(context.Background(), func(context.Context, worker.Tx, worker.Job) error { return nil }); err != nil {
 				t.Fatal(err)
 			}
 			clock.Set(at(13, 1))

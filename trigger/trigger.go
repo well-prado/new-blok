@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/well-prado/new-blok/contract/capacity"
 	"github.com/well-prado/new-blok/contract/schema"
 )
 
@@ -164,9 +165,11 @@ type Principal struct {
 	Roles []string `json:"roles,omitempty"`
 }
 
-// ErrSaturated is returned by an admission handler that has no capacity.
-// Adapters translate it into protocol backpressure without retrying.
-var ErrSaturated = errors.New("admission_saturated")
+// ErrSaturated is returned by an admission handler that has no capacity, or
+// by anything a handler calls that ran out of capacity, such as a busy store
+// (#190). Adapters translate it into protocol backpressure without retrying.
+// It is capacity.ErrSaturated.
+var ErrSaturated = capacity.ErrSaturated
 
 // ErrConflict reports a submission whose key was already accepted with a
 // different payload or principal. It is never silently deduplicated.

@@ -190,6 +190,9 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		http.Error(writer, `{"error":"unavailable"}`, http.StatusServiceUnavailable)
 		return
 	}
+	// abort ends when the application's drain times out; a disconnect
+	// workflow that runs without a lease still stops then.
+	abort := lease.Context()
 	lease.Release()
 	// Cheap checks first: a foreign origin and a full endpoint are refused
 	// before the authenticator runs, so neither can drive it without bound.
@@ -203,6 +206,7 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		http.Error(writer, `{"error":"saturated"}`, http.StatusServiceUnavailable)
 		return
 	}
+	c.abort = abort
 	principal, err := s.endpoint.Authenticate(request)
 	if err != nil || strings.TrimSpace(principal.ID) == "" {
 		s.release(c)
@@ -310,6 +314,7 @@ type conn struct {
 	// cancels the in-flight message.
 	ctx        context.Context
 	cancel     context.CancelFunc
+	abort      context.Context
 	queue      chan []byte
 	reason     string
 	stopOnce   sync.Once
@@ -366,14 +371,16 @@ func (c *conn) serve() {
 	}
 	if e.OnConnect != nil {
 		if err := c.connect(); err != nil {
-			code := "rejected"
-			if classified, _, ok := trigger.Classify(err); ok {
+			status, code, reason := websocket.StatusPolicyViolation, "rejected", ReasonRejected
+			if errors.Is(err, errConnectAborted) {
+				status, code, reason = websocket.StatusTryAgainLater, "unavailable", ReasonShutdown
+			} else if classified, _, ok := trigger.Classify(err); ok {
 				code = classified
 			}
 			c.stopOnce.Do(func() {
-				c.reason = ReasonRejected
+				c.reason = reason
 				c.cancel()
-				_ = c.socket.Close(websocket.StatusPolicyViolation, code)
+				_ = c.socket.Close(status, code)
 				close(c.closed)
 			})
 			// If a shutdown won the race, wait for its handshake instead.
@@ -507,7 +514,10 @@ func (c *conn) handle(r request) reply {
 		return reply{ID: r.ID, Error: "unavailable"}
 	}
 	defer lease.Release()
-	ctx, cancel := context.WithTimeout(c.ctx, s.endpoint.MessageTimeout)
+	// The message also stops if the application's drain times out.
+	bound, unbind := lease.Bind(c.ctx)
+	defer unbind()
+	ctx, cancel := context.WithTimeout(bound, s.endpoint.MessageTimeout)
 	defer cancel()
 	output, err := s.endpoint.OnMessage(ctx, Message{Connection: c.info, RequestID: r.ID, Input: append(json.RawMessage(nil), r.Input...)})
 	switch {
@@ -520,6 +530,11 @@ func (c *conn) handle(r request) reply {
 	}
 	if code, _, ok := trigger.Classify(err); ok {
 		return reply{ID: r.ID, Error: code}
+	}
+	if app.Aborted(ctx) {
+		// The drain timed out under the message. Its outcome is unknown,
+		// so it is not answered as a refusal to retry.
+		return reply{ID: r.ID, Error: "canceled"}
 	}
 	return reply{ID: r.ID, Error: "internal"}
 }
@@ -553,8 +568,12 @@ func (c *conn) write(r reply) {
 	}
 }
 
+// errConnectAborted reports a connection workflow canceled because the
+// application's drain timed out.
+var errConnectAborted = errors.New("websocket: connection workflow aborted by the application's drain")
+
 // connect runs the connection workflow under an application lease and the
-// message timeout.
+// message timeout; it also stops if the application's drain times out.
 func (c *conn) connect() error {
 	e := c.server.endpoint
 	lease, err := c.server.application.Begin()
@@ -562,9 +581,17 @@ func (c *conn) connect() error {
 		return err
 	}
 	defer lease.Release()
-	ctx, cancel := context.WithTimeout(c.ctx, e.MessageTimeout)
+	bound, unbind := lease.Bind(c.ctx)
+	defer unbind()
+	ctx, cancel := context.WithTimeout(bound, e.MessageTimeout)
 	defer cancel()
-	return e.OnConnect(ctx, c.info)
+	if err := e.OnConnect(ctx, c.info); err != nil {
+		if app.Aborted(ctx) {
+			return errConnectAborted
+		}
+		return err
+	}
+	return nil
 }
 
 // disconnected runs the disconnect workflow once, bounded by the message
@@ -578,10 +605,21 @@ func (c *conn) disconnected() {
 		if e.OnDisconnect == nil {
 			return
 		}
+		// Without a lease (the application drains) it still stops when the
+		// drain times out, before the dependencies close.
+		ctx := c.abort
+		if ctx == nil {
+			ctx = context.Background()
+		}
 		if lease, err := c.server.application.Begin(); err == nil {
 			defer lease.Release()
+			// Under a lease, it also stops if the application's drain
+			// times out.
+			bound, unbind := lease.Bind(ctx)
+			defer unbind()
+			ctx = bound
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), e.MessageTimeout)
+		ctx, cancel := context.WithTimeout(ctx, e.MessageTimeout)
 		defer cancel()
 		e.OnDisconnect(ctx, Disconnected{Connection: c.info, Reason: c.reason})
 	})
