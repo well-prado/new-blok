@@ -795,3 +795,34 @@ func TestUnrequestedConnsClosesConnectionsAcceptedAfterDrain(t *testing.T) {
 		t.Fatalf("drained tracker retained %d connections", len(u.conns))
 	}
 }
+
+func TestCloseAdmissionStopsAdmittingBeforeClosingConnections(t *testing.T) {
+	a, _ := app.New(app.Config{})
+	d, err := NewDeployment(a, deployment.Config{ListenerAddress: "127.0.0.1:0", MaxAdmission: 1, DrainTimeout: time.Second}, DeploymentChecks{Artifact: func(context.Context) error { return nil }}, http.NotFoundHandler())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, peer := net.Pipe()
+	defer peer.Close()
+	admittedWhenClosed := make(chan error, 1)
+	d.unrequested.track(&closeObserver{Conn: conn, closed: func() {
+		_, err := d.limiter.Admit()
+		admittedWhenClosed <- err
+	}}, http.StateNew)
+	d.closeAdmission()
+	select {
+	case err := <-admittedWhenClosed:
+		if err == nil {
+			t.Fatal("limiter still admitted work when the request-less connection was closed")
+		}
+	default:
+		t.Fatal("closeAdmission did not close the request-less connection")
+	}
+}
+
+type closeObserver struct {
+	net.Conn
+	closed func()
+}
+
+func (c *closeObserver) Close() error { c.closed(); return c.Conn.Close() }
