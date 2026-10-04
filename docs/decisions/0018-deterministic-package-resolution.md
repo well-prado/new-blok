@@ -68,9 +68,12 @@ modfile/overlay inputs fail with actionable unsupported-input diagnostics.
 npm capture asks npm to validate/project the existing lock graph without
 installing packages or running scripts, and binds `package.json`,
 `package-lock.json`, npm/Node versions, and every exact package version and
-integrity. Only lockfile versions 2 and 3 are accepted. Workspace/link and
-local-file dependencies are explicitly unsupported until their source trees
-can be pinned; missing integrity fails closed. Registry URLs, npm configuration,
+integrity. Only lockfile versions 2 and 3 are accepted. A manifest declaring
+dependencies without `package-lock.json` fails before invoking npm;
+`npm-shrinkwrap.json`, foreign manager lock/workspace files, and a non-npm
+`packageManager` declaration are explicitly unsupported. npm workspaces,
+link/local-file dependencies are rejected until their source trees can be
+pinned; missing integrity fails closed. Registry URLs, npm configuration,
 credentials, and command stderr are not copied into lock records or
 diagnostics. No universal installer or lifecycle-hook execution is added.
 
@@ -96,7 +99,11 @@ immutable identity conflict, trust-policy scoping, concurrent capacity and
 lock writes, malformed lock bounds, and context cancellation. Native
 integration tests invoke the actual Go and npm tools and verify lock files
 remain unchanged; a Go local-replacement test proves source-content changes
-alter the recorded digest and external replacements fail.
+alter the recorded digest and external replacements fail. A synthetic npm
+manifest-without-lock negative test repeats three times under the race
+detector, verifies an actionable error, and confirms its lifecycle marker is
+not created. Shrinkwrap, pnpm, and workspace inputs have explicit negative
+coverage; Go-only capture is retained by the real repository integration test.
 
 On final implementation commit `37c40bd753eabf238144d0270cafcc59fd8ac894`,
 after refreshing `origin/main` to `8a3a0c470cd3c23ee6744956b430fa4fb736a379`,

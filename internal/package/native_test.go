@@ -97,6 +97,43 @@ func TestCaptureNativeGoAndNPMLocksWithTheirManagers(t *testing.T) {
 	}
 }
 
+func TestCaptureNativeLocksRejectsMissingOrUnsupportedNPMLocks(t *testing.T) {
+	t.Run("declared dependencies without package lock", func(t *testing.T) {
+		root := t.TempDir()
+		marker := filepath.Join(root, "lifecycle-ran")
+		writeFixtureFile(t, filepath.Join(root, "package.json"), `{"name":"fixture","version":"1.0.0","scripts":{"preinstall":"/usr/bin/touch `+marker+`"},"dependencies":{"example.test/pkg":"1.0.0"}}`)
+		if locks, err := CaptureNativeLocks(context.Background(), root); err == nil || !strings.Contains(err.Error(), "package-lock.json is missing") {
+			t.Fatalf("declared npm dependency without a lock did not fail closed: locks=%+v err=%v", locks, err)
+		}
+		if _, err := os.Stat(marker); !os.IsNotExist(err) {
+			t.Fatalf("npm lifecycle marker exists after read-only capture: %v", err)
+		}
+	})
+	t.Run("npm shrinkwrap is explicitly unsupported", func(t *testing.T) {
+		root := t.TempDir()
+		writeFixtureFile(t, filepath.Join(root, "package.json"), `{"name":"fixture","version":"1.0.0","dependencies":{"example.test/pkg":"1.0.0"}}`)
+		writeFixtureFile(t, filepath.Join(root, "npm-shrinkwrap.json"), `{}`)
+		if _, err := CaptureNativeLocks(context.Background(), root); err == nil || !strings.Contains(err.Error(), "npm-shrinkwrap.json is unsupported") {
+			t.Fatalf("npm shrinkwrap input was silently ignored: %v", err)
+		}
+	})
+	t.Run("other package manager is explicitly unsupported", func(t *testing.T) {
+		root := t.TempDir()
+		writeFixtureFile(t, filepath.Join(root, "package.json"), `{"name":"fixture","version":"1.0.0","packageManager":"pnpm@10.0.0","dependencies":{"example.test/pkg":"1.0.0"}}`)
+		writeFixtureFile(t, filepath.Join(root, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n")
+		if _, err := CaptureNativeLocks(context.Background(), root); err == nil || !strings.Contains(err.Error(), "pnpm-lock.yaml is unsupported") {
+			t.Fatalf("pnpm lock input was silently ignored: %v", err)
+		}
+	})
+	t.Run("npm workspace source is explicitly unsupported", func(t *testing.T) {
+		root := t.TempDir()
+		writeFixtureFile(t, filepath.Join(root, "package.json"), `{"name":"fixture","version":"1.0.0","workspaces":["packages/*"]}`)
+		if _, err := CaptureNativeLocks(context.Background(), root); err == nil || !strings.Contains(err.Error(), "npm workspaces are unsupported") {
+			t.Fatalf("npm workspace source was silently omitted: %v", err)
+		}
+	})
+}
+
 func TestGoLocalReplaceSourceIsPinnedAndExternalSourceRejected(t *testing.T) {
 	if _, err := exec.LookPath("go"); err != nil {
 		t.Skip("Go native manager is unavailable")

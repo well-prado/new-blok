@@ -43,7 +43,11 @@ func CaptureNativeLocks(ctx context.Context, projectRoot string) ([]contractpack
 		}
 		locks = append(locks, captured...)
 	}
-	if fileExists(filepath.Join(root, "package.json")) && fileExists(filepath.Join(root, "package-lock.json")) {
+	captureNPMProject, err := inspectNPMProject(root)
+	if err != nil {
+		return nil, err
+	}
+	if captureNPMProject {
 		captured, err := captureNPM(ctx, root)
 		if err != nil {
 			return nil, err
@@ -52,6 +56,94 @@ func CaptureNativeLocks(ctx context.Context, projectRoot string) ([]contractpack
 	}
 	sort.Slice(locks, func(i, j int) bool { return locks[i].Manager+"/"+locks[i].Path < locks[j].Manager+"/"+locks[j].Path })
 	return locks, nil
+}
+
+func inspectNPMProject(root string) (bool, error) {
+	manifestPath := filepath.Join(root, "package.json")
+	manifestExists, err := regularNativeFile(manifestPath)
+	if err != nil {
+		return false, err
+	}
+	managerInputFiles := []string{"npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "pnpm-workspace.yaml", "bun.lock", "bun.lockb"}
+	var foundManagerLock string
+	for _, name := range managerInputFiles {
+		exists, err := regularNativeFile(filepath.Join(root, name))
+		if err != nil {
+			return false, err
+		}
+		if exists {
+			foundManagerLock = name
+			break
+		}
+	}
+	packageLockExists, err := regularNativeFile(filepath.Join(root, "package-lock.json"))
+	if err != nil {
+		return false, err
+	}
+	if !manifestExists {
+		if foundManagerLock != "" {
+			return false, fmt.Errorf("package: native lock %s exists without package.json", foundManagerLock)
+		}
+		if packageLockExists {
+			return false, fmt.Errorf("package: package-lock.json exists without package.json")
+		}
+		return false, nil
+	}
+	if foundManagerLock == "npm-shrinkwrap.json" {
+		return false, fmt.Errorf("package: npm-shrinkwrap.json is unsupported; native capture requires package-lock.json")
+	}
+	if foundManagerLock != "" {
+		return false, fmt.Errorf("package: native manager input %s is unsupported; Go/npm capture supports package-lock.json only", foundManagerLock)
+	}
+	data, err := readNativeBounded(manifestPath, maxNativeLockBytes)
+	if err != nil {
+		return false, err
+	}
+	var manifest struct {
+		PackageManager       string                     `json:"packageManager"`
+		Dependencies         map[string]json.RawMessage `json:"dependencies"`
+		DevDependencies      map[string]json.RawMessage `json:"devDependencies"`
+		OptionalDependencies map[string]json.RawMessage `json:"optionalDependencies"`
+		PeerDependencies     map[string]json.RawMessage `json:"peerDependencies"`
+		BundledDependencies  []string                   `json:"bundledDependencies"`
+		BundleDependencies   []string                   `json:"bundleDependencies"`
+		Workspaces           json.RawMessage            `json:"workspaces"`
+	}
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return false, fmt.Errorf("package: package.json is malformed; npm lock capture cannot determine declared dependencies")
+	}
+	if manager := strings.TrimSpace(manifest.PackageManager); manager != "" && manager != "npm" && !strings.HasPrefix(manager, "npm@") {
+		name, _, _ := strings.Cut(manager, "@")
+		if name == "" {
+			name = "unknown"
+		}
+		return false, fmt.Errorf("package: package.json declares unsupported package manager %q; native capture currently supports npm package-lock.json only", name)
+	}
+	if len(manifest.Workspaces) > 0 && string(manifest.Workspaces) != "null" {
+		return false, fmt.Errorf("package: npm workspaces are unsupported until workspace source trees can be pinned")
+	}
+	declaresDependencies := len(manifest.Dependencies)+len(manifest.DevDependencies)+len(manifest.OptionalDependencies)+len(manifest.PeerDependencies)+len(manifest.BundledDependencies)+len(manifest.BundleDependencies) > 0
+	if !packageLockExists {
+		if declaresDependencies {
+			return false, fmt.Errorf("package: package.json declares dependencies but package-lock.json is missing; generate and commit an npm lock with scripts disabled")
+		}
+		return false, nil
+	}
+	return true, nil
+}
+
+func regularNativeFile(path string) (bool, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("package: inspect native lock input %s", filepath.Base(path))
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return false, fmt.Errorf("package: native lock input %s must be a regular file", filepath.Base(path))
+	}
+	return true, nil
 }
 
 // ResolveProject binds the Blok package graph to the language-native lock
