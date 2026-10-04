@@ -19,7 +19,10 @@ the public `execution.NewRunner`; application-owned modules do not import the
 internal interpreter. Ordinary `Engine.Run` does not JSON-serialize observation payloads.
 Durable terminal projection is separately opt-in through the application-owned
 `RunOutcomePort`: `execution.Runner` records completed, failed, canceled, or
-explicitly uncertain outcomes after the real engine returns. The journal
+explicitly uncertain outcomes after the real engine returns. When this port is
+configured, run-terminal observation is deferred until the durable outcome
+attempt resolves; a failed terminal write is projected uncertain, never briefly
+completed. The journal
 provides a principal-checking adapter for that port without being imported by
 the engine. The trusted trigger/application boundary supplies the run ID and
 principal together; the adapter verifies their ownership match before any
@@ -30,6 +33,10 @@ times, and have a unique execution-attempt identity; each step attempt has its
 own identity and immutable input/output snapshots. The engine also captures
 structured Go node logs only when inspection is selected. Diagnostic labels
 are bounded and allowlisted; provider error messages are not projected.
+Observer payload capture is also bounded before serialization: each input or
+output is limited to 32 KiB, 8,192 visited values, and 32 nested levels. Larger
+or unsupported values become `{"$truncated":true}`. Capture structurally copies
+JSON-compatible fields and does not invoke caller-defined `MarshalJSON` methods.
 
 `inspect.Recorder` is a process-local development projection. It authorizes by
 exact principal, returns the same not-found result for unknown and unauthorized
@@ -47,6 +54,7 @@ Payload fields have a 64-byte minimum projection envelope; an explicit smaller
 is also reduced as needed to fit the aggregate payload slots under the response
 limit (256 KiB default, 1 MiB hard maximum). Oversized response envelopes fail
 closed rather than violating the response ceiling.
+Encoded cursors are limited to 1,024 bytes before base64 decoding.
 
 `inspection.Source` is a narrow bounded read port. The journal implements it
 without exposing the store implementation: principal authorization and SQL

@@ -15,6 +15,9 @@ import (
 )
 
 var ErrNotFound = errors.New("inspection: run not found")
+
+const maxCursorEncodedBytes = 1024
+
 var sensitiveLogText = regexp.MustCompile(`(?i)(\b(password|passwd|secret|token|authorization|credential|api[_-]?key|private[_-]?key)\b\s*[:=]\s*\S+|\bbearer\s+\S+|\bAKIA[0-9A-Z]{16}\b|\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b)`)
 
 type runRecord struct {
@@ -549,6 +552,9 @@ func encodeCursor(runID, stepID string, offset int) string {
 func decodeCursor(value, runID, stepID string) (int, error) {
 	if value == "" {
 		return 0, nil
+	}
+	if len(value) > maxCursorEncodedBytes {
+		return 0, fmt.Errorf("inspection: invalid cursor")
 	}
 	data, err := base64.RawURLEncoding.DecodeString(value)
 	if err != nil {

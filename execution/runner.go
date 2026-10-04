@@ -97,7 +97,11 @@ func (r *Runner) Run(ctx context.Context, program contract.InternalProgram, inpu
 	defer unbind()
 	var result engine.Result
 	if r.inspecting {
-		result, err = r.engine.RunObserved(runCtx, program, input, identity)
+		if r.outcomes != nil {
+			result, err = r.engine.RunObservedPending(runCtx, program, input, identity)
+		} else {
+			result, err = r.engine.RunObserved(runCtx, program, input, identity)
+		}
 	} else {
 		result, err = r.engine.Run(runCtx, program, input)
 	}
@@ -112,12 +116,40 @@ func (r *Runner) Run(ctx context.Context, program contract.InternalProgram, inpu
 		if outcomeErr != nil {
 			err = &OutcomeUncertainError{RunID: identity.RunID, ExecutionError: err, PersistenceErr: outcomeErr}
 		}
+		kind, code, class := observedTerminal(err)
+		r.engine.EmitRunTerminal(identity, program.WorkflowID, result, kind, code, class)
 	}
 	out := Result{Output: result.Output, State: result.State, Steps: make([]StepResult, len(result.Steps))}
 	for i, s := range result.Steps {
 		out.Steps[i] = StepResult{ID: s.ID, Executed: s.Executed, Input: s.Input, Attempt: s.Attempt, Output: s.Output, Error: s.Error, StartedAt: s.StartedAt, FinishedAt: s.FinishedAt}
 	}
 	return out, err
+}
+
+func observedTerminal(runErr error) (inspection.Kind, string, string) {
+	if runErr == nil {
+		return inspection.RunCompleted, "", ""
+	}
+	var outcomeUncertain *OutcomeUncertainError
+	if errors.As(runErr, &outcomeUncertain) {
+		return inspection.RunUncertain, "terminal_outcome_uncertain", "persistence"
+	}
+	var classified interface {
+		ErrorCode() string
+		ErrorClass() string
+		IsUncertain() bool
+	}
+	if errors.As(runErr, &classified) && classified.IsUncertain() {
+		return inspection.RunUncertain, classified.ErrorCode(), classified.ErrorClass()
+	}
+	if errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) {
+		return inspection.RunCanceled, "canceled", "cancellation"
+	}
+	code, class := "execution_failed", "workflow"
+	if errors.As(runErr, &classified) {
+		code, class = classified.ErrorCode(), classified.ErrorClass()
+	}
+	return inspection.RunFailed, code, class
 }
 
 func (r *Runner) recordOutcome(ctx context.Context, identity inspection.Invocation, result engine.Result, runErr error) error {

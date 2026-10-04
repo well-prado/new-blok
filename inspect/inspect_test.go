@@ -262,6 +262,22 @@ func (b blockingCompleteOutcome) CompleteRun(ctx context.Context, _ inspection.I
 	return ctx.Err()
 }
 
+type gatedCompleteOutcome struct {
+	app.RunOutcomePort
+	started chan struct{}
+	release chan struct{}
+}
+
+func (g gatedCompleteOutcome) CompleteRun(ctx context.Context, _ inspection.Invocation, _ json.RawMessage) error {
+	close(g.started)
+	select {
+	case <-g.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func TestApplicationRunnerReturnsReconciliationIdentityWhenTerminalWriteFails(t *testing.T) {
 	ctx := context.Background()
 	database, err := (sqlite.Backend{}).Open(ctx, filepath.Join(t.TempDir(), "outcome-write-failure.db"))
@@ -278,7 +294,8 @@ func TestApplicationRunnerReturnsReconciliationIdentityWhenTerminalWriteFails(t 
 		t.Fatal(err)
 	}
 	writeErr := errors.New("synthetic terminal store outage")
-	application, err := app.New(app.Config{Workflows: []app.Workflow{{Name: "quote"}}, RunOutcomes: failingCompleteOutcome{RunOutcomePort: journalStore.TerminalOutcomes(), err: writeErr}})
+	recorder := inspect.NewRecorder()
+	application, err := app.New(app.Config{Workflows: []app.Workflow{{Name: "quote"}}, Inspection: recorder, RunOutcomes: failingCompleteOutcome{RunOutcomePort: journalStore.TerminalOutcomes(), err: writeErr}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -305,6 +322,59 @@ func TestApplicationRunnerReturnsReconciliationIdentityWhenTerminalWriteFails(t 
 	}
 	if run, err := journalStore.Run(ctx, admission.RunID); err != nil || run.State != "accepted" {
 		t.Fatalf("failed terminal write falsely committed a run state: run=%+v err=%v", run, err)
+	}
+	page, err := recorder.Inspect("alice", inspection.Policy{MaxPageSize: 10}, inspection.Query{Version: inspection.Version, RunID: admission.RunID})
+	if err != nil || page.Run.Status != inspection.StatusUncertain {
+		t.Fatalf("failed durable terminal write projected a committed completion: page=%+v err=%v", page, err)
+	}
+}
+
+func TestApplicationRunnerDoesNotProjectCompletionBeforeDurableOutcome(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	recorder := inspect.NewRecorder()
+	application, err := app.New(app.Config{
+		Workflows: []app.Workflow{{Name: "quote"}}, Inspection: recorder,
+		RunOutcomes: gatedCompleteOutcome{started: started, release: release},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := application.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	definition, err := quote.NewNode(&catalog{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	program := contract.InternalProgram{WorkflowID: "quote", Instructions: []contract.InternalInstruction{
+		{Index: 0, ID: "calculate", Kind: "call", Node: "shop/calculate-quote"},
+		{Index: 1, ID: "respond", Kind: "output", References: []contract.Reference{{Step: "calculate", Path: []string{"totalCents"}}}},
+	}}
+	runner := execution.NewRunner(application, map[string]node.Any{"shop/calculate-quote": definition.Any()})
+	finished := make(chan error, 1)
+	go func() {
+		_, runErr := runner.Run(context.Background(), program, quote.Input{SKU: "coffee", Quantity: 1}, inspection.Invocation{RunID: "outcome-pending", Principal: "alice"})
+		finished <- runErr
+	}()
+	<-started
+	pending, err := recorder.Inspect("alice", inspection.Policy{MaxPageSize: 10}, inspection.Query{Version: inspection.Version, RunID: "outcome-pending"})
+	if err != nil || pending.Run.Status != inspection.StatusRunning {
+		t.Fatalf("uncommitted effect was projected terminal before durable outcome: page=%+v err=%v", pending, err)
+	}
+	close(release)
+	if err := <-finished; err != nil {
+		t.Fatalf("durable completion failed: %v", err)
+	}
+	completed, err := recorder.Inspect("alice", inspection.Policy{MaxPageSize: 10}, inspection.Query{Version: inspection.Version, RunID: "outcome-pending"})
+	if err != nil || completed.Run.Status != inspection.StatusCompleted {
+		t.Fatalf("committed effect was not projected completed: page=%+v err=%v", completed, err)
 	}
 }
 
@@ -575,6 +645,17 @@ func TestPaginationVersionRedactionAndPayloadBounds(t *testing.T) {
 	query.Version = "inspection/v99"
 	if _, err := recorder.Inspect("alice", policy, query); !errors.Is(err, inspection.ErrUnsupportedVersion) {
 		t.Fatalf("unsupported version err=%v", err)
+	}
+}
+
+func TestOversizedCursorIsRejectedBeforeBase64Decode(t *testing.T) {
+	recorder := inspect.NewRecorder()
+	recorder.Observe(inspection.Event{Kind: inspection.RunStarted, RunID: "cursor-bound", Principal: "alice", At: time.Unix(10, 0).UTC()})
+	_, err := recorder.Inspect("alice", fullPolicy(), inspection.Query{
+		Version: inspection.Version, RunID: "cursor-bound", Cursor: strings.Repeat("A", 1<<20),
+	})
+	if err == nil || !strings.Contains(err.Error(), "invalid cursor") {
+		t.Fatalf("oversized cursor was not rejected: %v", err)
 	}
 }
 

@@ -11,7 +11,7 @@ import (
 const Version = "inspection/v1"
 
 // Projection envelope limits keep per-step history bounded inside every page.
-// At most five recent attempts and five recent logs are projected per step.
+// At most five recent attempts and four recent logs are projected per step.
 const (
 	MinPayloadBytes      = 64
 	MaxProjectedAttempts = 5

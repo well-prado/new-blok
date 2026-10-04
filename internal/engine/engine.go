@@ -89,16 +89,45 @@ func (e *Engine) WithObserver(observer inspection.Observer) *Engine {
 }
 
 func (e *Engine) Run(ctx context.Context, program contract.InternalProgram, input any) (Result, error) {
-	return e.run(ctx, program, input, inspection.Invocation{}, false)
+	return e.run(ctx, program, input, inspection.Invocation{}, false, true)
 }
 
 // RunObserved executes the same production interpreter as Run and emits
 // read-only events tied to trusted invocation metadata.
 func (e *Engine) RunObserved(ctx context.Context, program contract.InternalProgram, input any, invocation inspection.Invocation) (result Result, runErr error) {
-	return e.run(ctx, program, input, invocation, true)
+	return e.run(ctx, program, input, invocation, true, true)
 }
 
-func (e *Engine) run(ctx context.Context, program contract.InternalProgram, input any, invocation inspection.Invocation, requested bool) (result Result, runErr error) {
+// RunObservedPending emits start and step evidence but leaves the run terminal
+// event to the application boundary that owns durable outcome persistence.
+func (e *Engine) RunObservedPending(ctx context.Context, program contract.InternalProgram, input any, invocation inspection.Invocation) (result Result, runErr error) {
+	return e.run(ctx, program, input, invocation, true, false)
+}
+
+// EmitRunTerminal publishes exactly one application-owned terminal projection.
+// Call it only after the corresponding durable outcome attempt has resolved.
+func (e *Engine) EmitRunTerminal(invocation inspection.Invocation, workflow string, result Result, kind inspection.Kind, code, class string) {
+	if e == nil || e.observer == nil || invocation.RunID == "" || invocation.Principal == "" {
+		return
+	}
+	switch kind {
+	case inspection.RunCompleted, inspection.RunFailed, inspection.RunCanceled, inspection.RunSuspended, inspection.RunUncertain:
+	default:
+		return
+	}
+	var output json.RawMessage
+	if kind == inspection.RunCompleted {
+		output = marshalObservation(result.Output)
+	}
+	e.observer.Observe(inspection.Event{
+		Kind: kind, RunID: invocation.RunID, Principal: invocation.Principal,
+		Workflow: workflow, ParentRun: invocation.ParentRun, ParentStep: invocation.ParentStep,
+		Output:    output,
+		ErrorCode: code, ErrorClass: class, At: time.Now().UTC(),
+	})
+}
+
+func (e *Engine) run(ctx context.Context, program contract.InternalProgram, input any, invocation inspection.Invocation, requested, terminalOwned bool) (result Result, runErr error) {
 	if e == nil {
 		return Result{}, &Error{Code: "nil_engine", Class: "configuration"}
 	}
@@ -136,6 +165,9 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 	}
 	emit(inspection.Event{Kind: inspection.RunStarted, Input: inputJSON})
 	defer func() {
+		if !terminalOwned {
+			return
+		}
 		terminal := inspection.Event{Kind: inspection.RunCompleted}
 		if runErr != nil {
 			terminal.Kind = inspection.RunFailed
@@ -150,7 +182,7 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 				terminal.Kind = inspection.RunCanceled
 			}
 		} else if observing {
-			terminal.Output, _ = json.Marshal(result.Output)
+			terminal.Output = marshalObservation(result.Output)
 		}
 		emit(terminal)
 	}()
@@ -276,7 +308,16 @@ func marshalObservation(value any) json.RawMessage {
 	if value == nil {
 		return nil
 	}
-	data, _ := json.Marshal(value)
+	const truncated = `{"$truncated":true}`
+	budget := observationBudget{remaining: maxObservedPayloadBytes, nodes: maxObservationNodes}
+	safe, ok := budget.capture(reflect.ValueOf(value), 0)
+	if !ok {
+		return json.RawMessage(truncated)
+	}
+	data, err := json.Marshal(safe)
+	if err != nil || len(data) > maxObservedPayloadBytes {
+		return json.RawMessage(truncated)
+	}
 	return data
 }
 
