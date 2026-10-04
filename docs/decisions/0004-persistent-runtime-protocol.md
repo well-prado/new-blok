@@ -91,11 +91,14 @@ standard streams go to the null device, never pipes, so a descendant that
 outlives the worker cannot keep it looking alive. On POSIX, after the drain,
 the supervisor sends SIGTERM and kills at its cleanup bound. Windows has no
 such request (#156): the worker starts with its own hidden console, so the
-host's Ctrl+C or Ctrl+Break does not reach it, inside a job object created
-before the process starts and set to kill every member when it closes.
-Stopping terminates the job; closing it after the worker exits also ends
+host's Ctrl+C or Ctrl+Break does not reach it, inside a job object set to
+kill every member when it closes. The worker is created suspended, joins the
+job, and only then is resumed (#224), so it cannot create a descendant outside
+the job: a process joins a job at creation only if its parent is already in
+it. Stopping terminates the job; closing it after the worker exits also ends
 descendants that outlived it, and breakaway is not allowed. A released job
-handle is never used again. A worker that fails to join its job is not run.
+handle is never used again. A worker that fails to join its job is terminated
+while still suspended, before it has run anything.
 
 #53 review hardening tightens pre-alpha call validation to the shared five-minute
 deadline bound. Earlier clients requesting longer deadlines must split the work

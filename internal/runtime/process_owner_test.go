@@ -53,7 +53,7 @@ func TestOwnedProcessHelper(t *testing.T) {
 }
 
 // startOwnedChild starts a worker child through the same command builder
-// Connect uses, adopts it, and returns the PID of the grandchild it launched.
+// Connect uses, owns it, and returns the PID of the grandchild it launched.
 func startOwnedChild(t *testing.T, exitEarly bool) (*exec.Cmd, *processOwner, int) {
 	t.Helper()
 	pidFile := filepath.Join(t.TempDir(), "grandchild.pid")
@@ -66,14 +66,9 @@ func startOwnedChild(t *testing.T, exitEarly bool) (*exec.Cmd, *processOwner, in
 		t.Fatalf("newProcessOwner: %v", err)
 	}
 	cmd := workerCommand(os.Args[0], []string{"-test.run=^TestOwnedProcessHelper$"}, "", []string{"BLOK_OWNED_ROLE=child", "BLOK_OWNED_PID_FILE=" + pidFile, "BLOK_OWNED_EXIT=" + exit})
-	if err := cmd.Start(); err != nil {
+	if err := owner.start(cmd); err != nil {
 		owner.release()
-		t.Fatal(err)
-	}
-	if err := owner.adopt(cmd); err != nil {
-		_ = cmd.Process.Kill()
-		owner.release()
-		t.Fatalf("adopt: %v", err)
+		t.Fatalf("start: %v", err)
 	}
 	pid := waitForPID(t, pidFile)
 	t.Cleanup(func() { // never leave a stray process behind, even on failure

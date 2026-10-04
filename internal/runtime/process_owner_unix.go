@@ -22,7 +22,12 @@ func newProcessOwner() (*processOwner, error) { return &processOwner{}, nil }
 // they are sent to.
 func isolateWorker(*exec.Cmd) {}
 
-func (o *processOwner) adopt(cmd *exec.Cmd) error {
+// start launches cmd. Signals reach only the process they are sent to, so
+// there is nothing to establish before it runs.
+func (o *processOwner) start(cmd *exec.Cmd) error {
+	if err := cmd.Start(); err != nil {
+		return err
+	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.process = cmd.Process
