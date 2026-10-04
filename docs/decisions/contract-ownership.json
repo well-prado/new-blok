@@ -145,6 +145,14 @@
       "status": "implemented",
       "decision": "Only tools the endpoint exposes by name@version, the catalog lists for the caller and whose schemas MCP can carry are visible; each call runs as the principal its own request authenticated, is schema-validated, bounded in concurrency and time, and dispatched through the catalog, where a named approval is only looked up; errors reach the model as stable codes; sessions and calls are bounded globally and per principal; a client cancel, a dropped request or the owner ending its session cancels the work (ADR 0014).",
       "evidence": ["mcp-fixture-cases", "mcp-discovery-and-resources", "mcp-unauthenticated", "mcp-revocation-mid-session", "mcp-session-hijack", "mcp-protocol-versions", "mcp-deadline", "mcp-client-cancel", "mcp-dropped-request-cancel", "mcp-session-end-cancel", "mcp-late-queued-call", "mcp-overload", "mcp-principal-slots", "mcp-session-bounds", "mcp-output-bound", "mcp-draining", "mcp-call-lease", "mcp-shutdown", "mcp-evicted-views", "mcp-view-building", "mcp-listing-panic", "mcp-goroutine-bounds", "mcp-approval-evidence", "mcp-workflow-tool", "mcp-dependency-rule", "mcp-selection-footprint", "mcp-trigger-conformance"]
+    },
+    {
+      "id": "versioned-run-step-inspection",
+      "question": "How are native run and step observations versioned, authorized, redacted, bounded and paginated?",
+      "owner": "E15-T01",
+      "status": "implemented",
+      "decision": "inspection/v1 exposes immutable app-composed Go and Node outcomes, a bounded process-local recorder, and a principal-authorized SQL journal read port for actual waits, attempts, uncertain effects and child lineage; payloads and blobs are separately bounded and redacted/authorized (ADR 0016).",
+      "evidence": ["inspection-actual-go-engine-golden", "inspection-actual-node-success-failure-cancellation-uncertain", "inspection-two-principal-isolation", "inspection-redaction-bounds-pagination", "inspection-recorder-saturation", "inspection-journal-wait-resume-uncertain-lineage", "inspection-authenticated-bounded-blob", "inspection-version-rejection", "inspection-immutable-projection"]
     }
   ]
 }

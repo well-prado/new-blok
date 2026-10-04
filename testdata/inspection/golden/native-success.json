@@ -1,0 +1,71 @@
+{
+  "version": "inspection/v1",
+  "run": {
+    "id": "run-alice",
+    "workflow": "quote",
+    "status": "completed",
+    "startedAt": "0001-01-01T00:00:00Z",
+    "finishedAt": "0001-01-01T00:00:00Z",
+    "input": {
+      "quantity": 2,
+      "sku": "coffee"
+    },
+    "output": 3000
+  },
+  "steps": [
+    {
+      "id": "calculate",
+      "status": "completed",
+      "attempt": 1,
+      "startedAt": "0001-01-01T00:00:00Z",
+      "finishedAt": "0001-01-01T00:00:00Z",
+      "input": {
+        "quantity": 2,
+        "sku": "coffee"
+      },
+      "output": {
+        "currency": "USD",
+        "quantity": 2,
+        "sku": "coffee",
+        "totalCents": 3000
+      },
+      "attempts": [
+        {
+          "id": "golden-attempt/calculate/1",
+          "number": 1,
+          "status": "completed",
+          "startedAt": "0001-01-01T00:00:00Z",
+          "finishedAt": "0001-01-01T00:00:00Z",
+          "input": {
+            "quantity": 2,
+            "sku": "coffee"
+          },
+          "output": {
+            "currency": "USD",
+            "quantity": 2,
+            "sku": "coffee",
+            "totalCents": 3000
+          }
+        }
+      ]
+    },
+    {
+      "id": "respond",
+      "status": "completed",
+      "attempt": 1,
+      "startedAt": "0001-01-01T00:00:00Z",
+      "finishedAt": "0001-01-01T00:00:00Z",
+      "output": 3000,
+      "attempts": [
+        {
+          "id": "golden-attempt/respond/1",
+          "number": 1,
+          "status": "completed",
+          "startedAt": "0001-01-01T00:00:00Z",
+          "finishedAt": "0001-01-01T00:00:00Z",
+          "output": 3000
+        }
+      ]
+    }
+  ]
+}
