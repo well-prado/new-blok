@@ -15,14 +15,8 @@ func TestMarshalObservationPreservesJSONShapeOrExplicitlyTruncates(t *testing.T)
 		ID string `json:"id"`
 	}
 	values := []any{
-		struct {
-			First  string `json:"x"`
-			Second string `json:"x"`
-		}{First: "a", Second: "b"},
-		struct {
-			First  string `json:"x,omitempty"`
-			Second string `json:"x"`
-		}{Second: "b"},
+		ambiguousObservationFields("x", "a", "b"),
+		ambiguousObservationFields("x,omitempty", "", "b"),
 		observationPrivateAppender("synthetic-private-value"),
 		observationPrivateJSONTo("synthetic-private-value"),
 		map[observationPrivateText]int{"synthetic-key": 1},
@@ -65,6 +59,19 @@ func TestMarshalObservationPreservesJSONShapeOrExplicitlyTruncates(t *testing.T)
 			t.Fatalf("%T: observed %s, canonical %s", value, captured, want)
 		}
 	}
+}
+
+// Construct deliberately invalid field metadata dynamically, so go vet still
+// checks real application structs rather than flagging this negative fixture.
+func ambiguousObservationFields(firstTag, first, second string) any {
+	typ := reflect.StructOf([]reflect.StructField{
+		{Name: "First", Type: reflect.TypeOf(""), Tag: reflect.StructTag(`json:"` + firstTag + `"`)},
+		{Name: "Second", Type: reflect.TypeOf(""), Tag: reflect.StructTag(`json:"x"`)},
+	})
+	value := reflect.New(typ).Elem()
+	value.Field(0).SetString(first)
+	value.Field(1).SetString(second)
+	return value.Interface()
 }
 
 func TestMarshalObservationRejectsInvalidStandardTime(t *testing.T) {
