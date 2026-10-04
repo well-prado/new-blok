@@ -490,12 +490,20 @@ func TestPrincipalIsPersistedAndPartOfRequestIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var seen trigger.Principal
-	if _, err := queue.ProcessOnce(context.Background(), func(_ context.Context, _ Tx, job Job) error { seen = job.Principal; return nil }); err != nil {
-		t.Fatal(err)
+	// Jobs enqueued within one clock step tie on created_at and are claimed
+	// in job_id order, not submission order; Windows' clock steps in
+	// milliseconds, so the test must not assume which comes first.
+	seen := map[string]trigger.Principal{}
+	for range 2 {
+		if _, err := queue.ProcessOnce(context.Background(), func(_ context.Context, _ Tx, job Job) error { seen[job.RequestKey] = job.Principal; return nil }); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if seen.ID != owner.ID || len(seen.Roles) != 1 || seen.Roles[0] != "orders" {
-		t.Fatalf("handler principal=%+v, want %+v", seen, owner)
+	if got := seen["evt-1"]; got.ID != owner.ID || len(got.Roles) != 1 || got.Roles[0] != "orders" {
+		t.Fatalf("handler principal for evt-1=%+v, want %+v", got, owner)
+	}
+	if got := seen["evt-3"]; got.ID != "multi" || len(got.Roles) != 2 {
+		t.Fatalf("handler principal for evt-3=%+v, want multi with two roles", got)
 	}
 }
 
@@ -672,10 +680,15 @@ func TestCanceledClaimWaitReportsConsumerLost(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// The two jobs may tie on created_at (Windows' clock steps in
+	// milliseconds), so whichever the first worker claims, the other is the
+	// one the canceled worker must leave untouched.
 	holding, release := make(chan struct{}), make(chan struct{})
 	first := make(chan error, 1)
+	var held string
 	go func() {
-		_, err := queue.ProcessOnce(ctx, func(context.Context, Tx, Job) error {
+		_, err := queue.ProcessOnce(ctx, func(_ context.Context, _ Tx, job Job) error {
+			held = job.RequestKey
 			close(holding)
 			<-release
 			return nil
@@ -695,7 +708,11 @@ func TestCanceledClaimWaitReportsConsumerLost(t *testing.T) {
 	if err := <-first; err != nil {
 		t.Fatal(err)
 	}
-	if job, err := queue.Get(ctx, "waiting"); err != nil || job.State != StatePending || job.Attempt != 0 {
+	untouched := "waiting"
+	if held == "waiting" {
+		untouched = "held"
+	}
+	if job, err := queue.Get(ctx, untouched); err != nil || job.State != StatePending || job.Attempt != 0 {
 		t.Fatalf("the canceled claim left %+v %v", job, err)
 	}
 }

@@ -491,17 +491,7 @@ func atomicWrite(path string, data []byte, mode os.FileMode) error {
 	if err := temp.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tempPath, absolute); err != nil {
-		return err
-	}
-	parent, err := os.Open(dir)
-	if err == nil {
-		defer parent.Close()
-		if err := parent.Sync(); err != nil {
-			return err
-		}
-	}
-	return nil
+	return replaceFile(tempPath, absolute)
 }
 
 func readBounded(path string, limit int64) ([]byte, error) {

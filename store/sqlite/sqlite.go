@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
+	"strings"
 
 	"github.com/well-prado/new-blok/store"
 	driver "modernc.org/sqlite"
@@ -96,9 +98,33 @@ func dsn(path string) string {
 	}
 	return (&url.URL{
 		Scheme:   "file",
-		Path:     path,
+		Path:     uriPath(path),
 		RawQuery: "_busy_timeout=5000&_journal_mode=WAL&_synchronous=FULL&_foreign_keys=ON",
 	}).String()
+}
+
+// uriPath turns a filesystem path into the path of a SQLite file: URI. It
+// must be absolute with forward slashes; a Windows drive path also gains a
+// leading slash (file:///C:/data/app.db). Otherwise "C:\data" or a relative
+// "app.db" lands in the URI's authority and SQLite refuses to open it.
+func uriPath(path string) string {
+	if goruntime.GOOS == "windows" {
+		// An extended-length prefix would turn into a literal "/?/" path
+		// segment; SQLite applies long-path handling itself.
+		if unc, ok := strings.CutPrefix(path, `\\?\UNC\`); ok {
+			path = `\\` + unc
+		} else {
+			path = strings.TrimPrefix(path, `\\?\`)
+		}
+	}
+	if absolute, err := filepath.Abs(path); err == nil {
+		path = absolute
+	}
+	path = filepath.ToSlash(path)
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return path
 }
 
 type connection struct {

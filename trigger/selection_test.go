@@ -54,6 +54,9 @@ func dependencies(t *testing.T, name string) map[string]int {
 func build(t *testing.T, name string) string {
 	t.Helper()
 	binary := filepath.Join(t.TempDir(), name)
+	if runtime.GOOS == "windows" {
+		binary += ".exe"
+	}
 	if output, err := exec.Command(goTool(t), "build", "-o", binary, "./testdata/selection/"+name).CombinedOutput(); err != nil {
 		t.Fatalf("go build %s: %v\n%s", name, err, output)
 	}
