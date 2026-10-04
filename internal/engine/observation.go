@@ -19,9 +19,10 @@ const (
 )
 
 var (
-	observationTimeType   = reflect.TypeOf(time.Time{})
-	observationNumberType = reflect.TypeOf(json.Number(""))
-	observationRawType    = reflect.TypeOf(json.RawMessage(nil))
+	observationTimeType      = reflect.TypeOf(time.Time{})
+	observationNumberType    = reflect.TypeOf(json.Number(""))
+	observationRawType       = reflect.TypeOf(json.RawMessage(nil))
+	observationMarshalerType = reflect.TypeOf((*json.Marshaler)(nil)).Elem()
 )
 
 type observationBudget struct {
@@ -78,6 +79,11 @@ func (b *observationBudget) capture(value reflect.Value, depth int) (any, bool) 
 		}
 		return append(json.RawMessage(nil), value.Bytes()...), true
 	}
+	// Custom JSON representations cannot be reconstructed without invoking
+	// application code. Mark them explicitly instead of inventing a shape.
+	if value.Type().Implements(observationMarshalerType) || reflect.PointerTo(value.Type()).Implements(observationMarshalerType) {
+		return nil, false
+	}
 
 	switch value.Kind() {
 	case reflect.Bool:
@@ -103,6 +109,9 @@ func (b *observationBudget) capture(value reflect.Value, depth int) (any, bool) 
 		}
 		return value.Float(), true
 	case reflect.Slice, reflect.Array:
+		if value.Kind() == reflect.Slice && value.IsNil() {
+			return nil, b.charge(4)
+		}
 		if value.Type().Elem().Kind() == reflect.Uint8 {
 			if value.Len() > b.remaining/2 {
 				return nil, false
@@ -158,6 +167,11 @@ func (b *observationBudget) capture(value reflect.Value, depth int) (any, bool) 
 		typ := value.Type()
 		for index := 0; index < value.NumField(); index++ {
 			field := typ.Field(index)
+			// encoding/json promotes anonymous fields and resolves collisions.
+			// This bounded walker does not implement that selection algorithm.
+			if field.Anonymous {
+				return nil, false
+			}
 			if field.PkgPath != "" {
 				continue
 			}
@@ -168,7 +182,11 @@ func (b *observationBudget) capture(value reflect.Value, depth int) (any, bool) 
 			if name == "" {
 				name = field.Name
 			}
-			if options == "omitempty" && value.Field(index).IsZero() {
+			optionSet := "," + options + ","
+			if strings.Contains(optionSet, ",string,") || strings.Contains(optionSet, ",omitzero,") {
+				return nil, false
+			}
+			if strings.Contains(optionSet, ",omitempty,") && observationEmpty(value.Field(index)) {
 				continue
 			}
 			if _, ok := b.captureString(name); !ok {
@@ -184,6 +202,18 @@ func (b *observationBudget) capture(value reflect.Value, depth int) (any, bool) 
 	default:
 		return nil, false
 	}
+}
+
+func observationEmpty(value reflect.Value) bool {
+	switch value.Kind() {
+	case reflect.Array, reflect.Map, reflect.Slice, reflect.String:
+		return value.Len() == 0
+	case reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64, reflect.Interface, reflect.Pointer:
+		return value.IsZero()
+	}
+	return false
 }
 
 func (b *observationBudget) captureString(value string) (any, bool) {

@@ -37,6 +37,10 @@ Observer payload capture is also bounded before serialization: each input or
 output is limited to 32 KiB, 8,192 visited values, and 32 nested levels. Larger
 or unsupported values become `{"$truncated":true}`. Capture structurally copies
 JSON-compatible fields and does not invoke caller-defined `MarshalJSON` methods.
+Custom marshalers, anonymous embedded fields, and `string`/`omitzero` JSON tags
+are explicitly truncated rather than approximated. Ordinary nil slices retain
+JSON null and `omitempty` retains standard empty-collection semantics. These
+capture limits affect diagnostic snapshots only, never business values.
 
 `inspect.Recorder` is a process-local development projection. It authorizes by
 exact principal, returns the same not-found result for unknown and unauthorized
