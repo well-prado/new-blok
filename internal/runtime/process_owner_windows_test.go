@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -161,6 +162,78 @@ func TestConsoleBreakDoesNotReachWorker(t *testing.T) {
 	}
 }
 
+var (
+	kernel32           = windows.NewLazySystemDLL("kernel32.dll")
+	procIsProcessInJob = kernel32.NewProc("IsProcessInJob")
+	procSuspendThread  = kernel32.NewProc("SuspendThread")
+)
+
+// processSuspended reports whether every thread of pid is suspended. Each
+// thread is suspended once more to read its previous count, then resumed.
+func processSuspended(pid uint32) (bool, error) {
+	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPTHREAD, 0)
+	if err != nil {
+		return false, err
+	}
+	defer windows.CloseHandle(snapshot)
+	threads, suspended := 0, true
+	entry := windows.ThreadEntry32{Size: uint32(unsafe.Sizeof(windows.ThreadEntry32{}))}
+	for err = windows.Thread32First(snapshot, &entry); err == nil; err = windows.Thread32Next(snapshot, &entry) {
+		if entry.OwnerProcessID != pid {
+			continue
+		}
+		thread, err := windows.OpenThread(windows.THREAD_SUSPEND_RESUME, false, entry.ThreadID)
+		if err != nil {
+			return false, err
+		}
+		previous, _, callErr := procSuspendThread.Call(uintptr(thread))
+		if uint32(previous) == 0xFFFFFFFF {
+			windows.CloseHandle(thread)
+			return false, callErr
+		}
+		_, _ = windows.ResumeThread(thread)
+		windows.CloseHandle(thread)
+		threads++
+		suspended = suspended && previous > 0
+	}
+	if !errors.Is(err, windows.ERROR_NO_MORE_FILES) {
+		return false, err
+	}
+	if threads == 0 {
+		return false, errors.New("process has no threads")
+	}
+	return suspended, nil
+}
+
+// openGrandchild holds the grandchild open, so its PID cannot be reused by
+// another process while the test inspects or terminates it.
+func openGrandchild(t *testing.T, pid int) windows.Handle {
+	t.Helper()
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.SYNCHRONIZE|windows.PROCESS_TERMINATE, false, uint32(pid))
+	if err != nil {
+		t.Fatalf("open grandchild %d: %v", pid, err)
+	}
+	t.Cleanup(func() { // never leave it behind, and never kill a reused PID
+		_ = windows.TerminateProcess(h, 1)
+		_ = windows.CloseHandle(h)
+	})
+	return h
+}
+
+func inJob(t *testing.T, process, job windows.Handle) bool {
+	t.Helper()
+	var member int32
+	if ok, _, err := procIsProcessInJob.Call(uintptr(process), uintptr(job), uintptr(unsafe.Pointer(&member))); ok == 0 {
+		t.Fatalf("IsProcessInJob: %v", err)
+	}
+	return member != 0
+}
+
+func handleEnded(h windows.Handle, wait time.Duration) bool {
+	event, _ := windows.WaitForSingleObject(h, uint32(wait/time.Millisecond))
+	return event == windows.WAIT_OBJECT_0
+}
+
 // ownedChildCommand builds a worker that, as its very first action, launches
 // a long-lived grandchild and writes the grandchild's PID to the returned
 // file.
@@ -180,10 +253,11 @@ func ownedChildCommand(t *testing.T, exitEarly bool) (*exec.Cmd, string) {
 const ownershipBarrier = 3 * time.Second
 
 // A worker must not run before it is owned. The barrier holds the launch
-// between process creation and job assignment for long enough that a running
-// worker would launch its grandchild there, outside the job (#224). A worker
-// started running and assigned afterwards fails both checks: its grandchild
-// appears during the barrier, and it survives stop and release.
+// between process creation and job assignment (#224). There the worker must
+// be suspended, which is checked directly, and must not reach its first
+// action, launching a grandchild, even given ownershipBarrier to do so. Once
+// started, that grandchild must be in the job, and stop or release must end
+// it. A worker started running and assigned afterwards fails these checks.
 func TestWorkerRunsNothingBeforeItIsOwned(t *testing.T) {
 	for _, exitEarly := range []bool{false, true} {
 		name := map[bool]string{false: "stop", true: "release-after-exit"}[exitEarly]
@@ -193,8 +267,10 @@ func TestWorkerRunsNothingBeforeItIsOwned(t *testing.T) {
 			if err != nil {
 				t.Fatalf("newProcessOwner: %v", err)
 			}
-			ranEarly := false
+			var suspended, ranEarly bool
+			var suspendedErr error
 			owner.beforeAssign = func() {
+				suspended, suspendedErr = processSuspended(uint32(cmd.Process.Pid))
 				for deadline := time.Now().Add(ownershipBarrier); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
 					if raw, err := os.ReadFile(pidFile); err == nil && len(raw) > 0 {
 						ranEarly = true
@@ -206,37 +282,40 @@ func TestWorkerRunsNothingBeforeItIsOwned(t *testing.T) {
 				owner.release()
 				t.Fatalf("start: %v", err)
 			}
-			grandchild := waitForPID(t, pidFile)
-			t.Cleanup(func() { // never leave a stray process behind
-				if p, err := os.FindProcess(grandchild); err == nil {
-					_ = p.Kill()
-				}
+			t.Cleanup(func() {
 				owner.kill()
 				owner.release()
 			})
+			grandchild := openGrandchild(t, waitForPID(t, pidFile))
+			if suspendedErr != nil || !suspended {
+				t.Errorf("the worker was not suspended before it joined the job (err=%v)", suspendedErr)
+			}
 			if ranEarly {
 				t.Error("the worker ran and launched its grandchild before it joined the job")
+			}
+			if !inJob(t, grandchild, owner.job) {
+				t.Error("the worker's grandchild is not in the job")
 			}
 			if exitEarly {
 				if err := cmd.Wait(); err != nil {
 					t.Fatalf("child: %v", err)
 				}
-				if processEnded(grandchild, 200*time.Millisecond) {
+				if handleEnded(grandchild, 200*time.Millisecond) {
 					t.Fatal("grandchild ended with its parent; the test proves nothing")
 				}
 				owner.release()
-				if !processEnded(grandchild, 5*time.Second) {
-					t.Fatal("release left a grandchild launched before ownership running")
+				if !handleEnded(grandchild, 5*time.Second) {
+					t.Fatal("release left the worker's grandchild running")
 				}
 				return
 			}
 			owner.stop()
 			_ = cmd.Wait()
 			// Checked before release, which would end the job's members too.
-			ended := processEnded(grandchild, 5*time.Second)
+			ended := handleEnded(grandchild, 5*time.Second)
 			owner.release()
 			if !ended {
-				t.Fatal("stop left a grandchild launched before ownership running")
+				t.Fatal("stop left the worker's grandchild running")
 			}
 		})
 	}
@@ -267,9 +346,7 @@ func TestWorkerThatCannotBeOwnedNeverRuns(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 	if raw, err := os.ReadFile(pidFile); err == nil {
 		if pid, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil {
-			if p, err := os.FindProcess(pid); err == nil { // never leave it behind
-				_ = p.Kill()
-			}
+			openGrandchild(t, pid) // terminated at cleanup
 		}
 		t.Fatalf("the unowned worker ran and launched grandchild %s", raw)
 	}

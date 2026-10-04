@@ -72,8 +72,8 @@ func isolateWorker(cmd *exec.Cmd) {
 // assigning it afterwards would let it create children outside the job in
 // between, and those would escape stop, kill and release.
 //
-// If the process cannot be owned it is terminated while still suspended: it
-// has run nothing and created nothing, so ending it ends everything. The
+// If the process cannot be assigned or resumed it is terminated before any of
+// its code has run: it has created nothing, so ending it ends everything. The
 // returned error then wraps errProcessOwnership.
 func (o *processOwner) start(cmd *exec.Cmd) error {
 	if cmd.SysProcAttr == nil {
@@ -118,8 +118,11 @@ func (o *processOwner) own(cmd *exec.Cmd) error {
 // resumeSuspended resumes the initial thread of a process created with
 // CREATE_SUSPENDED. os/exec closes the thread handle CreateProcess returns, so
 // the thread is found by its owner. A process created suspended has exactly
-// one thread until it is resumed; finding none, or more than one, means the
-// process is not the one this owner started suspended.
+// one thread until it is resumed (the loader's threads start after); finding
+// none, or more than one (a tool injecting a thread, say), fails closed. The
+// process is held open by its os.Process, but the thread ID is not reserved:
+// the suspend count check below rejects a thread that is not the suspended
+// initial one.
 func resumeSuspended(pid uint32) error {
 	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPTHREAD, 0)
 	if err != nil {
