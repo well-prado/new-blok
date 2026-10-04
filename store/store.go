@@ -108,6 +108,34 @@ func ErrorWriteDomain(err error) (*WriteDomain, bool) {
 	return annotated.domain, true
 }
 
+// ErrorWriteDomains reports every write domain err's tree was annotated with,
+// in the order errors.As visits them. Where ErrorWriteDomain reports only the
+// first, this also reports annotations on the other branches of a joined
+// error, such as a handler that returns errors.Join of failures from two
+// stores. Within one branch the outermost annotation wins, as it does for
+// ErrorWriteDomain.
+func ErrorWriteDomains(err error) []*WriteDomain {
+	var domains []*WriteDomain
+	var visit func(error)
+	visit = func(err error) {
+		for err != nil {
+			switch e := err.(type) {
+			case *domainError:
+				domains = append(domains, e.domain)
+				return
+			case interface{ Unwrap() []error }:
+				for _, branch := range e.Unwrap() {
+					visit(branch)
+				}
+				return
+			}
+			err = errors.Unwrap(err)
+		}
+	}
+	visit(err)
+	return domains
+}
+
 type domainError struct {
 	err    error
 	domain *WriteDomain

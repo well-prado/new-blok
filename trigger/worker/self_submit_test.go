@@ -344,3 +344,91 @@ func TestHandlerDetachedSubmitToAnotherBusyStoreDefers(t *testing.T) {
 		})
 	}
 }
+
+// TestHandlerJoinedSaturationIsClassifiedByEveryDomain: a handler may join a
+// self-submit's saturation with saturation from another, genuinely busy
+// store. The busy wait on the claim's own domain makes it a nested
+// submission whichever order the failures are joined in; joined failures
+// that name only other domains remain backpressure (#207).
+func TestHandlerJoinedSaturationIsClassifiedByEveryDomain(t *testing.T) {
+	for _, scenario := range []struct {
+		name, expected string
+		join           func(self, other error) error
+	}{
+		{"other-then-self", "same-store", func(self, other error) error { return errors.Join(other, self) }},
+		{"self-then-other", "same-store", func(self, other error) error { return errors.Join(self, other) }},
+		{"other-only", "other-store-busy", func(_, other error) error {
+			return fmt.Errorf("handler: %w", errors.Join(errors.New("audit write skipped"), other))
+		}},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			expected := nestedStoreExpected(t, scenario.expected)
+			wait := 250 * time.Millisecond
+			ctx := context.Background()
+			outerDB := openSQLite(t, filepath.Join(t.TempDir(), "outer.db"))
+			otherDB := openSQLite(t, filepath.Join(t.TempDir(), "other.db"))
+			outer, err := New(ctx, outerDB, time.Now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Detached and behind a wrapper that hides the write domain, so
+			// only the saturation's annotation can identify the claim.
+			self, err := New(ctx, shortBusyDatabase{Database: outerDB, timeout: wait}, time.Now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			other, err := New(ctx, forwardingShortBusyDatabase{shortBusyDatabase{Database: otherDB, timeout: wait}}, time.Now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := outer.Enqueue(ctx, EnqueueRequest{RequestKey: "outer", Kind: "outer", Payload: []byte(`{}`), MaxAttempts: 3}); err != nil {
+				t.Fatal(err)
+			}
+			holding, release, held := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+			go func() {
+				held <- otherDB.WithTx(ctx, func(tx *sql.Tx) error {
+					if _, err := tx.ExecContext(ctx, `UPDATE worker_jobs SET updated_at = updated_at`); err != nil {
+						return err
+					}
+					close(holding)
+					<-release
+					return nil
+				})
+			}()
+			<-holding
+			var released sync.Once
+			t.Cleanup(func() { released.Do(func() { close(release) }) })
+			var selfErr, otherErr error
+			processed, err := processBounded(outer, func(context.Context, Tx, Job) error {
+				_, otherErr = other.Submit(context.Background(), trigger.Submission{Key: "other", Kind: "nested", Payload: []byte(`{}`)})
+				if scenario.expected == "same-store" {
+					_, selfErr = self.Submit(context.Background(), trigger.Submission{Key: "self", Kind: "nested", Payload: []byte(`{}`)})
+				}
+				return scenario.join(selfErr, otherErr)
+			})
+			released.Do(func() { close(release) })
+			if err := <-held; err != nil {
+				t.Fatal(err)
+			}
+			if err != nil || !processed {
+				t.Fatalf("processed=%v err=%v", processed, err)
+			}
+			claimed, _ := store.WriteDomainOf(outerDB)
+			if domain, named := store.ErrorWriteDomain(otherErr); !errors.Is(otherErr, trigger.ErrSaturated) || !named || store.SameWriteDomain(domain, claimed) {
+				t.Fatalf("other-store submission returned %v naming %v; want saturation on another domain", otherErr, domain)
+			}
+			if scenario.expected == "same-store" {
+				if domain, named := store.ErrorWriteDomain(selfErr); !errors.Is(selfErr, trigger.ErrSaturated) || !named || !store.SameWriteDomain(domain, claimed) {
+					t.Fatalf("self-submission returned %v naming %v; want saturation on the claim's domain", selfErr, domain)
+				}
+			}
+			job, err := outer.Get(ctx, "outer")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if job.State != expected.State || job.Attempt != expected.Attempt || job.Deferrals != expected.Deferrals || job.Error != expected.JobError {
+				t.Fatalf("outer job=%+v; want state=%s attempt=%d deferrals=%d error=%q", job, expected.State, expected.Attempt, expected.Deferrals, expected.JobError)
+			}
+		})
+	}
+}

@@ -55,9 +55,11 @@ needs, and returns saturation that names the write domain it waited on
 (#207). The store names it: SQLite annotates its busy errors with its domain
 (`store.WithWriteDomain`), which survives wrappers that pass errors through;
 `Queue.Enqueue` adds its own queue's domain when the cause carries none.
-`ProcessOnce` compares that domain (`store.ErrorWriteDomain`) with its claim's
-while the claim is still held. A match means the claim itself was the
-contention, so deferring would only repeat the wait: the job fails as
+`ProcessOnce` compares every domain the handler's error names
+(`store.ErrorWriteDomains`, which also reads each branch of an `errors.Join`)
+with its claim's while the claim is still held. Checking only the first would
+let a handler that joins another store's saturation ahead of its own hide the
+self-submit. A match means the claim itself was the contention, so deferring would only repeat the wait: the job fails as
 `worker.ErrNestedSubmission`, is not retried, and dead-letters as `nested
 submission to claimed store; use worker.Tx for atomic writes`. Saturation
 naming a different domain, or no domain, is backpressure and still defers.
@@ -192,7 +194,8 @@ is never parsed before verification.
 | `store.WriteDomainProvider` and `worker.ErrNestedSubmission` | additive | Stores/wrappers may expose lock identity; handlers should use `worker.Tx` for same-store atomic writes |
 | Worker handler receives saturation from another store | behavioral | The job is deferred within its existing deferral budget without consuming an attempt |
 | `store.WithWriteDomain` / `store.ErrorWriteDomain`; SQLite busy errors and worker saturation name their write domain | additive (error chains) | `errors.Is` on `store.ErrBusy` / `trigger.ErrSaturated` keeps working; other stores may annotate their busy errors |
-| Worker handler returns saturation naming its own claim's domain | behavioral | The job fails as `worker.ErrNestedSubmission` after one busy wait instead of being deferred to `deferral_budget_exhausted` |
+| `store.ErrorWriteDomains` reports the outermost annotation on every branch of an error tree | additive | `store.ErrorWriteDomain` is unchanged and still reports the first |
+| Worker handler returns saturation naming its own claim's domain, alone or joined with other failures in any order | behavioral | The job fails as `worker.ErrNestedSubmission` after one busy wait instead of being deferred to `deferral_budget_exhausted` |
 | SQLite `:memory:` uses the memdb VFS instead of shared cache | behavioral | Same shared database per process; writer conflicts are `store.ErrBusy` within the busy timeout instead of an unbounded wait |
 | `principal_json` column | schema | added by `worker.New` |
 | New package `trigger/webhook` | additive | none |
