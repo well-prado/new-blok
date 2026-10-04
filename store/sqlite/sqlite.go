@@ -34,6 +34,10 @@ const (
 	busyTimeout = 5000
 )
 
+// dsn uses one named shared-cache URI for every :memory: open, so each handle
+// participates in the same SQLite writer domain.
+var sharedMemoryWriteDomain = store.NewWriteDomain()
+
 // Backend opens SQLite databases with the durability settings required by the
 // journal. It is the only package that imports the SQLite driver.
 type Backend struct{}
@@ -59,7 +63,16 @@ func (Backend) Open(ctx context.Context, path string) (store.Database, error) {
 		_ = database.Close()
 		return nil, err
 	}
-	return &connection{database: database}, nil
+	writeDomain := sharedMemoryWriteDomain
+	if path != ":memory:" {
+		file, err := os.Stat(path)
+		if err != nil {
+			_ = database.Close()
+			return nil, fmt.Errorf("sqlite: identify write domain: %w", err)
+		}
+		writeDomain = store.NewFileWriteDomain(file)
+	}
+	return &connection{database: database, writeDomain: writeDomain}, nil
 }
 
 func configure(ctx context.Context, database *sql.DB) error {
@@ -90,9 +103,12 @@ func dsn(path string) string {
 
 type connection struct {
 	database     *sql.DB
+	writeDomain  *store.WriteDomain
 	beforeCommit func()
 	afterCommit  func()
 }
+
+func (c *connection) WriteDomain() *store.WriteDomain { return c.writeDomain }
 
 func (c *connection) WithTx(ctx context.Context, fn func(*sql.Tx) error) error {
 	if fn == nil {
