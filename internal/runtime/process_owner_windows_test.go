@@ -280,6 +280,12 @@ func TestWorkerRunsNothingBeforeItIsOwned(t *testing.T) {
 			}
 			if err := owner.start(cmd); err != nil {
 				owner.release()
+				// A worker that ran early may have left a grandchild.
+				if raw, readErr := os.ReadFile(pidFile); readErr == nil {
+					if pid, convErr := strconv.Atoi(strings.TrimSpace(string(raw))); convErr == nil {
+						openGrandchild(t, pid)
+					}
+				}
 				t.Fatalf("start: %v", err)
 			}
 			t.Cleanup(func() {
