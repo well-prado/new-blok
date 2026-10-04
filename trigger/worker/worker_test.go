@@ -977,6 +977,81 @@ func TestHandlerSubmittingToAnotherBusyStoreDefers(t *testing.T) {
 	}
 }
 
+func TestHandlerSubmittingAcrossSharedMemoryHandlesFails(t *testing.T) {
+	expected := nestedStoreExpected(t, "same-store")
+	ctx := context.Background()
+	first, err := (sqlite.Backend{}).Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := (sqlite.Backend{}).Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	outer, err := New(ctx, first, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := New(ctx, second, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := outer.RegisterKind("shared-memory", []byte(`{"type":"object"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := other.RegisterKind("shared-memory", []byte(`{"type":"object"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.WithTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `CREATE TABLE nested_memory_effects (id TEXT PRIMARY KEY)`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := outer.Enqueue(ctx, EnqueueRequest{RequestKey: "outer-memory", Kind: "shared-memory", Payload: []byte(`{}`), MaxAttempts: 1}); err != nil {
+		t.Fatal(err)
+	}
+	var nested error
+	started := time.Now()
+	processed, err := outer.ProcessOnce(ctx, func(ctx context.Context, tx Tx, _ Job) error {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO nested_memory_effects VALUES ('rolled-back')`); err != nil {
+			return err
+		}
+		_, nested = other.Submit(ctx, trigger.Submission{Key: "inner-memory", Kind: "shared-memory", Payload: []byte(`{}`)})
+		return nested
+	})
+	if expected.ProcessError != "none" || err != nil || !processed {
+		t.Fatalf("processed=%v err=%v", processed, err)
+	}
+	if !errors.Is(nested, ErrNestedSubmission) || time.Since(started) >= time.Second {
+		t.Fatalf("shared-memory nested submission returned %v after %v; want immediate worker.ErrNestedSubmission", nested, time.Since(started))
+	}
+	job, err := outer.Get(ctx, "outer-memory")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.State != expected.State || job.Attempt != expected.Attempt || job.Deferrals != expected.Deferrals || job.Error != expected.JobError {
+		t.Fatalf("outer job=%+v; fixture wants state=%s attempt=%d deferrals=%d error=%q", job, expected.State, expected.Attempt, expected.Deferrals, expected.JobError)
+	}
+	if _, err := other.Get(ctx, "inner-memory"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("the rejected nested submission was persisted: %v", err)
+	}
+	var effects int
+	if err := second.WithTx(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM nested_memory_effects`).Scan(&effects)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if effects != expected.HandlerEffectRows {
+		t.Fatalf("shared-memory handler effects=%d; fixture wants %d", effects, expected.HandlerEffectRows)
+	}
+	if submissions := nestedSubmissionRows(t, second, "inner-memory"); submissions != expected.NestedSubmissionRows {
+		t.Fatalf("shared-memory nested submissions=%d; fixture wants %d", submissions, expected.NestedSubmissionRows)
+	}
+}
+
 // TestHandlerWritesNeverEscapeTheClaim: a consumer is canceled while its
 // handler's statement runs, and the handler, carelessly, ignores that
 // statement's error and writes again. SQLite rolls the whole transaction

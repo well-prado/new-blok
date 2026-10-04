@@ -42,9 +42,10 @@ for atomic writes; this is a failed handler result, not saturation to defer.
 
 The optional `store.WriteDomainProvider` capability supplies lock identity.
 SQLite compares file-backed domains using the filesystem's same-file identity,
-including separate handles to the same database file. Wrappers that share a
-write lock must forward the underlying token. When a wrapper hides this
-capability, or trusted handler code discards the supplied context (for example
+including separate handles and filesystem aliases to the same database file;
+its existing shared `:memory:` URI uses one stable domain token across opens.
+Wrappers that share a write lock must forward the underlying token. When a
+wrapper hides this capability, or trusted handler code discards the supplied context (for example
 by submitting with `context.Background()`), the queue cannot safely infer the
 relationship: that nested write follows the ordinary store busy timeout and
 its saturation behavior. Direct database writes that bypass `Queue.Enqueue`
