@@ -52,10 +52,14 @@ Do not run the parity/recovery commands while a parent-owned full gate is live;
 coordinate their execution window first. On 2026-10-04, with the gate window
 cleared, the migration test, full focused parity package command, and focused
 process-kill worker test and historical limited performance sampler passed on
-the recorded macOS/arm64 toolchain. The new persistent-process and
-durable-recovery samplers above have not yet run; they remain pending final
-gate coordination and, for recovery, an explicitly supplied disposable
-loopback PostgreSQL database.
+the recorded macOS/arm64 toolchain. An initial persistent-process sampler
+attempt exited before collecting samples: the old harness did not await the
+published async `workflow()` builder, so `Configuration.init()` fell through to
+the filesystem resolver and could not find the in-memory workflow. The harness
+now awaits that builder for its persistent HTTP and idle-worker applications;
+the corrected sampler and durable-recovery distributions remain unmeasured
+pending final gate coordination and, for recovery, the disposable loopback
+PostgreSQL database.
 The worker retry path uses the actual old `WorkerTrigger`/`InMemoryAdapter`
 and new SQLite queue plus real native engine.
 

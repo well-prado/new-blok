@@ -113,7 +113,7 @@ if (input.mode === "durable-worker-produce") {
 			return { status: response.status, body: await response.json() };
 		},
 	});
-	const application = workflow("parity-persistent-quote", {
+	const application = await workflow("parity-persistent-quote", {
 		version: "1.0.0",
 		trigger: http.post("/parity/quote"),
 	}, (req) => step("provider", providerNode, req.body));
@@ -175,7 +175,7 @@ if (input.mode === "durable-worker-produce") {
 		output: z.object({ ok: z.boolean() }),
 		async execute() { return { ok: true }; },
 	});
-	const idleWorkflow = workflow("parity-worker-idle", {
+	const idleWorkflow = await workflow("parity-worker-idle", {
 		version: "1.0.0",
 		trigger: { worker: { queue: "parity-idle", concurrency: 1, retries: 0 } },
 	}, () => step("probe", idleNode, {}));
