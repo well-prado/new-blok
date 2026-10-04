@@ -1,0 +1,7 @@
+{
+  "unauthorizedError": "signal_unauthorized",
+  "signalWinnerState": "signaled",
+  "timerWinnerState": "timed_out",
+  "expectedTransitionWinners": 1,
+  "expectedRunEffects": 1
+}
