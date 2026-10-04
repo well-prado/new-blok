@@ -1052,6 +1052,93 @@ func TestHandlerSubmittingAcrossSharedMemoryHandlesFails(t *testing.T) {
 	}
 }
 
+type rollbackNextDatabase struct {
+	store.Database
+	rollbackNext bool
+}
+
+func (database *rollbackNextDatabase) WriteDomain() *store.WriteDomain {
+	domain, _ := store.WriteDomainOf(database.Database)
+	return domain
+}
+
+func (database *rollbackNextDatabase) WithTx(ctx context.Context, fn func(*sql.Tx) error) error {
+	rollback := database.rollbackNext
+	database.rollbackNext = false
+	return database.Database.WithTx(ctx, func(tx *sql.Tx) error {
+		if err := fn(tx); err != nil {
+			return err
+		}
+		if rollback {
+			return errors.New("worker test: force claim rollback")
+		}
+		return nil
+	})
+}
+
+func TestClaimDiagnosticExpiresAfterTransaction(t *testing.T) {
+	for _, rollback := range []bool{false, true} {
+		name := "commit"
+		if rollback {
+			name = "rollback"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			database, err := (sqlite.Backend{}).Open(ctx, filepath.Join(t.TempDir(), "worker.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			var queueDB store.Database = database
+			var rollbackDB *rollbackNextDatabase
+			if rollback {
+				rollbackDB = &rollbackNextDatabase{Database: database}
+				queueDB = rollbackDB
+			}
+			queue, err := New(ctx, queueDB, time.Now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := queue.RegisterKind("lifecycle", []byte(`{"type":"object"}`)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := queue.Enqueue(ctx, EnqueueRequest{RequestKey: "claimed", Kind: "lifecycle", Payload: []byte(`{}`)}); err != nil {
+				t.Fatal(err)
+			}
+			if rollback {
+				rollbackDB.rollbackNext = true
+			}
+			var retained context.Context
+			processed, processErr := queue.ProcessOnce(ctx, func(handlerCtx context.Context, _ Tx, _ Job) error {
+				retained = handlerCtx
+				return nil
+			})
+			if rollback {
+				if processErr == nil || processed {
+					t.Fatalf("ProcessOnce did not report the forced rollback: processed=%v err=%v", processed, processErr)
+				}
+			} else if processErr != nil || !processed {
+				t.Fatalf("ProcessOnce failed: processed=%v err=%v", processed, processErr)
+			}
+			claimedJob, err := queue.Get(ctx, "claimed")
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantState, wantAttempt := StateCompleted, 1
+			if rollback {
+				wantState, wantAttempt = StatePending, 0
+			}
+			if claimedJob.State != wantState || claimedJob.Attempt != wantAttempt {
+				t.Fatalf("claim after %s: state=%s attempt=%d; want state=%s attempt=%d", name, claimedJob.State, claimedJob.Attempt, wantState, wantAttempt)
+			}
+			result, err := queue.Enqueue(retained, EnqueueRequest{RequestKey: "after-claim", Kind: "lifecycle", Payload: []byte(`{}`)})
+			if err != nil || !result.Accepted {
+				t.Fatalf("same-store enqueue with retained post-transaction context: accepted=%v err=%v; want accepted after %s", result.Accepted, err, name)
+			}
+		})
+	}
+}
+
 // TestHandlerWritesNeverEscapeTheClaim: a consumer is canceled while its
 // handler's statement runs, and the handler, carelessly, ignores that
 // statement's error and writes again. SQLite rolls the whole transaction

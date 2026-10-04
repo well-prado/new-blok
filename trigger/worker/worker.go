@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -425,8 +426,8 @@ func (q *Queue) RegisterKind(kind string, inputSchema []byte) error {
 
 func (q *Queue) Enqueue(ctx context.Context, request EnqueueRequest) (EnqueueResult, error) {
 	if q.writeDomain != nil {
-		claimed, ok := ctx.Value(claimedWriteDomainKey{}).(*store.WriteDomain)
-		if ok && store.SameWriteDomain(claimed, q.writeDomain) {
+		claimed, ok := ctx.Value(claimedWriteDomainKey{}).(*claimedWriteDomain)
+		if ok && claimed.active.Load() && store.SameWriteDomain(claimed.domain, q.writeDomain) {
 			return EnqueueResult{}, ErrNestedSubmission
 		}
 	}
@@ -512,6 +513,11 @@ var ErrConsumerLost = errors.New("worker: consumer lost before acknowledgment")
 // The value is attached only to the handler's trusted native context.
 type claimedWriteDomainKey struct{}
 
+type claimedWriteDomain struct {
+	domain *store.WriteDomain
+	active atomic.Bool
+}
+
 // ProcessOnce claims and processes one job. The handler and acknowledgment are
 // in the same transaction, so a crash rolls back both the business write and
 // the delivery acknowledgment. A handler must not perform unknown external
@@ -541,6 +547,12 @@ func (q *Queue) ProcessOnce(ctx context.Context, handler Handler) (bool, error) 
 	txCtx := context.WithoutCancel(ctx)
 	processed := false
 	var lost, died Job
+	var activeDomain *claimedWriteDomain
+	defer func() {
+		if activeDomain != nil {
+			activeDomain.active.Store(false)
+		}
+	}()
 	err := q.withTx(txCtx, func(tx *sql.Tx) error {
 		job, lease, err := q.claim(ctx, tx)
 		if errors.Is(err, ErrNotFound) {
@@ -569,7 +581,9 @@ func (q *Queue) ProcessOnce(ctx context.Context, handler Handler) (bool, error) 
 		}
 		handlerCtx := ctx
 		if q.writeDomain != nil {
-			handlerCtx = context.WithValue(ctx, claimedWriteDomainKey{}, q.writeDomain)
+			activeDomain = &claimedWriteDomain{domain: q.writeDomain}
+			activeDomain.active.Store(true)
+			handlerCtx = context.WithValue(ctx, claimedWriteDomainKey{}, activeDomain)
 		}
 		handlerErr := handler(handlerCtx, Tx{claim: claimed}, job)
 		if ctx.Err() != nil {
@@ -617,6 +631,11 @@ func (q *Queue) ProcessOnce(ctx context.Context, handler Handler) (bool, error) 
 		_, err = claimed.exec(txCtx, `UPDATE worker_jobs SET state = ?, available_at = ?, lease_until = NULL, error_text = ?, updated_at = ? WHERE job_id = ? AND state = ?`, state, available, message, q.now(), job.ID, StateProcessing)
 		return ended(err)
 	})
+	if activeDomain != nil {
+		// The transaction has committed or rolled back; retained handler
+		// contexts no longer represent a held write lock.
+		activeDomain.active.Store(false)
+	}
 	if errors.Is(err, ErrConsumerLost) && lost.ID != "" {
 		if deferErr := q.deferLost(txCtx, lost); deferErr != nil {
 			err = errors.Join(err, deferErr)
