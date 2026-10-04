@@ -142,11 +142,17 @@ func newFixture(t *testing.T, config sse.HubConfig, configure func(*sse.Endpoint
 
 func newFixtureWithListener(t *testing.T, config sse.HubConfig, configure func(*sse.Endpoint), listener net.Listener) *fixture {
 	t.Helper()
+	return newFixtureWith(t, app.Config{}, config, configure, listener)
+}
+
+// newFixtureWith is newFixtureWithListener with its application configured.
+func newFixtureWith(t *testing.T, appConfig app.Config, config sse.HubConfig, configure func(*sse.Endpoint), listener net.Listener) *fixture {
+	t.Helper()
 	hub, err := sse.NewHub(config)
 	if err != nil {
 		t.Fatal(err)
 	}
-	application, err := app.New(app.Config{})
+	application, err := app.New(appConfig)
 	if err != nil {
 		t.Fatal(err)
 	}

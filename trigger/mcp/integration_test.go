@@ -856,6 +856,125 @@ func TestShutdownWaitsForCallsThenClosesSessions(t *testing.T) {
 	}
 }
 
+// answerProbe watches one session on the server side of the wire. It
+// orders two events: the flush that puts a tools/call answer on the POST
+// carrying the call, and the end of the session's standing GET stream.
+type answerProbe struct {
+	seq      atomic.Int64
+	answered atomic.Int64
+	getEnded atomic.Int64
+	ended    chan struct{}
+	once     sync.Once
+}
+
+func newAnswerProbe() *answerProbe { return &answerProbe{ended: make(chan struct{})} }
+
+func (p *answerProbe) wrap(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.Method {
+		case http.MethodGet:
+			next.ServeHTTP(writer, request)
+			p.getEnded.CompareAndSwap(0, p.seq.Add(1))
+			p.once.Do(func() { close(p.ended) })
+			return
+		case http.MethodPost:
+			body, _ := io.ReadAll(request.Body)
+			request.Body = io.NopCloser(bytes.NewReader(body))
+			if strings.Contains(string(body), `"method":"tools/call"`) {
+				writer = &answerWriter{ResponseWriter: writer, probe: p}
+			}
+		}
+		next.ServeHTTP(writer, request)
+	})
+}
+
+// answerWriter records the flush that follows the write of an answer.
+type answerWriter struct {
+	http.ResponseWriter
+	probe  *answerProbe
+	answer bool
+}
+
+func (w *answerWriter) Write(data []byte) (int, error) {
+	if bytes.Contains(data, []byte(`"result"`)) {
+		w.answer = true
+	}
+	return w.ResponseWriter.Write(data)
+}
+
+func (w *answerWriter) Flush() {
+	if err := http.NewResponseController(w.ResponseWriter).Flush(); err == nil && w.answer {
+		w.probe.answered.CompareAndSwap(0, w.probe.seq.Add(1))
+	}
+}
+
+func (w *answerWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// TestShutdownAnswersTheCallInFlight starts Shutdown while a call is in
+// flight, then lets the call finish (#197). The SDK writes the answer after
+// the tool handler returns; the test holds it there briefly, so a Shutdown
+// that closes the session as soon as the call ends always beats it. On the
+// wire, the answer must be written and flushed before Shutdown ends the
+// session's standing stream, and the client must get it. The client
+// reconnects its standing stream as the SDK does by default: one that
+// treats the end of that stream as fatal at once can still fail the call,
+// because it reads the stream's end and the answer on separate
+// connections, in no fixed order (ADR 0014).
+func TestShutdownAnswersTheCallInFlight(t *testing.T) {
+	const trials = 100
+	unwritten, late, lost := 0, 0, 0
+	for trial := range trials {
+		probe := newAnswerProbe()
+		r := newWrappedRig(t, nil, probe.wrap)
+		client := sdk.NewClient(&sdk.Implementation{Name: "integration-client", Version: "1.0.0"}, nil)
+		transport := &sdk.StreamableClientTransport{Endpoint: r.endpoint, HTTPClient: &http.Client{Transport: recordingClient{token: "alice", log: r.wire}}}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		session, err := client.Connect(ctx, transport, nil)
+		cancel()
+		if err != nil {
+			t.Fatalf("trial %d: connect: %v", trial, err)
+		}
+		tmcp.HoldAnswers(r.adapter, 5*time.Millisecond)
+		done := make(chan error, 1)
+		go func() {
+			result, err := call(session, "demo.block_v1.0.0", map[string]any{}, nil)
+			if err == nil && result.IsError {
+				err = errors.New(toolCode(result))
+			}
+			done <- err
+		}()
+		<-r.catalog.started
+		stopped := make(chan error, 1)
+		go func() { stopped <- r.adapter.Shutdown(context.Background()) }()
+		close(r.catalog.release)
+		if err := <-done; err != nil {
+			lost++
+			t.Logf("trial %d: the client did not get the answer: %v", trial, err)
+		}
+		if err := <-stopped; err != nil {
+			t.Fatalf("trial %d: shutdown: %v", trial, err)
+		}
+		select {
+		case <-probe.ended:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("trial %d: Shutdown left the session open", trial)
+		}
+		switch answered, ended := probe.answered.Load(), probe.getEnded.Load(); {
+		case answered == 0:
+			unwritten++
+			t.Logf("trial %d: the answer was never written", trial)
+		case answered > ended:
+			late++
+			t.Logf("trial %d: the session's stream ended before the answer was written", trial)
+		}
+		_ = session.Close()
+		r.stop()
+	}
+	if unwritten+late+lost != 0 {
+		t.Fatalf("of %d calls in flight at Shutdown: %d answers never written, %d written after the session's stream ended, %d not received", trials, unwritten, late, lost)
+	}
+}
+
 // TestEvictedViewsSessionsCloseOnShutdown opens more principals than the
 // view cache holds and requires Shutdown to close every session.
 func TestEvictedViewsSessionsCloseOnShutdown(t *testing.T) {

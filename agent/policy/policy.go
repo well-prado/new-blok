@@ -188,7 +188,7 @@ func (p *Policy) Invoke(ctx context.Context, target Target, call Invocation) ([]
 	// Recheck lifetime/cancellation after the durable dispatch barrier and before
 	// executing the provider. Child invocations receive only this target's scope.
 	if err := approval.Authorize(ctx, p.cfg.Approvals, p.cfg.Clock(), req); err != nil {
-		return uncertain(err)
+		return uncertain(externalError(err, ErrExecution))
 	}
 	if err := ctx.Err(); err != nil {
 		return uncertain(err)
@@ -216,10 +216,12 @@ func (p *Policy) Invoke(ctx context.Context, target Target, call Invocation) ([]
 		return uncertain(err)
 	}
 	if err := approval.Authorize(ctx, p.cfg.Approvals, p.cfg.Clock(), req); err != nil {
-		return uncertain(err)
+		return uncertain(externalError(err, ErrExecution))
 	}
+	// Past the dispatch barrier a store error, even a busy one, leaves the
+	// effect uncertain: it must never read as retryable saturation (#190).
 	if err := p.cfg.Journal.CommitEffect(ctx, journal.EffectCommit{OperationKey: op.Key, AttemptID: attempt.ID, Result: output}); err != nil {
-		return uncertain(err)
+		return uncertain(externalError(err, ErrExecution))
 	}
 	return output, nil
 }

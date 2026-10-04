@@ -156,7 +156,11 @@ type Server struct {
 	views       map[string]*view
 	order       []string
 	calls       sync.WaitGroup
-	closing     bool
+	// answers counts the calls admitted whose carrying request has not
+	// ended: the SDK writes a call's answer on that request after the
+	// handler returns, so Shutdown closes no session before it (#197).
+	answers sync.WaitGroup
+	closing bool
 	// running counts each principal's calls in flight.
 	running map[string]int
 	// opened counts each principal's sessions, including those being
@@ -303,7 +307,16 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		lease.Release()
 	} else {
 		defer lease.Release()
+		// The request's own work (building the session's view) also
+		// stops if the application's drain times out. Only that work is
+		// bound: canceling the request itself would drop its response.
+		request = request.WithContext(context.WithValue(request.Context(), leaseKey{}, lease))
 	}
+	// The request's context ends when this handler returns, whatever
+	// server hosts it: a call's answer is written by then.
+	ctx, finish := context.WithCancel(request.Context())
+	defer finish()
+	request = request.WithContext(ctx)
 	s.mu.Lock()
 	closing := s.closing
 	s.mu.Unlock()
@@ -314,6 +327,9 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	}
 	s.transport.ServeHTTP(writer, request)
 }
+
+// leaseKey carries a request's application lease to the work it does.
+type leaseKey struct{}
 
 // open admits a request that opens a session within the session bounds, and
 // keeps the session counted until it closes. The count settles as the
@@ -490,6 +506,13 @@ func (s *Server) endSession(request *http.Request) {
 // also carries the request's context: a call ends with the request that
 // carries it.
 func (s *Server) verify(ctx context.Context, token string, request *http.Request) (*auth.TokenInfo, error) {
+	// Authentication runs under the request's lease: it also stops if the
+	// application's drain times out.
+	if lease, ok := request.Context().Value(leaseKey{}).(*app.Lease); ok {
+		bound, unbind := lease.Bind(ctx)
+		defer unbind()
+		ctx = bound
+	}
 	principal, err := s.config.Authenticate(ctx, token, request)
 	if err != nil || strings.TrimSpace(principal.ID) == "" {
 		return nil, auth.ErrInvalidToken
@@ -539,6 +562,11 @@ func (s *Server) serverFor(request *http.Request) (server *sdk.Server) {
 	}()
 	ctx, cancel := context.WithTimeout(request.Context(), s.config.Timeout)
 	defer cancel()
+	if lease, ok := request.Context().Value(leaseKey{}).(*app.Lease); ok {
+		bound, unbind := lease.Bind(ctx)
+		defer unbind()
+		ctx = bound
+	}
 	v, err := s.build(ctx, principal)
 	if err != nil {
 		return nil
@@ -676,6 +704,12 @@ func (s *Server) handler(owner tool.Principal, t Tool, input schema.Schema, outp
 			s.mu.Unlock()
 			return failure("unavailable"), nil
 		}
+		// The answer is written on the carrying request after this handler
+		// returns; Shutdown waits for that request to end (#197).
+		if carrier != nil {
+			s.answers.Add(1)
+			context.AfterFunc(carrier, s.answers.Done)
+		}
 		if s.running[principal.ID] >= s.config.MaxCallsPerPrincipal {
 			s.mu.Unlock()
 			return failure("saturated"), nil
@@ -704,6 +738,9 @@ func (s *Server) handler(owner tool.Principal, t Tool, input schema.Schema, outp
 			return failure("unavailable"), nil
 		}
 		defer lease.Release()
+		// The call also stops if the application's drain times out.
+		ctx, unbind := lease.Bind(ctx)
+		defer unbind()
 		arguments := request.Params.Arguments
 		if len(arguments) == 0 {
 			arguments = json.RawMessage("{}")
@@ -785,7 +822,8 @@ func codeFor(ctx context.Context, err error) string {
 	return "internal"
 }
 
-// Shutdown refuses new sessions and calls, waits for the calls in flight,
+// Shutdown refuses new sessions and calls, waits for the calls in flight
+// and for the requests that carry them to finish writing their answers,
 // closes every session and waits for its bookkeeping to settle, all within
 // ctx.
 func (s *Server) Shutdown(ctx context.Context) error {
@@ -793,6 +831,12 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.closing = true
 	s.mu.Unlock()
 	if err := wait(ctx, &s.calls); err != nil {
+		return err
+	}
+	// A call's handler returns before its answer is written: closing its
+	// session in between would end the session's streams with the answer
+	// unwritten (#197).
+	if err := wait(ctx, &s.answers); err != nil {
 		return err
 	}
 	s.mu.Lock()

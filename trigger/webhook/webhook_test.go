@@ -345,7 +345,7 @@ func TestConcurrentDuplicateEventsCreateOneAcceptedRun(t *testing.T) {
 	}
 	runs := 0
 	for {
-		processed, err := e.queue.ProcessOnce(context.Background(), func(context.Context, *sql.Tx, worker.Job) error { runs++; return nil })
+		processed, err := e.queue.ProcessOnce(context.Background(), func(context.Context, worker.Tx, worker.Job) error { runs++; return nil })
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -367,7 +367,7 @@ func TestVerifiedPrincipalTravelsThroughDurableSubmission(t *testing.T) {
 		t.Fatalf("status=%d", status)
 	}
 	var seen trigger.Principal
-	if _, err := e.queue.ProcessOnce(context.Background(), func(_ context.Context, _ *sql.Tx, job worker.Job) error {
+	if _, err := e.queue.ProcessOnce(context.Background(), func(_ context.Context, _ worker.Tx, job worker.Job) error {
 		seen = job.Principal
 		return nil
 	}); err != nil {
