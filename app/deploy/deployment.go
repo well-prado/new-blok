@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -35,6 +36,56 @@ type Deployment struct {
 	limiter     *deployment.Limiter
 	handler     http.Handler
 	rejected    atomic.Uint64
+	unrequested unrequestedConns
+}
+
+// unrequestedConns tracks accepted connections that have not yet delivered a
+// request (http.StateNew). They hold no admitted work, yet http.Server.Shutdown
+// keeps them open for five seconds, so a client's spare or speculative
+// connection would otherwise hold the drain until DrainTimeout. Once admission
+// is closed they are closed instead. The mutex is shared with the server's
+// synchronous ConnState hook: a connection is either still StateNew while
+// drain holds the lock, or it has become StateActive first and its request
+// meets the closed limiter. Admitted work is never cut short.
+type unrequestedConns struct {
+	mu       sync.Mutex
+	draining bool
+	conns    map[net.Conn]struct{}
+}
+
+func (u *unrequestedConns) track(c net.Conn, state http.ConnState) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if state != http.StateNew {
+		delete(u.conns, c)
+		return
+	}
+	if u.draining {
+		_ = c.Close()
+		return
+	}
+	if u.conns == nil {
+		u.conns = make(map[net.Conn]struct{})
+	}
+	u.conns[c] = struct{}{}
+}
+
+// drain must run after the limiter stops admitting work; use closeAdmission.
+func (u *unrequestedConns) drain() {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.draining = true
+	for c := range u.conns {
+		_ = c.Close()
+	}
+	clear(u.conns)
+}
+
+// closeAdmission stops admitting work, then closes request-less connections.
+// The order is the safety argument in unrequestedConns.
+func (d *Deployment) closeAdmission() {
+	d.limiter.BeginDrain()
+	d.unrequested.drain()
 }
 
 func NewDeployment(a *app.Application, c deployment.Config, checks DeploymentChecks, handler http.Handler) (*Deployment, error) {
@@ -160,7 +211,9 @@ func (d *Deployment) Run(ctx context.Context, signals <-chan os.Signal) error {
 	}
 	workCtx, cancelWork := context.WithCancelCause(context.Background())
 	defer cancelWork(context.Canceled)
-	server := &http.Server{Handler: d, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 32 << 10, BaseContext: func(net.Listener) context.Context { return workCtx }}
+	// HTTP/1 only: no TLS, so no HTTP/2, whose connections never report
+	// StateActive and would look request-less to unrequestedConns.
+	server := &http.Server{Handler: d, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 32 << 10, BaseContext: func(net.Listener) context.Context { return workCtx }, ConnState: d.unrequested.track}
 	served := make(chan error, 1)
 	go func() { served <- server.Serve(listener) }()
 	var serveErr error
@@ -169,7 +222,7 @@ func (d *Deployment) Run(ctx context.Context, signals <-chan os.Signal) error {
 	case <-signals:
 	case serveErr = <-served:
 	}
-	d.limiter.BeginDrain()
+	d.closeAdmission()
 	drainCtx, cancel := context.WithTimeout(context.Background(), d.config.DrainTimeout)
 	defer cancel()
 	shutdownErr := server.Shutdown(drainCtx)

@@ -50,6 +50,7 @@ func TestDeploymentSignalHelper(t *testing.T) {
 			os.Exit(4)
 		}
 	} else if err != nil {
+		_, _ = os.Stderr.WriteString("run: " + err.Error() + "\n")
 		os.Exit(5)
 	}
 	os.Exit(0)
@@ -69,6 +70,8 @@ func TestDeploymentSIGTERMDrain(t *testing.T) {
 			cmd := exec.Command(exe, "-test.run=^TestDeploymentSignalHelper$")
 			cmd.Env = append(os.Environ(), "BLOK_TEST_CHILD=1", "BLOK_TEST_ADDR="+addr, "BLOK_TEST_TIMEOUT="+timeout)
 			stdout, _ := cmd.StdoutPipe()
+			var stderr strings.Builder
+			cmd.Stderr = &stderr
 			if err := cmd.Start(); err != nil {
 				t.Fatal(err)
 			}
@@ -110,7 +113,7 @@ func TestDeploymentSIGTERMDrain(t *testing.T) {
 			}
 			closed, _ := io.ReadAll(stdout)
 			if err := cmd.Wait(); err != nil {
-				t.Fatal(err)
+				t.Fatalf("%v: %s", err, stderr.String())
 			}
 			if !strings.Contains(string(closed), "closed") || time.Since(start) > 2*time.Second {
 				t.Fatalf("drain: %s %s", closed, time.Since(start))
@@ -624,3 +627,202 @@ func runDeploymentRunCleanup(t *testing.T, releaseWithinGrace bool) {
 	releaseCleanup()
 	<-requestDone
 }
+
+// #194: a connection that has delivered no request (a client's spare or
+// speculative dial) holds no admitted work and must not hold the drain open.
+// http.Server.Shutdown alone keeps such a connection for five seconds, which
+// made a drain whose only real request had already finished report
+// ErrDrainTimeout.
+func TestDeploymentDrainDoesNotWaitForConnectionsWithoutRequests(t *testing.T) {
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := probe.Addr().String()
+	if err := probe.Close(); err != nil {
+		t.Fatal(err)
+	}
+	application, err := app.New(app.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var admitted atomic.Int32
+	entered, finish := make(chan struct{}, 1), make(chan struct{})
+	const drainTimeout = 2 * time.Second
+	d, err := NewDeployment(application, deployment.Config{ListenerAddress: address, MaxAdmission: 2, DrainTimeout: drainTimeout}, DeploymentChecks{Artifact: func(context.Context) error { return nil }}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		admitted.Add(1)
+		entered <- struct{}{}
+		<-finish
+		_, _ = w.Write([]byte("completed"))
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	defer cancelRun()
+	runDone := make(chan error, 1)
+	go func() { runDone <- d.Run(runCtx, nil) }()
+	var finishOnce sync.Once
+	defer finishOnce.Do(func() { close(finish) })
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	ready := false
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		if resp, err := client.Get("http://" + address + "/readyz"); err == nil {
+			resp.Body.Close()
+			if ready = resp.StatusCode == http.StatusOK; ready {
+				break
+			}
+		}
+	}
+	if !ready {
+		t.Fatal("deployment did not become ready")
+	}
+	silent, err := net.Dial("tcp", address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer silent.Close()
+	partial, err := net.Dial("tcp", address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer partial.Close()
+	if _, err := partial.Write([]byte("GET /work HTTP/1.1\r\nHost: deploy\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		d.unrequested.mu.Lock()
+		accepted := len(d.unrequested.conns)
+		d.unrequested.mu.Unlock()
+		if accepted == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("server accepted %d of 2 request-less connections", accepted)
+		}
+	}
+	completed := make(chan string, 1)
+	go func() {
+		resp, err := client.Get("http://" + address + "/work")
+		if err != nil {
+			completed <- "error: " + err.Error()
+			return
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		completed <- string(body)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("active request was not admitted")
+	}
+
+	started := time.Now()
+	cancelRun()
+	time.Sleep(50 * time.Millisecond)
+	finishOnce.Do(func() { close(finish) })
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Run error=%v after %v, want a clean drain", err, time.Since(started))
+		}
+	case <-time.After(drainTimeout + 2*time.Second):
+		t.Fatal("Run did not return")
+	}
+	if elapsed := time.Since(started); elapsed >= drainTimeout/2 {
+		t.Fatalf("drain took %v; request-less connections held it toward DrainTimeout %v", elapsed, drainTimeout)
+	}
+	if body := <-completed; body != "completed" {
+		t.Fatalf("lost active response %q", body)
+	}
+	for name, c := range map[string]net.Conn{"silent": silent, "partial": partial} {
+		_ = c.SetReadDeadline(time.Now().Add(time.Second))
+		n, err := c.Read(make([]byte, 64))
+		var timeout net.Error
+		if errors.As(err, &timeout) && timeout.Timeout() {
+			t.Fatalf("%s connection still open after drain", name)
+		}
+		if n != 0 {
+			t.Fatalf("%s connection received a response; it was never admitted", name)
+		}
+	}
+	if got := admitted.Load(); got != 1 {
+		t.Fatalf("admitted %d requests, want only the active one", got)
+	}
+}
+
+func TestUnrequestedConnsNeverClosesAConnectionPastStateNew(t *testing.T) {
+	var u unrequestedConns
+	pending, pendingPeer := net.Pipe()
+	defer pendingPeer.Close()
+	active, activePeer := net.Pipe()
+	defer activePeer.Close()
+	defer active.Close()
+	hijacked, hijackedPeer := net.Pipe()
+	defer hijackedPeer.Close()
+	defer hijacked.Close()
+	for _, c := range []net.Conn{pending, active, hijacked} {
+		u.track(c, http.StateNew)
+	}
+	u.track(active, http.StateActive)
+	u.track(hijacked, http.StateHijacked)
+	u.drain()
+	_ = pendingPeer.SetWriteDeadline(time.Now().Add(time.Second))
+	if _, err := pendingPeer.Write([]byte("x")); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("request-less connection survived drain: %v", err)
+	}
+	for name, peer := range map[string]net.Conn{"active": activePeer, "hijacked": hijackedPeer} {
+		_ = peer.SetWriteDeadline(time.Now().Add(50 * time.Millisecond))
+		if _, err := peer.Write([]byte("x")); errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("drain closed the %s connection", name)
+		}
+	}
+}
+
+func TestUnrequestedConnsClosesConnectionsAcceptedAfterDrain(t *testing.T) {
+	var u unrequestedConns
+	u.drain()
+	late, peer := net.Pipe()
+	defer peer.Close()
+	u.track(late, http.StateNew)
+	_ = peer.SetWriteDeadline(time.Now().Add(time.Second))
+	if _, err := peer.Write([]byte("x")); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("connection accepted after drain stayed open: %v", err)
+	}
+	if len(u.conns) != 0 {
+		t.Fatalf("drained tracker retained %d connections", len(u.conns))
+	}
+}
+
+func TestCloseAdmissionStopsAdmittingBeforeClosingConnections(t *testing.T) {
+	a, _ := app.New(app.Config{})
+	d, err := NewDeployment(a, deployment.Config{ListenerAddress: "127.0.0.1:0", MaxAdmission: 1, DrainTimeout: time.Second}, DeploymentChecks{Artifact: func(context.Context) error { return nil }}, http.NotFoundHandler())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, peer := net.Pipe()
+	defer peer.Close()
+	admittedWhenClosed := make(chan error, 1)
+	d.unrequested.track(&closeObserver{Conn: conn, closed: func() {
+		_, err := d.limiter.Admit()
+		admittedWhenClosed <- err
+	}}, http.StateNew)
+	d.closeAdmission()
+	select {
+	case err := <-admittedWhenClosed:
+		if err == nil {
+			t.Fatal("limiter still admitted work when the request-less connection was closed")
+		}
+	default:
+		t.Fatal("closeAdmission did not close the request-less connection")
+	}
+}
+
+type closeObserver struct {
+	net.Conn
+	closed func()
+}
+
+func (c *closeObserver) Close() error { c.closed(); return c.Conn.Close() }
