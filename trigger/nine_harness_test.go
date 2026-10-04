@@ -799,10 +799,10 @@ func wsQuote(ctx context.Context, socket *websocket.Conn, id string) (json.RawMe
 
 func (n *nine) mcpSession(ctx context.Context, principal string) (*sdk.ClientSession, error) {
 	client := sdk.NewClient(&sdk.Implementation{Name: "nine", Version: "1.0.0"}, nil)
-	// The SDK's default retries: with MaxRetries < 0, go-sdk v1.8.0 fails
-	// a call whose answer was delivered when the standing stream ends at
-	// shutdown (ADR 0014, #197).
-	return client.Connect(ctx, &sdk.StreamableClientTransport{Endpoint: n.base + "/mcp", HTTPClient: &http.Client{Transport: bearerTransport{base: n.transport, token: token(principal)}}}, nil)
+	// No retries: a dropped connection fails the call at once. The server
+	// offers no standalone stream, so its shutdown leaves the client no
+	// stream end to mistake for a failed connection (ADR 0014, #197).
+	return client.Connect(ctx, &sdk.StreamableClientTransport{Endpoint: n.base + "/mcp", HTTPClient: &http.Client{Transport: bearerTransport{base: n.transport, token: token(principal)}}, MaxRetries: -1}, nil)
 }
 
 func mcpQuote(ctx context.Context, session *sdk.ClientSession) (json.RawMessage, error) {

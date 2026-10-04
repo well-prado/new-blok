@@ -138,6 +138,37 @@ func TestNegotiateRejectsWrongVersionCatalogArtifactAndGeneration(t *testing.T) 
 	}
 }
 
+func TestProtocolMinorCompatibilityFixture(t *testing.T) {
+	data, err := os.ReadFile("../../testdata/runtime/minor-compatibility.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixtures []struct {
+		ID              string `json:"id"`
+		ClientMinor     int    `json:"clientMinor"`
+		WorkerMinor     int    `json:"workerMinor"`
+		Compatible      bool   `json:"compatible"`
+		NegotiatedMinor int    `json:"negotiatedMinor"`
+	}
+	if err := json.Unmarshal(data, &fixtures); err != nil {
+		t.Fatal(err)
+	}
+	for _, fixture := range fixtures {
+		t.Run(fixture.ID, func(t *testing.T) {
+			client, worker := hello(), hello()
+			client.Minor, worker.Minor = fixture.ClientMinor, fixture.WorkerMinor
+			ready, err := Negotiate(client, worker)
+			if fixture.Compatible {
+				if err != nil || ready.Minor != fixture.NegotiatedMinor {
+					t.Fatalf("ready=%+v err=%v", ready, err)
+				}
+			} else if !errors.Is(err, ErrIncompatibleProtocol) {
+				t.Fatalf("expected explicit compatibility rejection, got %v", err)
+			}
+		})
+	}
+}
+
 func TestCallRejectsStaleGenerationAndUnboundedPayload(t *testing.T) {
 	call := Call{CallID: "call-1", AttemptID: "attempt-1", Generation: 1, Node: "shop/quote", NodeVersion: "1.0.0", Deadline: time.Now().Add(time.Minute), Input: []byte(`{"sku":"coffee"}`)}
 	if err := call.Validate(DefaultLimits(), 2); err != ErrGenerationMismatch {

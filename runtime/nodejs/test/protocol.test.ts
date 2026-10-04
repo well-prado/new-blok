@@ -14,13 +14,25 @@ async function fixture(generation="1", replayEntries=8192,extra:readonly AnyNode
  const endpoint=`127.0.0.1:${address.port}`;
  const worker=new Worker({nodes:[...nodes,...extra],token,principal:"app-1",capabilities:caps,artifactDigest:artifact,generation,address:endpoint,replayEntries});await worker.listen();
  const client=new (loadProtocol().blok.runtime.v1.Worker)(endpoint,grpc.credentials.createInsecure());
- const hello={protocol:"blok.runtime",major:1,minor:0,artifactDigest:artifact,catalogDigest:worker.catalog.catalogDigest,generation,capabilities:[...caps],limits:DEFAULT_LIMITS};
+ const hello={protocol:"blok.runtime",major:1,minor:1,artifactDigest:artifact,catalogDigest:worker.catalog.catalogDigest,generation,capabilities:[...caps],limits:DEFAULT_LIMITS};
  const connect=(auth=token,principal="app-1")=>{const metadata=new grpc.Metadata();metadata.set("authorization",`Bearer ${auth}`);metadata.set("x-blok-principal",principal);const stream=client.Connect(metadata);stream.on("error",()=>{});return stream;};
  return {worker,client,hello,connect,close(){client.close();worker.close();}};
 }
 function receive<T>(stream:grpc.ClientDuplexStream<T,ReceivedFrame>):Promise<ReceivedFrame>{return new Promise((resolve,reject)=>{const timer=setTimeout(()=>done(new Error("test response timeout")),2000);const done=(err?:unknown,value?:ReceivedFrame)=>{clearTimeout(timer);stream.off("data",data);stream.off("error",error);if(err)reject(err);else resolve(value!);};const data=(value:ReceivedFrame)=>done(undefined,value);const error=(err:unknown)=>done(err);stream.once("data",data);stream.once("error",error);});}
 const call=(id:string,generation="1")=>({callId:id,attemptId:`attempt-${id}`,node:"fixture/echo",nodeVersion:"1.0.0",generation,deadlineUnixNanos:(BigInt(Date.now()+1000)*1000000n).toString(),input:Buffer.from('{"value":"1"}'),idempotencyKey:"operation",principal:"app-1",capabilities:["http:synthetic"]});
 const status=(expected:grpc.status)=>(error:unknown)=>typeof error==="object"&&error!==null&&"code" in error&&error.code===expected;
+test("protocol 1.1 carries bounded, call-scoped SDK logs and protocol 1.0 suppresses them",async()=>{
+ const logged=defineNode<Record<string,never>,{done:boolean},null>({name:"fixture/logged",version:"1.0.0",description:"Synthetic logger transport",input:{type:"object"},output:{type:"object",properties:{done:{type:"boolean"}},required:["done"]},dependencies:null,execute(ctx){ctx.logger.info("authorization: synthetic-secret",{api_token:"synthetic-secret",...Object.fromEntries(Array.from({length:32},(_,i)=>[`field${i}`,"x".repeat(256)])),step:"quote"});ctx.logger.debug("😀".repeat(1000));return {done:true};}});
+ const f=await fixture("1",8192,[logged]);try{
+  const s=f.connect();let result=receive(s);s.write({hello:f.hello});await result;
+  result=receive(s);s.write({call:{...call("logged"),node:"fixture/logged",input:Buffer.from("{}")}});
+  const log=(await result).log;assert.equal(log?.callId,"logged");assert.equal(log?.attemptId,"attempt-logged");assert.equal(log?.generation,"1");assert.equal(log?.message,"[redacted: sensitive-looking log message]");assert.ok(log!.attrsJson.length<=4096);assert.ok(!log?.attrsJson.toString().includes("synthetic-secret"));assert.ok(log?.attrsJson.toString().includes("redacted"));
+  result=receive(s);const bounded=(await result).log;assert.equal(Buffer.byteLength(bounded!.message),1024);assert.ok(!bounded!.message.includes("\ufffd"));
+  result=receive(s);assert.equal((await result).result?.output.toString(),'{"done":true}');
+ }finally{f.close();}
+ const legacy=await fixture("1");try{const s=legacy.connect();let result=receive(s);s.write({hello:{...legacy.hello,minor:0}});await result;result=receive(s);s.write({call:{...call("legacy"),node:"fixture/quote",input:Buffer.from('{"sku":"coffee","quantity":1}')}});assert.ok((await result).result?.output);
+ }finally{legacy.close();}
+});
 test("actual gRPC rejects bad authentication, negotiation and stale generations",async()=>{
  for(const failure of ["token","principal","catalog","generation"]){const f=await fixture();try{const s=f.connect(failure==="token"?"wrong":token,failure==="principal"?"spoof":"app-1");const result=receive(s);s.write({hello:{...f.hello,...(failure==="catalog"?{catalogDigest:`sha256:${"b".repeat(64)}`}:{ }),...(failure==="generation"?{generation:"2"}:{})}});await assert.rejects(result,status(failure==="token"||failure==="principal"?grpc.status.UNAUTHENTICATED:grpc.status.FAILED_PRECONDITION));}finally{f.close();}}
  const f=await fixture("2");try{const s=f.connect();let result=receive(s);s.write({hello:f.hello});assert.equal((await result).ready?.contract?.generation,"2");result=receive(s);s.write({call:call("stale","1")});await assert.rejects(result,status(grpc.status.FAILED_PRECONDITION));}finally{f.close();}
@@ -92,7 +104,8 @@ test("raw key scanner rejects shadowed invalid keys and malformed field bounds",
  assert.doesNotThrow(()=>validateFrameBytes(frame(Buffer.from([50,3,239,191,189]))));
 });
 test("wire rejects multiple envelopes and malformed length before decoding",()=>{
- for(const bytes of [Buffer.alloc(0),Buffer.from([10,1]),Buffer.from([10,0,18,0]),Buffer.from([58,0]),Buffer.from([10,128,128,128,128,128])])assert.throws(()=>validateFrameBytes(bytes));
+ for(const bytes of [Buffer.alloc(0),Buffer.from([10,1]),Buffer.from([10,0,18,0]),Buffer.from([10,128,128,128,128,128])])assert.throws(()=>validateFrameBytes(bytes));
+ assert.doesNotThrow(()=>validateFrameBytes(Buffer.from([58,0])));
  assert.doesNotThrow(()=>validateFrameBytes(Buffer.from([10,0])));
 });
 test("actual paused socket consumer fails closed at bounded outbound bytes",async()=>{

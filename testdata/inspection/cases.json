@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "owner": "E15-T01",
+  "contract": "inspection/v1",
+  "cases": [
+    {
+      "id": "engine-completed-run",
+      "kind": "accepted",
+      "input": "production Go engine emits run.started, step.processing, step.completed and run.completed",
+      "expected": {"runStatus": "completed", "stepStatuses": ["completed", "completed"], "effects": 1}
+    },
+    {
+      "id": "engine-failed-run",
+      "kind": "accepted",
+      "input": "production Go engine node returns a classified error",
+      "expected": {"runStatus": "failed", "stepStatuses": ["failed"], "effects": 1}
+    },
+    {
+      "id": "engine-canceled-run",
+      "kind": "accepted",
+      "input": "production Go engine receives a canceled context before a step",
+      "expected": {"runStatus": "canceled", "stepStatuses": [], "effects": 0}
+    },
+    {
+      "id": "engine-uncertain-run",
+      "kind": "accepted",
+      "input": "production Go node returns an uncertain domain error",
+      "expected": {"runStatus": "uncertain", "stepStatuses": ["uncertain"], "effects": 1}
+    },
+    {
+      "id": "second-principal-hidden",
+      "kind": "rejected",
+      "input": "principal bob reads a run owned by alice",
+      "expected": {"error": "run_not_found", "effects": 0}
+    },
+    {
+      "id": "future-version-rejected",
+      "kind": "rejected",
+      "input": "inspection/v99 request",
+      "expected": {"error": "unsupported_version", "effects": 0}
+    },
+    {
+      "id": "secret-redacted-and-large-payload-bounded",
+      "kind": "accepted",
+      "input": "authorized JSON projection contains api_token and exceeds its payload limit",
+      "expected": {"secret": "[redacted]", "truncated": true, "effects": 0}
+    },
+    {
+      "id": "suspended-node-worker-and-durable-history",
+      "kind": "insufficient-evidence",
+      "input": "suspended execution, actual Node worker workflow, or process restart",
+      "expected": {"error": "not_implemented_or_not_verified", "effects": 0}
+    }
+  ]
+}
