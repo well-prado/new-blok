@@ -45,6 +45,9 @@ Go 1.27 custom `MarshalJSONTo` and `AppendText` representations and unsupported
 quoted/invalid JSON field tags likewise truncate without invoking application
 methods. Map keys with custom representations also truncate rather than
 exposing their underlying value.
+Duplicate projected struct field names truncate before `omitempty` selection;
+capture never exposes a value that standard JSON would discard as ambiguous.
+Invalid standard-library time representations also truncate.
 
 `inspect.Recorder` is a process-local development projection. It authorizes by
 exact principal, returns the same not-found result for unknown and unauthorized

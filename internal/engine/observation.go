@@ -65,7 +65,13 @@ func (b *observationBudget) capture(value reflect.Value, depth int) (any, bool) 
 	}
 
 	if value.Type() == observationTimeType {
-		return b.captureString(value.Interface().(time.Time).Format(time.RFC3339Nano))
+		// This concrete standard-library type has a bounded representation.
+		// Its strict encoder rejects dates/offsets that Format would accept.
+		text, err := value.Interface().(time.Time).MarshalText()
+		if err != nil {
+			return nil, false
+		}
+		return b.captureString(string(text))
 	}
 	if value.Type() == observationNumberType {
 		text := value.Interface().(json.Number).String()
@@ -171,11 +177,16 @@ func (b *observationBudget) capture(value reflect.Value, depth int) (any, bool) 
 		return items, true
 	case reflect.Struct:
 		fields := make(map[string]any)
+		seenNames := make(map[string]struct{})
 		if !b.charge(2) {
 			return nil, false
 		}
 		typ := value.Type()
 		for index := 0; index < value.NumField(); index++ {
+			if b.nodes <= 0 {
+				return nil, false
+			}
+			b.nodes--
 			field := typ.Field(index)
 			// encoding/json promotes anonymous fields and resolves collisions.
 			// This bounded walker does not implement that selection algorithm.
@@ -196,6 +207,9 @@ func (b *observationBudget) capture(value reflect.Value, depth int) (any, bool) 
 			if name == "" {
 				name = field.Name
 			}
+			if len(name) > b.remaining {
+				return nil, false
+			}
 			for _, char := range name {
 				if !unicode.IsLetter(char) && !unicode.IsDigit(char) && !strings.ContainsRune("!#$%&()*+-./:;<=>?@[]^_{|}~ ", char) {
 					return nil, false
@@ -205,11 +219,17 @@ func (b *observationBudget) capture(value reflect.Value, depth int) (any, bool) 
 			if strings.Contains(optionSet, ",string,") || strings.Contains(optionSet, ",omitzero,") {
 				return nil, false
 			}
-			if strings.Contains(optionSet, ",omitempty,") && observationEmpty(value.Field(index)) {
-				continue
+			// JSON selects fields before omitting empty values. An ambiguous
+			// name must not expose the last field or an otherwise omitted one.
+			if _, duplicate := seenNames[name]; duplicate {
+				return nil, false
 			}
 			if _, ok := b.captureString(name); !ok {
 				return nil, false
+			}
+			seenNames[name] = struct{}{}
+			if strings.Contains(optionSet, ",omitempty,") && observationEmpty(value.Field(index)) {
+				continue
 			}
 			item, ok := b.capture(value.Field(index), depth+1)
 			if !ok {

@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestMarshalObservationPreservesJSONShapeOrExplicitlyTruncates(t *testing.T) {
@@ -14,6 +15,14 @@ func TestMarshalObservationPreservesJSONShapeOrExplicitlyTruncates(t *testing.T)
 		ID string `json:"id"`
 	}
 	values := []any{
+		struct {
+			First  string `json:"x"`
+			Second string `json:"x"`
+		}{First: "a", Second: "b"},
+		struct {
+			First  string `json:"x,omitempty"`
+			Second string `json:"x"`
+		}{Second: "b"},
 		observationPrivateAppender("synthetic-private-value"),
 		observationPrivateJSONTo("synthetic-private-value"),
 		map[observationPrivateText]int{"synthetic-key": 1},
@@ -54,6 +63,20 @@ func TestMarshalObservationPreservesJSONShapeOrExplicitlyTruncates(t *testing.T)
 		}
 		if !reflect.DeepEqual(actual, expected) {
 			t.Fatalf("%T: observed %s, canonical %s", value, captured, want)
+		}
+	}
+}
+
+func TestMarshalObservationRejectsInvalidStandardTime(t *testing.T) {
+	for _, value := range []time.Time{
+		time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 1, 1, 0, 0, 0, 0, time.FixedZone("invalid", 24*60*60)),
+	} {
+		if _, err := json.Marshal(value); err == nil {
+			t.Fatal("fixture unexpectedly encodes as valid JSON time")
+		}
+		if captured := marshalObservation(value); string(captured) != `{"$truncated":true}` {
+			t.Fatalf("invalid time silently represented: %s", captured)
 		}
 	}
 }
