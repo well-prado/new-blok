@@ -36,8 +36,8 @@ digest, and dependency edges. It never re-resolves to a newer version.
 
 The filesystem cache is bounded to 256 identity indexes and 144 MiB of
 content-addressed bundle data, with each encoded bundle limited by the package
-contract's bound. A cross-process lock serializes capacity reservations,
-immutable-identity checks, index publication, and lock replacement. Blobs are
+contract's bound. A context-aware cross-process cache lock serializes capacity
+reservations, immutable-identity checks, and index publication. Blobs are
 published before their index using same-directory temporary files, sync, and
 atomic rename. An identity index points to exactly one immutable blob; reads
 re-hash the blob, require canonical encoding, and run full package
@@ -48,11 +48,14 @@ closed. Offline `CacheSource.FetchLocked` verifies an existing lock's exact
 graph, while offline candidate listing is scoped to the requested package and
 trust policy. A missing exact identity returns the offline-missing diagnostic.
 
-Lock writes use canonical bytes and atomic same-directory replacement. Cache
-and lock coordination is cancellation-aware: lock acquisition uses bounded
-nonblocking retries and observes the request context on Unix and Windows.
-Windows support is implemented but native Windows execution evidence belongs
-to the separate #157 milestone; no Windows validation claim is made here.
+Lock writes use canonical bytes and atomic same-directory replacement, but do
+not acquire the cache lock. Concurrent lock writers therefore publish
+complete, parseable files with last-complete-writer-wins behavior; this is not
+a serialized writer protocol or a multi-file project transaction (#72). Cache
+lock acquisition uses bounded nonblocking retries and observes the request
+context on Unix and Windows. Windows support is implemented but native Windows
+execution evidence belongs to the separate #157 milestone; no Windows
+validation claim is made here.
 
 ## Native managers and unsupported inputs
 
@@ -105,8 +108,9 @@ Focused fixtures in `testdata/packages/resolution-fixtures.json` predeclare
 expected selected-package, source-read, package-execution, and external-effect
 counts for deterministic selection and conflict/cycle/unsupported-range
 failures. Cache tests cover exact replay, offline missing, corruption,
-immutable identity conflict, trust-policy scoping, concurrent capacity and
-lock writes, malformed lock bounds, and context cancellation. Native
+immutable identity conflict, trust-policy scoping, concurrent capacity,
+context cancellation, and concurrent parseability of atomic lock writes;
+malformed lock bounds are covered as well. Native
 integration tests invoke the actual Go and npm tools and verify lock files
 remain unchanged; a Go local-replacement test proves source-content changes
 alter the recorded digest and external replacements fail. A synthetic npm
@@ -121,11 +125,17 @@ On implementation commit
 `GOMAXPROCS=3 go test -p=3 ./...`, `GOMAXPROCS=3 go vet -p=3 ./...`,
 `GOMAXPROCS=3 go test -race -p=3 ./...`, and
 `CGO_ENABLED=0 GOMAXPROCS=3 go build -p=3 ./...`; `go mod verify`, `gofmt`
-cleanliness, and `git diff origin/main...HEAD --check` also passed. The
-repeated-copy npm determinism regression passed in the ordinary and full race
-suites. An independent Docker Go 1.27.1 review passed that test three times
-under `-race`, and passed the cache identity/replay, atomic capacity, and
-context-cancellation probes three times. Actual Go/npm integration tests run
-on the host and verify native lock files remain unchanged. No GitHub Actions
-workflow was dispatched. No native Windows execution is claimed; Windows
-validation remains with #157.
+cleanliness, and `git diff origin/main...HEAD --check` also passed. The parent
+independently reran the full ordinary, vet, race, CGO-disabled build,
+module-verification, diff, and root-gofmt gates on final pre-correction head
+`edface29b9ba464f8ea02bf49b13229b9c3048ad`; all exited successfully. On code
+commit `ff5c732ae181009e0dbdf37f64a9378893d1a61c`, the parent host's repeated
+npm canonicalization probe passed three race runs on Go 1.27.1/Darwin arm64
+with Node.js 24.21.0/npm 11.19.0: 90 actual npm captures produced identical
+canonical bytes in 54.097s. A separate Docker `golang:1.27.1` run installed
+Node.js/npm and ran `go test -race ./internal/package -run
+TestCaptureNativeNPMRepeatedCopiesAreDeterministic -count=3 -v`; all three
+runs passed without a skip under Node.js 20.19.2/npm 9.2.0. Actual Go/npm
+integration tests run on the host and verify native lock files remain
+unchanged. No GitHub Actions workflow was dispatched. No native Windows
+execution is claimed; Windows validation remains with #157.
