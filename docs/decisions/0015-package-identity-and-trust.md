@@ -1,6 +1,6 @@
 # ADR 0015: Package identity, compatibility, and trust protocol
 
-- Status: accepted for implementation in E13-T01 (#70)
+- Status: accepted; E13-T01 (#70) is implemented and E13-T02 (#71) is in review
 - Date: 2026-10-03
 - Owners: framework package contract (`contract/package`); hosted registry
   implementation belongs to the separate registry product
@@ -92,10 +92,11 @@ version expressions: whitespace-separated exact or comparator clauses, for
 example `>=1.2.0 <2.0.0`. OR expressions, wildcards, and prerelease versions are
 not supported, whitespace-only ranges are invalid, and numeric components must
 fit unsigned 64-bit values. Consumers check engine, schema, every declared
-runtime, and package dependencies during resolution. This contract verifies
-compatibility inputs; graph resolution, lock generation, cycle diagnostics,
-cache management, and atomic project edits belong to E13-T02/#71 and later
-issues.
+runtime, and package dependencies during resolution. E13-T02 (#71), described
+by [ADR 0018](0018-deterministic-package-resolution.md), implements
+deterministic graph resolution, exact lock verification, and the bounded
+verified offline cache. Atomic project edits and add/remove/update/verify CLI
+commands remain with E13-T03/#72.
 
 ## Immutability and local use
 
@@ -236,9 +237,9 @@ Tests prove missing/invalid metadata rejection, metadata-tampering signature
 failure, canonical schema ordering, and that store reads cannot mutate retained
 typed metadata. The checked-in artifact payload remains opaque test input and
 is not counted as typed or executable package evidence.
-This E13-T01 slice does not establish package resolution, lock generation,
-durable offline cache behavior, atomic project edits, CLI add/remove/update,
-hosted-registry availability, namespace ownership service, build
+The E13-T01 contract alone does not establish package resolution, lock
+generation, durable offline cache behavior, atomic project edits, CLI
+add/remove/update, hosted-registry availability, namespace ownership service, build
 reproducibility, sandboxing, or package execution.
 
 ## Verification record
@@ -276,5 +277,7 @@ optional explicit agent manifests, Go 1.27.1 on Darwin arm64 passed focused
 package tests (`GOMAXPROCS=3 go test -p=3 ./contract/package`) including
 metadata omission, schema rejection, canonicalization, signature tampering,
 ordinary-package trust without implicit agent admission, and workflow-document
-cases. Preflight-bound checks are part of this issue branch; resolver/installer
-evidence remains with E13-T02–T04.
+cases. Preflight-bound checks are part of this issue branch. Deterministic
+resolver, exact lock, cache, and native Go/npm integration behavior is
+implemented in E13-T02 (#71); atomic CLI operations and publishing remain
+E13-T03–T04.
