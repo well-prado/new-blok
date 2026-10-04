@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -25,7 +26,7 @@ func TestDistributedCompetingOwnersAndExpiredOwnerAreFenced(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	partition := fmt.Sprintf("fence-%d", time.Now().UnixNano())
-	owner, err := store.Acquire(ctx, partition, "owner-a", 2*time.Second)
+	owner, err := store.Acquire(ctx, partition, "owner-a", 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,11 +39,19 @@ func TestDistributedCompetingOwnersAndExpiredOwnerAreFenced(t *testing.T) {
 
 	var acquired int
 	var rejected int
+	var committed int
+	observedErrors := make(map[string]struct{})
 	for i := 0; i < 12; i++ {
-		if _, err := store.Acquire(ctx, partition, fmt.Sprintf("competitor-%02d", i), 2*time.Second); err == nil {
+		competitor, err := store.Acquire(ctx, partition, fmt.Sprintf("competitor-%02d", i), 2*time.Second)
+		if err == nil {
 			acquired++
+			if err := store.Commit(ctx, competitor, fmt.Sprintf("competitor-event-%02d", i), "state", []byte(`{"competitor":true}`)); err != nil {
+				t.Fatalf("acquired competitor could not commit: %v", err)
+			}
+			committed++
 		} else if errors.Is(err, ErrOwnershipLost) {
 			rejected++
+			observedErrors[errorLabel(err)] = struct{}{}
 		} else {
 			t.Fatalf("competing acquisition returned non-fencing error: %v", err)
 		}
@@ -51,12 +60,12 @@ func TestDistributedCompetingOwnersAndExpiredOwnerAreFenced(t *testing.T) {
 		t.Fatalf("live owner acquisitions: extra owners=%d fenced rejections=%d, want 0 and 12", acquired, rejected)
 	}
 	assertScenarioFixture(t, "competing-owner-before-expiry", map[string]any{
-		"additionalOwners": acquired, "committed": 0, "errors": []string{"ownership_lost"},
+		"additionalOwners": acquired, "committed": committed, "errors": sortedErrorLabels(observedErrors),
 	})
 
 	// The old owner is intentionally idle past its lease deadline, matching a
 	// paused process that cannot renew. Its resumed write must be rejected.
-	time.Sleep(2400 * time.Millisecond)
+	time.Sleep(5400 * time.Millisecond)
 	newOwner, err := store.Acquire(ctx, partition, "owner-b", 3*time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -108,6 +117,7 @@ func TestConcurrentAcquisitionHasExactlyOneFencedWinner(t *testing.T) {
 
 	var winner Owner
 	var winners, rejected int
+	observedErrors := make(map[string]struct{})
 	for outcome := range results {
 		if outcome.err == nil {
 			winner = outcome.owner
@@ -118,21 +128,40 @@ func TestConcurrentAcquisitionHasExactlyOneFencedWinner(t *testing.T) {
 			t.Fatalf("simultaneous acquisition returned non-fencing error: %v", outcome.err)
 		}
 		rejected++
+		observedErrors[errorLabel(outcome.err)] = struct{}{}
 	}
 	if winners != 1 || rejected != contenders-1 {
 		t.Fatalf("simultaneous acquisitions: winners=%d fenced rejections=%d, want 1 and %d", winners, rejected, contenders-1)
 	}
 	defer store.cleanupLease(winner.LeaseID)
+	committed := 0
 	if err := store.Commit(ctx, winner, "race-winner", "state", []byte(`{"winner":true}`)); err != nil {
 		t.Fatalf("only acquired owner commit: %v", err)
 	}
+	committed++
 	if value, err := store.Read(ctx, partition, "race-winner"); err != nil || value == nil {
 		t.Fatalf("winner record missing: value=%s err=%v", value, err)
 	}
 	assertScenarioFixture(t, "concurrent-competing-owners", map[string]any{
 		"successfulOwners": winners, "rejectedOwners": rejected,
-		"committed": 1, "errors": []string{"ownership_lost"},
+		"committed": committed, "errors": sortedErrorLabels(observedErrors),
 	})
+}
+
+func errorLabel(err error) string {
+	if errors.Is(err, ErrOwnershipLost) {
+		return "ownership_lost"
+	}
+	return "unexpected"
+}
+
+func sortedErrorLabels(observed map[string]struct{}) []string {
+	labels := make([]string, 0, len(observed))
+	for label := range observed {
+		labels = append(labels, label)
+	}
+	sort.Strings(labels)
+	return labels
 }
 
 func TestReplicaPauseCatchupAndQuorumLoss(t *testing.T) {
