@@ -45,6 +45,12 @@ func TestErrorWriteDomainsReportsEveryJoinedBranch(t *testing.T) {
 	if got := ErrorWriteDomains(WithWriteDomain(joined, outer)); len(got) != 1 || got[0] != outer {
 		t.Fatalf("outer annotation domains=%v; want [%v]", got, outer)
 	}
+	// A wrapper that exposes its cause only through As is still read, as
+	// errors.As reads it.
+	hidden := asOnlyError{cause: busy(first)}
+	if got := ErrorWriteDomains(errors.Join(busy(second), hidden)); len(got) != 2 || got[0] != second || got[1] != first {
+		t.Fatalf("As-only wrapper domains=%v; want [%v %v]", got, second, first)
+	}
 	if got := ErrorWriteDomains(errors.Join(errors.New("a"), nil)); len(got) != 0 {
 		t.Fatalf("unannotated domains=%v; want none", got)
 	}
@@ -52,3 +58,9 @@ func TestErrorWriteDomainsReportsEveryJoinedBranch(t *testing.T) {
 		t.Fatalf("nil domains=%v; want none", got)
 	}
 }
+
+// asOnlyError exposes its cause through As but not Unwrap.
+type asOnlyError struct{ cause error }
+
+func (e asOnlyError) Error() string      { return "redacted" }
+func (e asOnlyError) As(target any) bool { return errors.As(e.cause, target) }

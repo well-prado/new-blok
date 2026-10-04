@@ -119,10 +119,20 @@ func ErrorWriteDomains(err error) []*WriteDomain {
 	var visit func(error)
 	visit = func(err error) {
 		for err != nil {
-			switch e := err.(type) {
-			case *domainError:
+			if e, ok := err.(*domainError); ok {
 				domains = append(domains, e.domain)
 				return
+			}
+			// errors.As consults an error's own As method before unwrapping
+			// it; a wrapper exposing its cause only that way still names it.
+			if x, ok := err.(interface{ As(any) bool }); ok {
+				var annotated *domainError
+				if x.As(&annotated) {
+					domains = append(domains, annotated.domain)
+					return
+				}
+			}
+			switch e := err.(type) {
 			case interface{ Unwrap() []error }:
 				for _, branch := range e.Unwrap() {
 					visit(branch)

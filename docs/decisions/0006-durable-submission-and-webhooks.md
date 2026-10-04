@@ -56,10 +56,11 @@ needs, and returns saturation that names the write domain it waited on
 (`store.WithWriteDomain`), which survives wrappers that pass errors through;
 `Queue.Enqueue` adds its own queue's domain when the cause carries none.
 `ProcessOnce` compares every domain the handler's error names
-(`store.ErrorWriteDomains`, which also reads each branch of an `errors.Join`)
-with its claim's while the claim is still held. Checking only the first would
-let a handler that joins another store's saturation ahead of its own hide the
-self-submit. A match means the claim itself was the contention, so deferring would only repeat the wait: the job fails as
+(`store.ErrorWriteDomains`, which also reads each branch of an
+`errors.Join`) with its claim's while the claim is still held. Checking only
+the first would let a handler that joins another store's saturation ahead of
+its own hide the self-submit. A match means the claim itself was the
+contention, so deferring would only repeat the wait: the job fails as
 `worker.ErrNestedSubmission`, is not retried, and dead-letters as `nested
 submission to claimed store; use worker.Tx for atomic writes`. Saturation
 naming a different domain, or no domain, is backpressure and still defers.
