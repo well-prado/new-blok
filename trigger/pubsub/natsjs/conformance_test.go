@@ -95,7 +95,7 @@ func (d *natsDriver) construct(ctx context.Context) error {
 
 func (d *natsDriver) Start(context.Context) error { return nil }
 
-func (d *natsDriver) handle(ctx context.Context, tx *sql.Tx, job worker.Job) error {
+func (d *natsDriver) handle(ctx context.Context, tx worker.Tx, job worker.Job) error {
 	if _, err := d.env.Workflow(ctx, conformance.Call{Input: job.Payload, Principal: job.Principal}); err != nil {
 		return err
 	}
@@ -152,7 +152,7 @@ var workerConsumerLost = worker.ErrConsumerLost
 func (d *natsDriver) Recover(ctx context.Context) (conformance.Outcome, error) {
 	d.clock.Advance(2 * time.Minute)
 	var key string
-	if _, err := d.queue.ProcessOnce(ctx, func(ctx context.Context, tx *sql.Tx, job worker.Job) error {
+	if _, err := d.queue.ProcessOnce(ctx, func(ctx context.Context, tx worker.Tx, job worker.Job) error {
 		key = job.RequestKey
 		return d.handle(ctx, tx, job)
 	}); err != nil {

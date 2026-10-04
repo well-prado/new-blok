@@ -408,7 +408,10 @@ func (c *Catalog) execute(ctx context.Context, b binding, input []byte, s *execu
 					return nil, err
 				}
 				return decode(result)
-			}, node.Description("admitted tool dispatch"), node.Schemas([]byte(`{"type":"object"}`), []byte(`{"type":"object"}`)))
+			}, node.Description("admitted tool dispatch"), node.Schemas([]byte(`{"type":"object"}`), []byte(`{"type":"object"}`)),
+				// The child's effects, so the engine knows a later step's
+				// saturation is no longer safe to retry (#190).
+				node.Effects(child.manifest.Effects...))
 			nodes[key] = n.Any()
 		}
 		value, decodeErr := decode(normal)

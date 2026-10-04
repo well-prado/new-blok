@@ -326,6 +326,9 @@ func (s *Server) handler(b *binding) func(any, context.Context, func(any) error,
 			return nil, refusal(codes.Unavailable, "unavailable")
 		}
 		defer lease.Release()
+		// The call also stops if the application's drain times out.
+		ctx, unbind := lease.Bind(ctx)
+		defer unbind()
 		principal, err := s.authenticate(ctx)
 		if err != nil || strings.TrimSpace(principal.ID) == "" {
 			return nil, refusal(codes.Unauthenticated, "unauthorized")

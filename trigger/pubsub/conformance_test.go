@@ -94,7 +94,7 @@ func (d *memDriver) construct(ctx context.Context) error {
 
 func (d *memDriver) Start(context.Context) error { d.stopped = false; return nil }
 
-func (d *memDriver) handle(ctx context.Context, tx *sql.Tx, job worker.Job) error {
+func (d *memDriver) handle(ctx context.Context, tx worker.Tx, job worker.Job) error {
 	if _, err := d.env.Workflow(ctx, conformance.Call{Input: job.Payload, Principal: job.Principal}); err != nil {
 		return err
 	}
@@ -170,7 +170,7 @@ func jobOutcome(ctx context.Context, queue *worker.Queue, key string) (conforman
 func (d *memDriver) Recover(ctx context.Context) (conformance.Outcome, error) {
 	d.clock.Advance(2 * time.Minute)
 	var key string
-	if _, err := d.queue.ProcessOnce(ctx, func(ctx context.Context, tx *sql.Tx, job worker.Job) error {
+	if _, err := d.queue.ProcessOnce(ctx, func(ctx context.Context, tx worker.Tx, job worker.Job) error {
 		key = job.RequestKey
 		return d.handle(ctx, tx, job)
 	}); err != nil {

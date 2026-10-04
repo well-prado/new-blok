@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/well-prado/new-blok/contract"
+	"github.com/well-prado/new-blok/contract/capacity"
 	"github.com/well-prado/new-blok/contract/inspection"
 	"github.com/well-prado/new-blok/contract/schema"
 	"github.com/well-prado/new-blok/internal/value"
@@ -154,6 +155,9 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 	}()
 	state := make(map[string]any)
 	result = Result{State: state}
+	// effected is the last completed step that declared effects: once it has
+	// run, a later failure is no longer safe to retry (see afterEffect).
+	effected := ""
 	appendStep := func(step StepResult) {
 		result.Steps = append(result.Steps, step)
 		event := inspection.Event{Kind: inspection.StepCompleted, StepID: step.ID, Attempt: step.Attempt}
@@ -217,7 +221,7 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 			output, err := definition.Invoke(invokeCtx, callInput)
 			step.Executed = true
 			if err != nil {
-				step.Error = classify(instruction.ID, err)
+				step.Error = afterEffect(classify(instruction.ID, err), effected)
 				step.FinishedAt = time.Now().UTC()
 				appendStep(step)
 				return result, step.Error
@@ -237,6 +241,9 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 			}
 			state[instruction.ID] = committed
 			step.Output = committed
+			if len(definition.Descriptor().Effects) > 0 {
+				effected = instruction.ID
+			}
 		case "output":
 			step.StartedAt = time.Now().UTC()
 			step.Attempt = 1
@@ -313,6 +320,41 @@ func boundedLabel(value, fallback string) string {
 	}
 	return value
 }
+
+// afterEffect hides saturation from a step's failure once an earlier step
+// that declared effects has completed. Saturation tells the caller to
+// retry the whole workflow, and the retry would repeat that earlier effect
+// (#190). The failure keeps its code, class and text; it just no longer
+// matches capacity.ErrSaturated, so triggers answer it as a failure.
+func afterEffect(failure error, effected string) error {
+	var classified *Error
+	if effected == "" || !errors.Is(failure, capacity.ErrSaturated) || !errors.As(failure, &classified) {
+		return failure
+	}
+	return &Error{Code: classified.Code, Class: classified.Class, Step: classified.Step, Err: effectCommitted{err: classified.Err, step: effected}}
+}
+
+// effectCommitted is a step failure that follows a committed effect. It
+// matches whatever the failure matches except saturation and any error that
+// is itself saturation, such as store.ErrBusy; it has no Unwrap, which
+// would expose them further down the chain.
+type effectCommitted struct {
+	err  error
+	step string
+}
+
+func (e effectCommitted) Error() string {
+	return fmt.Sprintf("%v (after step %q committed its effects)", e.err, e.step)
+}
+
+func (e effectCommitted) Is(target error) bool {
+	if errors.Is(target, capacity.ErrSaturated) {
+		return false
+	}
+	return errors.Is(e.err, target)
+}
+
+func (e effectCommitted) As(target any) bool { return errors.As(e.err, target) }
 
 func resolveCallInput(state map[string]any, instruction contract.InternalInstruction, input any) (any, error) {
 	if len(instruction.References) == 0 {
