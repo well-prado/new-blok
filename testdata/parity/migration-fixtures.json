@@ -1,0 +1,173 @@
+{
+  "inventory": [
+    {
+      "id": "catalog",
+      "version": "1.0.0",
+      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "inputSchema": { "type": "object" },
+      "outputSchema": {
+        "type": "object",
+        "properties": { "sku": { "type": "string" } },
+        "required": ["sku"]
+      }
+    },
+    {
+      "id": "price",
+      "version": "1.0.0",
+      "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "inputSchema": {
+        "type": "object",
+        "properties": { "sku": { "type": "string" } },
+        "required": ["sku"]
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": { "totalCents": { "type": "integer" } },
+        "required": ["totalCents"]
+      }
+    }
+  ],
+  "cases": [
+    {
+      "name": "whole-value-structural-edges",
+      "source": {
+        "schemaVersion": "2",
+        "name": "order quote",
+        "version": "1.0.0",
+        "steps": [
+          { "id": "load", "use": "catalog", "inputs": { "$ref": { "step": "@trigger", "path": [] } } },
+          { "id": "total", "use": "price", "inputs": { "$ref": { "step": "load", "path": [] } } }
+        ]
+      },
+      "expected": { "supported": true, "workflow": "order-quote-18a8a3a558e885b0" }
+    },
+    {
+      "name": "mapper-expression-is-not-evaluated",
+      "source": {
+        "schemaVersion": "2",
+        "name": "mapped quote",
+        "version": "1.0.0",
+        "steps": [
+          { "id": "load", "use": "catalog", "inputs": { "sku": "js/ctx.request.body.sku" } }
+        ]
+      },
+      "expected": { "supported": false, "code": "unsupported_mapper_expression", "path": "steps[0].inputs" }
+    },
+    {
+      "name": "template-expression-is-actionable",
+      "source": {
+        "schemaVersion": "2",
+        "name": "templated quote",
+        "version": "1.0.0",
+        "steps": [
+          { "id": "load", "use": "catalog", "inputs": { "$tpl": ["sku:", { "$ref": { "step": "@trigger", "path": ["sku"] } }] } }
+        ]
+      },
+      "expected": { "supported": false, "code": "unsupported_mapper_expression", "path": "steps[0].inputs" }
+    },
+    {
+      "name": "nested-reference-metadata-is-not-ignored",
+      "source": {
+        "schemaVersion": "2",
+        "name": "nested metadata",
+        "version": "1.0.0",
+        "steps": [
+          { "id": "load", "use": "catalog", "inputs": { "$ref": { "step": "@trigger", "path": [], "fallback": "ignored-by-old-decoder" } } }
+        ]
+      },
+      "expected": { "supported": false, "code": "unsupported_mapper_expression", "path": "steps[0].inputs" }
+    },
+    {
+      "name": "duplicate-source-keys-are-rejected",
+      "source": {"schemaVersion":"2","name":"first","name":"second","version":"1.0.0","steps":[{"id":"load","use":"catalog"}]},
+      "expected": { "supported": false, "code": "duplicate_json_key", "path": "$" }
+    },
+    {
+      "name": "explicit-null-input-is-not-omission",
+      "source": {
+        "schemaVersion": "2",
+        "name": "null input",
+        "version": "1.0.0",
+        "steps": [ { "id": "load", "use": "catalog", "inputs": null } ]
+      },
+      "expected": { "supported": false, "code": "unsupported_mapper_expression", "path": "steps[0].inputs" }
+    },
+    {
+      "name": "null-trigger-config-is-not-an-empty-config",
+      "source": {
+        "schemaVersion": "2",
+        "name": "null config",
+        "version": "1.0.0",
+        "trigger": { "http": null },
+        "steps": [ { "id": "load", "use": "catalog" } ]
+      },
+      "expected": { "supported": false, "code": "unsupported_trigger_configuration", "path": "trigger.http" }
+    },
+    {
+      "name": "removed-queue-alias-is-actionable",
+      "source": {
+        "schemaVersion": "2",
+        "name": "old queue",
+        "version": "1.0.0",
+        "trigger": { "queue": {} },
+        "steps": [ { "id": "load", "use": "catalog" } ]
+      },
+      "expected": { "supported": false, "code": "removed_trigger_kind", "path": "trigger.queue" }
+    },
+    {
+      "name": "unknown-trigger-kind-is-actionable",
+      "source": {
+        "schemaVersion": "2",
+        "name": "unknown trigger",
+        "version": "1.0.0",
+        "trigger": { "custom": {} },
+        "steps": [ { "id": "load", "use": "catalog" } ]
+      },
+      "expected": { "supported": false, "code": "unsupported_trigger_kind", "path": "trigger.custom" }
+    },
+    {
+      "name": "retry-option-is-not-dropped",
+      "source": {
+        "schemaVersion": "2",
+        "name": "retry quote",
+        "version": "1.0.0",
+        "steps": [
+          { "id": "load", "use": "catalog", "retry": { "attempts": 3 } }
+        ]
+      },
+      "expected": { "supported": false, "code": "unsupported_step_option", "path": "steps[0].retry" }
+    },
+    {
+      "name": "route-configuration-needs-adapter-migration",
+      "source": {
+        "schemaVersion": "2",
+        "name": "http quote",
+        "version": "1.0.0",
+        "trigger": { "http": { "method": "POST", "path": "/quotes" } },
+        "steps": [
+          { "id": "load", "use": "catalog" }
+        ]
+      },
+      "expected": { "supported": false, "code": "unsupported_trigger_configuration", "path": "trigger.http" }
+    },
+    {
+      "name": "unknown-workflow-metadata-is-not-dropped",
+      "source": {
+        "schemaVersion": "2",
+        "name": "manifest quote",
+        "version": "1.0.0",
+        "capabilityManifest": { "effects": ["network"] },
+        "steps": [
+          { "id": "load", "use": "catalog" }
+        ]
+      },
+      "expected": { "supported": false, "code": "unsupported_workflow_field", "path": "capabilityManifest" }
+    }
+  ],
+  "exportCases": [
+    { "name": "output-must-return-final-call", "mutation": "output-earlier-call", "code": "unsupported_export_document" },
+    { "name": "extra-call-reference-is-not-dropped", "mutation": "extra-call-reference", "code": "unsupported_export_document" },
+    { "name": "multiple-bindings-are-not-dropped", "mutation": "multiple-bindings", "code": "unsupported_export_document" },
+    { "name": "unreferenced-descriptor-is-not-dropped", "mutation": "unreferenced-node", "code": "unsupported_export_document" }
+  ]
+}

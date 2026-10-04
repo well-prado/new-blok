@@ -1,0 +1,96 @@
+{
+  "schemaVersion": 1,
+  "evidenceClass": "synthetic-local-contract-comparison",
+  "provider": {
+    "name": "shared-parity-provider",
+    "version": "1.0.0",
+    "transport": "loopback-http",
+    "externalCalls": false,
+    "idempotencyHeader": "idempotency-key"
+  },
+  "workloads": [
+    {
+      "id": "quote-success",
+      "operation": "quote",
+      "request": { "requestKey": "quote-success", "sku": "coffee", "quantity": 2 },
+      "expected": {
+        "output": { "status": 200, "body": { "sku": "coffee", "quantity": 2, "totalCents": 3000, "currency": "USD" } },
+        "errorCode": "",
+        "providerCalls": 1,
+        "committedEffects": 1
+      }
+    },
+    {
+      "id": "quote-invalid-sku",
+      "operation": "quote",
+      "request": { "requestKey": "quote-invalid", "sku": "not-in-catalog", "quantity": 1 },
+      "expected": {
+        "output": null,
+        "errorCode": "unknown_sku",
+        "providerCalls": 1,
+        "committedEffects": 0,
+        "oldRunner": { "ok": false, "errorCode": "", "errorMessage": "synthetic unknown sku", "providerCalls": 1, "committedEffects": 0 },
+        "newNativeEngine": { "ok": false, "errorCode": "unknown_sku", "errorMessage": "unknown_sku: unknown_sku: synthetic unknown sku", "providerCalls": 1, "committedEffects": 0 }
+      }
+    },
+    {
+      "id": "order-duplicate-delivery",
+      "operation": "order",
+      "request": { "requestKey": "order-duplicate", "sku": "coffee", "quantity": 2 },
+      "deliveries": 2,
+      "expected": {
+        "normalizedOutput": { "status": 200, "body": { "requestKey": "order-duplicate", "sku": "coffee", "quantity": 2, "totalCents": 3000 } },
+        "providerCalls": 2,
+        "committedEffects": 1
+      }
+    },
+    {
+      "id": "job-retry",
+      "operation": "job-retry",
+      "request": { "requestKey": "job-retry", "jobId": "job-108", "sku": "coffee", "quantity": 2 },
+      "retry": { "maxAttempts": 2, "firstFailure": "temporary_provider_error" },
+      "expected": {
+        "oldRunner": { "ok": true, "providerCalls": 2, "committedEffects": 1 },
+        "newNativeEngine": { "ok": false, "errorCode": "temporary_provider_error", "errorMessage": "temporary_provider_error: temporary_provider_error: synthetic first-attempt failure", "providerCalls": 1, "committedEffects": 0 },
+        "newWorkerQueue": {
+          "output": { "status": 200, "body": { "jobId": "job-108", "state": "completed", "totalCents": 3000 } },
+          "providerCalls": 2,
+          "committedEffects": 1
+        }
+      }
+    },
+    {
+      "id": "webhook-duplicate",
+      "operation": "webhook",
+      "request": { "requestKey": "webhook-108", "eventId": "evt-108", "type": "order.created", "kind": "order.created", "orderId": "order-108" },
+      "deliveries": 2,
+      "expected": {
+        "normalizedOutput": { "eventId": "evt-108", "type": "order.created", "kind": "order.created", "orderId": "order-108", "requestKey": "webhook-108" },
+        "providerCalls": 1,
+        "committedEffects": 1,
+        "duplicateAcknowledged": true
+      }
+    },
+    {
+      "id": "stream-event-and-disconnect",
+      "operation": "stream",
+      "request": { "requestKey": "stream-108", "streamId": "stream-108", "events": [{ "id": "1", "event": "order", "data": { "orderId": "order-108", "state": "accepted" } }] },
+      "expected": {
+        "normalizedEvents": [{ "id": "1", "event": "order", "data": { "orderId": "order-108", "state": "accepted" } }],
+        "oldSSETriggerDisconnectCancelsWorkflow": true,
+        "newSSETriggerDisconnectPreservesAcceptedJob": true,
+        "deliverySemanticsMatch": false
+      }
+    }
+  ],
+  "recovery": {
+    "new": { "api": "trigger/worker.Queue", "expected": "accepted job remains durable and is processed after process restart" },
+    "old": { "api": "trigger/worker.InMemoryAdapter", "expected": "job is lost after process restart; adapter explicitly has no persistence" },
+    "comparison": "recovery guarantees differ; no workflow replay is inferred from persisted run traces"
+  },
+  "inertia": {
+    "status": "separate-contract-required",
+    "includedInBusinessParity": false,
+    "reason": "Inertia page props, partial reloads, deferred props, flash and redirect semantics require their own client/server protocol contract"
+  }
+}
