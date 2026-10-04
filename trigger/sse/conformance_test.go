@@ -146,7 +146,7 @@ func (d *sseDriver) work(ctx context.Context) error {
 	var stream string
 	var output json.RawMessage
 	var failure error
-	processed, err := d.queue.ProcessOnce(ctx, func(ctx context.Context, tx *sql.Tx, job worker.Job) error {
+	processed, err := d.queue.ProcessOnce(ctx, func(ctx context.Context, tx worker.Tx, job worker.Job) error {
 		stream = sse.StreamID(job.RequestKey)
 		output, failure = d.env.Workflow(ctx, conformance.Call{Input: job.Payload, Principal: job.Principal})
 		if errors.Is(failure, trigger.ErrSaturated) {

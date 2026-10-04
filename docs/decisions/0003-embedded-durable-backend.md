@@ -40,7 +40,32 @@ journal) waits for them under one busy-timeout budget per statement. A writer
 that waits longer than 5 seconds, behind one slow handler or several queued
 ones, still fails with `SQLITE_BUSY`; handlers must stay short. Such a
 failure is saturation, not a fault: every transaction error caused by
-`SQLITE_BUSY` matches `store.ErrBusy` (#184), so callers can retry it. A worker
+`SQLITE_BUSY` matches `store.ErrBusy` (#184), so callers can retry it.
+`store.ErrBusy` also matches `capacity.ErrSaturated`, which is
+`trigger.ErrSaturated` (#190): an in-band trigger that receives it answers
+with its saturation response (HTTP 503 with `Retry-After`, gRPC
+`ResourceExhausted`, WebSocket and MCP `saturated`). The sentinel lives in
+the leaf package `contract/capacity`, so the store does not depend on the
+triggers. Saturation promises only that the *failing* transaction
+committed nothing. Three things narrow it:
+
+- The engine hides it once an earlier step that declared effects has
+  completed: retrying the workflow would repeat that effect, so the
+  trigger answers the step's own failure instead (its classified code,
+  `node_error` unless a domain error names one). The failure still matches
+  whatever else it carries, such as a deadline, except anything that is
+  itself saturation (`store.ErrBusy` included), and its text names the
+  step that committed. An agent catalog workflow tool's dispatch steps
+  declare their child's effects, so the same holds for them.
+- Past an agent action's dispatch barrier, a busy store leaves the effect
+  uncertain, and the policy reports `ErrExecution`, never saturation.
+- A worker handler's busy store is a failure, not a deferral (ADR 0006).
+
+Not covered: a node that commits more than one transaction itself, a step
+whose writes are not declared as effects, and work outside the engine (a
+handler or catalog that writes before or around `engine.Run`, or a custom
+`tool.Gate` whose `Publish` reads a busy store after a native tool's
+effect). Retrying such work is safe only if its writes are idempotent. A worker
 whose consumer is canceled while it waits reports `ErrConsumerLost`, after
 up to the busy timeout, because the driver does not interrupt a busy wait.
 

@@ -187,7 +187,7 @@ func TestCrashAroundDurableSubmission(t *testing.T) {
 			}
 			runs := 0
 			for {
-				processed, err := queue.ProcessOnce(context.Background(), func(context.Context, *sql.Tx, worker.Job) error { runs++; return nil })
+				processed, err := queue.ProcessOnce(context.Background(), func(context.Context, worker.Tx, worker.Job) error { runs++; return nil })
 				if err != nil {
 					t.Fatal(err)
 				}
