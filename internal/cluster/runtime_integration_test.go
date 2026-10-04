@@ -285,13 +285,8 @@ func TestFailoverUnderSustainedLoadPreservesFairnessAndEffectCounts(t *testing.T
 	unblock := func() { releaseOnce.Do(func() { close(release) }) }
 	defer unblock()
 	var effects atomic.Int64
-	var effectOrderMu sync.Mutex
-	effectOrder := make([]string, 0, fixture.Tenants*fixture.RunsPerTenant)
 	definition := node.MustDefine("fixture/load-effect", "1.0.0", func(_ context.Context, input loadInput) (loadOutput, error) {
 		invocation := effects.Add(1)
-		effectOrderMu.Lock()
-		effectOrder = append(effectOrder, input.Tenant)
-		effectOrderMu.Unlock()
 		if invocation == 1 {
 			close(entered)
 			<-release
@@ -409,6 +404,7 @@ func TestFailoverUnderSustainedLoadPreservesFairnessAndEffectCounts(t *testing.T
 	}
 	completed, uncertain := 0, 0
 	processed := map[string]bool{firstRecovered.RunID: true}
+	processedTenants := []string{firstRecovered.Tenant}
 	if firstRecovered.State == "completed" {
 		completed++
 	} else if firstRecovered.State == "uncertain" {
@@ -425,6 +421,7 @@ func TestFailoverUnderSustainedLoadPreservesFairnessAndEffectCounts(t *testing.T
 			t.Fatal(processErr)
 		}
 		processed[run.RunID] = true
+		processedTenants = append(processedTenants, run.Tenant)
 		if run.State == "completed" {
 			completed++
 		} else if run.State == "uncertain" {
@@ -439,15 +436,12 @@ func TestFailoverUnderSustainedLoadPreservesFairnessAndEffectCounts(t *testing.T
 	if len(processed) != len(accepted) {
 		t.Fatalf("new owner processed %d runs, want %d", len(processed), len(accepted))
 	}
-	effectOrderMu.Lock()
-	order := append([]string(nil), effectOrder[1:]...)
-	effectOrderMu.Unlock()
 	firstRound := map[string]bool{}
-	for _, tenant := range order[:fixture.ExpectedFirstRoundTenants] {
+	for _, tenant := range processedTenants[:fixture.ExpectedFirstRoundTenants] {
 		firstRound[tenant] = true
 	}
 	if len(firstRound) != fixture.ExpectedFirstRoundTenants {
-		t.Fatalf("first post-takeover effect round served %d tenants, want %d; order=%v", len(firstRound), fixture.ExpectedFirstRoundTenants, order)
+		t.Fatalf("first post-takeover run round served %d tenants, want %d; order=%v", len(firstRound), fixture.ExpectedFirstRoundTenants, processedTenants)
 	}
 	unblock()
 	if err := <-oldDone; !errors.Is(err, distributed.ErrOwnershipLost) {
@@ -837,14 +831,15 @@ func TestScheduleWaitClassifiesQuorumLossAsUnavailable(t *testing.T) {
 		t.Fatal(err)
 	}
 	releaseOwnerOnCleanup(t, store, owner)
-	t.Logf("quorum-loss probe state: voters=[blok-distributed-spike-etcd1-1 blok-distributed-spike-etcd2-1 blok-distributed-spike-etcd3-1] paused=[blok-distributed-spike-etcd2-1 blok-distributed-spike-etcd3-1] partition=%s run=absent wait=wait-absent", partition)
+	voters := integrationEtcdVoters()
+	t.Logf("quorum-loss probe state: voters=%v paused=%v partition=%s run=absent wait=wait-absent", voters, voters[1:], partition)
 	paused := make([]string, 0, 2)
 	defer func() {
 		for index := len(paused) - 1; index >= 0; index-- {
 			_ = exec.Command("docker", "unpause", paused[index]).Run()
 		}
 	}()
-	for _, container := range []string{"blok-distributed-spike-etcd2-1", "blok-distributed-spike-etcd3-1"} {
+	for _, container := range voters[1:] {
 		output, err := exec.CommandContext(ctx, "docker", "pause", container).CombinedOutput()
 		if err != nil {
 			t.Fatalf("pause voter %s: %v: %s", container, err, output)
@@ -936,7 +931,8 @@ func TestStepJournalQuorumLossDefersAcceptedRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	releaseOwnerOnCleanup(t, store, owner)
-	t.Logf("quorum journal recovery state: voters=[blok-distributed-spike-etcd1-1 blok-distributed-spike-etcd2-1 blok-distributed-spike-etcd3-1] paused=[blok-distributed-spike-etcd2-1 blok-distributed-spike-etcd3-1] partition=%s run=%s", partition, admission.RunID)
+	voters := integrationEtcdVoters()
+	t.Logf("quorum journal recovery state: voters=%v paused=%v partition=%s run=%s", voters, voters[1:], partition, admission.RunID)
 	type processResult struct {
 		record RunRecord
 		err    error
@@ -953,7 +949,7 @@ func TestStepJournalQuorumLossDefersAcceptedRun(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("prefix did not reach quorum-loss barrier")
 	}
-	containers := []string{"blok-distributed-spike-etcd2-1", "blok-distributed-spike-etcd3-1"}
+	containers := voters[1:]
 	paused := make([]string, 0, len(containers))
 	restoreVoters := func() {
 		for index := len(paused) - 1; index >= 0; index-- {
@@ -1079,6 +1075,14 @@ func integrationDistributedStore(t *testing.T) *distributed.Store {
 		t.Fatal(err)
 	}
 	return store
+}
+
+func integrationEtcdVoters() []string {
+	voters := strings.Split(os.Getenv("BLOK_DISTRIBUTED_ETCD_VOTERS"), ",")
+	if len(voters) == 3 && voters[0] != "" && voters[1] != "" && voters[2] != "" {
+		return voters
+	}
+	return []string{"blok-distributed-spike-etcd1-1", "blok-distributed-spike-etcd2-1", "blok-distributed-spike-etcd3-1"}
 }
 
 func partitionWithoutPendingRuns(ctx context.Context, store *distributed.Store, partitions int) (string, error) {

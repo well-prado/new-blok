@@ -149,51 +149,65 @@ func (r *Runtime) DeliverSignal(ctx context.Context, tenant, waitID, signalID, p
 		}
 		return SignalResult{Late: true}, nil
 	}
-	wait.State, wait.SignalID, wait.Principal = "signaled", signalID, principal
-	wait.Payload = append(json.RawMessage(nil), payload...)
-	encoded, _ := json.Marshal(wait)
 	eventID := waitTransition("signal", tenant+"\x00"+waitID+"\x00"+signalID)
-	var commitErr error
 	var timerIndex *distributed.TimerIndexMutation
 	if !wait.DueAt.IsZero() {
 		timerIndex = &distributed.TimerIndexMutation{StateID: stateID, DueAt: wait.DueAt, Delete: true}
 	}
-	if wait.StepID != "" {
-		run, runRevision, readErr := r.readRun(ctx, partition, wait.RunID)
-		if readErr != nil {
-			return SignalResult{}, fmt.Errorf("%w: read suspended run for signal: %v", ErrUnavailable, readErr)
-		}
-		if run.State == "waiting" || run.State == "running" {
-			run.State, run.OwnerID, run.Fence = "accepted", owner.ID, owner.Token
-			encodedRun, _ := json.Marshal(run)
-			_, commitErr = r.store.CommitFencedWaitStates(ctx, owner, []distributed.StateMutation{
-				{StateID: stateID, ExpectedRevision: revision, State: encoded},
-				{StateID: run.RunID, ExpectedRevision: runRevision, State: encodedRun},
-			}, timerIndex, eventID, "wait.signaled", encoded)
-		} else {
-			_, commitErr = r.store.CommitFencedWaitStates(ctx, owner, []distributed.StateMutation{{StateID: stateID, ExpectedRevision: revision, State: encoded}}, timerIndex, eventID, "wait.signaled", encoded)
-		}
-	} else {
-		_, commitErr = r.store.CommitFencedWaitStates(ctx, owner, []distributed.StateMutation{{StateID: stateID, ExpectedRevision: revision, State: encoded}}, nil, eventID, "wait.signaled", encoded)
-	}
-	if commitErr != nil {
-		if errors.Is(commitErr, distributed.ErrStateConflict) || errors.Is(commitErr, distributed.ErrAlreadyWritten) {
-			latestData, latestRevision, readErr := r.store.ReadState(ctx, partition, stateID)
+	for attempt := 0; attempt < 4; attempt++ {
+		signaled := wait
+		signaled.State, signaled.SignalID, signaled.Principal = "signaled", signalID, principal
+		signaled.Payload = append(json.RawMessage(nil), payload...)
+		encoded, _ := json.Marshal(signaled)
+		mutations := []distributed.StateMutation{{StateID: stateID, ExpectedRevision: revision, State: encoded}}
+		if signaled.StepID != "" {
+			run, runRevision, readErr := r.readRun(ctx, partition, signaled.RunID)
 			if readErr != nil {
-				return SignalResult{}, fmt.Errorf("%w: reconcile signal race: %v", ErrUnavailable, readErr)
+				return SignalResult{}, fmt.Errorf("%w: read suspended run for signal: %v", ErrUnavailable, readErr)
 			}
-			var latest WaitRecord
-			if latestRevision > 0 && json.Unmarshal(latestData, &latest) == nil && latest.State == "signaled" && latest.SignalID == signalID && latest.Principal == principal && string(latest.Payload) == string(payload) {
-				return SignalResult{Accepted: true, Duplicate: true}, nil
+			if run.State == "waiting" || run.State == "running" {
+				run.State, run.OwnerID, run.Fence = "accepted", owner.ID, owner.Token
+				encodedRun, _ := json.Marshal(run)
+				mutations = append(mutations, distributed.StateMutation{StateID: run.RunID, ExpectedRevision: runRevision, State: encodedRun})
 			}
+		}
+		_, commitErr := r.store.CommitFencedWaitStates(ctx, owner, mutations, timerIndex, eventID, "wait.signaled", encoded)
+		if commitErr == nil {
+			return SignalResult{Accepted: true}, nil
+		}
+		latestData, latestRevision, readErr := r.store.ReadState(ctx, partition, stateID)
+		if readErr != nil {
+			return SignalResult{}, fmt.Errorf("%w: reconcile signal race after %v: %v", ErrUnavailable, commitErr, readErr)
+		}
+		if latestRevision == 0 {
+			return SignalResult{}, ErrWaitNotFound
+		}
+		var latest WaitRecord
+		if err := json.Unmarshal(latestData, &latest); err != nil || latest.Tenant != tenant {
+			return SignalResult{}, ErrRequestConflict
+		}
+		if latest.State == "signaled" && latest.SignalID == signalID {
+			if latest.Principal != principal || string(latest.Payload) != string(payload) {
+				return SignalResult{}, ErrRequestConflict
+			}
+			return SignalResult{Accepted: true, Duplicate: true}, nil
+		}
+		stateConflict := errors.Is(commitErr, distributed.ErrStateConflict) || errors.Is(commitErr, distributed.ErrAlreadyWritten)
+		if !stateConflict {
+			return SignalResult{}, fmt.Errorf("%w: signal commit outcome unresolved: %v", ErrUnavailable, commitErr)
+		}
+		if latest.State != "waiting" {
 			if err := r.commitLateSignal(ctx, owner, tenant, waitID, signalID, principal, payload); err != nil {
 				return SignalResult{}, err
 			}
 			return SignalResult{Late: true}, nil
 		}
-		return SignalResult{}, commitErr
+		if errors.Is(commitErr, distributed.ErrAlreadyWritten) {
+			return SignalResult{}, fmt.Errorf("%w: signal transition identity exists while wait remains open", ErrRequestConflict)
+		}
+		wait, revision = latest, latestRevision
 	}
-	return SignalResult{Accepted: true}, nil
+	return SignalResult{}, fmt.Errorf("%w: signal transition contention exceeded retry budget", ErrUnavailable)
 }
 
 func (r *Runtime) commitLateSignal(ctx context.Context, owner distributed.Owner, tenant, waitID, signalID, principal string, payload json.RawMessage) error {

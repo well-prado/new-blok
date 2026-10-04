@@ -285,8 +285,13 @@ func TestNetworkPartitionedVoterAllowsMajorityCommitAndCatchesUp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const network = "blok-distributed-spike"
-	const voter = "blok-distributed-spike-etcd3-1"
+	network := os.Getenv("BLOK_DISTRIBUTED_ETCD_NETWORK")
+	if network == "" {
+		network = "blok-distributed-spike"
+	}
+	voters := integrationEtcdVoters()
+	voter := voters[2]
+	endpoints := strings.Split(os.Getenv("BLOK_DISTRIBUTED_ENDPOINTS"), ",")
 	if output, err := exec.Command("docker", "network", "disconnect", network, voter).CombinedOutput(); err != nil {
 		t.Fatalf("isolate one voter from its peer/client network: %v: %s", err, output)
 	}
@@ -313,10 +318,10 @@ func TestNetworkPartitionedVoterAllowsMajorityCommitAndCatchesUp(t *testing.T) {
 			t.Errorf("wait for isolated voter quorum recovery: %v", err)
 		}
 	}()
-	if err := waitEndpointAt(ctx, "127.0.0.1:2379"); err != nil {
+	if err := waitEndpointAt(ctx, endpoints[0]); err != nil {
 		t.Fatalf("remaining voters did not establish a linearizable quorum: %v", err)
 	}
-	majorityClient, err := clientv3.New(clientv3.Config{Endpoints: []string{"http://127.0.0.1:2379", "http://127.0.0.1:22379"}, DialTimeout: 2 * time.Second})
+	majorityClient, err := clientv3.New(clientv3.Config{Endpoints: endpoints[:2], DialTimeout: 2 * time.Second})
 	if err != nil {
 		t.Fatalf("connect through non-partitioned voters: %v", err)
 	}
@@ -331,10 +336,10 @@ func TestNetworkPartitionedVoterAllowsMajorityCommitAndCatchesUp(t *testing.T) {
 	if err := restoreNetwork(); err != nil {
 		t.Fatal(err)
 	}
-	if err := waitEndpointAt(ctx, "127.0.0.1:32379"); err != nil {
+	if err := waitEndpointAt(ctx, endpoints[2]); err != nil {
 		t.Fatalf("isolated voter did not regain a linearizable quorum: %v", err)
 	}
-	if err := waitRead(ctx, client, "127.0.0.1:32379", eventKey(partition, "majority-during-partition")); err != nil {
+	if err := waitRead(ctx, client, endpoints[2], eventKey(partition, "majority-during-partition")); err != nil {
 		t.Fatalf("isolated voter did not recover the majority commit: %v", err)
 	}
 	assertScenarioFixture(t, "one-voter-network-partition", map[string]any{
@@ -668,6 +673,14 @@ func integrationStore(t *testing.T, env string) (*Store, *clientv3.Client) {
 		t.Fatal(err)
 	}
 	return store, client
+}
+
+func integrationEtcdVoters() []string {
+	voters := strings.Split(os.Getenv("BLOK_DISTRIBUTED_ETCD_VOTERS"), ",")
+	if len(voters) == 3 && voters[0] != "" && voters[1] != "" && voters[2] != "" {
+		return voters
+	}
+	return []string{"blok-distributed-spike-etcd1-1", "blok-distributed-spike-etcd2-1", "blok-distributed-spike-etcd3-1"}
 }
 
 func waitRead(ctx context.Context, client *clientv3.Client, endpoint, key string) error {
