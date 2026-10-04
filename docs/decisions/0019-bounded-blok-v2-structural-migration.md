@@ -29,8 +29,10 @@ The accepted subset is deliberately structural:
 - Each `use` resolves to an exact inventory descriptor carrying its version,
   digest, input schema and output schema. Different descriptors may not
   collide on one target node ID.
-- A call may omit `inputs`, or pass one whole-value structural `$ref` to
-  `@trigger` or a completed earlier step. A structural path is preserved.
+- A call may omit `inputs`, or provide exactly one structural `$ref` at the
+  input root. References to completed earlier steps may include a path
+  projection, which is preserved. `@trigger` is accepted only as the complete
+  trigger value; trigger-field projections remain unsupported.
 - Trigger configuration must be an empty object. Provider routes, auth,
   middleware, acknowledgments and delivery policy are configured and proven in
   application composition, not inferred by the converter.
@@ -41,7 +43,10 @@ The accepted subset is deliberately structural:
 
 `Export` is the inverse only for the exact subset emitted by `Convert`: calls
 followed by one final output of the final call, at most one representable
-binding, and at most one reference per call. It rejects additional bindings,
+binding, and at most one reference per call. Each call reference must target
+an earlier call; Export checks this explicitly because `Document.Validate`
+currently accepts a self-reference. Earlier-call path projections are
+retained. It rejects additional bindings,
 references, non-final/different output edges, source spans and other target-only
 metadata instead of silently dropping them. Round-trip means the represented
 workflow graph and pinned schemas survive; it does not restore provider
@@ -67,10 +72,11 @@ and updated valid/invalid fixtures under ADR 0001.
 ## Executable evidence
 
 - `testdata/parity/migration-fixtures.json` contains accepted and rejected
-  source documents, including structural refs, mapper/template input, nested
+  source documents, including root structural refs with earlier-call path
+  projections, mapper/template input, nested
   unknown `$ref` metadata, duplicate keys, retry options and trigger config.
-- The same fixture contains Export mutations for output-edge changes, extra
-  call references and multiple bindings; each must fail with
+- The same fixture contains Export mutations for output-edge changes,
+  self-references, extra call references and multiple bindings; each must fail with
   `unsupported_export_document`.
 - `migration/blokv2_test.go` verifies structural round-trip, schema preservation,
   size/step/inventory bounds, identity collisions, forward refs and bounded

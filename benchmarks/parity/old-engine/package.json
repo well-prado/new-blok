@@ -16,6 +16,8 @@
     "@blokjs/trigger-webhook": "2.5.0",
     "@blokjs/trigger-worker": "2.5.0",
     "hono": "4.11.7",
+    "pg-boss": "10.4.2",
+    "pg": "8.23.1",
     "zod": "3.25.76"
   }
 }

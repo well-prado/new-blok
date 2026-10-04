@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -41,11 +42,16 @@ type latencyDistribution struct {
 	MaxNS     int64   `json:"maxNs"`
 }
 
-// This opt-in test records bounded, raw local distributions. Old samples run
+// This separately opt-in legacy sampler records limited, non-equivalent
+// harness observations. It is retained only to reproduce the historical
+// artifact; it is not the persistent-application acceptance gate. Old samples run
 // the pinned Node process; new samples run the native engine in this Go test
 // process. Their process topologies differ and the values are not an SLO or a
 // normalized engine-speed comparison.
-func TestPerformanceDistributions(t *testing.T) {
+func TestLimitedHarnessPerformanceDistributions(t *testing.T) {
+	if os.Getenv("BLOK_PARITY_LIMITED_PERF") != "1" {
+		t.Skip("set BLOK_PARITY_LIMITED_PERF=1 to reproduce the historical limited harness samples")
+	}
 	quote := findWorkload(t, "quote-success")
 	provider := newProvider(t)
 	var distributions []latencyDistribution

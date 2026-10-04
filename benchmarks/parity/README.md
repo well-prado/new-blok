@@ -23,8 +23,10 @@ is involved.
   #71 package resolution). These are not a production deployment topology.
 - Published old packages: `@blokjs/core`, `@blokjs/runner`, `@blokjs/shared`,
   `@blokjs/trigger-sse`, `@blokjs/trigger-webhook`, and
-  `@blokjs/trigger-worker` all exactly `2.5.0`; `hono` `4.11.7`; `zod`
-  `3.25.76`; Node `24.21.0`.
+  `@blokjs/trigger-worker` all exactly `2.5.0`; transitive `@blokjs/helper`
+  `2.5.5`; `hono` `4.11.7`; `zod` `3.25.76`; Node `24.21.0`. The separately
+  gated durable-recovery process also pins `pg-boss` `10.4.2` and `pg` `8.23.1`,
+  and records the PostgreSQL server version queried read-only.
 - Local new framework: Go module `github.com/well-prado/new-blok`, current
   issue branch revision recorded by `git rev-parse HEAD`; Go version recorded
   by `go version`. The parity harness is in-process for the native engine.
@@ -39,15 +41,20 @@ From the new repository root:
 ```sh
 GOMAXPROCS=2 go test -p=1 ./migration -count=1 -v
 GOMAXPROCS=2 go test -p=1 ./benchmarks/parity -count=1 -v
-GOMAXPROCS=2 go test -p=1 ./benchmarks/parity -run '^TestPerformanceDistributions$' -count=1 -v
+BLOK_PARITY_PERF=1 GOMAXPROCS=2 go test -p=1 ./benchmarks/parity -run '^TestPersistentApplicationDistributions$' -count=1 -v
+BLOK_PARITY_LIMITED_PERF=1 GOMAXPROCS=2 go test -p=1 ./benchmarks/parity -run '^TestLimitedHarnessPerformanceDistributions$' -count=1 -v
+BLOK_PARITY_RECOVERY=1 BLOK_PARITY_POSTGRES_URL=postgres://...@127.0.0.1:5432/parity108_test GOMAXPROCS=2 go test -p=1 ./benchmarks/parity -run '^TestPersistentDurableRecoveryDistributions$' -count=1 -v
 GOMAXPROCS=2 go test -p=1 ./trigger/worker -run '^TestProcessKillRollsBackBusinessWriteAndAcknowledgment$' -count=1 -v
 ```
 
 Do not run the parity/recovery commands while a parent-owned full gate is live;
 coordinate their execution window first. On 2026-10-04, with the gate window
 cleared, the migration test, full focused parity package command, and focused
-process-kill worker test and bounded performance-distribution sampler above
-passed on the recorded macOS/arm64 toolchain.
+process-kill worker test and historical limited performance sampler passed on
+the recorded macOS/arm64 toolchain. The new persistent-process and
+durable-recovery samplers above have not yet run; they remain pending final
+gate coordination and, for recovery, an explicitly supplied disposable
+loopback PostgreSQL database.
 The worker retry path uses the actual old `WorkerTrigger`/`InMemoryAdapter`
 and new SQLite queue plus real native engine.
 
@@ -112,19 +119,16 @@ The `stream-event-and-disconnect` fixture declares those distinctions. The
 Inertia SPA protocol is explicitly out-of-scope for business-workflow parity
 and requires its own client/server contract. No production topology, provider
 throughput, cold-start, idle utilization, or load/recovery SLO is inferred from
-these focused tests. Bounded local distributions are recorded in
-[`performance-samples-2026-10-04.json`](../../testdata/parity/performance-samples-2026-10-04.json).
-The startup measurement includes one old Node process per request but measures
-new engine construction and execution inside an already-running Go test
-process. Idle measurements time different queue inspection APIs, not CPU or
-resident-memory use. Load uses four concurrent requests across three rounds;
-old requests each start a fresh Node process, while new requests share an
-in-process engine. Recovery reopens the actual SQLite worker queue and executes
-the native order workflow; the old InMemoryAdapter restart probe records the
-waiting job being lost. These are raw harness observations with different
-topologies, not normalized engine latency, production performance, capacity,
-throughput, or SLO claims. See the artifact's limitations before interpreting
-the distributions.
+these focused tests. Bounded historical local distributions are recorded in
+[`performance-samples-2026-10-04.json`](../../testdata/parity/performance-samples-2026-10-04.json);
+their process topologies do not match. The new opt-in application sampler
+instead keeps both processes alive, reuses each resolved engine across
+requests, and samples per-process CPU/RSS during a declared idle window. The
+separate recovery sampler kills each accepting process after durable commit,
+then measures fresh-consumer redelivery. Until both commands are run and their
+raw outputs reviewed, full startup/idle/load/recovery acceptance remains open.
+None of these local harnesses establish production performance, capacity,
+throughput, or SLO claims.
 
 The bounded public migration subset, compatibility classification, strict
 source/Export handling, and rejected cases are specified by
@@ -132,12 +136,54 @@ source/Export handling, and rejected cases are specified by
 The migration fixtures reject duplicate object keys, nested unknown `$ref`
 members, expressions, explicit-null inputs, trigger configuration and Export
 documents whose output/reference/binding semantics would otherwise be dropped.
+Earlier-call path projections are preserved; self/forward references are
+rejected at Export even if a manually constructed document passes
+`Document.Validate`.
+
+## Performance acceptance remains open
+
+The retained sample artifact is limited harness evidence and satisfies none of
+the required startup/idle/load/recovery distribution acceptance by itself.
+A replacement must launch both old and new applications as persistent
+processes, use the same synthetic provider and schema/delivery contract, and
+measure equivalent work under declared startup, sustained-idle, load, and
+process-recovery scenarios. Idle evidence must include process CPU/RSS over a
+fixed observation window, not queue-inspection call latency. Recovery must
+redeliver accepted work from durable storage on both sides with predeclared
+expected outputs, statuses, and effect counts; losing an in-memory old job is
+not a matched recovery sample. Keep raw samples, exact versions, commands,
+topology, durability settings, and limitations with the result. Do not relabel
+the existing mismatched topology samples as parity or production performance.
+
+The persistent recovery gate is separately opt-in because the published
+`PgBossAdapter` requires a disposable loopback PostgreSQL database. It pins
+`pg-boss` 10.4.2, accepts only loopback endpoints and a database name beginning
+`parity108_test`, uses a run-specific schema, kills each producer only after the
+old adapter's `send` or new SQLite `Enqueue` reports accepted, and then starts a
+fresh actual old `WorkerTrigger`/`Runner` or native-engine/SQLite consumer. The
+synthetic provider fails the first attempt and then succeeds; each recovered
+job must report one retry, the predeclared output, two provider calls, and one
+committed effect. PostgreSQL and SQLite are different local backends, so these
+samples establish only single-host accepted-job recovery, not disk-loss,
+multi-host, or production failover parity. The recovery command is destructive
+only within the explicitly supplied local disposable database: pg-boss creates
+its queue schema and leaves it there; never point it at a production database.
 
 ## Current raw sample scope
 
 The focused parity tests emit raw quote/order/job, webhook, SSE, and recovery
-envelopes and call/effect counts. The opt-in sampler emits bounded raw
-startup-plus-call, idle queue-inspection, concurrent quote, and recovery
-samples plus nearest-rank p50/p95; it does not measure production topology or
-idle resource utilization. Rerun only after coordinating around parent-owned
-full gates, and retain exact versions, command, topology, and raw samples.
+envelopes and call/effect counts. The persistent app sampler emits bounded raw
+startup and idle/load CPU/RSS, plus ten-second concurrent quote distributions;
+the separate durable recovery sampler emits kill-to-first-completion
+distributions and verifies stable post-retry queue settlement.
+Rerun only after coordinating around parent-owned full gates, and retain exact
+versions, command, topology, and raw samples.
+
+For the persistent quote sampler, old and new load requests use disjoint
+idempotency-key prefixes so both execute the same fresh synthetic-provider
+effect path; only the separately labelled warmup intentionally shares a key.
+The load windows run sequentially (published process first, native process
+second), so the JSON records this order and labels the distributions descriptive,
+not a controlled performance comparison. Process CPU uses macOS `ps` cumulative
+`cputime` with one-second resolution; one-second windows are quantized and can
+produce coarse or zero deltas. Resident memory is sampled from `ps` RSS.

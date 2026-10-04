@@ -80,6 +80,12 @@ func TestMigrationFixtures(t *testing.T) {
 			switch fixture.Mutation {
 			case "output-earlier-call":
 				doc.Workflow.Instructions[len(doc.Workflow.Instructions)-1].References[0].Step = "load"
+			case "call-self-reference":
+				call := &doc.Workflow.Instructions[1]
+				call.References[0].Step = call.ID
+				if err := doc.Validate(); err != nil {
+					t.Fatalf("public document validator no longer reproduces the self-reference edge case: %v", err)
+				}
 			case "extra-call-reference":
 				call := &doc.Workflow.Instructions[1]
 				call.References = append(call.References, contract.Reference{Step: "load", Path: []string{"sku"}})
@@ -103,7 +109,7 @@ func TestMigrationFixtures(t *testing.T) {
 }
 
 func TestStructuralMigrationRoundTrips(t *testing.T) {
-	fixture := []byte(`{"schemaVersion":"2","name":"order quote","version":"1.0.0","steps":[{"id":"load","use":"catalog","inputs":{"$ref":{"step":"@trigger","path":[]}}},{"id":"total","use":"price","inputs":{"$ref":{"step":"load"}}}]}`)
+	fixture := []byte(`{"schemaVersion":"2","name":"order quote","version":"1.0.0","steps":[{"id":"load","use":"catalog","inputs":{"$ref":{"step":"@trigger","path":[]}}},{"id":"total","use":"price-sku","inputs":{"$ref":{"step":"load","path":["sku"]}}}]}`)
 	inventory := fixtureInventory()
 	first, err := Convert(fixture, inventory)
 	if err != nil {
@@ -129,6 +135,9 @@ func TestStructuralMigrationRoundTrips(t *testing.T) {
 	}
 	if string(first.Workflow.InputSchema) != string(second.Workflow.InputSchema) || string(first.Workflow.OutputSchema) != string(second.Workflow.OutputSchema) {
 		t.Fatalf("schemas changed on round trip")
+	}
+	if got := second.Workflow.Instructions[1].References[0].Path; len(got) != 1 || got[0] != "sku" {
+		t.Fatalf("earlier-step path projection changed on export/convert round trip: %v", got)
 	}
 }
 
@@ -202,8 +211,9 @@ func diagnosticCode(t *testing.T, err error) string {
 
 func fixtureInventory() map[string]contract.NodeDescriptor {
 	return map[string]contract.NodeDescriptor{
-		"catalog": {ID: "catalog", Version: "1.0.0", Digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object","properties":{"sku":{"type":"string"}},"required":["sku"]}`)},
-		"price":   {ID: "price", Version: "1.0.0", Digest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", InputSchema: json.RawMessage(`{"type":"object","properties":{"sku":{"type":"string"}},"required":["sku"]}`), OutputSchema: json.RawMessage(`{"type":"object","properties":{"totalCents":{"type":"integer"}},"required":["totalCents"]}`)},
+		"catalog":   {ID: "catalog", Version: "1.0.0", Digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object","properties":{"sku":{"type":"string"}},"required":["sku"]}`)},
+		"price":     {ID: "price", Version: "1.0.0", Digest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", InputSchema: json.RawMessage(`{"type":"object","properties":{"sku":{"type":"string"}},"required":["sku"]}`), OutputSchema: json.RawMessage(`{"type":"object","properties":{"totalCents":{"type":"integer"}},"required":["totalCents"]}`)},
+		"price-sku": {ID: "price-sku", Version: "1.0.0", Digest: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", InputSchema: json.RawMessage(`{"type":"string"}`), OutputSchema: json.RawMessage(`{"type":"object","properties":{"totalCents":{"type":"integer"}},"required":["totalCents"]}`)},
 	}
 }
 

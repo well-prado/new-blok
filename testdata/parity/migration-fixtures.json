@@ -25,18 +25,29 @@
         "properties": { "totalCents": { "type": "integer" } },
         "required": ["totalCents"]
       }
+    },
+    {
+      "id": "price-sku",
+      "version": "1.0.0",
+      "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "inputSchema": { "type": "string" },
+      "outputSchema": {
+        "type": "object",
+        "properties": { "totalCents": { "type": "integer" } },
+        "required": ["totalCents"]
+      }
     }
   ],
   "cases": [
     {
-      "name": "whole-value-structural-edges",
+      "name": "root-structural-reference-preserves-step-path-projection",
       "source": {
         "schemaVersion": "2",
         "name": "order quote",
         "version": "1.0.0",
         "steps": [
           { "id": "load", "use": "catalog", "inputs": { "$ref": { "step": "@trigger", "path": [] } } },
-          { "id": "total", "use": "price", "inputs": { "$ref": { "step": "load", "path": [] } } }
+          { "id": "total", "use": "price-sku", "inputs": { "$ref": { "step": "load", "path": ["sku"] } } }
         ]
       },
       "expected": { "supported": true, "workflow": "order-quote-18a8a3a558e885b0" }
@@ -166,6 +177,7 @@
   ],
   "exportCases": [
     { "name": "output-must-return-final-call", "mutation": "output-earlier-call", "code": "unsupported_export_document" },
+    { "name": "call-self-reference-is-not-exportable", "mutation": "call-self-reference", "code": "unsupported_export_document" },
     { "name": "extra-call-reference-is-not-dropped", "mutation": "extra-call-reference", "code": "unsupported_export_document" },
     { "name": "multiple-bindings-are-not-dropped", "mutation": "multiple-bindings", "code": "unsupported_export_document" },
     { "name": "unreferenced-descriptor-is-not-dropped", "mutation": "unreferenced-node", "code": "unsupported_export_document" }

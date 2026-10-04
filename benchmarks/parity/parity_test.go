@@ -164,6 +164,35 @@ type providerLedger struct {
 	effects int
 	seen    map[string]bool
 	attempt map[string]int
+	gates   map[string]*providerGate
+}
+
+type providerGate struct {
+	entered chan struct{}
+	release chan struct{}
+	used    bool
+	once    sync.Once
+}
+
+func (l *ledgerServer) gateSuccessfulRetry(key string) *providerGate {
+	l.ledger.mu.Lock()
+	defer l.ledger.mu.Unlock()
+	gate := &providerGate{entered: make(chan struct{}), release: make(chan struct{})}
+	l.ledger.gates[key] = gate
+	return gate
+}
+
+func (g *providerGate) waitForCall() {
+	close(g.entered)
+	<-g.release
+}
+
+func (g *providerGate) unblock() { g.once.Do(func() { close(g.release) }) }
+
+func (l *ledgerServer) attemptsFor(operation, key string) int {
+	l.ledger.mu.Lock()
+	defer l.ledger.mu.Unlock()
+	return l.ledger.attempt[operation+"\x00"+key]
 }
 
 func TestExecutableOldAndNewEngineWorkloads(t *testing.T) {
@@ -967,7 +996,7 @@ func schemasForOperation(operation string) ([]byte, []byte) {
 
 func newProvider(t *testing.T) *ledgerServer {
 	t.Helper()
-	ledger := &providerLedger{seen: map[string]bool{}, attempt: map[string]int{}}
+	ledger := &providerLedger{seen: map[string]bool{}, attempt: map[string]int{}, gates: map[string]*providerGate{}}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1001,6 +1030,19 @@ func newProvider(t *testing.T) *ledgerServer {
 			}
 		}
 		ledger.mu.Unlock()
+		if operation == "job-retry" && attempt == 2 {
+			ledger.mu.Lock()
+			gate := ledger.gates[key]
+			if gate != nil && !gate.used {
+				gate.used = true
+			} else {
+				gate = nil
+			}
+			ledger.mu.Unlock()
+			if gate != nil {
+				gate.waitForCall()
+			}
+		}
 
 		switch operation {
 		case "quote":

@@ -74,9 +74,10 @@ func (e duplicateJSONKeyError) Error() string {
 	return "duplicate JSON object member " + shortDiagnosticValue(e.key, 80)
 }
 
-// Convert accepts workflows whose calls pass the complete trigger input or a
-// complete earlier step output. Node schemas and immutable identities come
-// from the caller's inventory, keyed by the source workflow's `use` value.
+// Convert accepts workflows whose calls pass one root structural reference:
+// the complete trigger value, or an earlier step value with an optional path
+// projection. Node schemas and immutable identities come from the caller's
+// inventory, keyed by the source workflow's `use` value.
 // Source and collection bounds are enforced before any target document is
 // emitted; unsupported mappings are returned as Diagnostic values.
 func Convert(source []byte, inventory map[string]contract.NodeDescriptor) (contract.Document, error) {
@@ -223,7 +224,7 @@ func Convert(source []byte, inventory map[string]contract.NodeDescriptor) (contr
 		instruction := contract.Instruction{ID: sourceStep.ID, Kind: "call", Node: descriptor.ID}
 		if _, hasInputs := stepFields["inputs"]; hasInputs {
 			if bytes.Equal(bytes.TrimSpace(sourceStep.Inputs), []byte("null")) {
-				return contract.Document{}, Diagnostic{Code: "unsupported_mapper_expression", Path: path + ".inputs", Message: "explicit null inputs are distinct from an omitted input and are outside the supported subset", Remediation: "express a supported whole-value `$ref` or keep this workflow on its source engine"}
+				return contract.Document{}, Diagnostic{Code: "unsupported_mapper_expression", Path: path + ".inputs", Message: "explicit null inputs are distinct from omission and are outside the supported subset", Remediation: "use one structural `$ref` at the input root or keep this workflow on its source engine"}
 			}
 			ref, err := parseInputReference(sourceStep.Inputs, path+".inputs")
 			if err != nil {
@@ -311,6 +312,7 @@ func Export(doc contract.Document) ([]byte, error) {
 		legacy["trigger"] = map[string]any{doc.Bindings[0].Kind: map[string]any{}}
 	}
 	steps := make([]map[string]any, 0, len(doc.Workflow.Instructions)-1)
+	earlierCalls := make(map[string]struct{}, len(doc.Workflow.Instructions)-1)
 	lastCall := ""
 	usedNodes := make(map[string]bool, len(doc.Nodes))
 	for index, instruction := range doc.Workflow.Instructions {
@@ -337,7 +339,7 @@ func Export(doc contract.Document) ([]byte, error) {
 			return nil, exportDiagnostic(fmt.Sprintf("workflow.instructions[%d]", index), "only calls followed by one final output instruction are representable", "remove unsupported control flow or keep the workflow on its source engine")
 		}
 		if len(instruction.References) > 1 {
-			return nil, exportDiagnostic(fmt.Sprintf("workflow.instructions[%d].references", index), "the source subset accepts one whole-value reference per call", "move input composition into a typed node before exporting")
+			return nil, exportDiagnostic(fmt.Sprintf("workflow.instructions[%d].references", index), "the source subset accepts one reference edge per call; path projections on that edge are preserved", "move multi-reference input composition into a typed node before exporting")
 		}
 		node, ok := nodes[instruction.Node]
 		if !ok {
@@ -351,6 +353,9 @@ func Export(doc contract.Document) ([]byte, error) {
 		step := map[string]any{"id": instruction.ID, "use": node.ID}
 		if len(instruction.References) > 0 {
 			ref := instruction.References[0]
+			if _, exists := earlierCalls[ref.Step]; !exists {
+				return nil, exportDiagnostic(fmt.Sprintf("workflow.instructions[%d].references[0]", index), "call references must target a completed earlier call; self and forward references are not representable", "reference a preceding call and preserve any required path projection")
+			}
 			reference := map[string]any{"step": ref.Step}
 			if ref.Path != nil {
 				reference["path"] = ref.Path
@@ -358,6 +363,7 @@ func Export(doc contract.Document) ([]byte, error) {
 			step["inputs"] = map[string]any{"$ref": reference}
 		}
 		steps = append(steps, step)
+		earlierCalls[instruction.ID] = struct{}{}
 	}
 	if len(steps) == 0 {
 		return nil, exportDiagnostic("workflow.instructions", "document has no call instruction", "convert a non-empty supported source workflow")
@@ -445,11 +451,11 @@ func exportDiagnostic(path, message, remediation string) error {
 func parseInputReference(raw json.RawMessage, path string) (structuralReference, error) {
 	var members map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &members); err != nil || members == nil || len(members) != 1 || len(members["$ref"]) == 0 {
-		message := "input must be one structural `$ref` covering the complete value"
+		message := "input must be exactly one structural `$ref` at the input root; earlier-step path projections are supported"
 		if err != nil {
 			message = err.Error()
 		}
-		return structuralReference{}, Diagnostic{Code: "unsupported_mapper_expression", Path: path, Message: message, Remediation: "rewrite it as one whole-value `$ref`, or move the transformation into a typed node; JavaScript mapper strings are never evaluated or rewritten"}
+		return structuralReference{}, Diagnostic{Code: "unsupported_mapper_expression", Path: path, Message: message, Remediation: "rewrite it as one root `$ref` (with an optional earlier-step path), or move input composition into a typed node; JavaScript mapper strings are never evaluated or rewritten"}
 	}
 	var referenceFields map[string]json.RawMessage
 	if err := json.Unmarshal(members["$ref"], &referenceFields); err != nil || referenceFields == nil {
