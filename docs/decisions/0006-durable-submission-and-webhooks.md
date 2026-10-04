@@ -2,7 +2,8 @@
 
 - Status: accepted
 - Date: 2026-10-02
-- Amended: #188 (worker nested-store diagnostics and saturation)
+- Amended: #188 (worker nested-store diagnostics and saturation), #207
+  (undetected self-submits fail after one busy wait)
 - Roadmap: E09-T02 ([#55](https://github.com/well-prado/new-blok/issues/55))
 - Amends: [ADR 0005](0005-trigger-adapter-contract.md) (webhook declaration)
 - Consumers: webhook now; cron (#56) and pubsub (#57) are expected to submit
@@ -43,13 +44,44 @@ for atomic writes; this is a failed handler result, not saturation to defer.
 The optional `store.WriteDomainProvider` capability supplies lock identity.
 SQLite compares file-backed domains using the filesystem's same-file identity,
 including separate handles and filesystem aliases to the same database file;
-its existing shared `:memory:` URI uses one stable domain token across opens.
-Wrappers that share a write lock must forward the underlying token. When a
-wrapper hides this capability, or trusted handler code discards the supplied context (for example
-by submitting with `context.Background()`), the queue cannot safely infer the
-relationship: that nested write follows the ordinary store busy timeout and
-its saturation behavior. Direct database writes that bypass `Queue.Enqueue`
-are likewise outside this diagnostic; handlers should use `worker.Tx`.
+every `:memory:` open is one shared database with one stable domain token.
+Wrappers that share a write lock must forward the underlying token.
+
+The context check cannot see a nested submission whose handler discarded the
+supplied context (for example by submitting with `context.Background()`) or
+that goes through a wrapper hiding `WriteDomainProvider`. Such a submission
+waits out the store's busy timeout once, because the claim holds the lock it
+needs, and returns saturation that names the write domain it waited on
+(#207). The store names it: SQLite annotates its busy errors with its domain
+(`store.WithWriteDomain`), which survives wrappers that pass errors through;
+`Queue.Enqueue` adds its own queue's domain when the cause carries none.
+`ProcessOnce` compares that domain (`store.ErrorWriteDomain`) with its claim's
+while the claim is still held. A match means the claim itself was the
+contention, so deferring would only repeat the wait: the job fails as
+`worker.ErrNestedSubmission`, is not retried, and dead-letters as `nested
+submission to claimed store; use worker.Tx for atomic writes`. Saturation
+naming a different domain, or no domain, is backpressure and still defers.
+The comparison needs the claiming queue's own domain: a queue opened on a
+wrapper that hides it cannot tell its claim apart and defers, as before.
+Direct database writes that bypass `Queue.Enqueue` are likewise outside this
+diagnostic; handlers should use `worker.Tx`.
+
+SQLite opens `:memory:` on its memdb VFS (`file:/new-blok-memory?vfs=memdb`),
+not in shared-cache mode. In shared-cache mode a writer blocked by another
+connection's write transaction gets `SQLITE_LOCKED_SHAREDCACHE`, which the
+driver waits out with `sqlite3_unlock_notify`: no busy timeout applies, the
+context cannot interrupt it, and SQLite reports a deadlock only when the
+blocking connection is itself waiting for an unlock. A claim waiting for its
+handler is not, so an undetected self-submit on `:memory:` blocked forever
+(#207). memdb locks report `SQLITE_BUSY` and honor the busy timeout like a
+file, so the same submission fails after one wait. The trade-off is ordinary
+locking without WAL: while a write transaction is open (a worker claim holds
+one for its whole handler), no other connection can even start a read; it
+waits out the busy timeout and fails with `store.ErrBusy` (measured: 5.05 s,
+where shared cache answered an unrelated read in 0.3 ms). Each connection
+also refreshes its schema at the start of a transaction rather than sharing
+one cache, and memdb caps the database at 1 GiB. `:memory:` is a test store;
+deployments open a file.
 
 A worker handler writes through `worker.Tx`, the claim's own transaction,
 so its writes commit only if the job is acknowledged. SQLite can end that
@@ -159,6 +191,9 @@ is never parsed before verification.
 | `worker.ErrInvalidPayload` / `ErrRequestConflict` wrap the trigger sentinels | additive (error chains) | `errors.Is` on the worker sentinels keeps working |
 | `store.WriteDomainProvider` and `worker.ErrNestedSubmission` | additive | Stores/wrappers may expose lock identity; handlers should use `worker.Tx` for same-store atomic writes |
 | Worker handler receives saturation from another store | behavioral | The job is deferred within its existing deferral budget without consuming an attempt |
+| `store.WithWriteDomain` / `store.ErrorWriteDomain`; SQLite busy errors and worker saturation name their write domain | additive (error chains) | `errors.Is` on `store.ErrBusy` / `trigger.ErrSaturated` keeps working; other stores may annotate their busy errors |
+| Worker handler returns saturation naming its own claim's domain | behavioral | The job fails as `worker.ErrNestedSubmission` after one busy wait instead of being deferred to `deferral_budget_exhausted` |
+| SQLite `:memory:` uses the memdb VFS instead of shared cache | behavioral | Same shared database per process; writer conflicts are `store.ErrBusy` within the busy timeout instead of an unbounded wait |
 | `principal_json` column | schema | added by `worker.New` |
 | New package `trigger/webhook` | additive | none |
 

@@ -82,7 +82,9 @@ assigns. Conformance distinguishes the two by counting dispatches per delivery.
 Redelivery is bounded. In the worker, a handler failure consumes an attempt;
 saturation and a lost consumer consume a separate deferral budget instead
 (`MaxDeferrals` = 16, backoff 1s doubling to a 1-minute cap), after which the
-job is dead-lettered with `deferral_budget_exhausted`.
+job is dead-lettered with `deferral_budget_exhausted`. Saturation that names
+the write domain the job's own claim holds is not backpressure but a nested
+submission, and fails the job (ADR 0006, #207).
 
 ### Drain timeout
 

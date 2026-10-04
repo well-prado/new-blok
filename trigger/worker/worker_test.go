@@ -1032,7 +1032,9 @@ func TestHandlerSubmittingAcrossSharedMemoryHandlesFails(t *testing.T) {
 	}
 	var nested error
 	started := time.Now()
-	processed, err := outer.ProcessOnce(ctx, func(ctx context.Context, tx Tx, _ Job) error {
+	// Bounded: an undiagnosed shared-memory self-submit once blocked forever
+	// (#207).
+	processed, err := processBounded(outer, func(ctx context.Context, tx Tx, _ Job) error {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO nested_memory_effects VALUES ('rolled-back')`); err != nil {
 			return err
 		}

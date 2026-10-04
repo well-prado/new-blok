@@ -21,11 +21,13 @@ import (
 const sqliteBusy = 5
 
 // busy marks an error caused by SQLITE_BUSY as store.ErrBusy, so callers can
-// tell a saturated store from a failure.
-func busy(err error) error {
+// tell a saturated store from a failure, and names the write domain whose
+// lock was not available. An error that already is store.ErrBusy, such as
+// another store's busy error returned through a callback, keeps its domain.
+func busy(err error, domain *store.WriteDomain) error {
 	var failure *driver.Error
 	if err != nil && errors.As(err, &failure) && failure.Code()&0xff == sqliteBusy && !errors.Is(err, store.ErrBusy) {
-		return fmt.Errorf("%w: %w", store.ErrBusy, err)
+		return store.WithWriteDomain(fmt.Errorf("%w: %w", store.ErrBusy, err), domain)
 	}
 	return err
 }
@@ -36,8 +38,7 @@ const (
 	busyTimeout = 5000
 )
 
-// dsn uses one named shared-cache URI for every :memory: open, so each handle
-// participates in the same SQLite writer domain.
+// sharedMemoryWriteDomain is the one writer domain of every :memory: handle.
 var sharedMemoryWriteDomain = store.NewWriteDomain()
 
 // Backend opens SQLite databases with the durability settings required by the
@@ -92,9 +93,11 @@ func configure(ctx context.Context, database *sql.DB) error {
 	return nil
 }
 
+// dsn opens every :memory: path as one named database on SQLite's memdb VFS,
+// so each handle shares the database and participates in one writer domain.
 func dsn(path string) string {
 	if path == ":memory:" {
-		return "file::memory:?cache=shared&_busy_timeout=5000&_journal_mode=MEMORY&_synchronous=FULL&_foreign_keys=ON"
+		return "file:/new-blok-memory?vfs=memdb&_busy_timeout=5000&_journal_mode=MEMORY&_synchronous=FULL&_foreign_keys=ON"
 	}
 	return (&url.URL{
 		Scheme:   "file",
@@ -142,17 +145,17 @@ func (c *connection) WithTx(ctx context.Context, fn func(*sql.Tx) error) error {
 	}
 	tx, err := c.database.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
-		return busy(fmt.Errorf("sqlite: begin: %w", err))
+		return busy(fmt.Errorf("sqlite: begin: %w", err), c.writeDomain)
 	}
 	if err := fn(tx); err != nil {
 		_ = tx.Rollback()
-		return busy(err)
+		return busy(err, c.writeDomain)
 	}
 	if c.beforeCommit != nil {
 		c.beforeCommit()
 	}
 	if err := tx.Commit(); err != nil {
-		return busy(fmt.Errorf("sqlite: commit: %w", err))
+		return busy(fmt.Errorf("sqlite: commit: %w", err), c.writeDomain)
 	}
 	if c.afterCommit != nil {
 		c.afterCommit()
