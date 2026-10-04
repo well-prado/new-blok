@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"sort"
 	"strings"
 	"sync"
@@ -36,6 +37,10 @@ type loadInput struct {
 type loadOutput struct {
 	Tenant   string `json:"tenant"`
 	Sequence int    `json:"sequence"`
+}
+
+type waitInput struct {
+	Value int `json:"value"`
 }
 
 func TestTwoIngressNodesPersistAndExecuteOneIdempotentRun(t *testing.T) {
@@ -587,6 +592,314 @@ func TestTimerAndSignalRaceHasOneFencedWinner(t *testing.T) {
 	if effects.Load() != fixture.ExpectedRunEffects {
 		t.Fatalf("run effect count=%d, want %d", effects.Load(), fixture.ExpectedRunEffects)
 	}
+}
+
+func TestSignalResumesDistributedRunFromCommittedPrefix(t *testing.T) {
+	fixture := readContinuationFixture(t)
+	store := integrationDistributedStore(t)
+	var prefixEffects, suffixEffects atomic.Int64
+	prefix := node.MustDefine("fixture/wait-prefix", "1.0.0", func(_ context.Context, input waitInput) (integrationOutput, error) {
+		prefixEffects.Add(1)
+		return integrationOutput{Value: input.Value + 1}, nil
+	}, node.Description("counted pre-wait effect"), node.Schemas([]byte(waitInputSchema), []byte(outputSchema)), node.Effects("fixture:prefix")).Any()
+	suffix := node.MustDefine("fixture/wait-suffix", "1.0.0", func(_ context.Context, input engine.WaitResult) (integrationOutput, error) {
+		suffixEffects.Add(1)
+		if input.SignalID != fixture.SignalID || string(input.Payload) != fixture.SignalPayload || input.TimedOut {
+			return integrationOutput{}, fmt.Errorf("unexpected resumed signal input: %+v", input)
+		}
+		return integrationOutput{Value: 99}, nil
+	}, node.Description("consumes committed signal wait outcome"), node.Schemas([]byte(waitConsumerSchema), []byte(outputSchema)), node.Effects("fixture:suffix")).Any()
+	runtime := newWaitIntegrationRuntime(t, store, "signal-continuation", []contract.InternalInstruction{
+		{Index: 0, ID: "prefix", Kind: "call", Node: "fixture/wait-prefix"},
+		{Index: 1, ID: "approval", Kind: "wait", Wait: &contract.WaitInstruction{Name: "approval"}},
+		{Index: 2, ID: "suffix", Kind: "call", Node: "fixture/wait-suffix", References: []contract.Reference{{Step: "approval"}}},
+		{Index: 3, ID: "output", Kind: "output", References: []contract.Reference{{Step: "suffix"}}},
+	}, map[string]node.Any{"fixture/wait-prefix": prefix, "fixture/wait-suffix": suffix})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	tenant, partition := tenantForEmptyPartition(t, ctx, store, runtime, "wait-signal-tenant")
+	admission, err := runtime.Admit(ctx, Submission{Tenant: tenant, RequestKey: "signal-continuation", Workflow: "signal-continuation", Input: json.RawMessage(`{"value":40}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("bounded continuation state: partition=%s tenant=%s run=%s wait=%s", partition, tenant, admission.RunID, WaitIDFor(admission.RunID, "approval"))
+	owner, err := store.Acquire(ctx, partition, "signal-continuation-owner", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.processOne(ctx, owner); !errors.Is(err, ErrNoWork) {
+		t.Fatalf("initial process error=%v, want suspended work yield", err)
+	}
+	waitID := WaitIDFor(admission.RunID, "approval")
+	wait, err := runtime.GetWait(ctx, tenant, waitID)
+	if err != nil || wait.State != "waiting" {
+		t.Fatalf("persisted wait=%+v err=%v", wait, err)
+	}
+	run, err := runtime.GetRun(ctx, tenant, admission.RunID)
+	if err != nil || run.State != "waiting" {
+		t.Fatalf("suspended run=%+v err=%v", run, err)
+	}
+	payload := json.RawMessage(fixture.SignalPayload)
+	if result, err := runtime.DeliverSignal(ctx, tenant, waitID, fixture.SignalID, "synthetic-principal", payload, true); err != nil || !result.Accepted {
+		t.Fatalf("signal result=%+v err=%v", result, err)
+	}
+	run, err = runtime.GetRun(ctx, tenant, admission.RunID)
+	if err != nil || run.State != "accepted" {
+		t.Fatalf("signal did not atomically resume run: %+v err=%v", run, err)
+	}
+	completed, err := runtime.processOne(ctx, owner)
+	if err != nil || completed.State != "completed" || string(completed.Output) != fixture.ExpectedOutput {
+		t.Fatalf("resumed execution=%+v err=%v", completed, err)
+	}
+	if prefixEffects.Load() != fixture.ExpectedPrefixEffects || suffixEffects.Load() != fixture.ExpectedSuffixEffects {
+		t.Fatalf("effect counts prefix=%d suffix=%d; expected %d/%d", prefixEffects.Load(), suffixEffects.Load(), fixture.ExpectedPrefixEffects, fixture.ExpectedSuffixEffects)
+	}
+}
+
+func TestTimerResumesDistributedRunFromCommittedPrefix(t *testing.T) {
+	fixture := readContinuationFixture(t)
+	store := integrationDistributedStore(t)
+	var prefixEffects, suffixEffects atomic.Int64
+	prefix := node.MustDefine("fixture/timer-prefix", "1.0.0", func(_ context.Context, input waitInput) (integrationOutput, error) {
+		prefixEffects.Add(1)
+		return integrationOutput{Value: input.Value + 1}, nil
+	}, node.Description("counted pre-timer effect"), node.Schemas([]byte(waitInputSchema), []byte(outputSchema)), node.Effects("fixture:timer-prefix")).Any()
+	suffix := node.MustDefine("fixture/timer-suffix", "1.0.0", func(_ context.Context, input engine.WaitResult) (integrationOutput, error) {
+		suffixEffects.Add(1)
+		if !input.TimedOut || input.SignalID != "" {
+			return integrationOutput{}, fmt.Errorf("unexpected resumed timer input: %+v", input)
+		}
+		return integrationOutput{Value: 100}, nil
+	}, node.Description("consumes committed timer wait outcome"), node.Schemas([]byte(waitConsumerSchema), []byte(outputSchema)), node.Effects("fixture:timer-suffix")).Any()
+	runtime := newWaitIntegrationRuntime(t, store, "timer-continuation", []contract.InternalInstruction{
+		{Index: 0, ID: "prefix", Kind: "call", Node: "fixture/timer-prefix"},
+		{Index: 1, ID: "delay", Kind: "wait", Wait: &contract.WaitInstruction{Name: "delay", TimeoutMillis: 1}},
+		{Index: 2, ID: "suffix", Kind: "call", Node: "fixture/timer-suffix", References: []contract.Reference{{Step: "delay"}}},
+		{Index: 3, ID: "output", Kind: "output", References: []contract.Reference{{Step: "suffix"}}},
+	}, map[string]node.Any{"fixture/timer-prefix": prefix, "fixture/timer-suffix": suffix})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	tenant, partition := tenantForEmptyPartition(t, ctx, store, runtime, "wait-timer-tenant")
+	admission, err := runtime.Admit(ctx, Submission{Tenant: tenant, RequestKey: "timer-continuation", Workflow: "timer-continuation", Input: json.RawMessage(`{"value":40}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("bounded continuation state: partition=%s tenant=%s run=%s wait=%s", partition, tenant, admission.RunID, WaitIDFor(admission.RunID, "delay"))
+	owner, err := store.Acquire(ctx, partition, "timer-continuation-owner", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.processOne(ctx, owner); !errors.Is(err, ErrNoWork) {
+		t.Fatalf("initial process error=%v, want suspended work yield", err)
+	}
+	if fired, err := runtime.FireDueWaits(ctx, owner, time.Now().UTC().Add(time.Second), 8); err != nil || len(fired) != 1 {
+		t.Fatalf("due timers=%d err=%v, want exactly one", len(fired), err)
+	}
+	run, err := runtime.GetRun(ctx, tenant, admission.RunID)
+	if err != nil || run.State != "accepted" {
+		t.Fatalf("timer did not atomically resume run: %+v err=%v", run, err)
+	}
+	completed, err := runtime.processOne(ctx, owner)
+	if err != nil || completed.State != "completed" || string(completed.Output) != fixture.ExpectedTimerOutput {
+		t.Fatalf("resumed execution=%+v err=%v", completed, err)
+	}
+	if prefixEffects.Load() != fixture.ExpectedPrefixEffects || suffixEffects.Load() != fixture.ExpectedSuffixEffects {
+		t.Fatalf("effect counts prefix=%d suffix=%d; expected %d/%d", prefixEffects.Load(), suffixEffects.Load(), fixture.ExpectedPrefixEffects, fixture.ExpectedSuffixEffects)
+	}
+}
+
+func TestPureStepDispatchCanRetryAfterOwnerTakeover(t *testing.T) {
+	var fixture struct {
+		ExpectedAttempts        int  `json:"expectedAttempts"`
+		ExpectedDifferentIDs    bool `json:"expectedDifferentAttemptIDs"`
+		ExpectedExternalEffects int  `json:"expectedExternalEffects"`
+	}
+	fixtureData, err := os.ReadFile("../../testdata/distributed/pure-step-takeover-fixtures.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(fixtureData, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	store := integrationDistributedStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	partition := fmt.Sprintf("p-pure-retry-%d", time.Now().UnixNano())
+	firstOwner, err := store.Acquire(ctx, partition, "pure-retry-old-owner", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &Runtime{store: store}
+	run := RunRecord{RunID: "run-pure-retry", ArtifactDigest: "sha256:" + strings.Repeat("f", 64)}
+	input := json.RawMessage(`{"value":1}`)
+	identity := engine.StepIdentity{RunID: run.RunID, ArtifactDigest: run.ArtifactDigest, StepID: "pure-step", InputDigest: digest(input), OperationKey: "op:" + strings.Repeat("a", 64)}
+	firstJournal := &runStepJournal{runtime: runtime, owner: firstOwner, record: run}
+	firstAttempt, err := firstJournal.Begin(ctx, identity, input, nil)
+	if err != nil {
+		t.Fatalf("first pure dispatch: %v", err)
+	}
+	if err := store.Release(ctx, firstOwner); err != nil {
+		t.Fatalf("release old owner before simulated crash takeover: %v", err)
+	}
+	newOwner, err := store.Acquire(ctx, partition, "pure-retry-new-owner", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("pure-step takeover state: partition=%s run=%s state=step-<sha256:...> oldFence=%d newFence=%d", partition, run.RunID, firstOwner.Token, newOwner.Token)
+	newJournal := &runStepJournal{runtime: runtime, owner: newOwner, record: run}
+	if _, completed, err := newJournal.Load(ctx, identity); err != nil || completed {
+		t.Fatalf("pure dispatched step replay state completed=%v err=%v; want safe redispatch", completed, err)
+	}
+	secondAttempt, err := newJournal.Begin(ctx, identity, input, nil)
+	if err != nil {
+		t.Fatalf("retry pure dispatch after takeover: %v", err)
+	}
+	data, _, err := store.ReadState(ctx, partition, stepStateID(identity.OperationKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted stepRecord
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.AttemptNumber != fixture.ExpectedAttempts || (firstAttempt.AttemptID != secondAttempt.AttemptID) != fixture.ExpectedDifferentIDs || fixture.ExpectedExternalEffects != 0 {
+		t.Fatalf("attempts=%d first=%s second=%s expected attempts=%d distinct=%v effects=%d", persisted.AttemptNumber, firstAttempt.AttemptID, secondAttempt.AttemptID, fixture.ExpectedAttempts, fixture.ExpectedDifferentIDs, fixture.ExpectedExternalEffects)
+	}
+}
+
+func TestTenantFairCursorSurvivesPartitionOwnerTakeover(t *testing.T) {
+	var fixture struct {
+		CandidateTenants  []string `json:"candidateTenants"`
+		ExpectedFirstTurn string   `json:"expectedFirstTurn"`
+		ExpectedNextTurn  string   `json:"expectedNextTurn"`
+	}
+	data, err := os.ReadFile("../../testdata/distributed/tenant-fairness-takeover-fixtures.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	store := integrationDistributedStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	partition := fmt.Sprintf("p-fair-cursor-%d", time.Now().UnixNano())
+	oldOwner, err := store.Acquire(ctx, partition, "fair-cursor-old-owner", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidates := make([]RunRecord, 0, len(fixture.CandidateTenants))
+	for index, tenant := range fixture.CandidateTenants {
+		candidates = append(candidates, RunRecord{RunID: fmt.Sprintf("run-%02d", index), Tenant: tenant})
+	}
+	oldRuntime := &Runtime{store: store}
+	first, err := oldRuntime.fairCandidate(ctx, oldOwner, candidates)
+	if err != nil || first.Tenant != fixture.ExpectedFirstTurn {
+		t.Fatalf("first tenant turn=%q err=%v, want %q", first.Tenant, err, fixture.ExpectedFirstTurn)
+	}
+	if err := store.Release(ctx, oldOwner); err != nil {
+		t.Fatal(err)
+	}
+	newOwner, err := store.Acquire(ctx, partition, "fair-cursor-new-owner", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newRuntime := &Runtime{store: store}
+	second, err := newRuntime.fairCandidate(ctx, newOwner, candidates)
+	t.Logf("fair cursor takeover state: partition=%s priorTenant=%s resumedTenant=%s oldFence=%d newFence=%d", partition, first.Tenant, second.Tenant, oldOwner.Token, newOwner.Token)
+	if err != nil || second.Tenant != fixture.ExpectedNextTurn {
+		t.Fatalf("post-takeover tenant turn=%q err=%v, want %q", second.Tenant, err, fixture.ExpectedNextTurn)
+	}
+}
+
+func TestScheduleWaitClassifiesQuorumLossAsUnavailable(t *testing.T) {
+	store := integrationDistributedStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	partition := fmt.Sprintf("p-wait-quorum-%d", time.Now().UnixNano())
+	owner, err := store.Acquire(ctx, partition, "wait-quorum-owner", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("quorum-loss probe state: voters=[blok-distributed-spike-etcd1-1 blok-distributed-spike-etcd2-1 blok-distributed-spike-etcd3-1] paused=[blok-distributed-spike-etcd2-1 blok-distributed-spike-etcd3-1] partition=%s run=absent wait=wait-absent", partition)
+	paused := make([]string, 0, 2)
+	defer func() {
+		for index := len(paused) - 1; index >= 0; index-- {
+			_ = exec.Command("docker", "unpause", paused[index]).Run()
+		}
+	}()
+	for _, container := range []string{"blok-distributed-spike-etcd2-1", "blok-distributed-spike-etcd3-1"} {
+		output, err := exec.CommandContext(ctx, "docker", "pause", container).CombinedOutput()
+		if err != nil {
+			t.Fatalf("pause voter %s: %v: %s", container, err, output)
+		}
+		paused = append(paused, container)
+	}
+	blockedCtx, stop := context.WithTimeout(ctx, 3*time.Second)
+	_, err = (&Runtime{store: store}).scheduleWait(blockedCtx, owner, "run-absent", "wait-absent", "approval", time.Now().Add(time.Minute), engine.StepIdentity{}, 0)
+	stop()
+	if !errors.Is(err, ErrUnavailable) || errors.Is(err, distributed.ErrOwnershipLost) {
+		t.Fatalf("quorum-loss schedule error=%v, want retryable ErrUnavailable and not ErrOwnershipLost", err)
+	}
+	for index := len(paused) - 1; index >= 0; index-- {
+		output, err := exec.CommandContext(ctx, "docker", "unpause", paused[index]).CombinedOutput()
+		if err != nil {
+			t.Fatalf("restore voter %s: %v: %s", paused[index], err, output)
+		}
+		paused = paused[:index]
+	}
+	if _, _, err := store.ReadState(ctx, partition, "recovery-check"); err != nil {
+		t.Fatalf("quorum did not recover after restoring all voters: %v", err)
+	}
+}
+
+const waitInputSchema = `{"type":"object","properties":{"value":{"type":"integer"}},"required":["value"],"additionalProperties":false}`
+const outputSchema = `{"type":"object","properties":{"value":{"type":"integer"}},"required":["value"],"additionalProperties":false}`
+const waitConsumerSchema = `{"type":"object"}`
+
+func readContinuationFixture(t *testing.T) struct {
+	SignalID              string `json:"signalId"`
+	SignalPayload         string `json:"signalPayload"`
+	ExpectedOutput        string `json:"expectedOutput"`
+	ExpectedTimerOutput   string `json:"expectedTimerOutput"`
+	ExpectedPrefixEffects int64  `json:"expectedPrefixEffects"`
+	ExpectedSuffixEffects int64  `json:"expectedSuffixEffects"`
+} {
+	t.Helper()
+	data, err := os.ReadFile("../../testdata/distributed/runtime-continuation-fixtures.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		SignalID              string `json:"signalId"`
+		SignalPayload         string `json:"signalPayload"`
+		ExpectedOutput        string `json:"expectedOutput"`
+		ExpectedTimerOutput   string `json:"expectedTimerOutput"`
+		ExpectedPrefixEffects int64  `json:"expectedPrefixEffects"`
+		ExpectedSuffixEffects int64  `json:"expectedSuffixEffects"`
+	}
+	if err := json.Unmarshal(data, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	return fixture
+}
+
+func newWaitIntegrationRuntime(t *testing.T, store *distributed.Store, workflowName string, instructions []contract.InternalInstruction, nodes map[string]node.Any) *Runtime {
+	t.Helper()
+	program := contract.InternalProgram{WorkflowID: workflowName, Digest: "sha256:" + strings.Repeat("e", 64), Instructions: instructions}
+	runtime, err := New(store, engine.New(nodes), map[string]Workflow{workflowName: {Program: program, DecodeInput: func(raw json.RawMessage) (any, error) {
+		var input waitInput
+		decoder := json.NewDecoder(strings.NewReader(string(raw)))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&input); err != nil {
+			return nil, err
+		}
+		return input, nil
+	}}}, Limits{Partitions: 8, PartitionAdmissions: 64, TenantAdmissions: 8, OwnerTTL: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return runtime
 }
 
 func integrationDistributedStore(t *testing.T) *distributed.Store {

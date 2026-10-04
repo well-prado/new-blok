@@ -24,6 +24,7 @@ type Error struct {
 	Step      string
 	Err       error
 	Uncertain bool
+	Suspended bool
 }
 
 func (e *Error) Error() string {
@@ -39,6 +40,7 @@ func (e *Error) Unwrap() error { return e.Err }
 func (e *Error) ErrorCode() string  { return e.Code }
 func (e *Error) ErrorClass() string { return e.Class }
 func (e *Error) IsUncertain() bool  { return e != nil && e.Uncertain }
+func (e *Error) IsSuspended() bool  { return e != nil && e.Suspended }
 
 type Result struct {
 	Output any
@@ -72,6 +74,26 @@ type StepJournal interface {
 	Begin(context.Context, StepIdentity, json.RawMessage, []string) (StepAttempt, error)
 	Complete(context.Context, StepAttempt, json.RawMessage) error
 	Fail(context.Context, StepAttempt, []string, error) error
+}
+
+// WaitJournal persists a wait transition and returns its committed outcome.
+// ready=false means the run must suspend without occupying an execution slot.
+// The journal is separate from step attempts because waiting is not an
+// external effect dispatch.
+type WaitJournal interface {
+	Await(context.Context, WaitIdentity) (WaitResult, bool, error)
+}
+
+type WaitIdentity struct {
+	Step          StepIdentity
+	Name          string
+	TimeoutMillis int64
+}
+
+type WaitResult struct {
+	SignalID string          `json:"signalId,omitempty"`
+	Payload  json.RawMessage `json:"payload,omitempty"`
+	TimedOut bool            `json:"timedOut,omitempty"`
 }
 
 // StepIdentity binds a checkpoint to the exact run artifact and resolved
@@ -145,6 +167,38 @@ func (e *Engine) RunJournaled(ctx context.Context, program contract.InternalProg
 		}
 		step := StepResult{ID: instruction.ID}
 		switch instruction.Kind {
+		case "wait":
+			if journal == nil || instruction.Wait == nil {
+				step.Error = &Error{Code: "wait_requires_durable_runner", Class: "configuration", Step: instruction.ID}
+				result.Steps = append(result.Steps, step)
+				return result, step.Error
+			}
+			waitJournal, ok := journal.(WaitJournal)
+			if !ok {
+				step.Error = &Error{Code: "wait_journal_unavailable", Class: "configuration", Step: instruction.ID}
+				result.Steps = append(result.Steps, step)
+				return result, step.Error
+			}
+			plan, err := json.Marshal(instruction.Wait)
+			if err != nil {
+				step.Error = &Error{Code: "wait_identity_encode", Class: "persistence", Step: instruction.ID, Err: err}
+				result.Steps = append(result.Steps, step)
+				return result, step.Error
+			}
+			identity := stepIdentity(runID, program.Digest, instruction.ID, plan)
+			waitResult, ready, waitErr := waitJournal.Await(ctx, WaitIdentity{Step: identity, Name: instruction.Wait.Name, TimeoutMillis: instruction.Wait.TimeoutMillis})
+			if waitErr != nil {
+				step.Error = journalFailure("journal_wait", instruction.ID, waitErr, nil)
+				result.Steps = append(result.Steps, step)
+				return result, step.Error
+			}
+			if !ready {
+				step.Error = &Error{Code: "run_suspended", Class: "waiting", Step: instruction.ID, Suspended: true}
+				result.Steps = append(result.Steps, step)
+				return result, step.Error
+			}
+			state[instruction.ID] = waitResult
+			step.Output = waitResult
 		case "call":
 			var stepAttempt StepAttempt
 			definition, ok := e.nodes[instruction.Node]

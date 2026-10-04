@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"sort"
-	"strings"
+	"strconv"
 	"sync"
 	"time"
 
@@ -57,12 +57,10 @@ type Workflow struct {
 }
 
 type Runtime struct {
-	store      *distributed.Store
-	engine     *engine.Engine
-	workflows  map[string]Workflow
-	limits     Limits
-	mu         sync.Mutex
-	lastTenant map[string]string
+	store     *distributed.Store
+	engine    *engine.Engine
+	workflows map[string]Workflow
+	limits    Limits
 }
 
 type Submission struct {
@@ -109,7 +107,7 @@ func New(store *distributed.Store, runner *engine.Engine, workflows map[string]W
 	if len(registered) == 0 {
 		return nil, fmt.Errorf("%w: at least one workflow is required", ErrInvalid)
 	}
-	return &Runtime{store: store, engine: runner, workflows: registered, limits: limits, lastTenant: map[string]string{}}, nil
+	return &Runtime{store: store, engine: runner, workflows: registered, limits: limits}, nil
 }
 
 // Partition deterministically routes a tenant to a stable partition. The
@@ -272,24 +270,18 @@ func (r *Runtime) processOne(ctx context.Context, owner distributed.Owner) (RunR
 	if _, err := r.FireDueWaits(ctx, owner, time.Now().UTC(), 64); err != nil {
 		return RunRecord{}, fmt.Errorf("cluster: fire due timers: %w", err)
 	}
-	events, err := r.store.ListEvents(ctx, owner.Partition)
+	runIDs, err := r.store.ListActiveRunIDs(ctx, owner.Partition, r.limits.PartitionAdmissions)
 	if err != nil {
 		return RunRecord{}, fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
 	candidates := make([]RunRecord, 0)
-	seen := map[string]bool{}
-	for _, event := range events {
-		if event.Kind != "run.accepted" || !strings.HasPrefix(event.ID, "accepted-run-") {
-			continue
-		}
-		runID := strings.TrimPrefix(event.ID, "accepted-")
-		if seen[runID] {
-			continue
-		}
-		seen[runID] = true
+	for _, runID := range runIDs {
 		record, _, err := r.readRun(ctx, owner.Partition, runID)
 		if err != nil {
 			return RunRecord{}, fmt.Errorf("%w: %v", ErrUnavailable, err)
+		}
+		if record.RunID == "" || record.RunID != runID {
+			return RunRecord{}, fmt.Errorf("cluster: active admission slot references missing run %q", runID)
 		}
 		if record.State == "accepted" || record.State == "running" {
 			candidates = append(candidates, record)
@@ -299,7 +291,10 @@ func (r *Runtime) processOne(ctx context.Context, owner distributed.Owner) (RunR
 		return RunRecord{}, ErrNoWork
 	}
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].RunID < candidates[j].RunID })
-	selected := r.fairCandidate(owner.Partition, candidates)
+	selected, err := r.fairCandidate(ctx, owner, candidates)
+	if err != nil {
+		return RunRecord{}, err
+	}
 	workflow, ok := r.workflows[selected.Workflow]
 	if !ok || workflow.Program.Digest != selected.ArtifactDigest {
 		return RunRecord{}, fmt.Errorf("cluster: registered artifact mismatch for run %s workflow=%q persisted=%q registered=%q", selected.RunID, selected.Workflow, selected.ArtifactDigest, workflow.Program.Digest)
@@ -313,7 +308,7 @@ func (r *Runtime) processOne(ctx context.Context, owner distributed.Owner) (RunR
 	}
 	selected.State, selected.OwnerID, selected.Fence = "running", owner.ID, owner.Token
 	state, _ := json.Marshal(selected)
-	claimID := transitionID("claim", selected.RunID, owner.Token)
+	claimID := transitionID("claim", selected.RunID+"\x00revision="+strconv.FormatInt(revision, 10), owner.Token)
 	if _, err := r.store.CommitFencedState(ctx, owner, selected.RunID, revision, claimID, "run.claimed", state, state); err != nil && !errors.Is(err, distributed.ErrAlreadyWritten) {
 		return RunRecord{}, err
 	}
@@ -324,14 +319,26 @@ func (r *Runtime) processOne(ctx context.Context, owner distributed.Owner) (RunR
 	journal := &runStepJournal{runtime: r, owner: owner, record: selected}
 	result, runErr := r.engine.RunJournaled(ctx, workflow.Program, input, selected.RunID, journal)
 	if runErr != nil {
+		var suspended interface{ IsSuspended() bool }
+		if errors.As(runErr, &suspended) && suspended.IsSuspended() {
+			var engineErr *engine.Error
+			if !errors.As(runErr, &engineErr) || engineErr.Step == "" {
+				return RunRecord{}, fmt.Errorf("cluster: suspended execution did not identify its wait step")
+			}
+			if err := r.suspend(ctx, owner, selected, engineErr.Step); err != nil {
+				return RunRecord{}, err
+			}
+			return RunRecord{}, ErrNoWork
+		}
 		terminal, code := "failed", "execution_failed"
+		var engineErr *engine.Error
+		if errors.As(runErr, &engineErr) {
+			code = engineErr.Code
+		}
 		var uncertainty interface{ IsUncertain() bool }
 		if errors.As(runErr, &uncertainty) && uncertainty.IsUncertain() {
 			terminal = "uncertain"
-			var engineErr *engine.Error
-			if errors.As(runErr, &engineErr) {
-				code = engineErr.Code
-			} else {
+			if engineErr == nil {
 				code = "effect_outcome_uncertain"
 			}
 		}
@@ -342,6 +349,40 @@ func (r *Runtime) processOne(ctx context.Context, owner distributed.Owner) (RunR
 		return r.finish(ctx, owner, selected, "failed", "output_encode", nil)
 	}
 	return r.finish(ctx, owner, selected, "completed", "", output)
+}
+
+func (r *Runtime) suspend(ctx context.Context, owner distributed.Owner, run RunRecord, stepID string) error {
+	latest, revision, err := r.readRun(ctx, owner.Partition, run.RunID)
+	if err != nil || revision == 0 {
+		return fmt.Errorf("%w: read run before suspension: %v", ErrUnavailable, err)
+	}
+	if latest.OwnerID != owner.ID || latest.Fence != owner.Token {
+		return distributed.ErrOwnershipLost
+	}
+	if latest.State == "waiting" {
+		return nil
+	}
+	if latest.State == "accepted" {
+		// A signal or timer may win after the wait record is committed but
+		// before this worker publishes its suspension transition.
+		return nil
+	}
+	if latest.State != "running" {
+		return fmt.Errorf("cluster: cannot suspend run in state %q", latest.State)
+	}
+	latest.State = "waiting"
+	state, _ := json.Marshal(latest)
+	transition := transitionID("suspend", run.RunID+"\x00"+stepID, owner.Token)
+	if _, err := r.store.CommitFencedState(ctx, owner, run.RunID, revision, transition, "run.waiting", state, state); err != nil {
+		if errors.Is(err, distributed.ErrAlreadyWritten) {
+			current, _, readErr := r.readRun(ctx, owner.Partition, run.RunID)
+			if readErr == nil && current.State == "waiting" && current.OwnerID == owner.ID && current.Fence == owner.Token {
+				return nil
+			}
+		}
+		return err
+	}
+	return nil
 }
 
 // Run owns every configured stable partition with one worker each. Thus the
@@ -467,7 +508,39 @@ func (r *Runtime) finish(ctx context.Context, owner distributed.Owner, run RunRe
 	return run, nil
 }
 
-func (r *Runtime) fairCandidate(partition string, records []RunRecord) RunRecord {
+func (r *Runtime) fairCandidate(ctx context.Context, owner distributed.Owner, records []RunRecord) (RunRecord, error) {
+	cursorData, revision, err := r.store.ReadState(ctx, owner.Partition, "scheduler-cursor")
+	if err != nil {
+		return RunRecord{}, fmt.Errorf("%w: read durable tenant scheduler cursor: %v", ErrUnavailable, err)
+	}
+	var cursor struct {
+		LastTenant string `json:"lastTenant"`
+	}
+	if revision > 0 {
+		if err := json.Unmarshal(cursorData, &cursor); err != nil {
+			return RunRecord{}, fmt.Errorf("cluster: decode durable tenant scheduler cursor: %w", err)
+		}
+	}
+	selected := nextFairCandidate(cursor.LastTenant, records)
+	cursor.LastTenant = selected.Tenant
+	encoded, _ := json.Marshal(cursor)
+	eventID := transitionID("scheduler-cursor", owner.Partition+"\x00"+strconv.FormatInt(revision, 10)+"\x00"+selected.Tenant, owner.Token)
+	if _, err := r.store.CommitFencedState(ctx, owner, "scheduler-cursor", revision, eventID, "scheduler.cursor", encoded, encoded); err != nil {
+		if errors.Is(err, distributed.ErrAlreadyWritten) {
+			currentData, currentRevision, readErr := r.store.ReadState(ctx, owner.Partition, "scheduler-cursor")
+			var current struct {
+				LastTenant string `json:"lastTenant"`
+			}
+			if readErr == nil && currentRevision > revision && json.Unmarshal(currentData, &current) == nil && current.LastTenant == selected.Tenant {
+				return selected, nil
+			}
+		}
+		return RunRecord{}, fmt.Errorf("cluster: persist durable tenant scheduler cursor: %w", err)
+	}
+	return selected, nil
+}
+
+func nextFairCandidate(lastTenant string, records []RunRecord) RunRecord {
 	byTenant := make(map[string]RunRecord, len(records))
 	for _, record := range records {
 		if _, exists := byTenant[record.Tenant]; !exists {
@@ -479,16 +552,13 @@ func (r *Runtime) fairCandidate(partition string, records []RunRecord) RunRecord
 		tenants = append(tenants, tenant)
 	}
 	sort.Strings(tenants)
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	last, selected := r.lastTenant[partition], tenants[0]
+	selected := tenants[0]
 	for _, tenant := range tenants {
-		if tenant > last {
+		if tenant > lastTenant {
 			selected = tenant
 			break
 		}
 	}
-	r.lastTenant[partition] = selected
 	return byTenant[selected]
 }
 

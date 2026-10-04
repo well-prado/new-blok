@@ -24,7 +24,13 @@ accepted-run event would not make workflow execution recoverable.
 - Bound outstanding accepted work with fixed etcd-backed global and per-tenant
   slots. One current owner worker executes each partition; thus execution is
   bounded by configured partition count and a tenant is serialized within its
-  partition. Selection rotates among tenants with pending work.
+  partition. Selection rotates among tenants with pending work; its cursor is
+  an owner-fenced durable projection, so takeover does not reset the rotation.
+- Select runnable work from the bounded admission-slot projection, not by
+  replaying the immutable event history. Due timers use a bounded ordered
+  index. There is no implicit event-history migration for pre-existing timer
+  records; operators must drain and migrate/rotate an older incarnation before
+  deploying this version. The runtime does not perform or claim that migration.
 - Add a backend-neutral engine `StepJournal` callback boundary. It carries the
   run, artifact digest, resolved input digest, stable operation key and a
   distinct attempt ID. The adapter validates the exact persisted run identity
@@ -60,9 +66,20 @@ proves the existing content-addressed blob adapter across takeover, not an
 artifact-registry integration.
 
 Timer and signal records are persisted as fenced, tenant-scoped transitions;
-signal/timer races have one committed winner. These APIs do not yet suspend and
-resume an engine continuation, buffer a signal that arrives before its wait,
-or deliver a signal to an external consumer. Event history also has no
-compactor/retention policy here, so bounded active admission is not a bound on
-total retained history. Those behaviors need their own execution/recovery and
-retention contracts rather than being inferred from this commit primitive.
+signal/timer races have one committed winner. A journaled wait now suspends the
+run after its committed prefix, then a signal or due timer atomically records
+the outcome and re-admits the same run for replay/resumption. A signal arriving
+before its wait is committed is not buffered. Signal delivery still does not
+invoke an external consumer.
+
+The immutable transition log has no per-event compactor in this slice. Its
+retention contract is therefore explicit but not size-bounded: events remain
+available for the lifetime of the cluster incarnation and must not be pruned
+individually, because they are the stable identities used to reconcile
+ambiguous commits. Operators are responsible for retaining snapshots and audit
+records through their required horizon, then retiring the entire incarnation
+as a unit; this implementation provides no automated retirement, backup
+inventory, or compaction. Bounded admission and indexed scheduling do not
+bound this append-only history, so long-lived or high-volume production use is
+not claimed. A bounded event-retention/compaction contract remains required
+before such a capacity claim.

@@ -3,10 +3,12 @@ package cluster
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/well-prado/new-blok/internal/engine"
 	"github.com/well-prado/new-blok/store/distributed"
@@ -126,6 +128,31 @@ func (j *runStepJournal) Complete(ctx context.Context, attempt engine.StepAttemp
 	return j.transition(ctx, attempt, "committed", "step.committed", output)
 }
 
+func (j *runStepJournal) Await(ctx context.Context, identity engine.WaitIdentity) (engine.WaitResult, bool, error) {
+	if !sameStepIdentity(identity.Step, j.record, identity.Step.StepID) || identity.Name == "" || identity.TimeoutMillis < 0 {
+		return engine.WaitResult{}, false, ErrRequestConflict
+	}
+	waitID := WaitIDFor(j.record.RunID, identity.Step.StepID)
+	var dueAt time.Time
+	if identity.TimeoutMillis > 0 {
+		dueAt = time.Now().UTC().Add(time.Duration(identity.TimeoutMillis) * time.Millisecond)
+	}
+	wait, err := j.runtime.scheduleWait(ctx, j.owner, j.record.RunID, waitID, identity.Name, dueAt, identity.Step, identity.TimeoutMillis)
+	if err != nil {
+		return engine.WaitResult{}, false, err
+	}
+	switch wait.State {
+	case "waiting":
+		return engine.WaitResult{}, false, nil
+	case "signaled":
+		return engine.WaitResult{SignalID: wait.SignalID, Payload: append(json.RawMessage(nil), wait.Payload...)}, true, nil
+	case "timed_out":
+		return engine.WaitResult{TimedOut: true}, true, nil
+	default:
+		return engine.WaitResult{}, false, fmt.Errorf("cluster: invalid durable wait state %q", wait.State)
+	}
+}
+
 func (j *runStepJournal) Fail(ctx context.Context, attempt engine.StepAttempt, effects []string, _ error) error {
 	state := "retryable"
 	kind := "step.retryable"
@@ -178,11 +205,14 @@ func stepStateID(operationKey string) string {
 }
 
 func stepTransition(kind, operationKey, attempt string) string {
-	hash := fmt.Sprintf("%x", []byte(operationKey+"\x00"+attempt))
-	if len(hash) > 32 {
-		hash = hash[:32]
-	}
-	return kind + "-" + hash
+	encoded, _ := json.Marshal(struct {
+		Domain       string `json:"domain"`
+		Kind         string `json:"kind"`
+		OperationKey string `json:"operationKey"`
+		AttemptID    string `json:"attemptId"`
+	}{"blok.step-transition.v1", kind, operationKey, attempt})
+	hash := sha256.Sum256(encoded)
+	return kind + "-" + hex.EncodeToString(hash[:])
 }
 
 func randomAttemptID() (string, error) {

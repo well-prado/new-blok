@@ -113,6 +113,20 @@ func validateInstructions(instructions []contract.InternalInstruction, maxDepth 
 		if !known[instruction.Kind] {
 			return fmt.Errorf("unknown_opcode: %s", instruction.Kind)
 		}
+		if instruction.Kind == "wait" {
+			if instruction.Wait == nil || instruction.Wait.Name == "" || instruction.Wait.TimeoutMillis < 0 || instruction.Wait.TimeoutMillis > 365*24*60*60*1000 {
+				return fmt.Errorf("invalid_wait: %s requires a valid name and timeout between zero and 365 days", instruction.ID)
+			}
+		} else if instruction.Wait != nil {
+			return fmt.Errorf("unexpected_wait: %s", instruction.ID)
+		}
+		if instruction.Kind == "wait" {
+			if instruction.Wait == nil || instruction.Wait.Name == "" || instruction.Wait.TimeoutMillis < 0 || instruction.Wait.TimeoutMillis > 365*24*60*60*1000 {
+				return fmt.Errorf("invalid_wait: %s requires a valid name and timeout between zero and 365 days", instruction.ID)
+			}
+		} else if instruction.Wait != nil {
+			return fmt.Errorf("unexpected_wait: %s", instruction.ID)
+		}
 		if seen[instruction.ID] {
 			return fmt.Errorf("duplicate_instruction: %s", instruction.ID)
 		}
@@ -151,6 +165,10 @@ func cloneInstructions(input []contract.InternalInstruction) []contract.Internal
 	for index, instruction := range input {
 		output[index] = instruction
 		output[index].References = append([]contract.Reference(nil), instruction.References...)
+		if instruction.Wait != nil {
+			wait := *instruction.Wait
+			output[index].Wait = &wait
+		}
 		for refIndex := range output[index].References {
 			output[index].References[refIndex].Path = append([]string(nil), instruction.References[refIndex].Path...)
 		}

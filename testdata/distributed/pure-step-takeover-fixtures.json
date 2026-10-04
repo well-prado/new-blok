@@ -1,0 +1,5 @@
+{
+  "expectedAttempts": 2,
+  "expectedDifferentAttemptIDs": true,
+  "expectedExternalEffects": 0
+}

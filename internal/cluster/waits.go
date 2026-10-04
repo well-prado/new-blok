@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/well-prado/new-blok/internal/engine"
 	"github.com/well-prado/new-blok/store/distributed"
 )
 
@@ -19,15 +20,19 @@ var (
 )
 
 type WaitRecord struct {
-	WaitID    string          `json:"waitId"`
-	RunID     string          `json:"runId"`
-	Tenant    string          `json:"tenant"`
-	Name      string          `json:"name"`
-	DueAt     time.Time       `json:"dueAt"`
-	State     string          `json:"state"`
-	SignalID  string          `json:"signalId,omitempty"`
-	Principal string          `json:"principal,omitempty"`
-	Payload   json.RawMessage `json:"payload,omitempty"`
+	WaitID         string          `json:"waitId"`
+	RunID          string          `json:"runId"`
+	Tenant         string          `json:"tenant"`
+	Name           string          `json:"name"`
+	DueAt          time.Time       `json:"dueAt,omitempty"`
+	State          string          `json:"state"`
+	ArtifactDigest string          `json:"artifactDigest,omitempty"`
+	StepID         string          `json:"stepId,omitempty"`
+	OperationKey   string          `json:"operationKey,omitempty"`
+	TimeoutMillis  int64           `json:"timeoutMillis,omitempty"`
+	SignalID       string          `json:"signalId,omitempty"`
+	Principal      string          `json:"principal,omitempty"`
+	Payload        json.RawMessage `json:"payload,omitempty"`
 }
 
 type SignalResult struct {
@@ -59,11 +64,18 @@ func (r *Runtime) GetWait(ctx context.Context, tenant, waitID string) (WaitRecor
 
 // ScheduleWait stores a timer under the same partition fence as the run.
 func (r *Runtime) ScheduleWait(ctx context.Context, owner distributed.Owner, runID, waitID, name string, dueAt time.Time) (WaitRecord, error) {
-	if runID == "" || waitID == "" || name == "" || dueAt.IsZero() || owner.Partition == "" {
+	return r.scheduleWait(ctx, owner, runID, waitID, name, dueAt, engine.StepIdentity{}, 0)
+}
+
+func (r *Runtime) scheduleWait(ctx context.Context, owner distributed.Owner, runID, waitID, name string, dueAt time.Time, identity engine.StepIdentity, timeoutMillis int64) (WaitRecord, error) {
+	if runID == "" || waitID == "" || name == "" || owner.Partition == "" || (identity.StepID == "" && dueAt.IsZero()) {
 		return WaitRecord{}, ErrInvalid
 	}
 	run, _, err := r.readRun(ctx, owner.Partition, runID)
-	if err != nil || run.RunID == "" || run.Tenant == "" || r.Partition(run.Tenant) != owner.Partition || run.State != "running" || run.Fence != owner.Token || run.OwnerID != owner.ID {
+	if err != nil {
+		return WaitRecord{}, fmt.Errorf("%w: read run before scheduling wait: %w", ErrUnavailable, err)
+	}
+	if run.RunID == "" || run.Tenant == "" || r.Partition(run.Tenant) != owner.Partition || run.State != "running" || run.Fence != owner.Token || run.OwnerID != owner.ID {
 		return WaitRecord{}, distributed.ErrOwnershipLost
 	}
 	stateID := waitStateID(run.Tenant, waitID)
@@ -74,14 +86,23 @@ func (r *Runtime) ScheduleWait(ctx context.Context, owner distributed.Owner, run
 		if err := json.Unmarshal(data, &existing); err != nil {
 			return WaitRecord{}, err
 		}
-		if existing.RunID != runID || existing.Name != name || !existing.DueAt.Equal(dueAt.UTC()) {
+		identityMismatch := identity.StepID != "" && (existing.ArtifactDigest != identity.ArtifactDigest || existing.StepID != identity.StepID || existing.OperationKey != identity.OperationKey || existing.TimeoutMillis != timeoutMillis)
+		dueMismatch := identity.StepID == "" && !existing.DueAt.Equal(dueAt.UTC())
+		if existing.RunID != runID || existing.Name != name || identityMismatch || dueMismatch {
 			return WaitRecord{}, ErrRequestConflict
 		}
 		return existing, nil
 	}
-	record := WaitRecord{WaitID: waitID, RunID: runID, Tenant: run.Tenant, Name: name, DueAt: dueAt.UTC(), State: "waiting"}
+	record := WaitRecord{WaitID: waitID, RunID: runID, Tenant: run.Tenant, Name: name, State: "waiting", ArtifactDigest: identity.ArtifactDigest, StepID: identity.StepID, OperationKey: identity.OperationKey, TimeoutMillis: timeoutMillis}
+	if !dueAt.IsZero() {
+		record.DueAt = dueAt.UTC()
+	}
 	encoded, _ := json.Marshal(record)
-	if _, err := r.store.CommitFencedState(ctx, owner, stateID, 0, waitTransition("scheduled", run.Tenant+"\x00"+waitID), "wait.scheduled", encoded, encoded); err != nil {
+	var timer *distributed.TimerIndexMutation
+	if !record.DueAt.IsZero() {
+		timer = &distributed.TimerIndexMutation{StateID: stateID, DueAt: record.DueAt}
+	}
+	if _, err := r.store.CommitFencedWaitStates(ctx, owner, []distributed.StateMutation{{StateID: stateID, ExpectedRevision: 0, State: encoded}}, timer, waitTransition("scheduled", run.Tenant+"\x00"+waitID), "wait.scheduled", encoded); err != nil {
 		return WaitRecord{}, err
 	}
 	return record, nil
@@ -131,8 +152,32 @@ func (r *Runtime) DeliverSignal(ctx context.Context, tenant, waitID, signalID, p
 	wait.State, wait.SignalID, wait.Principal = "signaled", signalID, principal
 	wait.Payload = append(json.RawMessage(nil), payload...)
 	encoded, _ := json.Marshal(wait)
-	if _, err := r.store.CommitFencedState(ctx, owner, stateID, revision, waitTransition("signal", tenant+"\x00"+waitID+"\x00"+signalID), "wait.signaled", encoded, encoded); err != nil {
-		if errors.Is(err, distributed.ErrStateConflict) || errors.Is(err, distributed.ErrAlreadyWritten) {
+	eventID := waitTransition("signal", tenant+"\x00"+waitID+"\x00"+signalID)
+	var commitErr error
+	var timerIndex *distributed.TimerIndexMutation
+	if !wait.DueAt.IsZero() {
+		timerIndex = &distributed.TimerIndexMutation{StateID: stateID, DueAt: wait.DueAt, Delete: true}
+	}
+	if wait.StepID != "" {
+		run, runRevision, readErr := r.readRun(ctx, partition, wait.RunID)
+		if readErr != nil {
+			return SignalResult{}, fmt.Errorf("%w: read suspended run for signal: %v", ErrUnavailable, readErr)
+		}
+		if run.State == "waiting" || run.State == "running" {
+			run.State, run.OwnerID, run.Fence = "accepted", owner.ID, owner.Token
+			encodedRun, _ := json.Marshal(run)
+			_, commitErr = r.store.CommitFencedWaitStates(ctx, owner, []distributed.StateMutation{
+				{StateID: stateID, ExpectedRevision: revision, State: encoded},
+				{StateID: run.RunID, ExpectedRevision: runRevision, State: encodedRun},
+			}, timerIndex, eventID, "wait.signaled", encoded)
+		} else {
+			_, commitErr = r.store.CommitFencedWaitStates(ctx, owner, []distributed.StateMutation{{StateID: stateID, ExpectedRevision: revision, State: encoded}}, timerIndex, eventID, "wait.signaled", encoded)
+		}
+	} else {
+		_, commitErr = r.store.CommitFencedWaitStates(ctx, owner, []distributed.StateMutation{{StateID: stateID, ExpectedRevision: revision, State: encoded}}, nil, eventID, "wait.signaled", encoded)
+	}
+	if commitErr != nil {
+		if errors.Is(commitErr, distributed.ErrStateConflict) || errors.Is(commitErr, distributed.ErrAlreadyWritten) {
 			latestData, latestRevision, readErr := r.store.ReadState(ctx, partition, stateID)
 			if readErr != nil {
 				return SignalResult{}, fmt.Errorf("%w: reconcile signal race: %v", ErrUnavailable, readErr)
@@ -146,7 +191,7 @@ func (r *Runtime) DeliverSignal(ctx context.Context, tenant, waitID, signalID, p
 			}
 			return SignalResult{Late: true}, nil
 		}
-		return SignalResult{}, err
+		return SignalResult{}, commitErr
 	}
 	return SignalResult{Accepted: true}, nil
 }
@@ -164,14 +209,17 @@ func (r *Runtime) commitLateSignal(ctx context.Context, owner distributed.Owner,
 	if !errors.Is(err, distributed.ErrAlreadyWritten) {
 		return err
 	}
-	events, readErr := r.store.ListEvents(ctx, owner.Partition)
+	committed, readErr := r.store.Read(ctx, owner.Partition, id)
 	if readErr != nil {
 		return readErr
 	}
-	for _, event := range events {
-		if event.ID == id && event.Kind == "wait.signal_late" && string(event.Payload) == string(data) {
-			return nil
-		}
+	var event struct {
+		ID      string          `json:"id"`
+		Kind    string          `json:"kind"`
+		Payload json.RawMessage `json:"payload"`
+	}
+	if json.Unmarshal(committed, &event) == nil && event.ID == id && event.Kind == "wait.signal_late" && string(event.Payload) == string(data) {
+		return nil
 	}
 	return ErrRequestConflict
 }
@@ -182,48 +230,55 @@ func (r *Runtime) FireDueWaits(ctx context.Context, owner distributed.Owner, now
 	if limit < 1 {
 		return nil, ErrInvalid
 	}
-	events, err := r.store.ListEvents(ctx, owner.Partition)
+	timers, err := r.store.ListDueTimers(ctx, owner.Partition, now, limit)
 	if err != nil {
 		return nil, err
 	}
-	seen := map[string]bool{}
-	fired := make([]WaitRecord, 0, limit)
-	for _, event := range events {
-		if event.Kind != "wait.scheduled" {
-			continue
-		}
-		var scheduled WaitRecord
-		if err := json.Unmarshal(event.Payload, &scheduled); err != nil {
-			return nil, err
-		}
-		if scheduled.Tenant == "" || r.Partition(scheduled.Tenant) != owner.Partition {
-			return nil, ErrRequestConflict
-		}
-		waitKey := scheduled.Tenant + "\x00" + scheduled.WaitID
-		if seen[waitKey] {
-			continue
-		}
-		seen[waitKey] = true
-		data, revision, err := r.store.ReadState(ctx, owner.Partition, waitStateID(scheduled.Tenant, scheduled.WaitID))
+	fired := make([]WaitRecord, 0, len(timers))
+	for _, timer := range timers {
+		data, revision, err := r.store.ReadState(ctx, owner.Partition, timer.StateID)
 		if err != nil {
 			return nil, err
 		}
 		var current WaitRecord
-		if revision == 0 || json.Unmarshal(data, &current) != nil || current.State != "waiting" || current.DueAt.After(now) {
+		if revision == 0 || json.Unmarshal(data, &current) != nil || current.State != "waiting" || current.DueAt.IsZero() || current.DueAt.After(now) {
 			continue
+		}
+		if current.Tenant == "" || r.Partition(current.Tenant) != owner.Partition || waitStateID(current.Tenant, current.WaitID) != timer.StateID {
+			return fired, ErrRequestConflict
 		}
 		current.State = "timed_out"
 		encoded, _ := json.Marshal(current)
-		if _, err := r.store.CommitFencedState(ctx, owner, waitStateID(current.Tenant, current.WaitID), revision, waitTransition("timer", current.Tenant+"\x00"+current.WaitID), "wait.timed_out", encoded, encoded); err != nil {
-			if errors.Is(err, distributed.ErrStateConflict) || errors.Is(err, distributed.ErrAlreadyWritten) {
+		eventID := waitTransition("timer", current.Tenant+"\x00"+current.WaitID)
+		var commitErr error
+		timerMutation := &distributed.TimerIndexMutation{StateID: timer.StateID, DueAt: current.DueAt, Delete: true}
+		if current.StepID != "" {
+			run, runRevision, readErr := r.readRun(ctx, owner.Partition, current.RunID)
+			if readErr != nil {
+				return fired, readErr
+			}
+			if run.State == "waiting" || run.State == "running" {
+				run.State, run.OwnerID, run.Fence = "accepted", owner.ID, owner.Token
+				encodedRun, _ := json.Marshal(run)
+				_, commitErr = r.store.CommitFencedWaitStates(ctx, owner, []distributed.StateMutation{
+					{StateID: timer.StateID, ExpectedRevision: revision, State: encoded},
+					{StateID: run.RunID, ExpectedRevision: runRevision, State: encodedRun},
+				}, timerMutation, eventID, "wait.timed_out", encoded)
+			} else if run.State == "accepted" {
+				_, commitErr = r.store.CommitFencedWaitStates(ctx, owner, []distributed.StateMutation{{StateID: timer.StateID, ExpectedRevision: revision, State: encoded}}, timerMutation, eventID, "wait.timed_out", encoded)
+			} else {
 				continue
 			}
-			return fired, err
+		} else {
+			_, commitErr = r.store.CommitFencedWaitStates(ctx, owner, []distributed.StateMutation{{StateID: timer.StateID, ExpectedRevision: revision, State: encoded}}, timerMutation, eventID, "wait.timed_out", encoded)
+		}
+		if commitErr != nil {
+			if errors.Is(commitErr, distributed.ErrStateConflict) || errors.Is(commitErr, distributed.ErrAlreadyWritten) {
+				continue
+			}
+			return fired, commitErr
 		}
 		fired = append(fired, current)
-		if len(fired) == limit {
-			break
-		}
 	}
 	return fired, nil
 }
@@ -236,4 +291,11 @@ func waitStateID(tenant, waitID string) string {
 func waitTransition(kind, identity string) string {
 	hash := sha256.Sum256([]byte(kind + "\x00" + identity))
 	return kind + "-" + hex.EncodeToString(hash[:16])
+}
+
+// WaitIDFor returns the stable external signal address for a durable wait step.
+// Callers must still authenticate and authorize every signal independently.
+func WaitIDFor(runID, stepID string) string {
+	hash := sha256.Sum256([]byte(runID + "\x00" + stepID))
+	return "wait-" + hex.EncodeToString(hash[:])
 }

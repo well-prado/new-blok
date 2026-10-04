@@ -33,6 +33,8 @@ type stepJournalFixture struct {
 	completeErr error
 	failErr     error
 	beginErr    error
+	waitReady   bool
+	waitResult  engine.WaitResult
 	runs        map[string]struct{ artifact, input string }
 }
 
@@ -112,6 +114,12 @@ func (j *stepJournalFixture) Fail(_ context.Context, attempt engine.StepAttempt,
 	return j.failErr
 }
 
+func (j *stepJournalFixture) Await(_ context.Context, _ engine.WaitIdentity) (engine.WaitResult, bool, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.waitResult, j.waitReady, nil
+}
+
 type journalInput struct {
 	Value int `json:"value"`
 }
@@ -136,6 +144,43 @@ func TestRunJournaledResumesCommittedEffectWithoutReinvokingIt(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("effect invocation count=%d, want 1 after resume", calls)
+	}
+}
+
+func TestRunJournaledSuspendsAndResumesFromCommittedSteps(t *testing.T) {
+	const testSchema = `{"type":"object","properties":{"value":{"type":"integer"}},"required":["value"]}`
+	calls := 0
+	write := node.MustDefine("test/write", "1.0.0", func(_ context.Context, in journalInput) (journalInput, error) {
+		calls++
+		return journalInput{Value: in.Value + 1}, nil
+	}, node.Description("journal fixture"), node.Schemas([]byte(testSchema), []byte(testSchema)), node.Effects("fixture:write")).Any()
+	runner := engine.New(map[string]node.Any{"test/write": write})
+	program := contract.InternalProgram{WorkflowID: "journal-wait", Digest: "sha256:artifact-wait", Instructions: []contract.InternalInstruction{
+		{Index: 0, ID: "write", Kind: "call", Node: "test/write"},
+		{Index: 1, ID: "approval", Kind: "wait", Wait: &contract.WaitInstruction{Name: "approval", TimeoutMillis: 60000}},
+		{Index: 2, ID: "output", Kind: "output", References: []contract.Reference{{Step: "approval"}}},
+	}}
+	journal := newStepJournalFixture()
+	journal.expectRun("run-wait", program.Digest, journalInput{Value: 4})
+	journal.waitResult = engine.WaitResult{SignalID: "signal-1", Payload: json.RawMessage(`{"approved":true}`)}
+	_, err := runner.RunJournaled(context.Background(), program, journalInput{Value: 4}, "run-wait", journal)
+	var suspended interface{ IsSuspended() bool }
+	if !errors.As(err, &suspended) || !suspended.IsSuspended() {
+		t.Fatalf("first execution error=%v, want durable suspension", err)
+	}
+	if calls != 1 {
+		t.Fatalf("effect calls after suspension=%d, want 1", calls)
+	}
+	journal.mu.Lock()
+	journal.waitReady = true
+	journal.mu.Unlock()
+	result, err := runner.RunJournaled(context.Background(), program, journalInput{Value: 4}, "run-wait", journal)
+	if err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	resumed, ok := result.Output.(engine.WaitResult)
+	if !ok || resumed.SignalID != "signal-1" || string(resumed.Payload) != `{"approved":true}` || calls != 1 {
+		t.Fatalf("output=%#v effect calls=%d, want committed wait outcome and one effect", result.Output, calls)
 	}
 }
 

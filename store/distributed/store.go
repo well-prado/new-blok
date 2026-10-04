@@ -103,6 +103,25 @@ type event struct {
 	Payload     json.RawMessage `json:"payload"`
 }
 
+// StateMutation identifies one projection update guarded by the same owner
+// fence and event identity as the rest of a distributed transition.
+type StateMutation struct {
+	StateID          string
+	ExpectedRevision int64
+	State            []byte
+}
+
+type TimerIndexMutation struct {
+	StateID string
+	DueAt   time.Time
+	Delete  bool
+}
+
+type DueTimer struct {
+	StateID string
+	DueAt   time.Time
+}
+
 // CommittedEvent is a linearizably read immutable transition record.
 type CommittedEvent struct {
 	Partition   string          `json:"partition"`
@@ -440,6 +459,138 @@ func (s *Store) CommitFencedState(ctx context.Context, owner Owner, stateID stri
 	return 0, s.classifyRejectedCommit(ctx, owner, transitionKey, encodedEvent)
 }
 
+// CommitFencedStates atomically commits one event and several state
+// projections. It is used when a timer or signal must both resolve a wait and
+// make its suspended run runnable; neither projection may become visible
+// without the other under the current partition fence.
+func (s *Store) CommitFencedStates(ctx context.Context, owner Owner, mutations []StateMutation, eventID, kind string, payload []byte) (int64, error) {
+	return s.commitFencedStates(ctx, owner, mutations, nil, eventID, kind, payload)
+}
+
+// CommitFencedWaitStates atomically updates wait/run projections and their
+// bounded due-timer index entry. A nil timer mutation is used for an
+// indefinite signal wait; Delete removes a previously scheduled timer.
+func (s *Store) CommitFencedWaitStates(ctx context.Context, owner Owner, mutations []StateMutation, timer *TimerIndexMutation, eventID, kind string, payload []byte) (int64, error) {
+	return s.commitFencedStates(ctx, owner, mutations, timer, eventID, kind, payload)
+}
+
+func (s *Store) commitFencedStates(ctx context.Context, owner Owner, mutations []StateMutation, timer *TimerIndexMutation, eventID, kind string, payload []byte) (int64, error) {
+	if !owner.valid() || len(mutations) < 1 || len(mutations) > 8 || !validName(eventID) || !validName(kind) || len(payload) > MaxPayloadBytes || !json.Valid(payload) {
+		return 0, errors.New("distributed store: bounded fenced state mutations, event identity and JSON payload are required")
+	}
+	conditions := []clientv3.Cmp{
+		clientv3.Compare(clientv3.Value(incarnationKey()), "=", owner.Incarnation),
+		clientv3.Compare(clientv3.CreateRevision(ownerKey(owner.Incarnation, owner.Partition)), "=", owner.Token),
+		clientv3.Compare(clientv3.Value(ownerKey(owner.Incarnation, owner.Partition)), "=", owner.ID),
+	}
+	operations := make([]clientv3.Op, 0, len(mutations)+1)
+	seen := make(map[string]bool, len(mutations))
+	for _, mutation := range mutations {
+		if !validName(mutation.StateID) || mutation.ExpectedRevision < 0 || len(mutation.State) > MaxPayloadBytes || !json.Valid(mutation.State) || seen[mutation.StateID] {
+			return 0, errors.New("distributed store: each fenced state mutation requires a unique identity, expected revision and bounded JSON")
+		}
+		seen[mutation.StateID] = true
+		statePath := projectionKey(owner.Partition, mutation.StateID)
+		if mutation.ExpectedRevision == 0 {
+			conditions = append(conditions, clientv3.Compare(clientv3.Version(statePath), "=", 0))
+		} else {
+			conditions = append(conditions, clientv3.Compare(clientv3.ModRevision(statePath), "=", mutation.ExpectedRevision))
+		}
+		operations = append(operations, clientv3.OpPut(statePath, string(mutation.State)))
+	}
+	if timer != nil {
+		if !validName(timer.StateID) || timer.DueAt.IsZero() {
+			return 0, errors.New("distributed store: timer index mutation requires a state identity and due time")
+		}
+		indexKey := timerIndexKey(owner.Partition, timer.DueAt, timer.StateID)
+		if timer.Delete {
+			operations = append(operations, clientv3.OpDelete(indexKey))
+		} else {
+			conditions = append(conditions, clientv3.Compare(clientv3.Version(indexKey), "=", 0))
+			operations = append(operations, clientv3.OpPut(indexKey, timer.StateID))
+		}
+	}
+	eventPath := eventKey(owner.Partition, eventID)
+	encodedEvent, err := json.Marshal(event{Partition: owner.Partition, ID: eventID, Kind: kind, Fence: owner.Token, Incarnation: owner.Incarnation, Payload: payload})
+	if err != nil {
+		return 0, fmt.Errorf("distributed store: encode state transition: %w", err)
+	}
+	conditions = append(conditions, clientv3.Compare(clientv3.Version(eventPath), "=", 0))
+	operations = append(operations, clientv3.OpPut(eventPath, string(encodedEvent)))
+	response, err := s.client.Txn(ctx).If(conditions...).Then(operations...).Commit()
+	if err != nil {
+		return 0, fmt.Errorf("distributed store: fenced multi-state commit (outcome must be reconciled by transition ID): %w", err)
+	}
+	if response.Succeeded {
+		return response.Header.Revision, nil
+	}
+	return 0, s.classifyRejectedCommit(ctx, owner, eventPath, encodedEvent)
+}
+
+// ListActiveRunIDs reads the admission-slot index, whose cardinality is
+// bounded by the configured partition capacity. Terminal transitions remove
+// their slot in the same transaction as publishing terminal state.
+func (s *Store) ListActiveRunIDs(ctx context.Context, partition string, limit int) ([]string, error) {
+	if !validName(partition) || limit < 1 || limit > 4096 {
+		return nil, errors.New("distributed store: active-run query requires a valid partition and bounded limit")
+	}
+	response, err := s.client.Txn(ctx).
+		If(clientv3.Compare(clientv3.Value(incarnationKey()), "=", s.incarnation)).
+		Then(clientv3.OpGet(globalSlotsPrefix(partition), clientv3.WithPrefix(), clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend), clientv3.WithLimit(int64(limit+1)))).Commit()
+	if err != nil {
+		return nil, fmt.Errorf("distributed store: list bounded active runs: %w", err)
+	}
+	if !response.Succeeded {
+		return nil, ErrIncarnation
+	}
+	if len(response.Responses) == 0 {
+		return []string{}, nil
+	}
+	entries := response.Responses[0].GetResponseRange().Kvs
+	if len(entries) > limit {
+		return nil, ErrAdmissionFull
+	}
+	runs := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !validName(string(entry.Value)) {
+			return nil, errors.New("distributed store: active-run slot contains an invalid run ID")
+		}
+		runs = append(runs, string(entry.Value))
+	}
+	return runs, nil
+}
+
+// ListDueTimers reads only the ordered timer-index prefix through now and
+// returns at most limit entries; later due timers remain for the next poll.
+func (s *Store) ListDueTimers(ctx context.Context, partition string, now time.Time, limit int) ([]DueTimer, error) {
+	if !validName(partition) || now.IsZero() || limit < 1 || limit > 4096 {
+		return nil, errors.New("distributed store: due-timer query requires a valid partition, time and bounded limit")
+	}
+	start := timerIndexPrefix(partition)
+	end := start + fmt.Sprintf("%020d/\xff", now.UTC().UnixNano())
+	response, err := s.client.Txn(ctx).
+		If(clientv3.Compare(clientv3.Value(incarnationKey()), "=", s.incarnation)).
+		Then(clientv3.OpGet(start, clientv3.WithRange(end), clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend), clientv3.WithLimit(int64(limit)))).Commit()
+	if err != nil {
+		return nil, fmt.Errorf("distributed store: list bounded due timers: %w", err)
+	}
+	if !response.Succeeded {
+		return nil, ErrIncarnation
+	}
+	if len(response.Responses) == 0 {
+		return []DueTimer{}, nil
+	}
+	result := make([]DueTimer, 0, len(response.Responses[0].GetResponseRange().Kvs))
+	for _, entry := range response.Responses[0].GetResponseRange().Kvs {
+		var due int64
+		if _, err := fmt.Sscanf(strings.TrimPrefix(string(entry.Key), start), "%d/", &due); err != nil || !validName(string(entry.Value)) {
+			return nil, errors.New("distributed store: malformed timer index entry")
+		}
+		result = append(result, DueTimer{StateID: string(entry.Value), DueAt: time.Unix(0, due).UTC()})
+	}
+	return result, nil
+}
+
 func (s *Store) classifyRejectedCommit(ctx context.Context, owner Owner, transitionKey string, intended []byte) error {
 	current, err := s.client.Get(ctx, ownerKey(owner.Incarnation, owner.Partition))
 	if err != nil {
@@ -600,6 +751,14 @@ func projectionKey(partition, id string) string {
 
 func globalSlotsPrefix(partition string) string {
 	return "/blok/v1/partitions/" + url.PathEscape(partition) + "/admission-slots/global/"
+}
+
+func timerIndexPrefix(partition string) string {
+	return "/blok/v1/partitions/" + url.PathEscape(partition) + "/timers/"
+}
+
+func timerIndexKey(partition string, dueAt time.Time, stateID string) string {
+	return timerIndexPrefix(partition) + fmt.Sprintf("%020d/", dueAt.UTC().UnixNano()) + url.PathEscape(stateID)
 }
 
 func globalSlotKey(partition, slot string) string {
