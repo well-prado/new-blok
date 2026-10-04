@@ -268,11 +268,13 @@ likely to be subtly wrong, and the official SDK tracks the specification.
   reads that end and the answer on separate connections in no fixed order:
   a client that treats the end of the stream as fatal at once (`MaxRetries`
   below zero) fails the connection, and the call with it, even with the
-  answer already on the wire (73 of 100 calls in the first probe, 21 of 100
-  in the regression test against a server that still served the stream).
+  answer already on the wire (73 of 100 calls in the first probe; 21 to 55
+  of 100 across regression-test runs against a server that still served the
+  stream).
   Upstream declined to change the client (modelcontextprotocol/go-sdk#1175).
   Refusing the GET with 405 leaves Shutdown no stream to end, so the flaw
-  cannot reach this server's clients, the SDK's or anyone else's; the
+  has nothing to act on for any client of this server, the SDK's or
+  anyone else's; the
   regression test's client disables retries and receives every answer.
 - A client sees its session closed by `Shutdown` only at its next request,
   which the closing adapter refuses with 503 (and a stopped listener does

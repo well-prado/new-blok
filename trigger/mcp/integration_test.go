@@ -662,19 +662,25 @@ func TestStandaloneStreamIsRefused(t *testing.T) {
 	version := alice.InitializeResult().ProtocolVersion
 	for _, c := range []struct {
 		method, token string
+		sessionless   bool
 		status        int
 	}{
-		{http.MethodGet, "alice", http.StatusMethodNotAllowed},
-		{http.MethodGet, "bob", http.StatusMethodNotAllowed},
-		{http.MethodPut, "alice", http.StatusMethodNotAllowed},
-		{http.MethodGet, "intruder", http.StatusUnauthorized},
+		{http.MethodGet, "alice", false, http.StatusMethodNotAllowed},
+		{http.MethodGet, "bob", false, http.StatusMethodNotAllowed},
+		{http.MethodGet, "alice", true, http.StatusMethodNotAllowed},
+		{http.MethodPut, "alice", false, http.StatusMethodNotAllowed},
+		{http.MethodHead, "alice", false, http.StatusMethodNotAllowed},
+		{http.MethodOptions, "alice", false, http.StatusMethodNotAllowed},
+		{http.MethodGet, "intruder", false, http.StatusUnauthorized},
 	} {
 		request, err := http.NewRequest(c.method, r.endpoint, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
 		request.Header.Set("Accept", "text/event-stream")
-		request.Header.Set("Mcp-Session-Id", alice.ID())
+		if !c.sessionless {
+			request.Header.Set("Mcp-Session-Id", alice.ID())
+		}
 		request.Header.Set("Mcp-Protocol-Version", version)
 		response, err := (&http.Client{Transport: recordingClient{token: c.token, log: r.wire}, Timeout: 5 * time.Second}).Do(request)
 		if err != nil {
@@ -682,7 +688,7 @@ func TestStandaloneStreamIsRefused(t *testing.T) {
 		}
 		_ = response.Body.Close()
 		if response.StatusCode != c.status {
-			t.Fatalf("%s as %s: status=%d, want %d", c.method, c.token, response.StatusCode, c.status)
+			t.Fatalf("%s as %s (sessionless=%v): status=%d, want %d", c.method, c.token, c.sessionless, response.StatusCode, c.status)
 		}
 		if allow := response.Header.Get("Allow"); c.status == http.StatusMethodNotAllowed && allow != "POST, DELETE" {
 			t.Fatalf("%s as %s: Allow=%q, want \"POST, DELETE\"", c.method, c.token, allow)
