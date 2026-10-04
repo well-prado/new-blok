@@ -194,7 +194,10 @@ type Call struct {
 	Blobs          []BlobRef    `json:"blobs,omitempty"`
 	Principal      string       `json:"principal"`
 	Capabilities   []Capability `json:"capabilities,omitempty"`
-	OnLog          func(Log)    `json:"-"`
+	// OnLog receives best-effort logs asynchronously on a bounded per-connection
+	// dispatcher. It must return promptly; blocking it drops later logs but
+	// cannot block result-frame processing or change call outcomes.
+	OnLog func(Log) `json:"-"`
 }
 
 // Log is a bounded, call-scoped worker record. OnLog is an invocation-local
