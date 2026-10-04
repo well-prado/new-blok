@@ -88,10 +88,7 @@ func (b *observationBudget) capture(value reflect.Value, depth int) (any, bool) 
 	}
 	// Custom JSON representations cannot be reconstructed without invoking
 	// application code. Mark them explicitly instead of inventing a shape.
-	if value.Type().Implements(observationMarshalerType) || reflect.PointerTo(value.Type()).Implements(observationMarshalerType) ||
-		value.Type().Implements(observationTextMarshalerType) || reflect.PointerTo(value.Type()).Implements(observationTextMarshalerType) ||
-		value.Type().Implements(observationTextAppenderType) || reflect.PointerTo(value.Type()).Implements(observationTextAppenderType) ||
-		value.Type().Implements(observationJSONToType) || reflect.PointerTo(value.Type()).Implements(observationJSONToType) {
+	if observationCustomRepresentation(value.Type()) {
 		return nil, false
 	}
 
@@ -155,7 +152,7 @@ func (b *observationBudget) capture(value reflect.Value, depth int) (any, bool) 
 		if value.IsNil() {
 			return nil, b.charge(4)
 		}
-		if value.Type().Key().Kind() != reflect.String || value.Len() > b.nodes/2 || !b.charge(2) {
+		if value.Type().Key().Kind() != reflect.String || observationCustomRepresentation(value.Type().Key()) || value.Len() > b.nodes/2 || !b.charge(2) {
 			return nil, false
 		}
 		items := make(map[string]any, value.Len())
@@ -224,6 +221,15 @@ func (b *observationBudget) capture(value reflect.Value, depth int) (any, bool) 
 	default:
 		return nil, false
 	}
+}
+
+func observationCustomRepresentation(typ reflect.Type) bool {
+	for _, custom := range []reflect.Type{observationMarshalerType, observationTextMarshalerType, observationTextAppenderType, observationJSONToType} {
+		if typ.Implements(custom) || reflect.PointerTo(typ).Implements(custom) {
+			return true
+		}
+	}
+	return false
 }
 
 func observationEmpty(value reflect.Value) bool {
