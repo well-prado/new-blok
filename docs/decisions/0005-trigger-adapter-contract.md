@@ -120,6 +120,12 @@ Shutdown then cancels it rather than closing the store under it (#177):
   or signal as the shutdown trigger; the configured two phases bound shutdown
   after that trigger. Direct `app.Shutdown(ctx)` instead keeps the caller's
   context as the bound for both of its waits.
+  Only admitted work holds the HTTP drain open. Once admission is closed,
+  `Run` closes every connection that has not yet delivered a request (a
+  client's spare or speculative dial): it carries no admitted work, and
+  `http.Server.Shutdown` alone would keep it for five seconds, timing out a
+  drain whose real work had finished (#194). Such a connection gets no
+  answer; its request was never admitted, so retrying it is safe.
 - Aborted work may already have committed something, so it is answered as
   a retry invitation only where a retry is harmless. The durable starts
   (webhook, SSE) are keyed, so they answer 503 `unavailable` with
@@ -246,6 +252,7 @@ not applicable with a reason, never as passed. Failures are
 | `app.Application.AbortGrace()` | additive | none; reports the effective configured grace for host shutdown orchestration |
 | A drain timeout cancels admitted work, waits up to `AbortGrace`, then closes the dependencies (#177) | behavioral (fix) | work that outlived `DrainTimeout` used to run on into closed dependencies. Handlers should observe their context |
 | HTTP's draining 503 carries `Retry-After` | additive | none |
+| `Deployment.Run` closes request-less connections when drain begins (#194) | behavioral (fix) | a connection opened but not yet carrying a request is closed instead of answered. Its request was never admitted. A drain that used to report `application_drain_timeout` because of such a connection now ends when the admitted work does |
 
 ## Limits
 
