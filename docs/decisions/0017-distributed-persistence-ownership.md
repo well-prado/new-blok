@@ -20,6 +20,15 @@ credentials only; they are not credentials, defaults, or examples for a
 deployment. The single SeaweedFS volume is only an S3 API availability fixture
 and supplies no replication evidence.
 
+There are no package-level connections or network effects in `init`. Creating
+the S3 adapter is local configuration only; bucket provisioning is an explicit
+network operation. `distributed.New(ctx, client, incarnation)` is an explicit
+network initialization call: it atomically establishes the cluster-incarnation
+key if absent, otherwise reads and validates it. It uses the supplied etcd
+client and caller context, so a canceled or deadline context bounds
+initialization. The application and engine do not construct or import these
+adapters.
+
 ## Authoritative fencing rule
 
 An owner is identified by `(cluster incarnation, partition, owner ID,
@@ -37,8 +46,11 @@ owner key in one linearizable transaction, then attaches the owner key to an
 etcd lease. A client created before an incarnation rotation therefore cannot
 acquire a lease in its stale namespace. A paused process cannot renew while
 paused. After lease expiry and takeover, its old create revision/owner ID no
-longer compare, so its write cannot commit. A renewal cannot recreate or revive
-an expired owner. Successful event commits are acknowledged only after etcd
+longer compare, so its write cannot commit. Renewal requires a positive lease
+keepalive and a linearizable comparison of incarnation, owner-key create
+revision and owner ID; a stale-incarnation lease is not authority even if it
+still reports time-to-live. Renewal cannot recreate or revive an expired
+owner. Successful event commits are acknowledged only after etcd
 reports the transaction committed. If the response is lost or times out, the
 outcome is unknown: after quorum returns, read the stable event ID, compare the
 stored partition, kind, owner fence and payload with the intended operation,
@@ -49,10 +61,11 @@ reconciliation establishes the result.
 
 The revision is not globally monotonic across snapshot restore. etcd restore
 creates a new cluster history and may reuse lower revisions. The fence is
-therefore the pair `(incarnation UUID, create revision)`, never the revision
-alone. Restore procedure: keep every worker and admission path stopped, restore
-the snapshot into an isolated cluster, use the recovery operator to compare
-and rotate `/blok/v1/cluster-incarnation` to a fresh UUID, validate retained
+therefore the pair `(incarnation identifier, create revision)`, never the
+revision alone. Restore procedure: keep every worker and admission path
+stopped, restore the snapshot into an isolated cluster, use the recovery
+operator to compare and rotate `/blok/v1/cluster-incarnation` to a fresh,
+unique identifier, validate retained
 artifacts and blob references, then route workers. Every commit compares this
 key, so a pre-restore owner is fenced after the rotation even if its numeric
 revision and owner ID recur. Starting workers before rotation is unsupported
@@ -63,7 +76,7 @@ primitive for this barrier; it is not a restore orchestrator.
 
 | Operation | Authority and acknowledgment | Failure behavior / limit |
 | --- | --- | --- |
-| Acquire / renew owner | etcd lease plus linearizable transaction / lease response | No quorum means no confirmed acquisition or renewal. Lease expiry makes the old owner unusable. |
+| Acquire / renew owner | Acquisition atomically compares incarnation and absent owner key before attaching an etcd lease. Renewal requires a positive keepalive and a linearizable comparison of incarnation, owner-key create revision and owner ID. | No quorum means no confirmed acquisition or renewal. A lease response alone is not authority. Lease expiry makes the old owner unusable. |
 | Commit state, timer, signal, or outbox identity | One etcd transaction compares incarnation and owner fence and writes record; acknowledge only on confirmed transaction success | Majority is required. Timeout or disconnect can leave outcome unknown; reconcile the same stable ID and verify the full record before retry. No external side effect is included in the transaction. |
 | Read state | Linearizable etcd transaction guarded by current incarnation | No quorum means unavailable; stale/serializable reads are not used for ownership or resume decisions. |
 | Store blob bytes | External S3-compatible object service; upload, read back and verify digest before committing reference | Not atomic with etcd. Missing/unavailable object blocks publication/resume; successful metadata commit alone does not replicate or preserve bytes. |
@@ -83,11 +96,14 @@ signal inbox/deduplication rows, event records and blob references carry that
 same partition identity. Timer claims and signal acceptance must use the same
 fenced transaction rule as ordinary state commits; delivery is not ownership.
 This spike tests timer and signal records remaining addressable under the same
-stable partition after a lease takeover, and verifies a referenced blob remains
-readable after that takeover. It does not implement a timer scheduler, signal
-authorization, compactor, retention inventory, or resharder. Partition and blob
-provider migration are documented rules, not implemented online migration
-operations.
+stable partition after a lease takeover. It then attempts timer-claim and
+signal-delivery commits with both the old and new owner: the old fence is
+rejected and the current owner's fence is recorded. It also verifies the
+referenced blob after takeover. This exercises durable ownership of claim
+records, not timer scheduling, signal authorization or delivery to external
+consumers. It does not implement a compactor, retention inventory, or
+resharder. Partition and blob-provider migration are documented rules, not
+implemented online migration operations.
 
 Blob names are content-addressed and immutable. Stage object, read/verify
 digest, then commit its reference. A crash between object write and reference
@@ -99,11 +115,17 @@ consistent journal cut; restore fails closed if any required digest is absent.
 
 ## Cost, topology and measurements
 
-The dependency cost is the etcd client package and its etcd API/client-pkg,
-zap, gateway/protobuf, and MinIO Go SDK v7.0.95 support modules. Both concrete
+The direct Go dependencies are etcd client v3.6.5 (coordination, leases,
+transactions, snapshots) and MinIO Go SDK v7.0.95 (S3-compatible blob I/O and
+digest verification). Their transitive graph includes etcd API/client support,
+gRPC/protobuf, zap, MinIO checksums/JSON/crypto, and `golang.org/x` support
+packages. The raw run measured 2 non-standard Go packages under `./store`
+versus 192 under `./store/distributed` (an incremental package-graph count of
+190; this is not a binary-size or runtime-memory measurement). Both concrete
 adapters are confined to `store/distributed`; neither is imported by engine,
-app, or runtime packages. Constructors perform no network I/O, while bucket
-provisioning is explicit. Adapter operations use caller contexts. The local
+app, or runtime packages. S3 client configuration is local; etcd `New` and
+bucket provisioning are explicit caller-context network operations. Adapter
+operations use caller contexts. The local
 topology is one Docker host with three etcd v3.6.5 voting members, each with a
 separate named volume, and one SeaweedFS v4.47 S3 endpoint with a single named
 volume. This tests replication across processes and volumes, not independent
@@ -111,13 +133,20 @@ machines, disks, racks, zones, or regions.
 
 The bounded runner is `go run ./benchmarks/distributed`; it requires explicit
 endpoints, incarnation and S3 credentials, never starts services, and writes
-raw samples as JSON. It records sequential and concurrent etcd commit/read
-latencies, verified S3 put/get latencies, snapshot export and offline restore
-durations, payload/workload settings, runtime, image identifiers and
-non-standard package counts. The committed raw artifact will identify the
-exact local run. Offline restore duration does not include serving readiness.
-These measurements are local design-spike evidence only. They are not fleet
-RPS, multi-region capacity, comparable durability across providers, or an SLA.
+raw samples as JSON. The [raw synthetic run](../../testdata/distributed/results-2026-10-04-go1.27.1-darwin-arm64.json)
+contains five repetitions of 100 sequential commits, reads and four-worker
+concurrent commits (500 latency observations per operation), verified S3
+put/get, and five snapshot export/offline restore observations. On this Go
+1.27.1 darwin/arm64 host, measured p50/p95/p99 were 3.22/5.76/9.56 ms for
+sequential commit, 0.77/1.58/2.14 ms for read, 6.67/22.05/29.64 ms for
+four-worker commit, 0.96/1.42/1.83 ms for S3 put+verify, and
+0.34/0.70/1.08 ms for S3 get+verify. Snapshot export was 11.96 ms p50 and
+offline `etcdutl` restore was 267.83 ms p50; snapshot size was 839,712 bytes.
+The artifact records workload, exact local image IDs/digests, endpoints,
+runtime and dependency package counts. Offline restore duration excludes
+member startup and serving readiness. These are local design-spike measurements,
+not fleet RPS, multi-region capacity, comparable durability across providers,
+or an SLA.
 
 ## Evidence and remaining limits
 
@@ -130,10 +159,11 @@ matching record or one retry if absent. The S3 test stages and verifies a
 synthetic object before reference commit, rejects a commit while S3 is
 unavailable, and blocks reads while a committed reference's object is
 unavailable. Snapshot/restore checks that the snapshot retained the old
-owner-key create revision, rotates the incarnation while isolated, then
-proves both the old owner commit and stale-store acquisition are rejected.
-This exercises the epoch barrier against a still-present old token; it is not
-a synthetic numeric revision-rewind test.
+owner-key create revision, advances the source revision beyond the snapshot,
+and proves the restored cluster issues a lower numeric token. It then proves
+old-incarnation commit and renewal, construction with the stale incarnation,
+and stale-store acquisition are rejected; a fresh-incarnation owner commits.
+This executes the epoch barrier against a measured numeric revision rewind.
 
 No log-only failover claim is made. The spike does not prove disk-loss
 survival, independent-host failure, geographic partition behavior, general

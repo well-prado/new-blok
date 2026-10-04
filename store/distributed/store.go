@@ -140,6 +140,26 @@ func (s *Store) Renew(ctx context.Context, owner Owner) error {
 		return ErrOwnershipLost
 	}
 	response, err := s.client.KeepAliveOnce(ctx, owner.LeaseID)
+	// A live etcd lease is not proof that this owner is authoritative: a
+	// restored cluster can retain the lease while its incarnation is rotated.
+	// Renew only reports ownership while the same linearizable fence still
+	// holds, matching Commit's authority check.
+	check, checkErr := s.client.Txn(ctx).
+		If(
+			clientv3.Compare(clientv3.Value(incarnationKey()), "=", owner.Incarnation),
+			clientv3.Compare(clientv3.CreateRevision(ownerKey(owner.Incarnation, owner.Partition)), "=", owner.Token),
+			clientv3.Compare(clientv3.Value(ownerKey(owner.Incarnation, owner.Partition)), "=", owner.ID),
+		).
+		Then(clientv3.OpGet(ownerKey(owner.Incarnation, owner.Partition))).Commit()
+	if checkErr != nil {
+		if err != nil {
+			return fmt.Errorf("distributed store: renew lease: %v; verify ownership: %w", err, checkErr)
+		}
+		return fmt.Errorf("distributed store: verify renewed ownership: %w", checkErr)
+	}
+	if !check.Succeeded {
+		return ErrOwnershipLost
+	}
 	if err != nil {
 		return fmt.Errorf("distributed store: renew lease: %w", err)
 	}

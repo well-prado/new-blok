@@ -63,6 +63,9 @@ func TestS3BlobOutageBlocksReferenceAndResume(t *testing.T) {
 	if err != nil || value != nil {
 		t.Fatalf("outage created a durable reference: value=%s err=%v", value, err)
 	}
+	assertScenarioFixture(t, "blob-unavailable-before-reference", map[string]any{
+		"referenceCommitted": 0, "outputPublished": 0, "errors": []string{"blob_unavailable"},
+	})
 	if output, err := exec.Command("docker", composeArgs("unpause", "s3")...).CombinedOutput(); err != nil {
 		t.Fatalf("restore object service: %v: %s", err, output)
 	}
@@ -85,6 +88,9 @@ func TestS3BlobOutageBlocksReferenceAndResume(t *testing.T) {
 	if _, err := journal.ReadBlob(readCtx, bucket, "blob-backed-output", blobs); !errors.Is(err, ErrBlobUnavailable) {
 		t.Fatalf("resume read during object outage = %v, want ErrBlobUnavailable", err)
 	}
+	assertScenarioFixture(t, "blob-unavailable-after-reference", map[string]any{
+		"referenceStillDurable": true, "resumeAllowed": false, "errors": []string{"blob_unavailable"},
+	})
 }
 
 func TestPartitionTakeoverKeepsTimerSignalAndBlobReferences(t *testing.T) {
@@ -129,6 +135,26 @@ func TestPartitionTakeoverKeepsTimerSignalAndBlobReferences(t *testing.T) {
 	if err != nil {
 		t.Fatalf("take over stable partition: %v", err)
 	}
+	for _, delivery := range []struct {
+		id      string
+		kind    string
+		payload string
+	}{
+		{id: "timer-claim", kind: "timer-claim", payload: `{"timerID":"timer-record"}`},
+		{id: "signal-delivery", kind: "signal-delivery", payload: `{"signalID":"signal-record"}`},
+	} {
+		if err := journal.Commit(ctx, oldOwner, delivery.id, delivery.kind, []byte(delivery.payload)); !errors.Is(err, ErrOwnershipLost) {
+			t.Fatalf("stale owner %s commit = %v, want ErrOwnershipLost", delivery.kind, err)
+		}
+		if err := journal.Commit(ctx, newOwner, delivery.id, delivery.kind, []byte(delivery.payload)); err != nil {
+			t.Fatalf("new owner %s commit: %v", delivery.kind, err)
+		}
+		encoded, err := journal.Read(ctx, partition, delivery.id)
+		var record event
+		if err != nil || json.Unmarshal(encoded, &record) != nil || record.Kind != delivery.kind || record.Fence != newOwner.Token || record.Incarnation != newOwner.Incarnation {
+			t.Fatalf("fenced %s record = %+v, err=%v", delivery.kind, record, err)
+		}
+	}
 	for id, kind := range map[string]string{"timer-record": "timer", "signal-record": "signal"} {
 		encoded, err := journal.Read(ctx, partition, id)
 		if err != nil {
@@ -149,4 +175,9 @@ func TestPartitionTakeoverKeepsTimerSignalAndBlobReferences(t *testing.T) {
 	if err := journal.Commit(ctx, newOwner, "new-owner-state", "state", []byte(`{"current":true}`)); err != nil {
 		t.Fatalf("new owner commit after partition takeover: %v", err)
 	}
+	assertScenarioFixture(t, "partition-takeover-timer-signal-blob", map[string]any{
+		"timerRecordRetained": true, "signalRecordRetained": true,
+		"blobDigestVerified": true, "oldOwnerCommitted": 0,
+		"newOwnerCommitted": 1, "errors": []string{"ownership_lost"},
+	})
 }

@@ -67,10 +67,12 @@ func main() {
 
 func run() {
 	var count, samples, workers, payloadBytes int
+	var outputPath string
 	flag.IntVar(&count, "commits", 100, "unique commits in each sequential/concurrent sample (1..10000)")
 	flag.IntVar(&samples, "samples", 5, "repeat count for each measurement (1..20)")
 	flag.IntVar(&workers, "workers", 4, "bounded concurrent commit workers (1..32)")
 	flag.IntVar(&payloadBytes, "payload-bytes", 256, "synthetic JSON payload size (1..512 KiB)")
+	flag.StringVar(&outputPath, "output", "", "create a new raw JSON artifact at this path (must not already exist)")
 	flag.Parse()
 	if count < 1 || count > 10000 || samples < 1 || samples > 20 || workers < 1 || workers > 32 || payloadBytes < 13 || payloadBytes > distributed.MaxPayloadBytes {
 		fatal(errors.New("commits must be 1..10000, samples 1..20, workers 1..32, payload-bytes 13..512 KiB"))
@@ -272,8 +274,26 @@ func run() {
 	}
 	out.Snapshot.summarize()
 	out.Restore.summarize()
-	if err := json.NewEncoder(os.Stdout).Encode(out); err != nil {
+	encoded, err := json.MarshalIndent(out, "", "  ")
+	if err != nil {
 		fatal(err)
+	}
+	encoded = append(encoded, '\n')
+	if outputPath == "" {
+		if _, err := os.Stdout.Write(encoded); err != nil {
+			fatal(err)
+		}
+		return
+	}
+	file, err := os.OpenFile(outputPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		fatal(fmt.Errorf("create raw measurement artifact without overwriting: %w", err))
+	}
+	_, writeErr := file.Write(encoded)
+	syncErr := file.Sync()
+	closeErr := file.Close()
+	if err := errors.Join(writeErr, syncErr, closeErr); err != nil {
+		fatal(fmt.Errorf("write raw measurement artifact: %w", err))
 	}
 }
 

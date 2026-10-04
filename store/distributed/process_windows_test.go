@@ -5,7 +5,6 @@ package distributed
 import (
 	"fmt"
 	"os"
-	"runtime"
 
 	"golang.org/x/sys/windows"
 )
@@ -21,10 +20,14 @@ func processControl(process *os.Process, name string) error {
 	if err := procedure.Find(); err != nil {
 		return err
 	}
-	status, _, callErr := procedure.Call(process.Handle())
-	runtime.KeepAlive(process)
-	if status != 0 {
-		return fmt.Errorf("%s returned NTSTATUS %#x: %w", name, status, callErr)
+	var processErr error
+	if err := process.WithHandle(func(handle uintptr) {
+		status, _, callErr := procedure.Call(handle)
+		if status != 0 {
+			processErr = fmt.Errorf("%s returned NTSTATUS %#x: %w", name, status, callErr)
+		}
+	}); err != nil {
+		return fmt.Errorf("access process handle for %s: %w", name, err)
 	}
-	return nil
+	return processErr
 }
