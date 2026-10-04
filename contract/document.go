@@ -210,7 +210,6 @@ func (d Document) Validate() error {
 		if instructionIDs[in.ID] {
 			return duplicate(in.ID, "workflow.instructions")
 		}
-		instructionIDs[in.ID] = true
 		if !instructionKinds[in.Kind] {
 			return &Error{Code: "unknown_instruction", Path: path + ".kind", Message: "instruction kind is not supported"}
 		}
@@ -227,6 +226,7 @@ func (d Document) Validate() error {
 				return &Error{Code: "invalid_reference", Path: path + ".references", Message: "references must target an earlier instruction"}
 			}
 		}
+		instructionIDs[in.ID] = true
 	}
 	for i, b := range d.Bindings {
 		path := fmt.Sprintf("bindings[%d]", i)
