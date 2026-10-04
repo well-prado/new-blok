@@ -148,8 +148,8 @@ order, which `trigger/nine_test.go` drives with work in flight (#173):
    `mcp.Server.Shutdown` refuses new sessions and calls and waits for the
    calls in flight and their answers (#197), the gRPC server's `GracefulStop` finishes its calls, and
    the HTTP server's `Shutdown` finishes its requests (HTTP, webhook, SSE
-   starts). The order matters: SSE subscriptions and MCP standing streams
-   keep their connections active, so the HTTP server's `Shutdown` would
+   starts). The order matters: SSE subscriptions keep their connections
+   active, so the HTTP server's `Shutdown` would
    wait on them until its deadline if they were not ended first. The
    application stays ready meanwhile, so work they hold completes and is
    answered, and until the HTTP server's `Shutdown` runs, HTTP, webhook and
