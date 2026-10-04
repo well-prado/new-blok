@@ -2,6 +2,8 @@ package packagemanager
 
 import (
 	"context"
+	"crypto/sha512"
+	"encoding/base64"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +13,61 @@ import (
 
 	contractpackage "github.com/well-prado/new-blok/contract/package"
 )
+
+func TestCaptureNativeNPMRepeatedCopiesAreDeterministic(t *testing.T) {
+	if _, err := exec.LookPath("npm"); err != nil {
+		t.Skip("npm native manager is unavailable")
+	}
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("Node.js runtime is unavailable")
+	}
+	root := t.TempDir()
+	manifest := `{"name":"synthetic-repeat","version":"1.0.0","dependencies":{"parent-a":"1.0.0","parent-b":"1.0.0"}}`
+	lock := `{"name":"synthetic-repeat","version":"1.0.0","lockfileVersion":3,"packages":{"":{"name":"synthetic-repeat","version":"1.0.0","dependencies":{"parent-a":"1.0.0","parent-b":"1.0.0"}},"node_modules/parent-a":{"version":"1.0.0","integrity":"INTEGRITY_A","dependencies":{"shared":"1.0.0"}},"node_modules/parent-b":{"version":"1.0.0","integrity":"INTEGRITY_B","dependencies":{"shared":"1.0.0"}},"node_modules/parent-a/node_modules/shared":{"version":"1.0.0","integrity":"INTEGRITY_C"},"node_modules/parent-b/node_modules/shared":{"version":"1.0.0","integrity":"INTEGRITY_D"}}}`
+	for marker, payload := range map[string]string{"INTEGRITY_A": "parent-a", "INTEGRITY_B": "parent-b", "INTEGRITY_C": "copy-a", "INTEGRITY_D": "copy-b"} {
+		digest := sha512.Sum512([]byte(payload))
+		lock = strings.ReplaceAll(lock, marker, "sha512-"+base64.StdEncoding.EncodeToString(digest[:]))
+	}
+	writeFixtureFile(t, filepath.Join(root, "package.json"), manifest)
+	writeFixtureFile(t, filepath.Join(root, "package-lock.json"), lock)
+
+	var first []byte
+	for i := 0; i < 30; i++ {
+		locks, err := CaptureNativeLocks(context.Background(), root)
+		if err != nil {
+			t.Fatalf("capture iteration %d: %v", i, err)
+		}
+		canonical, err := (contractpackage.Lock{FormatVersion: 1, Native: locks}).Canonical()
+		if err != nil {
+			t.Fatalf("canonicalize iteration %d: %v", i, err)
+		}
+		if i == 0 {
+			first = canonical
+		} else if string(canonical) != string(first) {
+			t.Fatalf("unchanged npm lock produced a different canonical graph on iteration %d", i)
+		}
+		if i == 0 {
+			var graph []contractpackage.NativeLockedPackage
+			for _, native := range locks {
+				if native.Manager == "npm" && native.Path == "package-lock.json" {
+					graph = native.Packages
+				}
+			}
+			copies := 0
+			for _, pkg := range graph {
+				if pkg.Name == "shared" {
+					copies++
+					if pkg.Source == "" {
+						t.Fatal("npm lock graph discarded the package-lock entry path")
+					}
+				}
+			}
+			if copies != 2 {
+				t.Fatalf("expected both nested shared copies in the graph, got %d", copies)
+			}
+		}
+	}
+}
 
 func TestCaptureNativeGoAndNPMLocksWithTheirManagers(t *testing.T) {
 	if _, err := exec.LookPath("go"); err != nil {

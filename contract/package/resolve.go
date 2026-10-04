@@ -95,13 +95,28 @@ func (l Lock) Canonical() ([]byte, error) {
 	})
 	for i := range c.Native {
 		sort.Slice(c.Native[i].Packages, func(a, b int) bool {
-			if c.Native[i].Packages[a].Name != c.Native[i].Packages[b].Name {
-				return c.Native[i].Packages[a].Name < c.Native[i].Packages[b].Name
-			}
-			return c.Native[i].Packages[a].Version < c.Native[i].Packages[b].Version
+			return nativePackageLess(c.Native[i].Packages[a], c.Native[i].Packages[b])
 		})
 	}
 	return json.Marshal(c)
+}
+
+// nativePackageLess orders by every serialized package field so distinct
+// copies of the same name and version have a stable order in canonical locks.
+func nativePackageLess(a, b NativeLockedPackage) bool {
+	if a.Name != b.Name {
+		return a.Name < b.Name
+	}
+	if a.Version != b.Version {
+		return a.Version < b.Version
+	}
+	if a.Source != b.Source {
+		return a.Source < b.Source
+	}
+	if a.Artifact != b.Artifact {
+		return a.Artifact < b.Artifact
+	}
+	return a.Integrity < b.Integrity
 }
 
 func (l Lock) Digest() (string, error) {
@@ -206,6 +221,7 @@ func (l Lock) Validate() error {
 		if len(native.Packages) > 16384 {
 			return &Error{Code: "invalid_lock", Path: "native.packages", Message: "native package graph exceeds 16384 entries"}
 		}
+		nativeSources := make(map[string]struct{}, len(native.Packages))
 		for _, pkg := range native.Packages {
 			if pkg.Name == "" || pkg.Version == "" {
 				return &Error{Code: "invalid_lock", Path: "native.packages", Message: "native package identity is incomplete"}
@@ -215,6 +231,15 @@ func (l Lock) Validate() error {
 			}
 			if native.Manager == "npm" && native.Path == "package-lock.json" && pkg.Integrity == "" {
 				return &Error{Code: "invalid_lock", Path: "native.packages.integrity", Message: "npm package integrity is required"}
+			}
+			if native.Manager == "npm" && native.Path == "package-lock.json" {
+				if pkg.Source == "" {
+					return &Error{Code: "invalid_lock", Path: "native.packages.source", Message: "npm package-lock entry path is required to distinguish installed copies"}
+				}
+				if _, exists := nativeSources[pkg.Source]; exists {
+					return &Error{Code: "invalid_lock", Path: "native.packages.source", Message: "npm package-lock entry path appears more than once"}
+				}
+				nativeSources[pkg.Source] = struct{}{}
 			}
 			if pkg.Source != "" && (path.Clean(pkg.Source) != pkg.Source || path.IsAbs(pkg.Source) || strings.Contains(pkg.Source, "\\") || pkg.Source == ".." || strings.HasPrefix(pkg.Source, "../")) {
 				return &Error{Code: "invalid_lock", Path: "native.packages.source", Message: "native source path escapes the project"}

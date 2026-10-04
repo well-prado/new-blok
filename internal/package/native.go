@@ -335,13 +335,22 @@ func captureNPM(ctx context.Context, root string) ([]contractpackage.NativeLock,
 		}
 		// Keep only integrity metadata. Resolved URLs may contain private mirror
 		// hostnames, so they are deliberately excluded from persisted evidence.
-		packages = append(packages, contractpackage.NativeLockedPackage{Name: name, Version: item.Version, Integrity: item.Integrity})
+		packages = append(packages, contractpackage.NativeLockedPackage{Name: name, Version: item.Version, Integrity: item.Integrity, Source: path})
 	}
 	sort.Slice(packages, func(i, j int) bool {
 		if packages[i].Name != packages[j].Name {
 			return packages[i].Name < packages[j].Name
 		}
-		return packages[i].Version < packages[j].Version
+		if packages[i].Version != packages[j].Version {
+			return packages[i].Version < packages[j].Version
+		}
+		if packages[i].Source != packages[j].Source {
+			return packages[i].Source < packages[j].Source
+		}
+		if packages[i].Artifact != packages[j].Artifact {
+			return packages[i].Artifact < packages[j].Artifact
+		}
+		return packages[i].Integrity < packages[j].Integrity
 	})
 	if len(packages) > 16384 {
 		return nil, fmt.Errorf("package: npm native graph exceeds 16384 packages")
