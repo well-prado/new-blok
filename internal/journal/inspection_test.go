@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -99,5 +100,144 @@ func TestJournalInspectionReadsActualWaitUncertainAndChildLineage(t *testing.T) 
 	metadata, err := inspect.InspectSource(ctx, j, "alice", inspection.Policy{MaxPageSize: 50}, inspection.Query{Version: inspection.Version, RunID: metadataRun.RunID})
 	if err != nil || len(metadata.Steps) != 20 {
 		t.Fatalf("default durable metadata inspection=%+v err=%v", metadata, err)
+	}
+}
+
+func TestJournalInspectionProjectsDurableStepAndAttemptInputs(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "inspect-inputs.db")
+	db, j := newJournalAtPath(t, path, Config{})
+	defer db.Close()
+	ctx := context.Background()
+	admission, err := j.Admit(ctx, AdmissionRequest{Principal: "alice", RequestKey: "inspect-inputs", Workflow: "payment", ArtifactDigest: "sha256:inputs", Input: []byte(`{"order":"o-17"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stepInput := []byte(`{"amountCents":4200,"currency":"USD"}`)
+	if _, err := j.StartScope(ctx, ScopeRecord{RunID: admission.RunID, Path: "charge", Kind: "node", Input: stepInput}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.StartScope(ctx, ScopeRecord{RunID: admission.RunID, Path: "charge", Kind: "node", Input: []byte(`{"amountCents":4300}`)}); !errors.Is(err, ErrRequestConflict) {
+		t.Fatalf("changed durable step input accepted: %v", err)
+	}
+	operation, err := j.BeginEffect(ctx, EffectIntent{Identity: OperationIdentity{RunID: admission.RunID, ArtifactDigest: "sha256:inputs", InvocationPath: "charge", IterationPath: "root"}, Input: stepInput})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.BeginEffect(ctx, EffectIntent{Identity: operation.Identity, Input: []byte(`{"amountCents":4300}`)}); !errors.Is(err, ErrRequestConflict) {
+		t.Fatalf("changed durable attempt input accepted: %v", err)
+	}
+	attempt, err := j.StartAttempt(ctx, operation.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, j = newJournalAtPath(t, path, Config{})
+	defer db.Close()
+	policy := inspection.Policy{Fields: map[inspection.Field]bool{inspection.FieldInput: true}, MaxPageSize: 10, MaxPayloadBytes: 1024}
+	page, err := inspect.InspectSource(ctx, j, "alice", policy, inspection.Query{Version: inspection.Version, RunID: admission.RunID})
+	if err != nil || len(page.Steps) != 2 {
+		t.Fatalf("durable input page=%+v err=%v", page, err)
+	}
+	var scoped, attempted *inspection.Step
+	for index := range page.Steps {
+		switch page.Steps[index].ID {
+		case "charge":
+			scoped = &page.Steps[index]
+		case "charge[root]":
+			attempted = &page.Steps[index]
+		}
+	}
+	if scoped == nil || string(scoped.Input) != string(stepInput) || attempted == nil || len(attempted.Attempts) != 1 || attempted.Attempts[0].ID != attempt.ID || string(attempted.Input) != string(stepInput) || string(attempted.Attempts[0].Input) != string(stepInput) {
+		t.Fatalf("durable step/attempt input missing: steps=%+v", page.Steps)
+	}
+}
+
+func TestJournalInspectionInputsAreBoundedBeforePersistence(t *testing.T) {
+	db, j := newJournal(t, "inspect-input-limit.db", Config{})
+	defer db.Close()
+	ctx := context.Background()
+	admission, err := j.Admit(ctx, AdmissionRequest{Principal: "alice", RequestKey: "inspect-input-limit", Workflow: "bounded", ArtifactDigest: "sha256:limit", Input: []byte(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oversized := []byte(`"` + strings.Repeat("x", MaxInspectionInputBytes) + `"`)
+	identity := OperationIdentity{RunID: admission.RunID, ArtifactDigest: "sha256:limit", InvocationPath: "large", IterationPath: "root"}
+	if _, err := j.BeginEffect(ctx, EffectIntent{Identity: identity, Input: oversized}); !errors.Is(err, ErrObservationLimit) {
+		t.Fatalf("oversized effect input err=%v", err)
+	}
+	if _, err := j.StartScope(ctx, ScopeRecord{RunID: admission.RunID, Path: "large", Kind: "node", Input: oversized}); !errors.Is(err, ErrObservationLimit) {
+		t.Fatalf("oversized step input err=%v", err)
+	}
+	if _, err := j.Operation(ctx, identity.Key()); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("oversized input persisted operation: %v", err)
+	}
+	page, err := inspect.InspectSource(ctx, j, "alice", inspection.Policy{MaxPageSize: 10}, inspection.Query{Version: inspection.Version, RunID: admission.RunID})
+	if err != nil || len(page.Steps) != 0 {
+		t.Fatalf("oversized input left inspection row: page=%+v err=%v", page, err)
+	}
+}
+
+func TestJournalRunFailureIsCanonicalAndSeparateFromAttemptRetry(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "inspect-failure.db")
+	db, j := newJournalAtPath(t, path, Config{})
+	defer db.Close()
+	ctx := context.Background()
+	admission, err := j.Admit(ctx, AdmissionRequest{Principal: "alice", RequestKey: "inspect-failure", Workflow: "payment", ArtifactDigest: "sha256:failure", Input: []byte(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation, err := j.BeginEffect(ctx, EffectIntent{Identity: OperationIdentity{RunID: admission.RunID, ArtifactDigest: "sha256:failure", InvocationPath: "charge", IterationPath: "root"}, Input: []byte(`{"amount":12}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := j.StartAttempt(ctx, operation.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := j.FailAttempt(ctx, operation.Key, first.ID, true, "temporary failure"); err != nil {
+		t.Fatal(err)
+	}
+	second, err := j.StartAttempt(ctx, operation.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activeScopeRun, err := j.Admit(ctx, AdmissionRequest{Principal: "alice", RequestKey: "inspect-failure-active-scope", Workflow: "payment", ArtifactDigest: "sha256:failure", Input: []byte(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.StartScope(ctx, ScopeRecord{RunID: activeScopeRun.RunID, Path: "running-node", Kind: "node"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.FailRun(ctx, activeScopeRun.RunID, "execution_failed", "workflow"); !errors.Is(err, ErrRunActiveWork) {
+		t.Fatalf("terminal failure accepted while a scope was still running: %v", err)
+	}
+	policy := inspection.Policy{Fields: map[inspection.Field]bool{inspection.FieldInput: true, inspection.FieldError: true}, MaxPageSize: 10, MaxPayloadBytes: 1024}
+	page, err := inspect.InspectSource(ctx, j, "alice", policy, inspection.Query{Version: inspection.Version, RunID: admission.RunID})
+	if err != nil || page.Run.Status != inspection.StatusRunning || len(page.Steps) != 1 || page.Steps[0].Status != inspection.StatusRunning || len(page.Steps[0].Attempts) != 2 || page.Steps[0].Attempts[0].Status != inspection.StatusFailed || page.Steps[0].Attempts[1].Status != inspection.StatusRunning {
+		t.Fatalf("retry incorrectly terminalized the run: page=%+v err=%v", page, err)
+	}
+	if err := j.FailRun(ctx, admission.RunID, "provider_rejected", "provider"); !errors.Is(err, ErrRunActiveWork) {
+		t.Fatalf("active attempt permitted terminal run failure: %v", err)
+	}
+	if err := j.FailAttempt(ctx, operation.Key, second.ID, false, "permanent provider rejection"); err != nil {
+		t.Fatal(err)
+	}
+	page, err = inspect.InspectSource(ctx, j, "alice", policy, inspection.Query{Version: inspection.Version, RunID: admission.RunID})
+	if err != nil || page.Run.Status != inspection.StatusRunning {
+		t.Fatalf("attempt failure invented whole-run termination: page=%+v err=%v", page, err)
+	}
+	if err := j.FailRun(ctx, admission.RunID, "provider_rejected", "provider"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, j = newJournalAtPath(t, path, Config{})
+	defer db.Close()
+	page, err = inspect.InspectSource(ctx, j, "alice", policy, inspection.Query{Version: inspection.Version, RunID: admission.RunID})
+	if err != nil || page.Run.Status != inspection.StatusFailed || page.Run.ErrorCode != "provider_rejected" || page.Run.ErrorClass != "provider" || page.Run.FinishedAt.IsZero() || len(page.Steps) != 1 || page.Steps[0].Status != inspection.StatusFailed || len(page.Steps[0].Attempts) == 0 || page.Steps[0].Attempts[len(page.Steps[0].Attempts)-1].ID != second.ID {
+		t.Fatalf("canonical terminal failure projection=%+v err=%v", page, err)
 	}
 }

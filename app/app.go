@@ -3,6 +3,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -39,10 +40,25 @@ type Config struct {
 	// DrainTimeout bounds how long Shutdown waits for admitted work.
 	DrainTimeout time.Duration
 	Inspection   inspection.Observer
+	// RunOutcomes optionally persists terminal outcomes for trusted invocation
+	// IDs supplied to execution.Runner. It is an application-owned port; the
+	// engine remains independent of durable stores and absent ports promise no
+	// durable run outcome.
+	RunOutcomes RunOutcomePort
 	// AbortGrace is how long Shutdown waits, after DrainTimeout, for work it
 	// has canceled to stop before it closes the dependencies anyway; zero
 	// means DefaultAbortGrace. Shutdown's own ctx bounds both waits.
 	AbortGrace time.Duration
+}
+
+// RunOutcomePort persists a terminal workflow result at the trusted
+// application boundary. Implementations must not infer workflow failure from
+// an individual failed attempt.
+type RunOutcomePort interface {
+	CompleteRun(context.Context, inspection.Invocation, json.RawMessage) error
+	FailRun(context.Context, inspection.Invocation, string, string) error
+	CancelRun(context.Context, inspection.Invocation, string) error
+	MarkRunUncertain(context.Context, inspection.Invocation, string, string) error
 }
 
 // DefaultAbortGrace is the AbortGrace when none is configured.
@@ -154,6 +170,15 @@ func (a *Application) InspectionObserver() inspection.Observer {
 // AbortGrace returns the configured bound for canceled work to release its
 // leases before Shutdown closes dependencies.
 func (a *Application) AbortGrace() time.Duration { return a.config.AbortGrace }
+
+// RunOutcomePort exposes the optional terminal-outcome writer to the public
+// execution composition package without importing a concrete journal/store.
+func (a *Application) RunOutcomePort() RunOutcomePort {
+	if a == nil {
+		return nil
+	}
+	return a.config.RunOutcomes
+}
 
 type Lease struct {
 	app  *Application

@@ -17,6 +17,14 @@ The additive wire contract is `inspection/v1` in `contract/inspection`. Public
 application composition selects an optional observer through `app.Config` and
 the public `execution.NewRunner`; application-owned modules do not import the
 internal interpreter. Ordinary `Engine.Run` does not JSON-serialize observation payloads.
+Durable terminal projection is separately opt-in through the application-owned
+`RunOutcomePort`: `execution.Runner` records completed, failed, canceled, or
+explicitly uncertain outcomes after the real engine returns. The journal
+provides a principal-checking adapter for that port without being imported by
+the engine. The trusted trigger/application boundary supplies the run ID and
+principal together; the adapter verifies their ownership match before any
+terminal mutation. If the application does not configure the port, the runner
+does not claim durable terminal state.
 Observed calls require a trusted run and principal, preserve supplied event
 times, and have a unique execution-attempt identity; each step attempt has its
 own identity and immutable input/output snapshots. The engine also captures
@@ -52,6 +60,25 @@ redaction and response projection. Blob retrieval is a separate opt-in path:
 the caller must allow it, provide a principal-bound authenticated reader, and
 set a hard maximum no greater than 1 MiB; digest, size, session, and principal
 are checked before bytes are returned.
+
+New durable step-scope and effect-intent inputs are capped at 64 KiB each,
+checked before JSON validation and before any SQL write. Attempt input is copied
+from its already-bounded immutable effect intent, not accepted independently.
+The additive migration leaves historical scope/operation/attempt input columns
+NULL; recovery never fills those unknown values from a later invocation. Run
+admission input remains its pre-existing journal contract and is not silently
+reclassified by this inspection-input limit. A terminal failed-run fact is an
+explicit `FailRun` transition from the execution owner, not an inference from
+`FailAttempt`; it is rejected while operations, waits, or scopes remain active,
+and uncertain effects remain uncertain rather than being converted to failure.
+New successful-run output writes are capped at 1 MiB before JSON validation or
+SQL persistence.
+The runner binds execution to its application lease, so shutdown abort reaches
+the node before dependencies close. Terminal writes use a bounded app-abort
+context detached from request cancellation so the outcome can commit before
+the lease is released. If terminal persistence fails after execution, the
+runner returns an explicit uncertain result with the run ID for reconciliation;
+it never presents the completed effect as a safely retryable generic failure.
 
 ## Compatibility and limits
 

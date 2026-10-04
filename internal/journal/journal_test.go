@@ -4,16 +4,95 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/well-prado/new-blok/contract/inspection"
+	"github.com/well-prado/new-blok/inspect"
 	"github.com/well-prado/new-blok/store"
 	"github.com/well-prado/new-blok/store/sqlite"
 )
+
+func TestJournalInspectionInputMigrationPreservesLegacyUnknowns(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "legacy-journal.db")
+	database, err := (sqlite.Backend{}).Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyStatements := make([]string, len(schemaStatements))
+	for index, statement := range schemaStatements {
+		statement = strings.ReplaceAll(statement, "\n\t\terror_code TEXT NOT NULL DEFAULT ''", "")
+		statement = strings.ReplaceAll(statement, "\n\t\terror_class TEXT NOT NULL DEFAULT ''", "")
+		statement = strings.ReplaceAll(statement, "\n\t\tinput_json BLOB,", "")
+		statement = strings.ReplaceAll(statement, "principal TEXT NOT NULL DEFAULT '',", "principal TEXT NOT NULL DEFAULT ''")
+		statement = strings.ReplaceAll(statement, ",,\n", ",\n")
+		statement = strings.ReplaceAll(statement, ",\n\t)", "\n\t)")
+		legacyStatements[index] = statement
+	}
+	if err := database.WithTx(ctx, func(tx *sql.Tx) error {
+		for index, statement := range legacyStatements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("legacy schema statement %d: %w (%s)", index, err, statement)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO journal_runs
+			(run_id,request_key,workflow,artifact_digest,input_json,input_digest,state,replay_of,created_at,principal)
+			VALUES ('run:legacy','legacy','legacy','sha256:legacy',?,'sha256:input','accepted','',1,'alice')`, []byte(`{"legacy":true}`)); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO journal_operations
+			(operation_key,run_id,artifact_digest,invocation_path,iteration_path,provider_operation_key,state,current_attempt_id,created_at,updated_at)
+			VALUES ('op:legacy','run:legacy','sha256:legacy','charge','root','provider:legacy','intent','',1,1)`); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO journal_attempts
+			(attempt_id,operation_key,attempt_number,provider_operation_key,state,error_text,started_at)
+			VALUES ('attempt:legacy','op:legacy',1,'provider:legacy','failed','legacy failure',1)`); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `INSERT INTO journal_scopes(run_id,path,kind,parent_path,state,updated_at)
+			VALUES ('run:legacy','legacy-step','node','','running',1)`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	database, journal := newJournalAtPath(t, path, Config{})
+	defer database.Close()
+	if run, err := journal.Run(ctx, "run:legacy"); err != nil || run.Principal != "alice" || string(run.Input) != `{"legacy":true}` || run.ErrorCode != "" {
+		t.Fatalf("legacy run migration=%+v err=%v", run, err)
+	}
+	identity := OperationIdentity{RunID: "run:legacy", ArtifactDigest: "sha256:legacy", InvocationPath: "charge", IterationPath: "root"}
+	if _, err := journal.BeginEffect(ctx, EffectIntent{Identity: identity, Input: []byte(`{"guessed":true}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := journal.StartScope(ctx, ScopeRecord{RunID: "run:legacy", Path: "legacy-step", Kind: "node", Input: []byte(`{"guessed":true}`)}); err != nil {
+		t.Fatal(err)
+	}
+	page, err := inspect.InspectSource(ctx, journal, "alice", inspection.Policy{Fields: map[inspection.Field]bool{inspection.FieldInput: true}, MaxPageSize: 10}, inspection.Query{Version: inspection.Version, RunID: "run:legacy"})
+	if err != nil || len(page.Steps) != 2 {
+		t.Fatalf("legacy migrated page=%+v err=%v", page, err)
+	}
+	for _, step := range page.Steps {
+		if len(step.Input) != 0 {
+			t.Fatalf("invented legacy step input for %q: %s", step.ID, step.Input)
+		}
+		for _, attempt := range step.Attempts {
+			if len(attempt.Input) != 0 {
+				t.Fatalf("invented legacy attempt input for %q: %s", step.ID, attempt.Input)
+			}
+		}
+	}
+}
 
 func TestConcurrentAdmissionDeduplicatesAndRejectsConflicts(t *testing.T) {
 	database, journal := newJournal(t, "journal.db", Config{})
@@ -317,6 +396,9 @@ func runTransitionChild() {
 			panic(err)
 		}
 		return
+	}
+	if err := journal.CommitEffect(context.Background(), EffectCommit{OperationKey: operation.Key, AttemptID: attempt.ID, Result: []byte(`{"ok":true}`)}); err != nil {
+		panic(err)
 	}
 	if err := journal.CompleteRun(context.Background(), admission.RunID, []byte(`{"ok":true}`)); err != nil {
 		panic(err)

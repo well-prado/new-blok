@@ -159,6 +159,9 @@ func (j *Journal) CancelRun(ctx context.Context, runID, reason string) error {
 		return errors.New("journal: run and cancellation reason are required")
 	}
 	return j.withTx(ctx, "run-cancel", func(tx *sql.Tx) error {
+		if err := requireQuiescentRun(ctx, tx, runID); err != nil {
+			return err
+		}
 		result, err := tx.ExecContext(ctx, `UPDATE journal_runs SET state = ?, completed_at = ? WHERE run_id = ? AND state = ?`, runCanceled, j.now(), runID, runAccepted)
 		if err != nil {
 			return err

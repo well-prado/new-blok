@@ -35,7 +35,8 @@ func (e *Error) Error() string {
 	}
 	return e.Code + ": " + e.Err.Error()
 }
-func (e *Error) Unwrap() error { return e.Err }
+func (e *Error) Unwrap() error     { return e.Err }
+func (e *Error) IsUncertain() bool { return e.Uncertain }
 
 // ErrorCode and ErrorClass expose the stable classification to adapters
 // without requiring them to import the engine.
