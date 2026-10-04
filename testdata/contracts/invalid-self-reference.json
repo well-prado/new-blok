@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "workflow": {
+    "id": "self-reference",
+    "name": "synthetic/self-reference",
+    "version": "1.0.0",
+    "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "inputSchema": {},
+    "outputSchema": {},
+    "instructions": [
+      {"id": "respond", "kind": "output", "references": [{"step": "respond"}]}
+    ]
+  }
+}
