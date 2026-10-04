@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 
 	"github.com/well-prado/new-blok/store"
@@ -107,6 +108,15 @@ func dsn(path string) string {
 // leading slash (file:///C:/data/app.db). Otherwise "C:\data" or a relative
 // "app.db" lands in the URI's authority and SQLite refuses to open it.
 func uriPath(path string) string {
+	if goruntime.GOOS == "windows" {
+		// An extended-length prefix would turn into a literal "/?/" path
+		// segment; SQLite applies long-path handling itself.
+		if unc, ok := strings.CutPrefix(path, `\\?\UNC\`); ok {
+			path = `\\` + unc
+		} else {
+			path = strings.TrimPrefix(path, `\\?\`)
+		}
+	}
 	if absolute, err := filepath.Abs(path); err == nil {
 		path = absolute
 	}

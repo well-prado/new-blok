@@ -36,7 +36,7 @@ func TestProcessKillBeforeDuringAndAfterCommit(t *testing.T) {
 			// child; Windows refuses to terminate an exited process.
 			killErr := command.Process.Kill()
 			_ = command.Wait()
-			if killErr != nil && !command.ProcessState.Exited() {
+			if killErr != nil && (command.ProcessState == nil || !command.ProcessState.Exited()) {
 				t.Fatal(killErr)
 			}
 

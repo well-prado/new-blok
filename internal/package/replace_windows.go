@@ -15,8 +15,10 @@ import (
 const replaceRetryBudget = 2 * time.Second
 
 // replaceFile atomically installs src at dst. Windows refuses to sync a
-// directory handle, so durability comes from MOVEFILE_WRITE_THROUGH: the call
-// returns only once the rename has been flushed to disk.
+// directory handle, so the rename asks for MOVEFILE_WRITE_THROUGH instead.
+// Microsoft documents the flush for moves done as copy-and-delete; a
+// same-volume rename relies on NTFS metadata journaling. It is the strongest
+// durability available to a standard user.
 //
 // Windows also refuses a rename onto a file another process or goroutine has
 // open or is replacing at that moment (ERROR_ACCESS_DENIED or
