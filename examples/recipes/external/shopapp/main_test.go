@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -16,7 +17,35 @@ import (
 
 func TestExternalModuleComposesHTTPWorkflowAndDurablePublisher(t *testing.T) {
 	ctx := context.Background()
-	const expectedAccepted = 1
+	data, err := os.ReadFile(filepath.Join("..", "..", "shop", "fixtures.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixtures struct {
+		SchemaVersion string `json:"schemaVersion"`
+		Cases         []struct {
+			ID              string `json:"id"`
+			ExpectedEffects *int   `json:"expectedEffects"`
+		} `json:"cases"`
+	}
+	if err := json.Unmarshal(data, &fixtures); err != nil {
+		t.Fatal(err)
+	}
+	if fixtures.SchemaVersion != "recipes/v1" {
+		t.Fatalf("unsupported fixture schema %q", fixtures.SchemaVersion)
+	}
+	var expectedAccepted *int
+	for _, fixture := range fixtures.Cases {
+		if fixture.ID == "external-module-composition" {
+			if expectedAccepted != nil || fixture.ExpectedEffects == nil || *fixture.ExpectedEffects < 0 {
+				t.Fatal("external composition fixture must have one explicit nonnegative expected effect count")
+			}
+			expectedAccepted = fixture.ExpectedEffects
+		}
+	}
+	if expectedAccepted == nil {
+		t.Fatal("missing external-module-composition fixture")
+	}
 	database, err := (sqlite.Backend{}).Open(ctx, filepath.Join(t.TempDir(), "app.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -75,8 +104,8 @@ func TestExternalModuleComposesHTTPWorkflowAndDurablePublisher(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if accepted != expectedAccepted {
-		t.Fatalf("synthetic receiver accepted %d events, want %d", accepted, expectedAccepted)
+	if accepted != *expectedAccepted {
+		t.Fatalf("synthetic receiver accepted %d events, want %d", accepted, *expectedAccepted)
 	}
 	var event shop.RecordEvent
 	if err := json.Unmarshal(payload, &event); err != nil {

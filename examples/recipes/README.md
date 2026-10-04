@@ -56,6 +56,25 @@ most one outbox event. Business state, outbox event, and worker acknowledgment
 share the worker transaction. Publishing happens after an atomic lease claim
 has committed, outside the app database write transaction.
 
+Native PowerShell setup, from the repository root with Go 1.27.1 already
+installed, uses the same explicit configuration:
+
+```powershell
+$env:SHOP_DB_PATH = Join-Path (Get-Location) '.local/shop.db'
+$env:SHOP_TOKEN_ALICE = 'synthetic-alice-token-0001'
+$env:SHOP_TOKEN_BOB = 'synthetic-bob-token-00002'
+$env:SHOP_WEBHOOK_SECRET = 'synthetic-webhook-key-00000001'
+$env:SHOP_SINK_DB_PATH = Join-Path (Get-Location) '.local/synthetic-receiver.db'
+$env:SHOP_LISTEN_ADDR = '127.0.0.1:8080'
+go run ./examples/recipes/cmd/shop migrate-up
+go run ./examples/recipes/cmd/shop migrate-status
+go run ./examples/recipes/cmd/shop serve
+```
+
+These PowerShell instructions are not native Windows execution evidence.
+Clean-machine setup, standard-user permissions, Ctrl+C and SQLite reopen
+validation remain required under #157; this recipe is not Windows-certified.
+
 The independent consumer module at
 [`external/shopapp`](external/shopapp) imports the exported recipe and SQLite
 packages from outside the root Go module. From that directory, run
