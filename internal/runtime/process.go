@@ -4,11 +4,9 @@ import (
 	"context"
 	"errors"
 	contract "github.com/well-prado/new-blok/contract/runtime"
-	"io"
 	"os"
 	"os/exec"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -23,6 +21,7 @@ type ProcessFactory struct {
 type processConnection struct {
 	Connection
 	cmd    *exec.Cmd
+	owned  *processOwner
 	exited chan struct{}
 	once   sync.Once
 }
@@ -40,16 +39,29 @@ func (f ProcessFactory) Connect(ctx context.Context, h contract.Hello) (Connecti
 	}
 	startup, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	cmd := exec.Command(f.Command, f.Args...)
-	cmd.Dir = f.Dir
-	cmd.Env = append(os.Environ(), f.Env...)
-	cmd.Stdout = io.Discard
-	cmd.Stderr = io.Discard
+	// The owner exists before the process starts, so the window between
+	// start and adoption is as short as the platform allows.
+	owned, err := newProcessOwner()
+	if err != nil {
+		return nil, contract.Ready{}, errors.New("worker process ownership failed")
+	}
+	cmd := workerCommand(f.Command, f.Args, f.Dir, f.Env)
 	if err := cmd.Start(); err != nil {
+		owned.release()
 		return nil, contract.Ready{}, errors.New("worker process startup failed")
 	}
-	p := &processConnection{cmd: cmd, exited: make(chan struct{})}
-	go func() { _ = cmd.Wait(); close(p.exited) }()
+	if err := owned.adopt(cmd); err != nil {
+		// Without ownership the supervisor could not end the worker's
+		// descendants, so it does not run one it cannot fully stop.
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		owned.release()
+		return nil, contract.Ready{}, errors.New("worker process ownership failed")
+	}
+	p := &processConnection{cmd: cmd, owned: owned, exited: make(chan struct{})}
+	// exited closes only after the process has been reaped and, where the
+	// platform tracks them, its remaining descendants have been ended.
+	go func() { _ = cmd.Wait(); owned.release(); close(p.exited) }()
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -70,7 +82,7 @@ func (f ProcessFactory) Connect(ctx context.Context, h contract.Hello) (Connecti
 		case <-p.exited:
 			return nil, contract.Ready{}, errors.New("worker exited before readiness")
 		case <-startup.Done():
-			_ = cmd.Process.Kill()
+			owned.kill()
 			<-p.exited
 			return nil, contract.Ready{}, startup.Err()
 		case <-ticker.C:
@@ -93,14 +105,26 @@ func (p *processConnection) Close(ctx context.Context) error {
 			c.fail()
 		}
 	}
-	p.once.Do(func() { _ = p.cmd.Process.Signal(syscall.SIGTERM) })
+	p.once.Do(p.owned.stop)
 	select {
 	case <-p.exited:
 	case <-cleanup.Done():
-		_ = p.cmd.Process.Kill()
+		p.owned.kill()
 		<-p.exited
 		return cleanup.Err()
 	}
 	return err
 }
 func (p *processConnection) PID() int { return p.cmd.Process.Pid }
+
+// workerCommand builds the worker process exactly as Connect starts it.
+// Standard streams go to the null device, never to pipes: with a pipe, Wait
+// would not return until every descendant holding it had exited, so a
+// surviving grandchild would keep a dead worker looking alive.
+func workerCommand(name string, args []string, dir string, env []string) *exec.Cmd {
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), env...)
+	isolateWorker(cmd)
+	return cmd
+}

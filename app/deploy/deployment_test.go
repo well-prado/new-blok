@@ -14,7 +14,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -43,7 +42,7 @@ func TestDeploymentSignalHelper(t *testing.T) {
 		os.Exit(3)
 	}
 	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, syscall.SIGTERM)
+	signal.Notify(signals, shutdownSignal)
 	err = d.Run(context.Background(), signals)
 	if os.Getenv("BLOK_TEST_TIMEOUT") == "1" {
 		if !errors.Is(err, app.ErrDrainTimeout) {
@@ -72,6 +71,7 @@ func TestDeploymentSIGTERMDrain(t *testing.T) {
 			stdout, _ := cmd.StdoutPipe()
 			var stderr strings.Builder
 			cmd.Stderr = &stderr
+			prepareShutdownChild(cmd)
 			if err := cmd.Start(); err != nil {
 				t.Fatal(err)
 			}
@@ -108,7 +108,7 @@ func TestDeploymentSIGTERMDrain(t *testing.T) {
 				t.Fatalf("entry: %s %v", marker, err)
 			}
 			start := time.Now()
-			if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+			if err := requestShutdown(cmd); err != nil {
 				t.Fatal(err)
 			}
 			closed, _ := io.ReadAll(stdout)
@@ -826,3 +826,30 @@ type closeObserver struct {
 }
 
 func (c *closeObserver) Close() error { c.closed(); return c.Conn.Close() }
+
+// #156: a shutdown request that arrives while Run is still starting is a
+// shutdown, not a readiness failure. Run's startup probe used the caller's
+// context, so a cancellation in that window failed every check and Run
+// reported ErrNotReady. Windows' slower startup exposed the race.
+func TestRunTreatsCancellationDuringStartupAsShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a, err := app.New(app.Config{Dependencies: []app.Dependency{{
+		Name:  "store",
+		Start: func(context.Context) error { cancel(); return nil },
+		Close: func(context.Context) error { return nil },
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := NewDeployment(a, deployment.Config{ListenerAddress: "127.0.0.1:0", MaxAdmission: 1, DrainTimeout: time.Second}, DeploymentChecks{Artifact: func(ctx context.Context) error { return ctx.Err() }}, http.NotFoundHandler())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Run(ctx, nil); err != nil {
+		t.Fatalf("Run error=%v, want a clean shutdown", err)
+	}
+	if a.Ready() {
+		t.Fatal("application still ready after Run returned")
+	}
+}

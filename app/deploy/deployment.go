@@ -200,7 +200,10 @@ func (d *Deployment) Run(ctx context.Context, signals <-chan os.Signal) error {
 		defer cancel()
 		_ = d.application.Shutdown(closeCtx)
 	}
-	if !d.status(ctx).Ready {
+	// The startup probe judges the dependencies, not the shutdown signal: a
+	// cancellation that arrives now is handled by the drain below, so it must
+	// not fail the probe and turn a clean stop into ErrNotReady.
+	if !d.status(context.WithoutCancel(ctx)).Ready {
 		cleanup()
 		return deployment.ErrNotReady
 	}
