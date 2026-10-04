@@ -354,6 +354,9 @@ func ReadLock(path string) (contractpackage.Lock, string, error) {
 	if err != nil {
 		return contractpackage.Lock{}, "", err
 	}
+	if !bytesEqual(canonical, data) {
+		return contractpackage.Lock{}, "", fmt.Errorf("package: lock is not canonical JSON")
+	}
 	return lock, fileDigest(canonical), nil
 }
 

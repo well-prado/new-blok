@@ -329,7 +329,12 @@ func fileExists(path string) bool {
 type goContext struct{ ToolVersion, ContextDigest, WorkPath string }
 
 func captureGoContext(ctx context.Context, root string) (goContext, error) {
-	data, err := runNativeOutput(ctx, root, "go", "env", "-json", "GOVERSION", "GOOS", "GOARCH", "CGO_ENABLED", "GOFLAGS", "GOWORK")
+	contextKeys := []string{
+		"GOVERSION", "GOTOOLCHAIN", "GOOS", "GOARCH", "GOAMD64", "GOARM", "GOARM64", "GO386", "GOMIPS", "GOMIPS64",
+		"GOEXPERIMENT", "CGO_ENABLED", "GOFLAGS", "GOWORK", "CC", "CXX", "CGO_CFLAGS", "CGO_CPPFLAGS", "CGO_CXXFLAGS", "CGO_LDFLAGS",
+	}
+	args := append([]string{"env", "-json"}, contextKeys...)
+	data, err := runNativeOutput(ctx, root, "go", args...)
 	if err != nil {
 		return goContext{}, fmt.Errorf("package: Go execution context could not be captured")
 	}
@@ -354,9 +359,12 @@ func captureGoContext(ctx context.Context, root string) (goContext, error) {
 		}
 		workPath = filepath.ToSlash(rel)
 	}
-	contextBytes, _ := json.Marshal(struct{ GoOS, GoArch, CGOEnabled, GOFLAGS, GOWORK string }{
-		values["GOOS"], values["GOARCH"], values["CGO_ENABLED"], values["GOFLAGS"], filepath.Base(values["GOWORK"]),
-	})
+	context := make(map[string]string, len(contextKeys))
+	for _, key := range contextKeys {
+		context[key] = values[key]
+	}
+	context["GOWORK"] = filepath.Base(values["GOWORK"])
+	contextBytes, _ := json.Marshal(context)
 	return goContext{ToolVersion: values["GOVERSION"], ContextDigest: digestBytes(contextBytes), WorkPath: workPath}, nil
 }
 
