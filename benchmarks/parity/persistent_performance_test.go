@@ -129,6 +129,12 @@ func TestPersistentDurableRecoveryDistributions(t *testing.T) {
 		t.Skip("set BLOK_PARITY_RECOVERY=1 with a disposable loopback PostgreSQL database to run durable restart recovery")
 	}
 	postgresURL := requireLoopbackPostgres(t)
+	postgresImage := os.Getenv("BLOK_PARITY_POSTGRES_IMAGE")
+	postgresImageDigest := os.Getenv("BLOK_PARITY_POSTGRES_IMAGE_DIGEST")
+	digestHex := strings.TrimPrefix(postgresImageDigest, "postgres@sha256:")
+	if postgresImage == "" || len(digestHex) != 64 || strings.Trim(digestHex, "0123456789abcdef") != "" {
+		t.Fatal("set BLOK_PARITY_POSTGRES_IMAGE and BLOK_PARITY_POSTGRES_IMAGE_DIGEST to record the disposable server image identity")
+	}
 	provider := newProvider(t)
 	schema := fmt.Sprintf("parity108_%d_%d", os.Getpid(), time.Now().UnixNano())
 	oldRecovery := make([]int64, 0, persistentRecoveryRuns)
@@ -273,7 +279,7 @@ func TestPersistentDurableRecoveryDistributions(t *testing.T) {
 		"old":           map[string]any{"framework": "published @blokjs packages 2.5.0", "adapter": "PgBossAdapter", "broker": "pg-boss 10.4.2 / PostgreSQL", "process": "producer force-killed after durable send; fresh WorkerTrigger consumer and published Runner recover job", "delivery": "two addJob calls with same jobId; pg-boss singleton-key behavior is checked by exactly-one completion; retryLimit=2; synthetic provider fails first call"},
 		"new":           map[string]any{"framework": "native engine", "adapter": "trigger/worker.Queue", "broker": "SQLite WAL synchronous=FULL", "process": "producer force-killed after Enqueue commit; fresh process reopens SQLite and executes native Engine", "delivery": "two Enqueue calls with same request key yield accepted=true then accepted=false; MaxAttempts=3; synthetic provider fails first call"},
 		"providerCalls": calls, "committedEffects": effects,
-		"backendVersions": map[string]string{"postgresql": postgresVersion, "sqlite": sqliteVersion + " (WAL/synchronous=FULL)"},
+		"backendVersions": map[string]string{"postgresql": postgresVersion, "postgresImage": postgresImage, "postgresImageDigest": postgresImageDigest, "sqlite": sqliteVersion + " (WAL/synchronous=FULL)"},
 		"oldRecoveryNs":   distribution("kill-to-first-completion", "published Blok 2.5.0 + pg-boss 10.4.2", oldRecovery),
 		"newRecoveryNs":   distribution("kill-to-first-completion", "native engine + SQLite WAL/FULL", newRecovery),
 		"samples":         persistentRecoveryRuns,

@@ -43,7 +43,7 @@ GOMAXPROCS=2 go test -p=1 ./migration -count=1 -v
 GOMAXPROCS=2 go test -p=1 ./benchmarks/parity -count=1 -v
 BLOK_PARITY_PERF=1 GOMAXPROCS=2 go test -p=1 ./benchmarks/parity -run '^TestPersistentApplicationDistributions$' -count=1 -v
 BLOK_PARITY_LIMITED_PERF=1 GOMAXPROCS=2 go test -p=1 ./benchmarks/parity -run '^TestLimitedHarnessPerformanceDistributions$' -count=1 -v
-BLOK_PARITY_RECOVERY=1 BLOK_PARITY_POSTGRES_URL=postgres://...@127.0.0.1:5432/parity108_test GOMAXPROCS=2 go test -p=1 ./benchmarks/parity -run '^TestPersistentDurableRecoveryDistributions$' -count=1 -v
+BLOK_PARITY_RECOVERY=1 BLOK_PARITY_POSTGRES_URL=postgres://parity108@127.0.0.1:<port>/parity108_test_ephemeral BLOK_PARITY_POSTGRES_IMAGE=postgres:17 BLOK_PARITY_POSTGRES_IMAGE_DIGEST=postgres@sha256:<resolved-digest> GOMAXPROCS=2 go test -p=1 ./benchmarks/parity -run '^TestPersistentDurableRecoveryDistributions$' -count=1 -v
 GOMAXPROCS=2 go test -p=1 ./trigger/worker -run '^TestProcessKillRollsBackBusinessWriteAndAcknowledgment$' -count=1 -v
 ```
 
@@ -168,6 +168,21 @@ samples establish only single-host accepted-job recovery, not disk-loss,
 multi-host, or production failover parity. The recovery command is destructive
 only within the explicitly supplied local disposable database: pg-boss creates
 its queue schema and leaves it there; never point it at a production database.
+For a fresh local instance, resolve and record the official image digest, then
+run PostgreSQL with a new container name, a loopback-only random host port, and
+an in-container tmpfs data directory (no named or reused volume):
+
+```sh
+docker pull postgres:17
+docker image inspect postgres:17 --format '{{index .RepoDigests 0}}'
+docker run --rm -d --name parity108-pg-<unique> --tmpfs /var/lib/postgresql/data:rw,size=512m -e POSTGRES_HOST_AUTH_METHOD=trust -e POSTGRES_USER=parity108 -e POSTGRES_DB=parity108_test_ephemeral -p 127.0.0.1::5432 postgres:17
+docker port parity108-pg-<unique> 5432/tcp
+```
+
+Provide the resulting port plus image tag and repository digest to the recovery
+command. The sampler queries `SHOW server_version` and includes server version,
+image identity, and SQLite version in its raw result. Stop only this named
+ephemeral container after the gate; its tmpfs database disappears with it.
 
 ## Current raw sample scope
 
