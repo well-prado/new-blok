@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -23,6 +22,7 @@ type ProcessFactory struct {
 type processConnection struct {
 	Connection
 	cmd    *exec.Cmd
+	owned  ownedProcess
 	exited chan struct{}
 	once   sync.Once
 }
@@ -48,8 +48,18 @@ func (f ProcessFactory) Connect(ctx context.Context, h contract.Hello) (Connecti
 	if err := cmd.Start(); err != nil {
 		return nil, contract.Ready{}, errors.New("worker process startup failed")
 	}
-	p := &processConnection{cmd: cmd, exited: make(chan struct{})}
-	go func() { _ = cmd.Wait(); close(p.exited) }()
+	owned, err := ownProcess(cmd)
+	if err != nil {
+		// Without ownership the supervisor could not end the worker's
+		// descendants, so it does not run one it cannot fully stop.
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return nil, contract.Ready{}, errors.New("worker process ownership failed")
+	}
+	p := &processConnection{cmd: cmd, owned: owned, exited: make(chan struct{})}
+	// exited closes only after the process has been reaped and, where the
+	// platform tracks them, its remaining descendants have been ended.
+	go func() { _ = cmd.Wait(); owned.release(); close(p.exited) }()
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -70,7 +80,7 @@ func (f ProcessFactory) Connect(ctx context.Context, h contract.Hello) (Connecti
 		case <-p.exited:
 			return nil, contract.Ready{}, errors.New("worker exited before readiness")
 		case <-startup.Done():
-			_ = cmd.Process.Kill()
+			owned.kill()
 			<-p.exited
 			return nil, contract.Ready{}, startup.Err()
 		case <-ticker.C:
@@ -93,11 +103,11 @@ func (p *processConnection) Close(ctx context.Context) error {
 			c.fail()
 		}
 	}
-	p.once.Do(func() { _ = p.cmd.Process.Signal(syscall.SIGTERM) })
+	p.once.Do(p.owned.stop)
 	select {
 	case <-p.exited:
 	case <-cleanup.Done():
-		_ = p.cmd.Process.Kill()
+		p.owned.kill()
 		<-p.exited
 		return cleanup.Err()
 	}
