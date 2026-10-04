@@ -59,7 +59,9 @@ committed nothing. Three things narrow it:
   declare their child's effects, so the same holds for them.
 - Past an agent action's dispatch barrier, a busy store leaves the effect
   uncertain, and the policy reports `ErrExecution`, never saturation.
-- A worker handler's busy store is a failure, not a deferral (ADR 0006).
+- A worker handler's busy store defers the job when it is another store,
+  and fails it as a nested submission when the busy error names the write
+  domain the handler's own claim holds (ADR 0006, #207).
 
 Not covered: a node that commits more than one transaction itself, a step
 whose writes are not declared as effects, and work outside the engine (a

@@ -115,10 +115,14 @@ Worker handlers write durable business state through the handler's `worker.Tx`
 so effects and acknowledgment commit together. The handler context carries the
 claim's write domain when the store exposes it; a nested queue submission to
 that same domain returns an actionable error before waiting on its own writer
-lock. Saturation from another store remains backpressure and defers the job
-without spending an attempt. Stores and wrappers opt into precise detection by
-exposing and forwarding `store.WriteDomainProvider`; opaque wrappers and
-handlers that replace the provided context cannot be inferred safely.
+lock. A nested submission that bypasses that check (a replaced context, or a
+wrapper that hides the domain) waits out one busy timeout; its saturation
+names the write domain it waited on, and when that is the claim's own the job
+fails as a nested submission instead of being deferred. Saturation from
+another store remains backpressure and defers the job without spending an
+attempt. Stores and wrappers opt into detection by exposing and forwarding
+`store.WriteDomainProvider` and by naming the domain on their busy errors
+(`store.WithWriteDomain`).
 
 ## 7. Durability, effects and artifacts
 

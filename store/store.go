@@ -4,6 +4,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 
 	"github.com/well-prado/new-blok/contract/capacity"
@@ -83,3 +84,35 @@ func WriteDomainOf(database Database) (*WriteDomain, bool) {
 	domain := provider.WriteDomain()
 	return domain, domain != nil
 }
+
+// WithWriteDomain annotates err with the write domain it concerns, typically
+// the domain whose write lock a transaction waited for before failing with
+// ErrBusy. The result matches everything err matches. A nil err or domain
+// returns err unchanged. Stores annotate their own busy errors so a caller
+// can identify the contended domain even through a wrapper that does not
+// forward WriteDomainProvider.
+func WithWriteDomain(err error, domain *WriteDomain) error {
+	if err == nil || domain == nil {
+		return err
+	}
+	return &domainError{err: err, domain: domain}
+}
+
+// ErrorWriteDomain reports the write domain err, or an error it wraps, was
+// annotated with by WithWriteDomain. The outermost annotation wins.
+func ErrorWriteDomain(err error) (*WriteDomain, bool) {
+	var annotated *domainError
+	if !errors.As(err, &annotated) {
+		return nil, false
+	}
+	return annotated.domain, true
+}
+
+type domainError struct {
+	err    error
+	domain *WriteDomain
+}
+
+func (e *domainError) Error() string { return e.err.Error() }
+
+func (e *domainError) Unwrap() error { return e.err }

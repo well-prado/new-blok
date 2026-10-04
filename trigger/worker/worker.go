@@ -110,9 +110,11 @@ func (e *HandlerError) Error() string { return e.Message }
 // transaction as the job's acknowledgment, so they commit only if the job
 // does. ctx is the consumer's: it is canceled when the consumer is lost. The
 // context also carries the claimed write domain when the store exposes one,
-// allowing Queue.Enqueue/Submit to reject a nested write to that same domain.
-// Preserve ctx when submitting; replacing it with context.Background loses
-// that diagnostic context.
+// allowing Queue.Enqueue/Submit to reject a nested write to that same domain
+// before it waits. Preserve ctx when submitting: a nested submission made
+// with context.Background (or through a wrapper that hides the write domain)
+// still fails the job as ErrNestedSubmission, but only after waiting out the
+// store's busy timeout once.
 type Handler func(ctx context.Context, tx Tx, job Job) error
 
 // ErrClaimLost reports that the claim's transaction ended while a handler
@@ -497,7 +499,16 @@ func (q *Queue) Enqueue(ctx context.Context, request EnqueueRequest) (EnqueueRes
 			// committed (database/sql checks the deadline before COMMIT),
 			// so the submission may be retried. A caller that canceled is
 			// not saturation.
-			return EnqueueResult{}, fmt.Errorf("worker: enqueue: %w: %w", trigger.ErrSaturated, err)
+			saturated := fmt.Errorf("worker: enqueue: %w: %w", trigger.ErrSaturated, err)
+			// Name the write domain the submission waited on. A store that
+			// annotates its busy errors already did, even through a wrapper
+			// that hides WriteDomain; otherwise it is this queue's own. A
+			// handler that returns this error from inside a claim on the
+			// same domain is diagnosed by ProcessOnce (#207).
+			if _, named := store.ErrorWriteDomain(saturated); !named {
+				saturated = store.WithWriteDomain(saturated, q.writeDomain)
+			}
+			return EnqueueResult{}, saturated
 		}
 		return EnqueueResult{}, fmt.Errorf("worker: enqueue: %w", err)
 	}
@@ -610,7 +621,17 @@ func (q *Queue) ProcessOnce(ctx context.Context, handler Handler) (bool, error) 
 		}
 		// Store saturation is backpressure. Enqueue diagnoses a submission
 		// to this claim's own write domain as ErrNestedSubmission before it
-		// waits; busy errors and deadlines from other domains defer normally.
+		// waits when the handler's context reaches it. When it did not (a
+		// detached context, or a wrapper that hides WriteDomain) the
+		// submission waits out the busy timeout and names the domain it
+		// waited on: if that is this claim's, the claim itself held the
+		// lock, and deferring would only repeat the wait (#207). Busy errors
+		// and deadlines from other domains defer normally.
+		if errors.Is(handlerErr, trigger.ErrSaturated) && !errors.Is(handlerErr, ErrNestedSubmission) {
+			if domain, named := store.ErrorWriteDomain(handlerErr); named && store.SameWriteDomain(domain, q.writeDomain) {
+				handlerErr = fmt.Errorf("%w: %w", ErrNestedSubmission, handlerErr)
+			}
+		}
 		if errors.Is(handlerErr, trigger.ErrSaturated) && !errors.Is(handlerErr, ErrNestedSubmission) {
 			// Saturation is backpressure, not a handler failure: the job is
 			// deferred without consuming an attempt, within its deferral budget.
