@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -40,7 +41,7 @@ func TestExtensionModuleRunsConformanceWithoutEngineInternals(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	write(filepath.Join(dir, "go.mod"), []byte(strings.ReplaceAll(string(template), "REPOSITORY_ROOT", filepath.ToSlash(root))))
+	write(filepath.Join(dir, "go.mod"), []byte(strings.ReplaceAll(string(template), "REPOSITORY_ROOT", strconv.Quote(filepath.ToSlash(root)))))
 	sum, err := os.ReadFile(filepath.Join(root, "go.sum"))
 	if err != nil {
 		t.Fatal(err)
