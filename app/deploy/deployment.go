@@ -113,7 +113,16 @@ func (d *Deployment) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
-	if !d.status(r.Context()).Ready {
+	lease, err := d.application.Begin()
+	if err != nil {
+		d.reject(w)
+		return
+	}
+	defer lease.Release()
+	ctx, unbind := lease.Bind(r.Context())
+	defer unbind()
+	r = r.WithContext(ctx)
+	if !d.status(ctx).Ready {
 		d.reject(w)
 		return
 	}
@@ -126,9 +135,11 @@ func (d *Deployment) reject(w http.ResponseWriter) {
 	http.Error(w, "deployment unavailable", http.StatusServiceUnavailable)
 }
 
-// Run owns the configured listener and signal drain. A single deadline covers
-// HTTP drain and dependency close. At expiry active handlers are cancelled and
-// connections closed. Dependencies must honor the supplied close context.
+// Run owns the configured listener and signal drain. DrainTimeout bounds the
+// HTTP drain. If it expires, Run cancels request contexts, closes connections,
+// then gives canceled handlers the application's AbortGrace to release their
+// leases before dependencies close. Dependencies must honor the supplied close
+// context.
 func (d *Deployment) Run(ctx context.Context, signals <-chan os.Signal) error {
 	if err := d.application.Start(ctx); err != nil {
 		return err
@@ -147,8 +158,8 @@ func (d *Deployment) Run(ctx context.Context, signals <-chan os.Signal) error {
 		cleanup()
 		return errors.New("deployment: listener unavailable")
 	}
-	workCtx, cancelWork := context.WithCancel(context.Background())
-	defer cancelWork()
+	workCtx, cancelWork := context.WithCancelCause(context.Background())
+	defer cancelWork(context.Canceled)
 	server := &http.Server{Handler: d, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 32 << 10, BaseContext: func(net.Listener) context.Context { return workCtx }}
 	served := make(chan error, 1)
 	go func() { served <- server.Serve(listener) }()
@@ -163,10 +174,20 @@ func (d *Deployment) Run(ctx context.Context, signals <-chan os.Signal) error {
 	defer cancel()
 	shutdownErr := server.Shutdown(drainCtx)
 	if shutdownErr != nil {
-		cancelWork()
+		cancelWork(app.ErrDrainTimeout)
 		_ = server.Close()
 	}
-	closeErr := d.application.Shutdown(drainCtx)
+	var closeErr error
+	if shutdownErr != nil {
+		// The listener's drain deadline has already expired. Keep the post-cancel
+		// wait bounded by the application's configured abort grace instead of
+		// passing an expired context that would close dependencies immediately.
+		closeCtx, cancelClose := context.WithTimeout(context.Background(), d.application.AbortGrace())
+		closeErr = d.application.Shutdown(closeCtx)
+		cancelClose()
+	} else {
+		closeErr = d.application.Shutdown(drainCtx)
+	}
 	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
 		return errors.New("deployment: listener failed")
 	}

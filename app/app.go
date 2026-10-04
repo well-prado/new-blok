@@ -139,6 +139,10 @@ func (a *Application) Start(ctx context.Context) error {
 func (a *Application) State() State { a.mu.Lock(); defer a.mu.Unlock(); return a.state }
 func (a *Application) Ready() bool  { return a.State() == ReadyState }
 
+// AbortGrace returns the configured bound for canceled work to release its
+// leases before Shutdown closes dependencies.
+func (a *Application) AbortGrace() time.Duration { return a.config.AbortGrace }
+
 type Lease struct {
 	app  *Application
 	once sync.Once

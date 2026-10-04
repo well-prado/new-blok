@@ -107,6 +107,19 @@ Shutdown then cancels it rather than closing the store under it (#177):
   bounds the grace. Work that ignores its context beyond that still meets
   closed dependencies: it fails with their error, and nothing it was
   writing commits.
+- `app/deploy.Deployment.Run` has two bounded phases. Its configured
+  `deployment.Config.DrainTimeout` bounds HTTP server drain. If that expires,
+  it cancels request contexts with `app.ErrDrainTimeout`, closes the listener
+  and connections, then gives the application at most its configured
+  `AbortGrace` for canceled handlers to release their leases. The overall
+  handler-drain bound is therefore the deployment drain timeout plus the
+  application abort grace. A handler that ignores cancellation beyond that
+  grace may still be running when dependencies close; native application code
+  is trusted code, so the host cannot guarantee it stops. Dependencies must
+  honor their close context. `Deployment.Run` treats its `ctx` cancellation
+  or signal as the shutdown trigger; the configured two phases bound shutdown
+  after that trigger. Direct `app.Shutdown(ctx)` instead keeps the caller's
+  context as the bound for both of its waits.
 - Aborted work may already have committed something, so it is answered as
   a retry invitation only where a retry is harmless. The durable starts
   (webhook, SSE) are keyed, so they answer 503 `unavailable` with
@@ -230,6 +243,7 @@ not applicable with a reason, never as passed. Failures are
 | Agent catalog workflow tools' dispatch steps declare their child's effects (#190) | behavioral | lets the engine hide saturation after a child's effect; dispatch steps are internal, so nothing else observes it |
 | `store.ErrBusy` text is `store: busy` | behavioral | log text only; match it with `errors.Is` |
 | `app.Lease.Context`/`Bind`, `app.Aborted`, `Config.AbortGrace` | additive | none |
+| `app.Application.AbortGrace()` | additive | none; reports the effective configured grace for host shutdown orchestration |
 | A drain timeout cancels admitted work, waits up to `AbortGrace`, then closes the dependencies (#177) | behavioral (fix) | work that outlived `DrainTimeout` used to run on into closed dependencies. Handlers should observe their context |
 | HTTP's draining 503 carries `Retry-After` | additive | none |
 
