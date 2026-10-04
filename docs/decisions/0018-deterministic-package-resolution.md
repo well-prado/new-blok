@@ -67,8 +67,12 @@ modfile/overlay inputs fail with actionable unsupported-input diagnostics.
 
 npm capture asks npm to validate/project the existing lock graph without
 installing packages or running scripts, and binds `package.json`,
-`package-lock.json`, npm/Node versions, and every exact package version and
-integrity. Only lockfile versions 2 and 3 are accepted. A manifest declaring
+`package-lock.json`, npm/Node versions, and every exact package version,
+integrity, and package-lock entry path. Retaining the path distinguishes
+nested installed copies that share a name/version but have different content.
+Both capture and canonical lock serialization use a total order over all
+serialized package identity/content fields. Only lockfile versions 2 and 3
+are accepted. A manifest declaring
 dependencies without `package-lock.json` fails before invoking npm;
 `npm-shrinkwrap.json`, foreign manager lock/workspace files, and a non-npm
 `packageManager` declaration are explicitly unsupported. npm workspaces,
@@ -76,6 +80,12 @@ link/local-file dependencies are rejected until their source trees can be
 pinned; missing integrity fails closed. Registry URLs, npm configuration,
 credentials, and command stderr are not copied into lock records or
 diagnostics. No universal installer or lifecycle-hook execution is added.
+
+The native-lock graph remains format version 1 because this protocol is still
+unreleased and under review. Earlier in-review npm lock records that lack the
+entry `Source` path are invalid under the strengthened exact-identity check;
+recapture them from the native npm lock inputs. No silent migration or
+ambiguous fallback is performed.
 
 ## Consequences and scope
 
@@ -105,15 +115,17 @@ detector, verifies an actionable error, and confirms its lifecycle marker is
 not created. Shrinkwrap, pnpm, and workspace inputs have explicit negative
 coverage; Go-only capture is retained by the real repository integration test.
 
-After the missing-lock review fix, implementation commit
-`523455edef7ddaf3cdd772e44921e96c2c4e54f5` was validated against refreshed
-`origin/main` `3fee58ec85fc41efbc9eacff876cb8182d11c0a2` using Go 1.27.1 on
-Darwin arm64. `go mod verify`, `gofmt` cleanliness, `git diff --check`,
-`GOMAXPROCS=3 go vet -p=3 ./...`, `GOMAXPROCS=3 go test -race -p=3 ./...`,
-and `GOMAXPROCS=3 go build -p=3 ./...` all passed. The focused contract/cache/
-native suite passed; the missing/unsupported npm-lock negative suite passed
-three times under `-race`. The independent reviewer's RED probe reproduced
-the omission 3/3 at the prior head; this fix now fails closed with actionable
-diagnostics and lifecycle-marker evidence. No GitHub Actions workflow was
-dispatched. No native Windows execution is claimed; Windows validation remains
-with #157.
+On implementation commit
+`ff5c732ae181009e0dbdf37f64a9378893d1a61c`, based on refreshed `origin/main`
+`7aae21db6f9815c898660dc95c1df1dd45eecb97`, Go 1.27.1 on Darwin arm64 passed
+`GOMAXPROCS=3 go test -p=3 ./...`, `GOMAXPROCS=3 go vet -p=3 ./...`,
+`GOMAXPROCS=3 go test -race -p=3 ./...`, and
+`CGO_ENABLED=0 GOMAXPROCS=3 go build -p=3 ./...`; `go mod verify`, `gofmt`
+cleanliness, and `git diff origin/main...HEAD --check` also passed. The
+repeated-copy npm determinism regression passed in the ordinary and full race
+suites. An independent Docker Go 1.27.1 review passed that test three times
+under `-race`, and passed the cache identity/replay, atomic capacity, and
+context-cancellation probes three times. Actual Go/npm integration tests run
+on the host and verify native lock files remain unchanged. No GitHub Actions
+workflow was dispatched. No native Windows execution is claimed; Windows
+validation remains with #157.
