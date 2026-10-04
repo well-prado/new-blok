@@ -338,7 +338,11 @@ func (e *Engine) RunJournaled(ctx context.Context, program contract.InternalProg
 					}
 				}
 				if encodeErr != nil {
-					step.Error = classifyJournaledFailure("journal_step_complete", instruction.ID, encodeErr, definition.Descriptor().Effects, effected, true)
+					if len(definition.Descriptor().Effects) > 0 {
+						step.Error = classifyJournaledFailure("journal_step_complete", instruction.ID, encodeErr, definition.Descriptor().Effects, effected, true)
+					} else {
+						step.Error = &Error{Code: "journal_step_complete", Class: "persistence", Step: instruction.ID, Err: encodeErr}
+					}
 					result.Steps = append(result.Steps, step)
 					return result, step.Error
 				}

@@ -330,8 +330,18 @@ func (r *Runtime) processOne(ctx context.Context, owner distributed.Owner) (RunR
 			}
 			return RunRecord{}, ErrNoWork
 		}
-		terminal, code := "failed", "execution_failed"
+		// Accepted work is durable. A transient journal/quorum failure or
+		// cooperative cancellation must leave its admission slots intact so a
+		// later owner can replay the committed prefix; it is not a business
+		// failure and must not be acknowledged as terminal.
 		var engineErr *engine.Error
+		if errors.As(runErr, &engineErr) && engineErr.Class == "persistence" {
+			return RunRecord{}, runErr
+		}
+		if errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) {
+			return RunRecord{}, runErr
+		}
+		terminal, code := "failed", "execution_failed"
 		if errors.As(runErr, &engineErr) {
 			code = engineErr.Code
 		}

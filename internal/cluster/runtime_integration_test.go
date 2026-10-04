@@ -278,6 +278,9 @@ func TestFailoverUnderSustainedLoadPreservesFairnessAndEffectCounts(t *testing.T
 	}
 	store := integrationDistributedStore(t)
 	entered, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
 	var effects atomic.Int64
 	var effectOrderMu sync.Mutex
 	effectOrder := make([]string, 0, fixture.Tenants*fixture.RunsPerTenant)
@@ -441,7 +444,7 @@ func TestFailoverUnderSustainedLoadPreservesFairnessAndEffectCounts(t *testing.T
 	if len(firstRound) != fixture.ExpectedFirstRoundTenants {
 		t.Fatalf("first post-takeover effect round served %d tenants, want %d; order=%v", len(firstRound), fixture.ExpectedFirstRoundTenants, order)
 	}
-	close(release)
+	unblock()
 	if err := <-oldDone; !errors.Is(err, distributed.ErrOwnershipLost) {
 		t.Fatalf("paused owner's resumed result=%v, want %s", err, fixture.ExpectedStaleResult)
 	}
@@ -850,6 +853,145 @@ func TestScheduleWaitClassifiesQuorumLossAsUnavailable(t *testing.T) {
 	}
 	if _, _, err := store.ReadState(ctx, partition, "recovery-check"); err != nil {
 		t.Fatalf("quorum did not recover after restoring all voters: %v", err)
+	}
+}
+
+func TestStepJournalQuorumLossDefersAcceptedRun(t *testing.T) {
+	var fixture struct {
+		ExpectedFailureClass      string `json:"expectedFailureClass"`
+		ExpectedPrefixInvocations int64  `json:"expectedPrefixInvocations"`
+		ExpectedExternalEffects   int64  `json:"expectedExternalEffects"`
+		ExpectedFinalState        string `json:"expectedFinalState"`
+		ExpectedActiveRuns        int    `json:"expectedActiveRuns"`
+		ExpectedOutput            string `json:"expectedOutput"`
+	}
+	fixtureData, err := os.ReadFile("../../testdata/distributed/runtime-quorum-defer-fixtures.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(fixtureData, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	store := integrationDistributedStore(t)
+	entered, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
+	var prefixInvocations, effects atomic.Int64
+	prefix := node.MustDefine("fixture/quorum-prefix", "1.0.0", func(_ context.Context, input integrationInput) (integrationOutput, error) {
+		if prefixInvocations.Add(1) == 1 {
+			close(entered)
+			<-release
+		}
+		return integrationOutput{Value: input.Value + 1}, nil
+	}, node.Description("pure step held across a real quorum loss"), node.Schemas(
+		[]byte(`{"type":"object","properties":{"value":{"type":"integer"}},"required":["value"],"additionalProperties":false}`),
+		[]byte(`{"type":"object","properties":{"value":{"type":"integer"}},"required":["value"],"additionalProperties":false}`),
+	)).Any()
+	effect := node.MustDefine("fixture/quorum-effect", "1.0.0", func(_ context.Context, input integrationInput) (integrationOutput, error) {
+		effects.Add(1)
+		return integrationOutput{Value: input.Value + 1}, nil
+	}, node.Description("counted synthetic external effect after journal recovery"), node.Schemas(
+		[]byte(`{"type":"object","properties":{"value":{"type":"integer"}},"required":["value"],"additionalProperties":false}`),
+		[]byte(`{"type":"object","properties":{"value":{"type":"integer"}},"required":["value"],"additionalProperties":false}`),
+	), node.Effects("fixture:quorum-counter")).Any()
+	program := contract.InternalProgram{WorkflowID: "quorum-defer-fixture", Digest: "sha256:" + strings.Repeat("9", 64), Instructions: []contract.InternalInstruction{
+		{Index: 0, ID: "prefix", Kind: "call", Node: "fixture/quorum-prefix"},
+		{Index: 1, ID: "effect", Kind: "call", Node: "fixture/quorum-effect"},
+		{Index: 2, ID: "output", Kind: "output", References: []contract.Reference{{Step: "effect"}}},
+	}}
+	workflow := Workflow{Program: program, DecodeInput: func(raw json.RawMessage) (any, error) {
+		var input integrationInput
+		if err := json.Unmarshal(raw, &input); err != nil {
+			return nil, err
+		}
+		return input, nil
+	}}
+	runtime, err := New(store, engine.New(map[string]node.Any{"fixture/quorum-prefix": prefix, "fixture/quorum-effect": effect}), map[string]Workflow{"quorum-defer-fixture": workflow}, Limits{Partitions: 8, PartitionAdmissions: 64, TenantAdmissions: 8, OwnerTTL: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	tenant, partition := tenantForEmptyPartition(t, ctx, store, runtime, "quorum-defer-tenant")
+	admission, err := runtime.Admit(ctx, Submission{Tenant: tenant, RequestKey: "quorum-defer", Workflow: "quorum-defer-fixture", Input: json.RawMessage(`{"value":40}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, err := store.Acquire(ctx, partition, "quorum-defer-owner", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("quorum journal recovery state: voters=[blok-distributed-spike-etcd1-1 blok-distributed-spike-etcd2-1 blok-distributed-spike-etcd3-1] paused=[blok-distributed-spike-etcd2-1 blok-distributed-spike-etcd3-1] partition=%s run=%s", partition, admission.RunID)
+	type processResult struct {
+		record RunRecord
+		err    error
+	}
+	processCtx, cancelProcess := context.WithTimeout(ctx, 4*time.Second)
+	defer cancelProcess()
+	oldDone := make(chan processResult, 1)
+	go func() {
+		record, processErr := runtime.processOne(processCtx, owner)
+		oldDone <- processResult{record: record, err: processErr}
+	}()
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal("prefix did not reach quorum-loss barrier")
+	}
+	containers := []string{"blok-distributed-spike-etcd2-1", "blok-distributed-spike-etcd3-1"}
+	paused := make([]string, 0, len(containers))
+	restoreVoters := func() {
+		for index := len(paused) - 1; index >= 0; index-- {
+			_ = exec.Command("docker", "unpause", paused[index]).Run()
+		}
+	}
+	t.Cleanup(restoreVoters)
+	for _, container := range containers {
+		output, pauseErr := exec.CommandContext(ctx, "docker", "pause", container).CombinedOutput()
+		if pauseErr != nil {
+			t.Fatalf("pause voter %s: %v: %s", container, pauseErr, output)
+		}
+		paused = append(paused, container)
+	}
+	unblock()
+	var oldResult processResult
+	select {
+	case oldResult = <-oldDone:
+	case <-ctx.Done():
+		t.Fatal("journal commit did not surface quorum loss")
+	}
+	var engineErr *engine.Error
+	if !errors.As(oldResult.err, &engineErr) || engineErr.Class != fixture.ExpectedFailureClass {
+		t.Fatalf("journal outage result=%v; want failure class %q", oldResult.err, fixture.ExpectedFailureClass)
+	}
+	for index := len(paused) - 1; index >= 0; index-- {
+		output, unpauseErr := exec.CommandContext(ctx, "docker", "unpause", paused[index]).CombinedOutput()
+		if unpauseErr != nil {
+			t.Fatalf("restore voter %s: %v: %s", paused[index], unpauseErr, output)
+		}
+		paused = paused[:index]
+	}
+	var newOwner distributed.Owner
+	for newOwner.ID == "" {
+		newOwner, err = store.Acquire(ctx, partition, "quorum-defer-recovery-owner", time.Second)
+		if errors.Is(err, distributed.ErrOwnershipLost) {
+			if err := waitContext(ctx, 100*time.Millisecond); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	recovered, err := runtime.processOne(ctx, newOwner)
+	if err != nil || recovered.State != fixture.ExpectedFinalState || string(recovered.Output) != fixture.ExpectedOutput {
+		t.Fatalf("recovered=%+v err=%v; expected %s / %s", recovered, err, fixture.ExpectedFinalState, fixture.ExpectedOutput)
+	}
+	active, err := store.ListActiveRunIDs(ctx, partition, runtime.limits.PartitionAdmissions)
+	if err != nil || len(active) != fixture.ExpectedActiveRuns || prefixInvocations.Load() != fixture.ExpectedPrefixInvocations || effects.Load() != fixture.ExpectedExternalEffects {
+		t.Fatalf("active=%v err=%v prefixInvocations=%d effects=%d; expected active=%d prefix=%d effects=%d", active, err, prefixInvocations.Load(), effects.Load(), fixture.ExpectedActiveRuns, fixture.ExpectedPrefixInvocations, fixture.ExpectedExternalEffects)
 	}
 }
 
