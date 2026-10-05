@@ -193,26 +193,28 @@ func (j *Journal) compactRun(ctx context.Context, tx *sql.Tx, run compactionCand
 
 // backfillReconciliationRecords writes the audit record of a reconciliation
 // that predates audit before its actor is erased, since afterwards it could
-// not be reproduced. The record takes the system tenant (""): the original
-// decision's tenant is not stored. Without an audit journal nothing is
+// not be reproduced. The record takes the decision's own tenant when the row
+// stored one (#286), and the system tenant ("") otherwise, never the tenant
+// of whoever runs the compaction. Without an audit journal nothing is
 // written, and Verify reports such a decision as it reports any pre-audit
 // decision (#284).
 func (j *Journal) backfillReconciliationRecords(ctx context.Context, tx *sql.Tx, runID string) ([]audit.Record, error) {
 	if j.audit == nil {
 		return nil, nil
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT operation_key, actor, evidence_digest, result_digest, created_at FROM journal_reconciliations WHERE run_id = ? AND erased_at IS NULL ORDER BY operation_key`, runID)
+	rows, err := tx.QueryContext(ctx, `SELECT operation_key, tenant, actor, evidence_digest, result_digest, created_at FROM journal_reconciliations WHERE run_id = ? AND erased_at IS NULL ORDER BY operation_key`, runID)
 	if err != nil {
 		return nil, err
 	}
 	type pending struct {
 		key, actor, evidence, result string
+		tenant                       sql.NullString
 		at                           int64
 	}
 	var all []pending
 	for rows.Next() {
 		var p pending
-		if err := rows.Scan(&p.key, &p.actor, &p.evidence, &p.result, &p.at); err != nil {
+		if err := rows.Scan(&p.key, &p.tenant, &p.actor, &p.evidence, &p.result, &p.at); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -230,7 +232,9 @@ func (j *Journal) backfillReconciliationRecords(ctx context.Context, tx *sql.Tx,
 		if recorded {
 			continue
 		}
-		record, inserted, err := j.audit.Append(ctx, tx, reconciliationRecord("", p.key, p.actor, p.evidence, p.result, runID, p.at))
+		// The record is missing, so the stored tenant (or "") is the only
+		// account of who decided it.
+		record, inserted, err := j.audit.Append(ctx, tx, reconciliationRecord(p.tenant.String, p.key, p.actor, p.evidence, p.result, runID, p.at))
 		if err != nil {
 			return nil, err
 		}

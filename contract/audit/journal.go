@@ -190,6 +190,27 @@ func (j *Journal) Recorded(ctx context.Context, tx *sql.Tx, id string) (bool, er
 	return found > 0, nil
 }
 
+// RecordTenant reports, inside tx, the tenant of the record with id. The
+// record is verified first (digest, shape, indexed columns), and one that
+// fails is ErrCorrupt, so an owner deciding who may see a decision never
+// trusts an altered tenant. An owner uses it for a decision that predates
+// its own tenant column: the record the decision wrote names its tenant.
+func (j *Journal) RecordTenant(ctx context.Context, tx *sql.Tx, id string) (tenant string, found bool, err error) {
+	if j == nil || tx == nil {
+		return "", false, ErrRequired
+	}
+	_, record, err := scanVerified(tx.QueryRowContext(ctx, `SELECT seq, id, kind, tenant, run_id, record, digest FROM audit_records_v1 WHERE id = ?`, id))
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return "", false, nil
+	case errors.Is(err, ErrCorrupt):
+		return "", false, ErrCorrupt
+	case err != nil:
+		return "", false, unavailableErr(err)
+	}
+	return record.Tenant, true, nil
+}
+
 // Notify offers committed records to the optional Mirror. Owners call it
 // after their transaction committed. It never blocks on, fails because of,
 // or changes durable audit; a refused or panicking Mirror counts a drop.

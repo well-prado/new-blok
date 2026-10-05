@@ -6,7 +6,8 @@
   builds on ADR 0008 (durable approvals, #75), ADR 0016 (inspection, #76/#77),
   ADR 0020 (optional observability, #79) and the #49 journal retention,
   compaction, backup and restore
-- Amended by: #281 (§7, erasure of run data)
+- Amended by: #281 (§7, erasure of run data), #286 (§8, the tenant of a
+  reconciliation)
 - Amends: [ADR 0008](0008-durable-tool-policy.md) (approval decisions now
   require audit), [ADR 0016](0016-versioned-inspection.md) (projection
   redaction and error labels), [ADR 0020](0020-optional-observability-export.md)
@@ -75,9 +76,10 @@ A refused decision can be retried once the store recovers; the retry writes
 the decision and its record exactly once. A re-delivered approval or
 reconciliation whose record is missing (it predates audit) writes that
 record. A re-delivered reconciliation whose record exists is a duplicate
-and never rewrites it, whatever tenant context carries the re-delivery; a
-backfilled record takes the re-delivery's tenant (#286 tracks changing
-that). A record compaction backfills (§7) takes the system tenant `""`.
+and never rewrites it. A backfilled record, whether a re-delivery or
+compaction (§7) writes it, takes the decision's own tenant, or the system
+tenant `""` when that is unknown, never the tenant of whoever re-delivers
+or compacts (§8).
 
 ### 3. Access
 
@@ -271,12 +273,13 @@ uncertain and active runs are never compacted. For each erased run, in one
 transaction:
 
 1. Each reconciliation of the run whose audit record is missing (it
-   predates audit) gets that record first, under the system tenant `""`,
-   since the actor it needs is about to be erased. Without an audit
+   predates audit) gets that record first, since the actor it needs is
+   about to be erased. It takes the tenant stored with the reconciliation,
+   or the system tenant `""` for a row from before #286 (§8). Without an audit
    journal composed nothing is written, and `Verify` reports the decision as
    it reports any pre-audit decision (#284).
-2. Each reconciliation keeps its operation key, run id, state, creation
-   time, `evidence_digest` and `result_digest` (the digests its audit
+2. Each reconciliation keeps its operation key, run id, tenant, state,
+   creation time, `evidence_digest` and `result_digest` (the digests its audit
    record carries) and gains `erased_at`; actor, evidence and result are
    erased. The row stays, so `audit.Verify`'s cross-check still knows the
    decision existed, and the record's digests stay comparable to it.
@@ -296,8 +299,8 @@ transaction:
 A re-delivered reconciliation whose run was compacted is a duplicate that
 returns `Duplicate` and `Erased` with the operation key and state only:
 erased content is never returned again, to any caller or tenant. Before
-erasure a duplicate still returns the stored evidence and result; who may
-receive them is #286's decision, which this one does not change.
+erasure a duplicate returns the stored evidence and result, to the deciding
+tenant only (§8).
 
 **Bytes, not just rows.** Deleting a row only hides it. The SQLite backend
 therefore opens every pooled connection with `secure_delete=ON` (ADR 0003),
@@ -356,6 +359,65 @@ it does not hold. What is guaranteed:
   backups no longer than their erasure deadline allows. Erasing content
   inside an existing backup file is outside the framework.
 
+### 8. The tenant of a reconciliation (#286)
+
+A reconciliation belongs to the tenant that decided it: the tenant of the
+deciding context (`audit.WithTenant`), which is now stored with it
+(`journal_reconciliations.tenant`) as well as in its record. That tenant,
+and only that tenant, may repeat the decision.
+
+| Re-delivery under | Retained run | Compacted run | Writes |
+| --- | --- | --- | --- |
+| The deciding tenant | `Duplicate`, the original actor, evidence and result (never the re-delivery's own) | `Duplicate` + `Erased`, key and state only | a missing record, under the deciding tenant |
+| Any other tenant, the system tenant `""` included | `ErrNotReconciliable`, an empty `Reconciliation` | not found, an empty `Reconciliation` | nothing |
+
+**Why a refusal, not a bare duplicate.** ADR 0006's idempotency rule is
+that a duplicate is the same key with the same identity; a key reused with
+a different identity is never silently deduplicated. Another tenant's
+re-delivery is not a retry of its own decision; it is a fresh attempt to
+decide an operation that is already decided, and a successful
+`Duplicate` would tell that tenant its evidence was accepted when it was
+discarded. So the journal answers it exactly as it answers a fresh
+reconciliation of an operation that settled without one: the operation is
+looked up as if the reconciliation did not exist. The response is the same
+error and the same empty value, field for field, as for such an operation
+(`ErrNotReconciliable` while it is retained, and the same not-found error
+once it is compacted), so it carries no evidence, no result, no actor, and
+not even the fact that a reconciliation exists. What it still reveals is
+what any authorized caller already learned before #286: that the operation
+key exists and is no longer uncertain. Operations themselves are not
+tenant-scoped, which is outside this decision. A refused re-delivery writes
+nothing, as every refused decision writes nothing (§2); the deciding
+tenant's next re-delivery, or compaction, writes a missing record.
+
+Tenant comparison is exact. The system tenant `""` is not a wildcard here:
+a system-context re-delivery of tenant A's reconciliation is refused like
+any other. Application-wide reading goes through `audit.Journal.List` and
+its `ReadAuthorizer` (§3), not through re-delivery.
+
+**Rows from before #286.** They have no stored tenant (`NULL`). Their
+tenant is then the tenant of their audit record, which the original
+decision wrote under its own tenant; it is read through
+`audit.Journal.RecordTenant`, which verifies the record first, so a record
+whose tenant was altered fails with `ErrCorrupt` and the re-delivery is
+refused rather than answered. A row with neither a tenant nor a record (it
+predates audit too) belongs to the system tenant `""`, the tenant compaction
+files its backfilled record under, so the journal and the audit agree on
+who owns it. Such a row's deciding tenant cannot be known: a tenant-scoped
+re-delivery of it is refused, the deciding tenant's included, and only a
+system-context re-delivery returns it. The tenant is derived on each
+re-delivery; rows are not rewritten.
+
+**Migration.** Opening a journal adds the nullable `tenant` column inside
+the schema transaction, after the #281 migration and with the same
+pattern: idempotent (the column is added only if absent, and reopening
+changes nothing), retried while concurrent openers race (#235), rolled back
+whole by a crash. A journal rebuilt by the #281 migration gets the column
+from the rebuilt table. There is no journal schema version yet
+([#291](https://github.com/well-prado/new-blok/issues/291)), so an older
+binary opening a migrated journal is not refused; it ignores the column
+and writes `NULL`, which reads as a row from before #286.
+
 ## Compatibility
 
 Pre-alpha. Classified per surface:
@@ -404,6 +466,24 @@ Erasure (#281), classified separately:
   the `journal_meta` table (created on open),
   `Reconciliation.Erased`, and the optional `store.Purger` capability
   (`PurgeLog`, `PurgeFree`, `store.PurgerOf`).
+
+The tenant of a reconciliation (#286), classified separately:
+
+- **Behaviour change (breaking, pre-alpha)**: a re-delivered reconciliation
+  under a tenant other than the deciding one, the system tenant included,
+  is refused (`ErrNotReconciliable`, or not found once compacted) with an
+  empty `Reconciliation` and nothing written, where it returned `Duplicate`
+  with the original evidence and result (and, after compaction,
+  `Duplicate` + `Erased`) and backfilled a missing record under its own
+  tenant. A reconciliation from before #286 with no audit record is
+  answered only to the system tenant. The deciding tenant's re-delivery is
+  unchanged.
+- **Behaviour change**: compaction backfills a missing record under the
+  stored tenant; only rows from before #286 still take `""`.
+- **Schema change, with data migration**: `journal_reconciliations` gains a
+  nullable `tenant` column on open; existing rows keep `NULL`. Additive for
+  an older binary, which ignores it (#291).
+- **Additive**: `audit.Journal.RecordTenant`.
 
 ## Evidence
 
@@ -457,6 +537,18 @@ Erasure (#281), classified separately:
   pooled connection, a control without it that keeps the content, purge
   refusing beside a reader). The tests are red on origin/main; mutations
   are listed in the PR.
+- Tenant of a reconciliation (#286), against real SQLite files:
+  `contract/audit/reconcile_tenant_test.go` (another tenant's re-delivery of
+  a pre-audit and of a recorded reconciliation compared field for field and
+  error for error with a never-reconciled operation, before and after
+  compaction, with no record written; the deciding tenant's duplicate
+  unchanged under `""` and under a named tenant; compaction run in another
+  tenant's context backfilling under the deciding tenant; a row with no
+  known tenant answered only to `""`; a journal written by origin/main at
+  `99a9228`, `testdata/restore/reconcile-tenant-286/legacy-main-99a9228.db.gz`,
+  migrated, answered by its records' tenants, reopened unchanged, and
+  refusing a record whose tenant column was altered). The tests are red on
+  origin/main; mutations are listed in the PR.
 
 ## Limits
 
@@ -501,4 +593,12 @@ Erasure (#281), classified separately:
 - The live event stream (`observe/event`, `inspect/events*.go`) was not
   reshaped: it gains the new redaction through the shared `inspect`
   projection only.
+- A reconciliation written before #286 whose record was missing and was
+  backfilled by an earlier re-delivery took that re-delivery's tenant
+  (the bug #286 fixes); nothing can tell such a record from the original,
+  so it keeps answering to that tenant.
+- Journal operations are not tenant-scoped: any authorized caller can learn
+  whether an operation key exists and is uncertain, and can reconcile an
+  uncertain operation of any tenant. #286 scopes the reconciliation, not
+  the operation.
 - Windows is vetted (`GOOS=windows go vet`) but not executed.

@@ -1,0 +1,374 @@
+package audit_test
+
+import (
+	"compress/gzip"
+	"context"
+	"database/sql"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/well-prado/new-blok/contract/audit"
+	"github.com/well-prado/new-blok/internal/journal"
+)
+
+// A reconciliation belongs to the tenant that decided it (#286). Only that
+// tenant may repeat it and read back its evidence and provider result; to
+// any other tenant the operation looks exactly like one that settled
+// without a reconciliation. A record a re-delivery or compaction backfills
+// takes the decision's tenant, or the system tenant "" when it is unknown,
+// never the tenant of whoever happens to re-deliver or compact.
+
+const tenantMarker = "SYNTHETIC-286-"
+
+var (
+	tenantA = func(ctx context.Context) context.Context { return audit.WithTenant(ctx, "tenant-a") }
+	tenantB = func(ctx context.Context) context.Context { return audit.WithTenant(ctx, "tenant-b") }
+)
+
+// decideUnder reconciles an uncertain effect of a fresh run under ctx, with
+// evidence and result marked by label.
+func (r *rig) decideUnder(ctx context.Context, label string) (journal.Operation, journal.Reconciliation) {
+	r.t.Helper()
+	_, op := r.uncertainEffect(label)
+	decided, err := r.journal.Reconcile(ctx, op.Key, "operator:"+label, "provider lookup "+tenantMarker+label+"-EVIDENCE", []byte(`{"receipt":"`+tenantMarker+label+`-RESULT"}`), true)
+	if err != nil || decided.Duplicate {
+		r.t.Fatalf("reconcile %s=%+v err=%v", label, decided, err)
+	}
+	return op, decided
+}
+
+// settledEffect commits an effect of a fresh run normally: an operation that
+// is no longer uncertain and was never reconciled.
+func (r *rig) settledEffect(label string) (string, journal.Operation) {
+	r.t.Helper()
+	run, err := r.journal.Admit(r.ctx, journal.AdmissionRequest{RequestKey: label, Principal: "alice", Workflow: "orders", ArtifactDigest: digest("artifact"), Input: []byte(`{}`)})
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	op, err := r.journal.BeginEffect(r.ctx, journal.EffectIntent{Identity: journal.OperationIdentity{RunID: run.RunID, ArtifactDigest: digest("artifact"), InvocationPath: "charge-" + label, IterationPath: "root"}})
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	attempt, err := r.journal.StartAttempt(r.ctx, op.Key)
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	if err := r.journal.CommitEffect(r.ctx, journal.EffectCommit{OperationKey: op.Key, AttemptID: attempt.ID, Result: []byte(`{"charged":true}`)}); err != nil {
+		r.t.Fatal(err)
+	}
+	return run.RunID, op
+}
+
+// dropReconciliationRecords makes every reconciliation pre-audit: its row
+// stays, its record is gone, as in a journal written before audit existed.
+func (r *rig) dropReconciliationRecords() {
+	r.t.Helper()
+	r.exec(`UPDATE audit_meta_v1 SET value = value - (SELECT COUNT(*) FROM audit_records_v1 WHERE kind = 'reconciliation.decision') WHERE name = 'records'`,
+		`DELETE FROM audit_records_v1 WHERE kind = 'reconciliation.decision'`)
+	if _, err := r.audit.Verify(r.ctx, r.journal); !errors.Is(err, audit.ErrMismatch) {
+		r.t.Fatalf("fixture: a reconciliation without its record must mismatch, got %v", err)
+	}
+}
+
+func (r *rig) exec(statements ...string) {
+	r.t.Helper()
+	if err := r.db.WithTx(r.ctx, func(tx *sql.Tx) error {
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(r.ctx, statement); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		r.t.Fatal(err)
+	}
+}
+
+func (r *rig) records(tenant string) int {
+	r.t.Helper()
+	return r.count(`SELECT COUNT(*) FROM audit_records_v1 WHERE kind = 'reconciliation.decision' AND tenant = ?`, tenant)
+}
+
+// redeliverAs re-delivers op under ctx with evidence and a result of its
+// own, which a duplicate must never adopt.
+func (r *rig) redeliverAs(ctx context.Context, key string) (journal.Reconciliation, error) {
+	return r.journal.Reconcile(ctx, key, "operator:redelivery", "redelivered evidence", []byte(`{"redelivered":true}`), true)
+}
+
+// requireIndistinguishable: the response to another tenant's reconciliation
+// is the response to an operation that was never reconciled, field for
+// field and error for error, so it carries no evidence or result and says
+// nothing a settled operation would not.
+func requireIndistinguishable(t *testing.T, got journal.Reconciliation, gotErr error, control journal.Reconciliation, controlErr error) {
+	t.Helper()
+	if gotErr == nil || controlErr == nil || gotErr.Error() != controlErr.Error() || !reflect.DeepEqual(got, control) {
+		t.Fatalf("cross-tenant re-delivery=%+v err=%v; never-reconciled control=%+v err=%v", got, gotErr, control, controlErr)
+	}
+	if got.Actor != "" || got.Evidence != "" || len(got.Result) != 0 || got.Duplicate || strings.Contains(got.Evidence+string(got.Result), tenantMarker) {
+		t.Fatalf("cross-tenant re-delivery carried content: %+v", got)
+	}
+}
+
+// TestCrossTenantRedeliveryOfAPreAuditReconciliation: tenant A's
+// reconciliation has no audit record (it predates audit). Tenant B
+// re-delivers it: B gets what it would get for an operation that settled
+// without one, and nothing is written, so no record lands under B. A's own
+// re-delivery still returns the original and backfills the record under A.
+func TestCrossTenantRedeliveryOfAPreAuditReconciliation(t *testing.T) {
+	r := newRig(t, rigOptions{})
+	op, original := r.decideUnder(tenantA(r.ctx), "A")
+	_, settled := r.settledEffect("settled")
+	r.dropReconciliationRecords()
+	mirrored := r.mirror.accepted.Load()
+
+	got, err := r.redeliverAs(tenantB(r.ctx), op.Key)
+	control, controlErr := r.redeliverAs(tenantB(r.ctx), settled.Key)
+	requireIndistinguishable(t, got, err, control, controlErr)
+	if !errors.Is(err, journal.ErrNotReconciliable) {
+		t.Fatalf("cross-tenant err=%v, want ErrNotReconciliable", err)
+	}
+	if n := r.records("tenant-b"); n != 0 {
+		t.Fatalf("tenant B re-delivery filed %d records under tenant B", n)
+	}
+	if n := r.count(`SELECT COUNT(*) FROM audit_records_v1`); n != 0 || r.mirror.accepted.Load() != mirrored {
+		t.Fatalf("a refused re-delivery wrote %d records", n)
+	}
+
+	again, err := r.redeliverAs(tenantA(r.ctx), op.Key)
+	want := original
+	want.Duplicate = true
+	if err != nil || !reflect.DeepEqual(again, want) {
+		t.Fatalf("own-tenant re-delivery=%+v err=%v, want the original %+v", again, err, want)
+	}
+	if r.records("tenant-a") != 1 || r.records("tenant-b") != 0 || r.records("") != 0 {
+		t.Fatalf("backfill records a=%d b=%d system=%d, want it under tenant A only", r.records("tenant-a"), r.records("tenant-b"), r.records(""))
+	}
+	r.mustVerify(1)
+}
+
+// TestOwnTenantRedeliveryReturnsTheOriginal: the duplicate contract is
+// unchanged for the deciding tenant, the system tenant included: the
+// original actor, evidence and result, whatever the re-delivery carries,
+// and no second record.
+func TestOwnTenantRedeliveryReturnsTheOriginal(t *testing.T) {
+	for _, tenant := range []string{"", "tenant-a"} {
+		t.Run("tenant="+tenant, func(t *testing.T) {
+			r := newRig(t, rigOptions{})
+			ctx := audit.WithTenant(r.ctx, tenant)
+			op, original := r.decideUnder(ctx, "OWN")
+			again, err := r.redeliverAs(ctx, op.Key)
+			want := original
+			want.Duplicate = true
+			if err != nil || !reflect.DeepEqual(again, want) || !strings.Contains(again.Evidence, tenantMarker+"OWN-EVIDENCE") {
+				t.Fatalf("own re-delivery=%+v err=%v, want %+v", again, err, want)
+			}
+			if r.records(tenant) != 1 || r.mirror.accepted.Load() != 1 {
+				t.Fatalf("records=%d mirrored=%d, want 1 and 1", r.records(tenant), r.mirror.accepted.Load())
+			}
+			r.mustVerify(1)
+		})
+	}
+}
+
+// TestRedeliveredReconciliationUnderAnotherTenantIsRefused: with its record
+// intact, another tenant's re-delivery, the system tenant's included, is
+// refused like a re-delivery of a settled operation, and the original
+// record is not rewritten.
+func TestRedeliveredReconciliationUnderAnotherTenantIsRefused(t *testing.T) {
+	r := newRig(t, rigOptions{})
+	op, _ := r.decideUnder(tenantA(r.ctx), "RECORDED")
+	_, settled := r.settledEffect("settled")
+	for _, ctx := range []context.Context{tenantB(r.ctx), r.ctx} {
+		got, err := r.redeliverAs(ctx, op.Key)
+		control, controlErr := r.redeliverAs(ctx, settled.Key)
+		requireIndistinguishable(t, got, err, control, controlErr)
+	}
+	if r.records("tenant-a") != 1 || r.records("tenant-b") != 0 || r.records("") != 0 {
+		t.Fatal("the original record was rewritten or another was added")
+	}
+	r.mustVerify(1)
+
+	// Reconcile commits the operation with its reconciliation, so a
+	// reconciled operation is never uncertain. Should one read uncertain
+	// anyway, another tenant still cannot decide it a second time.
+	r.exec(`UPDATE journal_operations SET state = 'uncertain' WHERE operation_key = '` + op.Key + `'`)
+	before := r.count(`SELECT COUNT(*) FROM journal_reconciliations WHERE operation_key = ? AND actor = 'operator:RECORDED' AND tenant = 'tenant-a'`, op.Key)
+	if got, err := r.redeliverAs(tenantB(r.ctx), op.Key); !errors.Is(err, journal.ErrNotReconciliable) || !reflect.DeepEqual(got, journal.Reconciliation{}) {
+		t.Fatalf("re-delivery of an uncertain-reading reconciled operation=%+v err=%v", got, err)
+	}
+	if after := r.count(`SELECT COUNT(*) FROM journal_reconciliations WHERE operation_key = ? AND actor = 'operator:RECORDED' AND tenant = 'tenant-a'`, op.Key); before != 1 || after != 1 {
+		t.Fatalf("original reconciliation changed: before=%d after=%d", before, after)
+	}
+}
+
+// TestCompactionBackfillsUnderTheDecisionsTenant: compaction writes a
+// missing record before it erases the actor (§7). It takes the decision's
+// tenant, not the tenant of the operator running Compact. After erasure,
+// another tenant's re-delivery still learns only what it would of a
+// compacted operation that was never reconciled; the deciding tenant gets
+// the erased duplicate.
+func TestCompactionBackfillsUnderTheDecisionsTenant(t *testing.T) {
+	r := newRig(t, rigOptions{})
+	op, _ := r.decideUnder(tenantA(r.ctx), "COMPACT")
+	settledRun, settled := r.settledEffect("settled")
+	runID := r.operationRun(op.Key)
+	for _, id := range []string{runID, settledRun} {
+		if err := r.journal.CompleteRun(r.ctx, id, []byte(`{}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r.dropReconciliationRecords()
+	r.clock = r.clock.Add(48 * time.Hour)
+	if report, err := r.journal.Compact(tenantB(r.ctx), r.clock); err != nil || report.RemovedRuns != 2 {
+		t.Fatalf("compact=%+v err=%v", report, err)
+	}
+	if r.records("tenant-a") != 1 || r.records("tenant-b") != 0 || r.records("") != 0 {
+		t.Fatalf("compaction backfill records a=%d b=%d system=%d, want it under tenant A", r.records("tenant-a"), r.records("tenant-b"), r.records(""))
+	}
+	r.mustVerify(1)
+	got, err := r.redeliverAs(tenantB(r.ctx), op.Key)
+	control, controlErr := r.redeliverAs(tenantB(r.ctx), settled.Key)
+	requireIndistinguishable(t, got, err, control, controlErr)
+	erased, err := r.redeliverAs(tenantA(r.ctx), op.Key)
+	if err != nil || !erased.Duplicate || !erased.Erased || erased.State == "" || erased.Actor != "" || erased.Evidence != "" || len(erased.Result) != 0 {
+		t.Fatalf("own-tenant erased re-delivery=%+v err=%v", erased, err)
+	}
+}
+
+func (r *rig) operationRun(key string) string {
+	r.t.Helper()
+	var runID string
+	if err := r.db.WithTx(r.ctx, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(r.ctx, `SELECT run_id FROM journal_operations WHERE operation_key = ?`, key).Scan(&runID)
+	}); err != nil {
+		r.t.Fatal(err)
+	}
+	return runID
+}
+
+// TestReconciliationWithNoKnownTenantBelongsToTheSystemTenant: a row from
+// before #286 recorded no tenant, and with no audit record either (it
+// predates audit) nothing says which tenant decided it. It belongs to the
+// system tenant "", the tenant compaction files its record under: a
+// tenant-scoped re-delivery, the deciding tenant's included, is refused and
+// writes nothing; a system re-delivery returns it and backfills under "".
+func TestReconciliationWithNoKnownTenantBelongsToTheSystemTenant(t *testing.T) {
+	r := newRig(t, rigOptions{})
+	op, original := r.decideUnder(tenantA(r.ctx), "UNKNOWN")
+	_, settled := r.settledEffect("settled")
+	r.exec(`UPDATE journal_reconciliations SET tenant = NULL`)
+	r.dropReconciliationRecords()
+	for _, ctx := range []context.Context{tenantA(r.ctx), tenantB(r.ctx)} {
+		got, err := r.redeliverAs(ctx, op.Key)
+		control, controlErr := r.redeliverAs(ctx, settled.Key)
+		requireIndistinguishable(t, got, err, control, controlErr)
+	}
+	if n := r.count(`SELECT COUNT(*) FROM audit_records_v1`); n != 0 {
+		t.Fatalf("refused re-deliveries wrote %d records", n)
+	}
+	again, err := r.redeliverAs(r.ctx, op.Key)
+	want := original
+	want.Duplicate = true
+	if err != nil || !reflect.DeepEqual(again, want) {
+		t.Fatalf("system re-delivery=%+v err=%v, want %+v", again, err, want)
+	}
+	if r.records("") != 1 || r.records("tenant-a") != 0 || r.records("tenant-b") != 0 {
+		t.Fatalf("backfill records system=%d a=%d b=%d, want it under the system tenant", r.records(""), r.records("tenant-a"), r.records("tenant-b"))
+	}
+	r.mustVerify(1)
+}
+
+// tenantFixture is a journal written by origin/main at 99a9228, after #281
+// and before #286 (testdata/restore/reconcile-tenant-286/generate.go): its
+// reconciliations table has no tenant column. One reconciliation was
+// decided under tenant-a, one under the system tenant; both have records.
+const tenantFixture = "../../testdata/restore/reconcile-tenant-286/legacy-main-99a9228.db.gz"
+
+func tenantFixtureDatabase(t *testing.T) string {
+	t.Helper()
+	compressed, err := os.Open(tenantFixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer compressed.Close()
+	reader, err := gzip.NewReader(compressed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "legacy-286.db")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(file, reader); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func (r *rig) keyWithEvidence(label string) string {
+	r.t.Helper()
+	var key string
+	if err := r.db.WithTx(r.ctx, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(r.ctx, `SELECT operation_key FROM journal_reconciliations WHERE evidence LIKE ?`, "%"+tenantMarker+label+"-EVIDENCE%").Scan(&key)
+	}); err != nil {
+		r.t.Fatal(err)
+	}
+	return key
+}
+
+// TestPreColumnReconciliationsAreAnsweredOnlyToTheirRecordedTenant opens a
+// journal origin/main wrote. Its reconciliations gain an empty tenant on
+// open; each is then answered only to the tenant its audit record carries,
+// the one that decided it. Reopening changes nothing, and Verify passes.
+func TestPreColumnReconciliationsAreAnsweredOnlyToTheirRecordedTenant(t *testing.T) {
+	path := tenantFixtureDatabase(t)
+	r := openRig(t, path, rigOptions{})
+	if n := r.count(`SELECT COUNT(*) FROM journal_reconciliations WHERE tenant IS NULL`); n != 2 {
+		t.Fatalf("pre-column reconciliations without a tenant=%d, want 2", n)
+	}
+	r.mustVerify(2)
+	keyA, keySystem := r.keyWithEvidence("A"), r.keyWithEvidence("SYSTEM")
+	_, settled := r.settledEffect("settled")
+	for _, c := range []struct {
+		key   string
+		owner context.Context
+		label string
+		other []context.Context
+	}{
+		{keyA, tenantA(r.ctx), "A", []context.Context{tenantB(r.ctx), r.ctx}},
+		{keySystem, r.ctx, "SYSTEM", []context.Context{tenantA(r.ctx), tenantB(r.ctx)}},
+	} {
+		for _, ctx := range c.other {
+			got, err := r.redeliverAs(ctx, c.key)
+			control, controlErr := r.redeliverAs(ctx, settled.Key)
+			requireIndistinguishable(t, got, err, control, controlErr)
+		}
+		own, err := r.redeliverAs(c.owner, c.key)
+		if err != nil || !own.Duplicate || own.Erased || own.Actor != "operator:bob" || !strings.Contains(own.Evidence, tenantMarker+c.label+"-EVIDENCE") || !strings.Contains(string(own.Result), tenantMarker+c.label+"-RESULT") {
+			t.Fatalf("%s own re-delivery=%+v err=%v", c.label, own, err)
+		}
+	}
+	migrated := r.snapshot()
+	if again := openRig(t, path, rigOptions{}).snapshot(); again != migrated {
+		t.Fatal("reopening a migrated journal changed it")
+	}
+	r.mustVerify(2)
+
+	// The tenant is read from the verified record, never from a column
+	// alone: a record whose tenant column was altered fails verification,
+	// and the re-delivery is refused with it instead of answering.
+	r.exec(`UPDATE audit_records_v1 SET tenant = 'tenant-b' WHERE id = 'reconcile:` + keyA + `'`)
+	if got, err := r.redeliverAs(tenantB(r.ctx), keyA); !errors.Is(err, audit.ErrCorrupt) || !reflect.DeepEqual(got, journal.Reconciliation{}) {
+		t.Fatalf("re-delivery against a tampered record=%+v err=%v, want ErrCorrupt and nothing", got, err)
+	}
+}
