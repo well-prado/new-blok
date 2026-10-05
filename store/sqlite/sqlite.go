@@ -175,19 +175,38 @@ func (c *connection) WithTx(ctx context.Context, fn func(*sql.Tx) error) error {
 		if err != nil {
 			return err
 		}
+		// Deferred before the rollback below, so it runs after it: the next
+		// marked writer gets its turn only once this transaction has let go
+		// of the write lock, on every exit.
 		defer release()
 	}
 	tx, err := c.database.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
 		return busy(fmt.Errorf("sqlite: begin: %w", err), c.writeDomain)
 	}
+	// Roll back on every exit that does not reach COMMIT, including a
+	// callback (or the commit hook) that panics or calls runtime.Goexit
+	// (#267). database/sql never rolls such a transaction back on its own
+	// unless its context is canceled, and the worker's is deliberately not
+	// cancelable: the transaction kept the write lock and its pooled
+	// connection, so every later writer on the file failed busy until the
+	// process exited. Nothing is recovered: a panic continues to the caller
+	// with its original value and stack once the rollback has run.
+	committing := false
+	defer func() {
+		if !committing {
+			_ = tx.Rollback()
+		}
+	}()
 	if err := fn(tx); err != nil {
-		_ = tx.Rollback()
 		return busy(err, c.writeDomain)
 	}
 	if c.beforeCommit != nil {
 		c.beforeCommit()
 	}
+	// From here database/sql ends the transaction itself, committed or not:
+	// a failed COMMIT is rolled back by the driver.
+	committing = true
 	if err := tx.Commit(); err != nil {
 		return busy(fmt.Errorf("sqlite: commit: %w", err), c.writeDomain)
 	}

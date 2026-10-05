@@ -83,6 +83,40 @@ commits two write transactions (the attempt's start, then the handler with
 its acknowledgment; ADR 0006): 29–32 ms against 22–28 ms on the same macOS
 host, 0 busy errors on both.
 
+## Transactions that do not return (#267)
+
+`Database.WithTx` rolls the transaction back on every exit that does not
+reach COMMIT, including a callback that panics or calls `runtime.Goexit`,
+and a panic in the commit hook the crash tests install. It does not
+recover the panic: the rollback runs as the panic unwinds, and the caller
+receives the original value with its original stack. A panic after COMMIT
+leaves the commit in place. A marked writer's turn in the writer queue
+(#214) is released after the rollback, on every exit, so the next writer
+never takes its turn while the lock is still held. The busy and
+write-domain annotations (#184, #207) apply only to returned errors; a
+panic is never converted into one.
+
+Before #267 `WithTx` rolled back only when its callback returned an error.
+`database/sql` rolls back a transaction left open only when its context is
+canceled, and the worker's handle transaction runs on a context that is
+deliberately not cancelable (ADR 0006). A handler panic that a supervisor
+recovered therefore kept the write lock and a pooled connection for the
+life of the process: every later writer on the file, on any handle, failed
+`store.ErrBusy` after the busy timeout, and on `:memory:` no other
+connection could even read. A read transaction left open by a panicking
+`RetainedArtifacts` visitor kept its connection, and eight of them spent the
+pool, after which every call waited for a connection forever.
+
+The rollback covers every caller of the port: the worker, the journal and
+the engine through it, cron, provider records, approval records, and the
+examples. A panic inside the driver's own COMMIT is not reachable through
+this package: `database/sql` marks the transaction done before it calls the
+driver, so a rollback could not undo it there.
+
+| Change | Class | Migration |
+| --- | --- | --- |
+| `WithTx` rolls back when its callback, or the commit hook, panics or calls `runtime.Goexit`, then lets the panic continue (#267) | behavioral (bug fix) | None. Callbacks that return are unaffected. A caller that recovered a panic from `WithTx` and relied on the transaction staying open, which no API exposed, now finds it rolled back. Other `store.Database` implementations must do the same |
+
 ## Alternatives considered
 
 The executable spike compares SQLite with `go.etcd.io/bbolt` v1.5.0. bbolt is

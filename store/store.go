@@ -33,7 +33,10 @@ type Backend interface {
 
 // Database is the minimal durable boundary needed by the journal. A callback
 // returns only after commit has completed, so callers can acknowledge accepted
-// work after WithTx returns successfully.
+// work after WithTx returns successfully. WithTx rolls back whenever the
+// transaction does not commit, including when its callback panics or calls
+// runtime.Goexit; it does not recover a panic, which reaches the caller with
+// its original value once the transaction has been rolled back (#267).
 type Database interface {
 	WithTx(context.Context, func(*sql.Tx) error) error
 	Backup(context.Context, string) error
