@@ -1,0 +1,17 @@
+{
+  "purpose": "Synthetic export fixtures for E16-T01 (#79). Each case runs the real engine through execution.Runner with the OTLP/HTTP exporters aimed at an in-process collector. Expected counts are declared before the run: business outputs, errors and committed effects, and what the collector must receive.",
+  "cases": [
+    {"id": "completed", "ratio": 1, "tenant": "tenant-a", "input": {"sku": "coffee", "quantity": 2, "note": "synthetic-payload-sentinel"},
+     "expected": {"outputs": 1, "errors": 0, "effects": 1, "errorCode": "", "runOutcome": "completed", "spans": 4, "errorSpans": 0, "logs": 1, "tenantLabel": "tenant-a", "steps": {"validate": "completed", "charge": "completed", "output": "completed"}}},
+    {"id": "invalid-quantity", "ratio": 1, "tenant": "tenant-a", "input": {"sku": "coffee", "quantity": 0, "note": "synthetic-payload-sentinel"},
+     "expected": {"outputs": 0, "errors": 1, "effects": 0, "errorCode": "invalid_input", "runOutcome": "failed", "spans": 2, "errorSpans": 2, "logs": 0, "tenantLabel": "tenant-a", "steps": {"validate": "failed"}}},
+    {"id": "declined", "ratio": 1, "tenant": "tenant-a", "input": {"sku": "declined", "quantity": 1},
+     "expected": {"outputs": 0, "errors": 1, "effects": 0, "errorCode": "card_declined", "runOutcome": "failed", "spans": 3, "errorSpans": 2, "logs": 1, "tenantLabel": "tenant-a", "steps": {"validate": "completed", "charge": "failed"}}},
+    {"id": "uncertain", "ratio": 1, "tenant": "tenant-a", "input": {"sku": "uncertain", "quantity": 1},
+     "expected": {"outputs": 0, "errors": 1, "effects": 1, "errorCode": "charge_unconfirmed", "runOutcome": "uncertain", "spans": 3, "errorSpans": 2, "logs": 1, "tenantLabel": "tenant-a", "steps": {"validate": "completed", "charge": "uncertain"}}},
+    {"id": "unsampled", "ratio": 1e-12, "tenant": "tenant-a", "input": {"sku": "coffee", "quantity": 1},
+     "expected": {"outputs": 1, "errors": 0, "effects": 1, "errorCode": "", "runOutcome": "completed", "spans": 0, "errorSpans": 0, "logs": 0, "tenantLabel": "tenant-a", "steps": {"validate": "completed", "charge": "completed", "output": "completed"}}},
+    {"id": "unlisted-tenant", "ratio": 1, "tenant": "tenant-zzz-unlisted", "input": {"sku": "coffee", "quantity": 1},
+     "expected": {"outputs": 1, "errors": 0, "effects": 1, "errorCode": "", "runOutcome": "completed", "spans": 4, "errorSpans": 0, "logs": 1, "tenantLabel": "other", "steps": {"validate": "completed", "charge": "completed", "output": "completed"}}}
+  ]
+}

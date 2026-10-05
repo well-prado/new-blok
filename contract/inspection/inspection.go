@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"time"
+
+	"github.com/well-prado/new-blok/contract/observe"
 )
 
 const Version = "inspection/v1"
@@ -61,6 +63,14 @@ type Invocation struct {
 	AttemptID  string
 	ParentRun  string
 	ParentStep string
+	// Tenant is the trusted tenant the run executes for, supplied by the
+	// same boundary as Principal. It correlates telemetry; exporters use it
+	// as a metric label only when the application allowlists it (ADR 0020).
+	Tenant string
+	// Trace is an optional parent trace context the application chose to
+	// trust (for example an inbound traceparent). When it is invalid, a run
+	// started from inside a traced step inherits that step's context.
+	Trace observe.TraceContext
 }
 
 // Event is an immutable observation emitted by the engine. Payloads are JSON
@@ -83,6 +93,13 @@ type Event struct {
 	LogLevel   string          `json:"logLevel,omitempty"`
 	LogMessage string          `json:"logMessage,omitempty"`
 	LogAttrs   json.RawMessage `json:"logAttrs,omitempty"`
+	// Tenant and Trace are in-process correlation for telemetry exporters
+	// (ADR 0020). They are not part of the inspection/v1 wire projection.
+	// Trace is the run span on run events and the step attempt span on step
+	// events and logs; it is zero when the application selected no
+	// TracePolicy.
+	Tenant string       `json:"-"`
+	Trace  observe.Span `json:"-"`
 }
 
 type Observer interface{ Observe(Event) }

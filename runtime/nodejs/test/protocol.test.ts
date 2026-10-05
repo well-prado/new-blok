@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as grpc from "@grpc/grpc-js";
 import { createServer } from "node:net";
-import { Worker, DEFAULT_LIMITS } from "../worker.js";
+import { Worker, DEFAULT_LIMITS, traceContext } from "../worker.js";
 import { loadProtocol, validateFrameBytes, type Frame, type ReceivedFrame } from "../protocol.js";
 import { nodes } from "../../../testdata/worker/nodejs/nodes.js";
 import { defineNode, type AnyNode } from "../../../sdk/nodejs/index.js";
@@ -129,4 +129,26 @@ test("actual socket rejects truncated and oversized serialized messages",async()
    assert.equal(error.code,fixtureBytes.length>1<<20?grpc.status.RESOURCE_EXHAUSTED:grpc.status.INTERNAL);
   }finally{f.close();}
  }
+});
+test("call trace context reaches the node only when canonical, and never changes the outcome",async()=>{
+ const seen=defineNode<Record<string,never>,{trace:string},null>({name:"fixture/trace-seen",version:"1.0.0",description:"Synthetic trace context probe",input:{type:"object"},output:{type:"object",properties:{trace:{type:"string"}},required:["trace"]},dependencies:null,execute(ctx){return {trace:ctx.trace?`${ctx.trace.traceparent}|${ctx.trace.tracestate}`:"absent"};}});
+ const valid="00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+ const cases:[string,string,string,string][]=[
+  ["canonical",valid,"vendor=opaque",`${valid}|vendor=opaque`],
+  ["unsampled","00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00","",`00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00|`],
+  ["absent","","","absent"],
+  ["uppercase",valid.toUpperCase(),"","absent"],
+  ["zero-trace","00-00000000000000000000000000000000-00f067aa0ba902b7-01","","absent"],
+  ["zero-span","00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01","","absent"],
+  ["future-version","01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01","","absent"],
+  ["oversized-state",valid,"k=".padEnd(257,"v"),"absent"],
+  ["control-state",valid,"k=v\n","absent"],
+ ];
+ const f=await fixture("1",8192,[seen]);try{
+  const s=f.connect();let result=receive(s);s.write({hello:f.hello});await result;
+  for(const [id,traceparent,tracestate,expected] of cases){result=receive(s);s.write({call:{...call(`trace-${id}`),node:"fixture/trace-seen",input:Buffer.from("{}"),traceparent,tracestate}});const r=(await result).result;assert.equal(r?.error,null,id);assert.equal(r?.output.toString(),JSON.stringify({trace:expected}),id);}
+ }finally{f.close();}
+ assert.deepEqual(traceContext(valid,""),{traceparent:valid,tracestate:""});
+ assert.ok(Object.isFrozen(traceContext(valid,"")));
+ assert.equal(traceContext(42,""),undefined);
 });
