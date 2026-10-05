@@ -221,6 +221,62 @@ every retained run is live, the read is refused as saturated.
 The snapshot holds journal facts only: transient transitions, logs, and
 steps that had not yet written a journal fact are not reconstructed.
 
+**Following a run nobody publishes (#263).** A recovered run that no
+execution in this process publishes for (a crashed run, a run on another
+replica, every cluster run) has nothing that would end it. Its follower
+therefore re-reads it from `Source` every `RecoveredPoll` (2 s; at least
+100 ms, at most 1 min), as the reader and with the connection's field
+selection, each read bounded by `SourceTimeout`. A reconstruction that
+changed is sent as a new `snapshot` frame, at the reader's current position;
+an unchanged one is not resent. When the source reports the run terminal
+(`completed`, `failed`, `canceled`, `uncertain`; `suspended` is not), the
+follower receives that final snapshot and `end`, is released, and the hub
+closes the attachment, so a later reader gets the reconstruction and `end` at
+once. One connection makes at most `MaxDuration / RecoveredPoll` durable
+reads, and `Authorize` and `Policy` are still evaluated once per connection.
+Polling stops as soon as a trusted publisher claims the run, which then ends
+with its own terminal frame. A failed poll is skipped, not retried at once.
+
+**Idle unfinished runs (#263).** A run that started here and never finished
+(suspended, or whose execution stopped without a terminal transition) used to
+be protected from recovered reads forever, so a hub at `MaxRuns` holding only
+such runs refused every durable read. An unfinished run that has had no
+publication and no follower for `IdleTimeout` (10 min, at most 2 h) is now as
+recyclable by a recovered read as a closed run (`Stats.IdleRecycled`). A
+followed run never is, and a follower leaving restarts the bound. If its
+publisher later resumes it, the run is re-created behind an `evicted` gap, as
+for any eviction.
+
+**Durable and cluster runs (#263).** The cluster runtime's
+`InspectionSource` (`internal/cluster`) is an `inspection.Source` and
+`RunOwnerSource` over `store/distributed`. A run is owned by its tenant, as
+its durable run record names it; the reader never supplies the owner. By
+default a reader may look up only its own tenant's runs; an application may
+map a reader to at most 16 tenants, and `Authorize` must agree. A run is found
+only in the partition of one of those tenants and only when its record names
+that tenant, so another tenant's run is not found even in the same partition.
+Steps are the step journal's committed facts in program order: the step
+records are keyed by an operation key that digests each step's resolved
+input, so the source replays the run through the engine's journaled
+interpreter with a read-only journal that restores committed outputs, as a
+takeover does, and stops at the first step without one. That journal refuses
+every dispatch, so inspection never invokes a node and never writes. A replay
+reads at most one record per instruction and stops after one step beyond the
+requested page. The distributed store records no timestamps, so run and step
+times are zero; step input is not kept (only its digest); a step record holds
+only its current attempt; a terminal record whose input was dropped to fit
+(#265) is shown without steps.
+
+Cluster runs do not emit live inspection events (ADR 0019). A cluster run
+executes on whichever replica owns its partition, while the hub is
+process-local, so a live frame would reach only readers connected to that
+replica; the durable store is the one view every replica shares. A durable
+run also spans several engine calls (suspension, replay after takeover)
+whose per-attempt events would misreport a suspension as a failed step and a
+restored output as a fresh completion. Snapshots polled at `RecoveredPoll`
+report each committed step transition from any replica, cannot affect
+execution (they only read), and end the stream at the terminal state.
+
 **Bounds** (zero takes the default; above the hard limit `New` refuses):
 
 | Bound | Default | Hard limit | Saturation |
@@ -236,18 +292,16 @@ steps that had not yet written a journal fact are not reconstructed.
 | subscription `MaxDuration` | 30 min | 2 h | ends; client resumes from cursor |
 | heartbeat / write timeout | 15 s / 5 s | 1 min / 1 min | write timeout ends the subscription |
 | durable snapshot read / size (one per admitted reader) | 5 s / 64 KiB | 1 min / 1 MiB | no snapshot; the gap is still sent |
+| recovered follower poll `RecoveredPoll` | 2 s | 100 ms – 1 min | one durable read per tick; a failed read is skipped |
+| unfinished run idle bound `IdleTimeout` | 10 min | 2 h | past it, an unfollowed unfinished run is recyclable by a recovered read |
 
 `Hub.Close` ends every subscription (`shutdown`) and refuses new ones while
 publication continues, so stopping the stream never affects a run.
 
 **Limits.** One hub per process: a reader connected to another replica sees
-nothing from this one. Durable and cluster runs are invisible to the stream
-(#263): journaled execution (`RunJournaled`, ADR 0019, whose only caller
-writes `store/distributed`) emits no inspection events, and the only
-`inspection.Source` is `internal/journal`, which does not hold those runs, so a
-reader gets 404, with neither live frames nor a reconstruction. A followed
-recovered run that no execution in this process ever publishes stays open
-until `MaxDuration` (also #263). The engine serializes observation payloads whenever
+nothing from this one, and a cluster run is visible only through its durable
+reconstruction, at most `RecoveredPoll` late, never as live frames (#263,
+above). The engine serializes observation payloads whenever
 any observer is selected, including when the stream discards them; that costs
 CPU, not retention. Measured overhead and latency in the PR are one
 developer machine's figures, not performance claims.
@@ -307,3 +361,15 @@ the SQLite journal under the old cursor; late logs after `run.completed`, both
 from the engine's logger and from the actual Node worker; and measured run
 overhead, delivery latency, goroutine and retained-heap figures. Each guarded
 behavior was shown to fail under a deliberate mutation before it was trusted.
+
+Durable run evidence (#263): a run executed by the cluster runtime against a
+real three-voter etcd cluster, followed over real HTTP by its tenant while its
+first step was in flight, suspended at a wait and resumed by a signal, with
+each step-journal transition reconstructed and the stream ended after the
+durable run completed; a tenant in the same partition and an unknown
+principal answered 404, and a mapped reader attached the run under its
+tenant. A journal run completed with no publisher ended its follower within a
+poll interval, with bounded reads, no resent snapshot, one policy evaluation
+and no payload under default capture; a hub at `MaxRuns` with idle unfinished
+runs admitted the recovered read only past `IdleTimeout`. Each guarded
+behavior was shown to fail under a deliberate mutation.

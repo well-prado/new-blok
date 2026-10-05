@@ -1,6 +1,7 @@
 package inspect
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -30,6 +31,9 @@ const (
 	MaxEventSnapshotBytes     = 1 << 20
 	MinEventRetry             = 100 * time.Millisecond
 	MaxEventRetry             = 10 * time.Minute
+	DefaultEventRecoveredPoll = 2 * time.Second
+	MinEventRecoveredPoll     = 100 * time.Millisecond
+	MaxEventRecoveredPoll     = time.Minute
 	defaultEventSnapshotPage  = 20
 )
 
@@ -60,6 +64,14 @@ type EventHandlerConfig struct {
 	SourceTimeout time.Duration
 	// Retry is the reconnect hint sent to EventSource.
 	Retry time.Duration
+	// RecoveredPoll is how often a reader following a recovered run (one
+	// known only from Source, that no execution in this process publishes,
+	// such as a cluster run or a crashed one) re-reads it from Source. A
+	// changed reconstruction is sent as a new snapshot; a terminal one
+	// ends the stream. Each poll is one durable read, bounded by
+	// SourceTimeout, so one connection makes at most MaxDuration /
+	// RecoveredPoll of them.
+	RecoveredPoll time.Duration
 	// SnapshotBytes bounds a reconstructed snapshot.
 	SnapshotBytes int
 }
@@ -88,6 +100,7 @@ func NewEventHandler(stream *EventStream, config EventHandlerConfig) (http.Handl
 		{&config.WriteTimeout, DefaultEventWriteTimeout, 0, MaxEventWriteTimeout, "WriteTimeout"},
 		{&config.SourceTimeout, DefaultEventSourceTimeout, 0, MaxEventSourceTimeout, "SourceTimeout"},
 		{&config.Retry, DefaultEventRetry, MinEventRetry, MaxEventRetry, "Retry"},
+		{&config.RecoveredPoll, DefaultEventRecoveredPoll, MinEventRecoveredPoll, MaxEventRecoveredPoll, "RecoveredPoll"},
 	}
 	for _, bound := range bounds {
 		if *bound.value < 0 {
@@ -219,13 +232,16 @@ func (h *eventHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reque
 	}
 	session := &eventSession{writer: writer, control: control, timeout: h.cfg.WriteTimeout, seen: cursor}
 	var planned []plannedFrame
+	// sent is the last reconstruction this reader received, so a poll only
+	// sends one that changed.
+	var sent []byte
 	if replay.Gap != nil {
 		gap, _ := json.Marshal(replay.Gap)
 		planned = append(planned, plannedFrame{id: replay.GapCursor, name: event.GapName, data: gap})
 		if snapshot != nil {
-			data, err := json.Marshal(recoveredSnapshot{Source: "journal", Reconstructed: true, Page: *snapshot, Unavailable: []string{"transient transitions", "logs", "payloads the journal does not keep"}})
-			if err == nil && len(data) <= h.cfg.SnapshotBytes {
+			if data, ok := h.snapshotFrame(*snapshot); ok {
 				planned = append(planned, plannedFrame{id: replay.GapCursor, name: "snapshot", data: data})
+				sent = data
 			}
 		}
 		session.seen = replay.GapCursor
@@ -303,6 +319,15 @@ func (h *eventHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reque
 	defer lifetime.Stop()
 	heartbeat := time.NewTicker(h.cfg.Heartbeat)
 	defer heartbeat.Stop()
+	// A recovered run has no publisher that would ever end it here, so its
+	// follower watches the durable source at a bounded rate (#263). The
+	// field selection is the connection's, computed once above.
+	var poll <-chan time.Time
+	if replay.Recovered && h.cfg.Source != nil {
+		ticker := time.NewTicker(h.cfg.RecoveredPoll)
+		defer ticker.Stop()
+		poll = ticker.C
+	}
 	deliver := func(frame *event.Frame) error {
 		if name, data, ok := project(frame, fields); ok {
 			heartbeat.Reset(h.cfg.Heartbeat)
@@ -323,6 +348,54 @@ func (h *eventHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reque
 			}
 		case <-sub.Done():
 			return
+		case <-poll:
+			if !hub.Recovered(sub) {
+				// A trusted publisher claimed the run: it is live now and
+				// ends with its own terminal frame.
+				poll = nil
+				continue
+			}
+			page, err := h.snapshot(request.Context(), principal, runID, fields)
+			if err != nil {
+				// Unavailable for now; the next poll tries again, and
+				// MaxDuration still bounds the subscription.
+				continue
+			}
+			terminal := terminalStatus(page.Run.Status)
+			// The durable run is over: close the attachment, so later
+			// readers get the reconstruction and an end. If a publisher
+			// claimed the run during the read, it is live and ends with its
+			// own terminal frame instead.
+			if terminal && !hub.FinishRecovered(sub) {
+				poll = nil
+				continue
+			}
+			if data, ok := h.snapshotFrame(page); ok && !bytes.Equal(data, sent) {
+				if session.frame(plannedFrame{id: session.seen, name: "snapshot", data: data}) != nil || session.flush() != nil {
+					return
+				}
+				sent = data
+				heartbeat.Reset(h.cfg.Heartbeat)
+			}
+			if terminal {
+				// Release this reader, and hand over anything a publisher
+				// queued meanwhile before the end.
+				stopWatching()
+				hub.Unsubscribe(sub, "recovered_terminal")
+			drainRecovered:
+				for {
+					select {
+					case frame := <-sub.Events():
+						if deliver(frame) != nil {
+							return
+						}
+					default:
+						break drainRecovered
+					}
+				}
+				end()
+				return
+			}
 		case <-closeTimer:
 			// The late window has closed: stop following, then hand over
 			// everything the hub queued before it did.
@@ -449,6 +522,13 @@ type recoveredSnapshot struct {
 	Reconstructed bool            `json:"reconstructed"`
 	Page          inspection.Page `json:"page"`
 	Unavailable   []string        `json:"unavailable"`
+}
+
+// snapshotFrame encodes a reconstruction, or reports that it does not fit
+// SnapshotBytes.
+func (h *eventHandler) snapshotFrame(page inspection.Page) ([]byte, bool) {
+	data, err := json.Marshal(recoveredSnapshot{Source: "journal", Reconstructed: true, Page: page, Unavailable: []string{"transient transitions", "logs", "payloads the journal does not keep"}})
+	return data, err == nil && len(data) <= h.cfg.SnapshotBytes
 }
 
 func (h *eventHandler) snapshot(parent context.Context, principal, runID string, fields map[inspection.Field]bool) (inspection.Page, error) {
