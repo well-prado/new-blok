@@ -43,15 +43,25 @@ go build -o bin/blok ./cmd/blok
 Create a conventional Go application without a registry account or foreign runtime:
 
 ```sh
-go run ./cmd/blok new ./my-app --module example.com/my-app --name my-app --non-interactive
-cd my-app
+go run ./cmd/blok new ../my-app --module example.com/my-app --non-interactive --framework .
+cd ../my-app
 go test ./...
-go run ./cmd/my-app
+go run ./cmd/my_app
 ```
 
+The starter is a New Blok application: a typed quote node, a workflow that
+composes it through generated typed accessors, and the HTTP trigger, wired in
+`internal/app`. Post `{"sku":"coffee","quantity":2}` to
+`http://localhost:8080/quotes`. `--framework .` points the new module at this
+checkout through a `replace` directive; a `blok` installed from a published
+version depends on that version instead. `--layout unified` places the node
+under `nodes/go/` instead of `runtimes/go/nodes/`. `blok new` runs
+`go mod tidy`, so the application builds as created.
+
 The framework generator analyzes Go source without executing package
-initializers and writes only marked generated files. Repeat generation with
-`--check` to verify byte-stable output.
+initializers and writes only marked generated files. In the application,
+`blok generate` regenerates the accessors from the types file `blok.json`
+names; repeat it with `--check` to verify byte-stable output.
 
 The initial toolchain is Go 1.27.1. The first application milestone delivers a quote service that can be authored, tested and served entirely in Go. Follow the [roadmap](ROADMAP.md) for implementation order, issue dependencies, and exit evidence.
 
