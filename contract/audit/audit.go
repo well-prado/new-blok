@@ -60,13 +60,23 @@ var (
 	ErrDenied = errors.New("audit: access denied")
 	// ErrCorrupt reports a stored record that failed verification.
 	ErrCorrupt = errors.New("audit: stored record failed verification")
+	// ErrMismatch reports audit and durable state that disagree: a decision
+	// without its record, or a record without its decision.
+	ErrMismatch = errors.New("audit: audit and durable state disagree")
 )
 
 // unavailable carries the cause for diagnosis while its message stays fixed:
 // store errors never become operator-facing text.
 type unavailable struct{ cause error }
 
-func (u unavailable) Error() string    { return ErrUnavailable.Error() }
+// Error is fixed text; only a full store is named, because it needs a
+// different response (provisioning or pruning) than an outage.
+func (u unavailable) Error() string {
+	if errors.Is(u.cause, ErrCapacity) {
+		return ErrUnavailable.Error() + ": capacity exhausted"
+	}
+	return ErrUnavailable.Error()
+}
 func (u unavailable) Unwrap() []error  { return []error{ErrUnavailable, u.cause} }
 func unavailableErr(cause error) error { return unavailable{cause: cause} }
 

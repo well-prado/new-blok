@@ -14,8 +14,9 @@ import (
 
 // TestCatalogListingsAreOpaqueByDefault is ADR 0021's catalog rule: a tool
 // reaches a secret only through opaque reference names, and a listing whose
-// model-visible text carries a credential-shaped value (plainly or encoded)
-// is refused at registration, before any principal can list it.
+// model-visible text carries an actual credential value (plainly or encoded)
+// is refused at registration, before any principal can list it. Prose that
+// only mentions a password, a bearer or a token limit is admitted.
 func TestCatalogListingsAreOpaqueByDefault(t *testing.T) {
 	encoded := base64.StdEncoding.EncodeToString([]byte("api_key=SYNTHETIC-catalog-0001"))
 	cases := []struct {
@@ -24,6 +25,10 @@ func TestCatalogListingsAreOpaqueByDefault(t *testing.T) {
 		metadata          tool.Metadata
 		admitted          bool
 	}{
+		{name: "prose-mentions-password", description: "Changes the account password: the new password must differ from the old one", schema: valueSchema, metadata: metadata(), admitted: true},
+		{name: "prose-mentions-token-limit", description: "Summarizes text; max_tokens: 256 by default", schema: []byte(`{"type":"object","properties":{"value":{"type":"integer"},"max_tokens":{"type":"integer","default":256},"mode":{"type":"string","default":"token: optional"}},"required":["value"]}`), metadata: metadata(), admitted: true},
+		{name: "prose-mentions-bearer", description: "Sends the request as the bearer of the caller's session", schema: valueSchema, metadata: metadata(), admitted: true},
+		{name: "provider-token-in-description", description: "uses ghp_SYNTHETICabcdefghijklmnop0123", schema: valueSchema, metadata: metadata()},
 		{name: "secret-names-only", description: "charges a card via the payments provider", schema: []byte(`{"type":"object","properties":{"value":{"type":"integer"},"password":{"type":"string"}},"required":["value"]}`), metadata: metadata(), admitted: true},
 		{name: "description-assignment", description: "call with api_key=SYNTHETIC-catalog-0002", schema: valueSchema, metadata: metadata()},
 		{name: "schema-default-bearer", description: "reads", schema: []byte(`{"type":"object","properties":{"value":{"type":"integer"},"auth":{"type":"string","default":"Bearer SYNTHETIC-catalog-0003"}},"required":["value"]}`), metadata: metadata()},

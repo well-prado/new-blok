@@ -34,9 +34,9 @@ var ErrDenied = errors.New("agent: capability denied")
 var ErrCapacity = errors.New("agent: active invocation capacity exceeded")
 
 // ErrSensitiveListing refuses a tool whose model-visible listing (its
-// description, schema literals such as defaults, or its
-// reviewed references) carries a credential-shaped value, encoded ones
-// included (ADR 0021). Secrets reach a tool only as opaque reference names.
+// description, schema literals such as defaults, or its reviewed
+// references) carries an actual credential value, encoded ones included
+// (ADR 0021). Secrets reach a tool only as opaque reference names.
 var ErrSensitiveListing = errors.New("agent: catalog listing carries a credential-shaped value")
 
 type Listing struct {
@@ -285,17 +285,19 @@ func prepare(name, version, description string, input, output []byte, m Manifest
 	return binding{listing: l, manifest: cloneManifest(m), in: in, out: out}, nil
 }
 
-// sensitiveListing is the catalog's redaction enforcement point: everything
-// a model can read in a listing is checked once, at registration.
+// sensitiveListing is the catalog's enforcement point: everything a model
+// can read in a listing is checked once, at registration, for an actual
+// credential value (redact.Credential). Prose that merely mentions a
+// password or a token limit is a legitimate tool description and is kept.
 func sensitiveListing(description string, input, output []byte, metadata tool.Metadata) bool {
 	for _, text := range []string{description, metadata.Source, metadata.Example, metadata.Test} {
-		if redact.Sensitive(text) {
+		if redact.Credential(text) {
 			return true
 		}
 	}
 	for _, raw := range [][]byte{input, output} {
 		value, err := decode(raw)
-		if err != nil || redact.HasSensitiveValue(value) {
+		if err != nil || redact.HasCredentialValue(value) {
 			return true
 		}
 	}

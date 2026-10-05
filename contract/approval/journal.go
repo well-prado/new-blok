@@ -100,6 +100,7 @@ func (s *JournalStore) Record(ctx context.Context, id string, p Proposal, grant 
 		return Decision{}, ErrCapacity
 	}
 	var record audit.Record
+	inserted := false
 	err = s.database.WithTx(store.Writer(ctx), func(tx *sql.Tx) error {
 		// Reserve the write lock before reading limits or detecting duplicates;
 		// concurrent writers cannot both consume the last capacity slot.
@@ -121,7 +122,7 @@ func (s *JournalStore) Record(ctx context.Context, id string, p Proposal, grant 
 			d = existing
 			// A retried decision writes the same record: a no-op when it
 			// exists, and the missing record when an earlier store lacked it.
-			record, err = s.audit.Append(ctx, tx, decisionRecord(ctx, d, p))
+			record, inserted, err = s.audit.Append(ctx, tx, decisionRecord(ctx, d, p))
 			return err
 		}
 		if !errors.Is(err, sql.ErrNoRows) {
@@ -137,14 +138,38 @@ func (s *JournalStore) Record(ctx context.Context, id string, p Proposal, grant 
 		if _, err = tx.ExecContext(ctx, `INSERT INTO approval_decisions_v1 (id,decision,proposal,binding,recorded_at) VALUES (?,?,?,?,?)`, id, encoded, proposalJSON, digest, now.Format(time.RFC3339Nano)); err != nil {
 			return err
 		}
-		record, err = s.audit.Append(ctx, tx, decisionRecord(ctx, d, p))
+		record, inserted, err = s.audit.Append(ctx, tx, decisionRecord(ctx, d, p))
 		return err
 	})
 	if err != nil {
 		return Decision{}, err
 	}
-	s.audit.Notify(record)
+	if inserted {
+		s.audit.Notify(record)
+	}
 	return d, nil
+}
+
+// AuditKind and AuditedIDs make the store an audit.Owner: every recorded
+// decision requires its approval record, which audit.Journal.Verify checks.
+func (s *JournalStore) AuditKind() audit.Kind { return audit.KindApproval }
+
+func (s *JournalStore) AuditedIDs(ctx context.Context, tx *sql.Tx, fn func(string) error) error {
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM approval_decisions_v1 ORDER BY id`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		if err := fn("approval:" + id); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
 }
 
 // decisionRecord is the audit form of a decision: the authenticated reviewer,

@@ -42,27 +42,68 @@ const (
 	minBase64Bytes = 12
 )
 
-var sensitiveKeyMarkers = []string{"password", "passwd", "secret", "token", "authorization", "credential", "apikey", "privatekey", "cookie", "sessionid"}
+var sensitiveKeyMarkers = []string{"password", "passwd", "pwd", "passphrase", "secret", "token", "authorization", "credential", "apikey", "privatekey", "cookie", "sessionid"}
+
+// tokenCountSuffixes name counts and limits of model tokens, not tokens:
+// "total_tokens", "maxTokens", "token_count", "tokenLimit".
+var tokenCountSuffixes = []string{"tokens", "tokencount", "tokenlimit", "tokenbudget", "tokenusage"}
 
 // Key reports whether a structured key names sensitive content. Case and the
 // separators '_', '-' and '.' are ignored, so "api_key", "API-Key" and
-// "client.secret" all match.
+// "client.secret" all match. A token count or limit ("usage.total_tokens",
+// "max_tokens") is not a token and is not matched by "token" alone.
 func Key(key string) bool {
 	key = strings.ToLower(strings.NewReplacer("_", "", "-", "", ".", "").Replace(key))
 	for _, marker := range sensitiveKeyMarkers {
-		if strings.Contains(key, marker) {
+		if !strings.Contains(key, marker) {
+			continue
+		}
+		if marker == "token" && tokenCount(key) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func tokenCount(key string) bool {
+	for _, suffix := range tokenCountSuffixes {
+		if strings.HasSuffix(key, suffix) {
 			return true
 		}
 	}
 	return false
 }
 
-// Sensitive reports whether text is credential-shaped as written or after up
-// to MaxDecodeDepth bounded decodings.
-func Sensitive(text string) bool { return sensitive(text, MaxDecodeDepth) }
+// mode selects the predicate: broad for redacting projected copies, strict
+// for refusing content (a credential value, not a sensitive word).
+type mode bool
 
-func sensitive(text string, depth int) bool {
-	if observe.SensitiveText(text) || basicCredential(text) {
+const (
+	broad  mode = false
+	strict mode = true
+)
+
+func (m mode) text(text string) bool {
+	if m == strict {
+		return observe.CredentialText(text)
+	}
+	return observe.SensitiveText(text)
+}
+
+// Sensitive reports whether text is credential-shaped as written or after up
+// to MaxDecodeDepth bounded decodings. It is broad: use it to redact.
+func Sensitive(text string) bool { return sensitive(text, MaxDecodeDepth, broad) }
+
+// Credential reports whether text holds an actual credential value, plainly
+// or after the same bounded decodings: a credential shape, or a generated-
+// looking value after a sensitive key ("api_key=k3y..."), never a sensitive
+// word in prose ("password: the new password", "max_tokens: 256"). Use it to
+// refuse content at a boundary such as catalog registration.
+func Credential(text string) bool { return sensitive(text, MaxDecodeDepth, strict) }
+
+func sensitive(text string, depth int, m mode) bool {
+	if m.text(text) || basicCredential(text) {
 		return true
 	}
 	if depth == 0 || len(text) > MaxDecodeBytes {
@@ -70,17 +111,17 @@ func sensitive(text string, depth int) bool {
 	}
 	trimmed := strings.TrimSpace(text)
 	if len(trimmed) >= 2 && (trimmed[0] == '{' || trimmed[0] == '[' || trimmed[0] == '"') {
-		if value, err := decode([]byte(trimmed)); err == nil && containsSensitive(value, depth-1, 0) {
+		if value, err := decode([]byte(trimmed)); err == nil && containsSensitive(value, depth-1, 0, m) {
 			return true
 		}
 	}
 	if strings.Contains(text, "%") {
-		if decoded, ok := percentDecode(text); ok && sensitive(decoded, depth-1) {
+		if decoded, ok := percentDecode(text); ok && sensitive(decoded, depth-1, m) {
 			return true
 		}
 	}
 	for _, token := range base64Candidates(trimmed) {
-		if decoded, ok := decodeBase64(token); ok && sensitive(decoded, depth-1) {
+		if decoded, ok := decodeBase64(token); ok && sensitive(decoded, depth-1, m) {
 			return true
 		}
 	}
@@ -145,13 +186,18 @@ func base64Candidates(text string) []string {
 	tokens := strings.FieldsFunc(text, func(r rune) bool {
 		return unicode.IsSpace(r) || r == '&' || r == '?' || r == ',' || r == ';' || r == '"' || r == '\''
 	})
-	out := tokens[:0]
+	var out []string
 	for _, token := range tokens {
-		if eq := strings.IndexByte(token, '='); eq > 0 && eq < len(token)-1 && !strings.HasSuffix(token, "=") {
-			token = token[eq+1:] // a key=value pair: decode the value
-		}
 		if len(token) >= minBase64Bytes {
 			out = append(out, token)
+		}
+		// A key=value pair: also decode the value, padding included. Base64
+		// has '=' only as trailing padding, so a first '=' followed by
+		// anything other than padding separates a key from its value.
+		if eq := strings.IndexByte(token, '='); eq > 0 && strings.Trim(token[eq:], "=") != "" {
+			if value := token[eq+1:]; len(value) >= minBase64Bytes {
+				out = append(out, value)
+			}
 		}
 	}
 	return out
@@ -198,53 +244,66 @@ func printable(data []byte) bool {
 	return ok*10 >= total*9
 }
 
-func containsSensitive(value any, depth, level int) bool {
+func containsSensitive(value any, depth, level int, m mode) bool {
 	if level > maxValueDepth {
 		return true
 	}
 	switch item := value.(type) {
 	case map[string]any:
 		for key, child := range item {
-			if Key(key) || sensitive(key, 0) || containsSensitive(child, depth, level+1) {
+			if sensitive(key, 0, m) || containsSensitive(child, depth, level+1, m) {
 				return true
+			}
+			if Key(key) {
+				// Broad: a sensitive key hides any value. Strict: only a
+				// value that is itself credential-looking.
+				text, isText := child.(string)
+				if m == broad || isText && observe.LooksSecret(text) {
+					return true
+				}
 			}
 		}
 	case []any:
 		for _, child := range item {
-			if containsSensitive(child, depth, level+1) {
+			if containsSensitive(child, depth, level+1, m) {
 				return true
 			}
 		}
 	case string:
-		return sensitive(item, depth)
+		return sensitive(item, depth, m)
 	}
 	return false
 }
 
 // HasSensitiveValue reports whether any string value inside a decoded JSON
-// value is credential-shaped. Keys are names here, not secrets: a schema
-// property called "password" is legitimate, a default of "Bearer ..." is not.
-func HasSensitiveValue(value any) bool { return hasSensitiveValue(value, 0) }
+// value is credential-shaped (broad). Keys are names here, not secrets: a
+// schema property called "password" is legitimate, a default of
+// "Bearer ..." is not.
+func HasSensitiveValue(value any) bool { return hasValue(value, 0, broad) }
 
-func hasSensitiveValue(value any, level int) bool {
+// HasCredentialValue is HasSensitiveValue with the strict Credential
+// predicate, for refusing content.
+func HasCredentialValue(value any) bool { return hasValue(value, 0, strict) }
+
+func hasValue(value any, level int, m mode) bool {
 	if level > maxValueDepth {
 		return true
 	}
 	switch item := value.(type) {
 	case map[string]any:
 		for _, child := range item {
-			if hasSensitiveValue(child, level+1) {
+			if hasValue(child, level+1, m) {
 				return true
 			}
 		}
 	case []any:
 		for _, child := range item {
-			if hasSensitiveValue(child, level+1) {
+			if hasValue(child, level+1, m) {
 				return true
 			}
 		}
 	case string:
-		return Sensitive(item)
+		return sensitive(item, MaxDecodeDepth, m)
 	}
 	return false
 }

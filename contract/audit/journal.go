@@ -38,15 +38,20 @@ type Config struct {
 // owned tables never modify another component's tables; owners write
 // records inside their own transactions on the same database.
 type Journal struct {
-	database store.Database
-	cfg      Config
-	mirrored atomic.Uint64
-	dropped  atomic.Uint64
+	database        store.Database
+	cfg             Config
+	mirrored        atomic.Uint64
+	dropped         atomic.Uint64
+	refused         atomic.Uint64
+	refusedCapacity atomic.Uint64
 }
 
-// Stats reports optional mirror delivery. Durable records are counted by the
-// store, never by these counters.
-type Stats struct{ Mirrored, MirrorDropped uint64 }
+// Stats reports optional mirror delivery and refused appends. Durable
+// records are counted by the store, never by these counters. Refused counts
+// every append that returned ErrUnavailable (so its decision was refused);
+// RefusedCapacity is the subset caused by a full store, which needs
+// provisioning or pruning rather than an outage response.
+type Stats struct{ Mirrored, MirrorDropped, Refused, RefusedCapacity uint64 }
 
 // NewJournal creates the audit tables if needed. It refuses a configuration
 // without a capacity bound or a read authorizer.
@@ -68,13 +73,18 @@ func NewJournal(ctx context.Context, database store.Database, cfg Config) (*Jour
 				id TEXT NOT NULL UNIQUE,
 				kind TEXT NOT NULL,
 				tenant TEXT NOT NULL,
+				tenant_seq INTEGER NOT NULL,
 				run_id TEXT NOT NULL,
 				recorded_at INTEGER NOT NULL,
 				record BLOB NOT NULL CHECK(length(record) <= 16384),
-				digest TEXT NOT NULL)`,
-			`CREATE INDEX IF NOT EXISTS audit_records_v1_tenant ON audit_records_v1(tenant, seq)`,
+				digest TEXT NOT NULL,
+				UNIQUE(tenant, tenant_seq))`,
 			`CREATE INDEX IF NOT EXISTS audit_records_v1_time ON audit_records_v1(recorded_at, seq)`,
+			`CREATE INDEX IF NOT EXISTS audit_records_v1_kind ON audit_records_v1(kind, id)`,
 			`CREATE TABLE IF NOT EXISTS audit_meta_v1 (name TEXT PRIMARY KEY, value INTEGER NOT NULL)`,
+			// A pruned record leaves its id, so Verify can tell a pruned
+			// record from a missing one.
+			`CREATE TABLE IF NOT EXISTS audit_pruned_v1 (id TEXT PRIMARY KEY, kind TEXT NOT NULL, pruned_at INTEGER NOT NULL)`,
 			`INSERT INTO audit_meta_v1 (name, value) SELECT 'records', COUNT(*) FROM audit_records_v1 WHERE true ON CONFLICT(name) DO NOTHING`,
 		} {
 			if _, err := tx.ExecContext(ctx, statement); err != nil {
@@ -98,51 +108,71 @@ func (j *Journal) Shares(database store.Database) bool {
 
 // Append writes r inside tx, the transaction of the decision it records:
 // both commit or neither does. A record without a time is stamped. The
-// same record appended again is a no-op; a different record under the same
-// id is ErrConflict. Every store failure is ErrUnavailable, and the caller
-// must return it so its transaction rolls back.
-func (j *Journal) Append(ctx context.Context, tx *sql.Tx, r Record) (Record, error) {
+// same record appended again is a no-op (inserted is false); a different
+// record under the same id is ErrConflict. Every store failure is
+// ErrUnavailable, and the caller must return it so its transaction rolls
+// back. Owners pass the record to Notify after commit only when inserted, so
+// a retried decision is not mirrored twice.
+func (j *Journal) Append(ctx context.Context, tx *sql.Tx, r Record) (record Record, inserted bool, err error) {
 	if j == nil || tx == nil {
-		return Record{}, ErrRequired
+		return Record{}, false, ErrRequired
 	}
+	defer func() {
+		if errors.Is(err, ErrUnavailable) {
+			j.refused.Add(1)
+			if errors.Is(err, ErrCapacity) {
+				j.refusedCapacity.Add(1)
+			}
+		}
+	}()
 	if r.At.IsZero() {
 		r.At = j.cfg.Clock()
 	}
 	r.At = r.At.UTC()
 	r = clone(r)
 	if err := r.Validate(); err != nil {
-		return Record{}, err
+		return Record{}, false, err
 	}
 	encoded, err := r.encode()
 	if err != nil {
-		return Record{}, ErrInvalid
+		return Record{}, false, ErrInvalid
 	}
 	var existing []byte
 	err = tx.QueryRowContext(ctx, `SELECT record FROM audit_records_v1 WHERE id = ?`, r.ID).Scan(&existing)
 	switch {
 	case err == nil:
 		if !bytes.Equal(existing, encoded) {
-			return Record{}, ErrConflict
+			return Record{}, false, ErrConflict
 		}
-		return r, nil
+		return r, false, nil
 	case !errors.Is(err, sql.ErrNoRows):
-		return Record{}, unavailableErr(err)
+		return Record{}, false, unavailableErr(err)
 	}
 	var count int
 	if err := tx.QueryRowContext(ctx, `SELECT value FROM audit_meta_v1 WHERE name = 'records'`).Scan(&count); err != nil {
-		return Record{}, unavailableErr(err)
+		return Record{}, false, unavailableErr(err)
 	}
 	if count >= j.cfg.MaxRecords {
-		return Record{}, unavailableErr(ErrCapacity)
+		return Record{}, false, unavailableErr(ErrCapacity)
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO audit_records_v1 (id, kind, tenant, run_id, recorded_at, record, digest) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		r.ID, string(r.Kind), r.Tenant, r.RunID, r.At.UnixNano(), encoded, Digest(encoded)); err != nil {
-		return Record{}, unavailableErr(err)
+	// Each tenant has its own monotonic sequence, so a reader's cursor
+	// reveals nothing about other tenants' write volume.
+	counter := "tenant:" + r.Tenant
+	if _, err := tx.ExecContext(ctx, `INSERT INTO audit_meta_v1 (name, value) VALUES (?, 1) ON CONFLICT(name) DO UPDATE SET value = value + 1`, counter); err != nil {
+		return Record{}, false, unavailableErr(err)
+	}
+	var tenantSeq int64
+	if err := tx.QueryRowContext(ctx, `SELECT value FROM audit_meta_v1 WHERE name = ?`, counter).Scan(&tenantSeq); err != nil {
+		return Record{}, false, unavailableErr(err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO audit_records_v1 (id, kind, tenant, tenant_seq, run_id, recorded_at, record, digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.ID, string(r.Kind), r.Tenant, tenantSeq, r.RunID, r.At.UnixNano(), encoded, Digest(encoded)); err != nil {
+		return Record{}, false, unavailableErr(err)
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE audit_meta_v1 SET value = value + 1 WHERE name = 'records'`); err != nil {
-		return Record{}, unavailableErr(err)
+		return Record{}, false, unavailableErr(err)
 	}
-	return r, nil
+	return r, true, nil
 }
 
 // Notify offers committed records to the optional Mirror. Owners call it
@@ -175,13 +205,14 @@ func (j *Journal) Stats() Stats {
 	if j == nil {
 		return Stats{}
 	}
-	return Stats{Mirrored: j.mirrored.Load(), MirrorDropped: j.dropped.Load()}
+	return Stats{Mirrored: j.mirrored.Load(), MirrorDropped: j.dropped.Load(), Refused: j.refused.Load(), RefusedCapacity: j.refusedCapacity.Load()}
 }
 
 // List returns one tenant's records in commit order after cursor ("" is the
 // beginning), at most limit (capped at MaxPage). The reader is authorized
 // before anything is read; an unauthorized reader gets ErrDenied and no
 // records. Every returned record is verified against its stored digest.
+// The cursor is the tenant's own sequence number, not a store-wide one.
 func (j *Journal) List(ctx context.Context, tenant, cursor string, limit int) ([]Record, string, error) {
 	if j == nil {
 		return nil, "", ErrRequired
@@ -206,7 +237,7 @@ func (j *Journal) List(ctx context.Context, tenant, cursor string, limit int) ([
 	var out []Record
 	next := ""
 	err := j.database.WithTx(ctx, func(tx *sql.Tx) error {
-		rows, err := tx.QueryContext(ctx, `SELECT seq, id, kind, tenant, run_id, record, digest FROM audit_records_v1 WHERE tenant = ? AND seq > ? ORDER BY seq LIMIT ?`, tenant, after, limit+1)
+		rows, err := tx.QueryContext(ctx, `SELECT tenant_seq, id, kind, tenant, run_id, record, digest FROM audit_records_v1 WHERE tenant = ? AND tenant_seq > ? ORDER BY tenant_seq LIMIT ?`, tenant, after, limit+1)
 		if err != nil {
 			return err
 		}
@@ -232,10 +263,26 @@ func (j *Journal) List(ctx context.Context, tenant, cursor string, limit int) ([
 	return out, next, nil
 }
 
+// Owner is a component whose durable decisions each require an audit
+// record. Verify cross-checks it: every decision it lists must have its
+// record (or a tombstone from Prune), and every record of its kind must
+// name a decision it still has.
+type Owner interface {
+	AuditKind() Kind
+	// AuditedIDs calls fn with the audit record id of each durable decision,
+	// read in tx.
+	AuditedIDs(ctx context.Context, tx *sql.Tx, fn func(id string) error) error
+}
+
 // Verify reads every record and checks it against its digest, its indexed
-// columns and the record count. Run it after a restore: a restored store
-// with a damaged or partial audit table fails with ErrCorrupt.
-func (j *Journal) Verify(ctx context.Context) (int, error) {
+// columns and the record count (ErrCorrupt), then cross-checks each owner's
+// durable decisions against the records (ErrMismatch): a decision without
+// its record or tombstone, or a record naming a decision the owner does not
+// have. Run it after a restore with every owner composed on the store.
+// Records of a kind no owner is passed for (deployment decisions have no
+// owner table) are integrity-checked only. It holds one read transaction
+// and, per owner, a set of its decision ids in memory.
+func (j *Journal) Verify(ctx context.Context, owners ...Owner) (int, error) {
 	if j == nil {
 		return 0, ErrRequired
 	}
@@ -262,13 +309,57 @@ func (j *Journal) Verify(ctx context.Context) (int, error) {
 		if count != verified {
 			return ErrCorrupt
 		}
+		for _, owner := range owners {
+			if err := crossCheck(ctx, tx, owner); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	return verified, err
 }
 
+func crossCheck(ctx context.Context, tx *sql.Tx, owner Owner) error {
+	kind := owner.AuditKind()
+	decisions := map[string]bool{}
+	err := owner.AuditedIDs(ctx, tx, func(id string) error {
+		decisions[id] = true
+		var found int
+		if err := tx.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM audit_records_v1 WHERE id = ? AND kind = ?) + (SELECT COUNT(*) FROM audit_pruned_v1 WHERE id = ? AND kind = ?)`, id, string(kind), id, string(kind)).Scan(&found); err != nil {
+			return err
+		}
+		if found == 0 {
+			return ErrMismatch
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM audit_records_v1 WHERE kind = ?`, string(kind))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		if !decisions[id] {
+			return ErrMismatch
+		}
+	}
+	return rows.Err()
+}
+
 type scanner interface{ Scan(...any) error }
 
+// scanVerified checks a stored record's integrity only: digest, decodable
+// shape, indexed columns and canonical encoding. It deliberately does not
+// re-run Validate: the sensitivity heuristic and bounds may change between
+// releases, and a record accepted under an older rule must stay readable,
+// listable and prunable rather than lock every reader out.
 func scanVerified(row scanner) (int64, Record, error) {
 	var seq int64
 	var id, kind, tenant, runID, digest string
@@ -280,7 +371,7 @@ func scanVerified(row scanner) (int64, Record, error) {
 		return 0, Record{}, ErrCorrupt
 	}
 	var r Record
-	if err := json.Unmarshal(encoded, &r); err != nil || r.Validate() != nil || r.ID != id || string(r.Kind) != kind || r.Tenant != tenant || r.RunID != runID {
+	if err := json.Unmarshal(encoded, &r); err != nil || r.ID == "" || r.At.IsZero() || r.ID != id || string(r.Kind) != kind || r.Tenant != tenant || r.RunID != runID {
 		return 0, Record{}, ErrCorrupt
 	}
 	if again, err := r.encode(); err != nil || !bytes.Equal(again, encoded) {
@@ -303,9 +394,11 @@ type PruneReport struct {
 	KeptHeld   int
 }
 
-// Prune deletes records committed before cutoff, never one younger than
-// Config.MinRetention, never one whose run activity reports active, and
-// never one the application's Hold keeps. activity is required: without it
+// Prune deletes records committed strictly before cutoff, never one younger
+// than Config.MinRetention, never one whose run activity reports active (an
+// activity port must report a run it cannot prove ended as active), and
+// never one the application's Hold keeps; it leaves each deleted record's id
+// as a tombstone for Verify. activity is required: without it
 // a run's state is unknown, so nothing is deleted. Each batch is its own
 // bounded transaction; a failure leaves earlier batches committed and
 // deletes nothing in the failed one.
@@ -386,6 +479,9 @@ func (j *Journal) pruneBatch(ctx context.Context, cutoff, after int64, activity 
 				continue
 			}
 			if _, err := tx.ExecContext(ctx, `DELETE FROM audit_records_v1 WHERE seq = ?`, item.seq); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO audit_pruned_v1 (id, kind, pruned_at) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET pruned_at = excluded.pruned_at`, item.record.ID, string(item.record.Kind), j.cfg.Clock().UTC().UnixNano()); err != nil {
 				return err
 			}
 			report.Removed++

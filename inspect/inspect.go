@@ -466,9 +466,25 @@ func boundedProjectionPolicy(policy inspection.Policy, stepCount, attemptCount, 
 	return policy, nil
 }
 
+// maxRedactedPayloadBytes caps the redaction work one projected payload may
+// cost. Redaction decodes and pattern-matches every string (measured at up
+// to ~250 us per KiB of marker-dense text), so a payload larger than twice
+// its slot or than this cap is truncated without being decoded or redacted.
+// A payload whose redacted form would have fit (redaction can shrink a long
+// secret to the marker) is then truncated too: the safe direction. Work per
+// page is therefore bounded by about twice the response limit.
+const maxRedactedPayloadBytes = 128 << 10
+
 func bound(raw json.RawMessage, maxBytes int) json.RawMessage {
 	if len(raw) == 0 {
 		return nil
+	}
+	if maxBytes <= 0 || maxBytes > 1<<20 {
+		maxBytes = 64 << 10
+	}
+	if len(raw) > min(2*maxBytes, maxRedactedPayloadBytes) {
+		encoded, _ := json.Marshal(map[string]any{"$truncated": true, "originalBytes": len(raw)})
+		return encoded
 	}
 	value, err := decode(raw)
 	if err != nil {
@@ -478,9 +494,6 @@ func bound(raw json.RawMessage, maxBytes int) json.RawMessage {
 	encoded, err := json.Marshal(value)
 	if err != nil {
 		return json.RawMessage(`"[redacted: unencodable payload]"`)
-	}
-	if maxBytes <= 0 || maxBytes > 1<<20 {
-		maxBytes = 64 << 10
 	}
 	if len(encoded) > maxBytes {
 		encoded, _ = json.Marshal(map[string]any{"$truncated": true, "originalBytes": len(encoded)})

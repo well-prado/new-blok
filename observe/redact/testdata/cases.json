@@ -294,6 +294,182 @@
       "input": "quote calculated for 2 items",
       "expected": "quote calculated for 2 items",
       "redacted": 0
+    },
+    {
+      "name": "padded-base64-in-key-value",
+      "kind": "value",
+      "input": {
+        "d": "data=cGFzc3dvcmQ9U1lOVEhFVElDLXBhZC0wMQ=="
+      },
+      "expected": {
+        "d": "[redacted]"
+      },
+      "redacted": 1
+    },
+    {
+      "name": "padded-base64-percent-encoded-query-value",
+      "kind": "value",
+      "input": {
+        "link": "https://example.test/cb?state=c2VjcmV0PVNZTlRIRVRJQy1xMg%3D%3D&x=1"
+      },
+      "expected": {
+        "link": "[redacted]"
+      },
+      "redacted": 1
+    },
+    {
+      "name": "base64url-alphabet",
+      "kind": "value",
+      "input": {
+        "blob": "dG9rZW49U1lOVEhFVElDLXVybC0xfn4_"
+      },
+      "expected": {
+        "blob": "[redacted]"
+      },
+      "redacted": 1
+    },
+    {
+      "name": "triple-base64",
+      "kind": "value",
+      "input": {
+        "blob": "WkVjNWNscFhORGxWTVd4UFZrVm9SbFpGYkVSTVdGSjVZVmhDYzFwVE1IZE5VVDA5"
+      },
+      "expected": {
+        "blob": "[redacted]"
+      },
+      "redacted": 1
+    },
+    {
+      "name": "plus-decoded-as-space",
+      "kind": "value",
+      "input": {
+        "q": "password+%3D+SYNTHETIC-plus-01"
+      },
+      "expected": {
+        "q": "[redacted]"
+      },
+      "redacted": 1
+    },
+    {
+      "name": "cookie-header-text",
+      "kind": "value",
+      "input": {
+        "h": "Cookie: sid=SYNTHETIC-cookie-01",
+        "s": "Set-Cookie: session=SYNTHETIC-cookie-02; Path=/",
+        "t": "sessionid=SYNTHETIC-sess-03"
+      },
+      "expected": {
+        "h": "[redacted]",
+        "s": "[redacted]",
+        "t": "[redacted]"
+      },
+      "redacted": 3
+    },
+    {
+      "name": "pwd-and-passphrase-keys",
+      "kind": "value",
+      "input": {
+        "pwd": "SYNTHETIC-pwd-01",
+        "key_passphrase": "SYNTHETIC-pp-02",
+        "note": "ops pwd=SYNTHETIC-pwd-03"
+      },
+      "expected": {
+        "pwd": "[redacted]",
+        "key_passphrase": "[redacted]",
+        "note": "[redacted]"
+      },
+      "redacted": 3
+    },
+    {
+      "name": "provider-token-prefixes",
+      "kind": "value",
+      "input": {
+        "gh": "ghp_SYNTHETICabcdefghijklmnop0123",
+        "oa": "sk-SYNTHETICabcdefghij0123",
+        "sl": "xoxb-SYNTHETIC-0123456789"
+      },
+      "expected": {
+        "gh": "[redacted]",
+        "oa": "[redacted]",
+        "sl": "[redacted]"
+      },
+      "redacted": 3
+    },
+    {
+      "name": "escaped-json-in-prose",
+      "kind": "value",
+      "input": {
+        "note": "body={\\\"password\\\":\\\"SYNTHETIC-esc-01\\\"}"
+      },
+      "expected": {
+        "note": "[redacted]"
+      },
+      "redacted": 1
+    },
+    {
+      "name": "xml-element",
+      "kind": "value",
+      "input": {
+        "note": "<user>a</user><password>SYNTHETIC-xml-01</password>"
+      },
+      "expected": {
+        "note": "[redacted]"
+      },
+      "redacted": 1
+    },
+    {
+      "name": "token-counts-are-not-tokens",
+      "kind": "value",
+      "input": {
+        "usage": {
+          "total_tokens": 1234,
+          "prompt_tokens": 1000
+        },
+        "max_tokens": 256,
+        "tokenLimit": 4096,
+        "note": "max_tokens: 256 by default"
+      },
+      "expected": {
+        "usage": {
+          "total_tokens": 1234,
+          "prompt_tokens": 1000
+        },
+        "max_tokens": 256,
+        "tokenLimit": 4096,
+        "note": "max_tokens: 256 by default"
+      },
+      "redacted": 0
+    },
+    {
+      "name": "boundary-unicode-escaped-json-after-prefix-not-detected",
+      "kind": "value",
+      "boundary": true,
+      "input": {
+        "note": "body={\"pass\\u0077ord\":\"SYNTHETIC-uesc-01\"}"
+      },
+      "expected": {
+        "note": "body={\"pass\\u0077ord\":\"SYNTHETIC-uesc-01\"}"
+      },
+      "redacted": 0
+    },
+    {
+      "name": "boundary-gzip-base64-not-detected",
+      "kind": "value",
+      "boundary": true,
+      "input": {
+        "blob": "H4sIAAAAAAAC/ytILC4uzy9KsQ2O9AvxcA3xdNZNr8os0DUwBADbuEkZGgAAAA=="
+      },
+      "expected": {
+        "blob": "H4sIAAAAAAAC/ytILC4uzy9KsQ2O9AvxcA3xdNZNr8os0DUwBADbuEkZGgAAAA=="
+      },
+      "redacted": 0
+    },
+    {
+      "name": "message-token-count-kept",
+      "kind": "message",
+      "input": "request used max_tokens: 256",
+      "expected": "request used max_tokens: 256",
+      "redacted": 0
     }
   ]
 }

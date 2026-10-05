@@ -202,7 +202,7 @@ func (r *rig) repairAudit() {
 func (r *rig) seedAudit(record audit.Record) {
 	r.t.Helper()
 	if err := r.db.WithTx(r.ctx, func(tx *sql.Tx) error {
-		_, err := r.audit.Append(r.ctx, tx, record)
+		_, _, err := r.audit.Append(r.ctx, tx, record)
 		return err
 	}); err != nil {
 		r.t.Fatal(err)
@@ -388,7 +388,7 @@ func TestAuditDecisionFixtures(t *testing.T) {
 				t.Fatalf("audit stored a secret-shaped or raw value: %s", leaked)
 			}
 			if r.audit != nil {
-				if _, err := r.audit.Verify(r.ctx); err != nil {
+				if _, err := r.audit.Verify(r.ctx, r.approval, r.journal); err != nil {
 					t.Fatalf("verify: %v", err)
 				}
 			}
@@ -457,7 +457,7 @@ func TestOptionalMirrorDropCannotRemoveAudit(t *testing.T) {
 			}
 		}
 		durable := r.count(`SELECT COUNT(*) FROM audit_records_v1`)
-		verified, err := r.audit.Verify(r.ctx)
+		verified, err := r.audit.Verify(r.ctx, r.approval, r.journal)
 		stats := r.audit.Stats()
 		wantMirrored := uint64(1)
 		if panics {
@@ -617,7 +617,7 @@ func TestRestoreAuditWithDurableState(t *testing.T) {
 		t.Fatal(err)
 	}
 	restored := openRig(t, restoredPath, rigOptions{})
-	verified, err := restored.audit.Verify(restored.ctx)
+	verified, err := restored.audit.Verify(restored.ctx, restored.approval, restored.journal)
 	if err != nil || verified != 3 {
 		t.Fatalf("restored audit verified=%d err=%v; want 3", verified, err)
 	}
@@ -644,6 +644,19 @@ func TestRestoreAuditWithDurableState(t *testing.T) {
 	}
 	if restored.count(`SELECT COUNT(*) FROM journal_operations WHERE operation_key = ? AND state = 'uncertain'`, later.Key) != 0 {
 		t.Fatal("an operation from after the backup exists in the restored store")
+	}
+	// A restored store whose audit lost a record is detected, not trusted.
+	if err := restored.db.WithTx(restored.ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(restored.ctx, `DELETE FROM audit_records_v1 WHERE kind = 'approval.decision'`); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(restored.ctx, `UPDATE audit_meta_v1 SET value = value - 1 WHERE name = 'records'`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restored.audit.Verify(restored.ctx, restored.approval, restored.journal); !errors.Is(err, audit.ErrMismatch) {
+		t.Fatalf("restored audit missing a decision's record verified: %v", err)
 	}
 	// A damaged restored audit table is detected, not trusted.
 	if err := restored.db.WithTx(restored.ctx, func(tx *sql.Tx) error {

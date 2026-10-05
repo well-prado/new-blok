@@ -111,49 +111,88 @@ func (j *Journal) Reconcile(ctx context.Context, operationKey, actor, evidence s
 func (j *Journal) reconcileOnce(ctx context.Context, operationKey, actor, evidence string, result json.RawMessage) (Reconciliation, audit.Record, error) {
 	var reconciliation Reconciliation
 	var record audit.Record
+	inserted := false
 	err := j.withTx(ctx, "reconcile", func(tx *sql.Tx) error {
 		var existing Reconciliation
 		var existingResult []byte
-		err := tx.QueryRowContext(ctx, `SELECT operation_key, actor, evidence, result_json, state FROM journal_reconciliations WHERE operation_key = ?`, operationKey).Scan(&existing.OperationKey, &existing.Actor, &existing.Evidence, &existingResult, &existing.State)
+		var createdAt int64
+		var runID string
+		err := tx.QueryRowContext(ctx, `SELECT r.operation_key, r.actor, r.evidence, r.result_json, r.state, r.created_at, o.run_id FROM journal_reconciliations r JOIN journal_operations o ON o.operation_key = r.operation_key WHERE r.operation_key = ?`, operationKey).Scan(&existing.OperationKey, &existing.Actor, &existing.Evidence, &existingResult, &existing.State, &createdAt, &runID)
 		if err == nil {
 			existing.Result = append([]byte(nil), existingResult...)
 			existing.Duplicate = true
 			reconciliation = existing
-			return nil
+			// A re-delivered reconciliation writes the record the original
+			// one wrote: a no-op when it exists, the missing record when the
+			// original predates audit.
+			record, inserted, err = j.audit.Append(ctx, tx, reconciliationRecord(ctx, existing.OperationKey, existing.Actor, existing.Evidence, existing.Result, runID, createdAt))
+			return err
 		}
 		if !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
-		var state, attemptID, runID string
+		var state, attemptID string
 		if err := tx.QueryRowContext(ctx, `SELECT state, current_attempt_id, run_id FROM journal_operations WHERE operation_key = ?`, operationKey).Scan(&state, &attemptID, &runID); err != nil {
 			return err
 		}
 		if state != operationUncertain {
 			return ErrNotReconciliable
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO journal_reconciliations (operation_key, actor, evidence, result_json, state, created_at) VALUES (?, ?, ?, ?, ?, ?)`, operationKey, actor, evidence, []byte(result), operationCommitted, j.now()); err != nil {
+		now := j.now()
+		if _, err := tx.ExecContext(ctx, `INSERT INTO journal_reconciliations (operation_key, actor, evidence, result_json, state, created_at) VALUES (?, ?, ?, ?, ?, ?)`, operationKey, actor, evidence, []byte(result), operationCommitted, now); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE journal_attempts SET state = ?, result_json = ?, finished_at = ? WHERE attempt_id = ? AND operation_key = ? AND state = ?`, attemptCommitted, []byte(result), j.now(), attemptID, operationKey, attemptUncertain); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE journal_attempts SET state = ?, result_json = ?, finished_at = ? WHERE attempt_id = ? AND operation_key = ? AND state = ?`, attemptCommitted, []byte(result), now, attemptID, operationKey, attemptUncertain); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE journal_operations SET state = ?, result_json = ?, updated_at = ? WHERE operation_key = ? AND state = ?`, operationCommitted, []byte(result), j.now(), operationKey, operationUncertain); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE journal_operations SET state = ?, result_json = ?, updated_at = ? WHERE operation_key = ? AND state = ?`, operationCommitted, []byte(result), now, operationKey, operationUncertain); err != nil {
 			return err
 		}
 		reconciliation = Reconciliation{OperationKey: operationKey, Actor: actor, Evidence: evidence, Result: append([]byte(nil), result...), State: operationCommitted}
-		// The record binds evidence and result by digest only: the evidence
-		// text and the provider result never enter audit.
-		record, err = j.audit.Append(ctx, tx, audit.Record{
-			ID: "reconcile:" + operationKey, Kind: audit.KindReconciliation, Tenant: audit.TenantFrom(ctx),
-			Actor: actor, Subject: operationKey, RunID: runID, Action: "reconcile", Outcome: audit.OutcomeApplied,
-			Digests: map[string]string{"evidence": audit.Digest([]byte(evidence)), "result": audit.Digest(result)},
-		})
+		record, inserted, err = j.audit.Append(ctx, tx, reconciliationRecord(ctx, operationKey, actor, evidence, result, runID, now))
 		return err
 	})
 	if err != nil {
 		return Reconciliation{}, audit.Record{}, err
 	}
+	if !inserted {
+		record = audit.Record{}
+	}
 	return reconciliation, record, nil
+}
+
+// reconciliationRecord binds evidence and result by digest only: the
+// evidence text and the provider result never enter audit. Its time is the
+// reconciliation's own, so a re-delivery produces the identical record.
+func reconciliationRecord(ctx context.Context, operationKey, actor, evidence string, result []byte, runID string, at int64) audit.Record {
+	return audit.Record{
+		ID: "reconcile:" + operationKey, Kind: audit.KindReconciliation, Tenant: audit.TenantFrom(ctx),
+		Actor: actor, Subject: operationKey, RunID: runID, Action: "reconcile", Outcome: audit.OutcomeApplied,
+		Digests: map[string]string{"evidence": audit.Digest([]byte(evidence)), "result": audit.Digest(result)},
+		At:      time.Unix(0, at).UTC(),
+	}
+}
+
+// AuditKind and AuditedIDs make the journal an audit.Owner: every
+// reconciliation requires its record, which audit.Journal.Verify checks.
+func (j *Journal) AuditKind() audit.Kind { return audit.KindReconciliation }
+
+func (j *Journal) AuditedIDs(ctx context.Context, tx *sql.Tx, fn func(string) error) error {
+	rows, err := tx.QueryContext(ctx, `SELECT operation_key FROM journal_reconciliations ORDER BY operation_key`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return err
+		}
+		if err := fn("reconcile:" + key); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
 }
 
 func (j *Journal) PlanUpgrade(ctx context.Context, fromDigest, toDigest string, retainRuns bool) (UpgradePlan, error) {
@@ -223,7 +262,7 @@ func (j *Journal) DecideUpgrade(ctx context.Context, actor, fromDigest, toDigest
 			}
 		}
 		var err error
-		record, err = j.audit.Append(ctx, tx, audit.Record{
+		record, _, err = j.audit.Append(ctx, tx, audit.Record{
 			ID: id, Kind: audit.KindDeployment, Tenant: audit.TenantFrom(ctx), Actor: actor,
 			Subject: fromDigest + " -> " + toDigest, Action: action, Outcome: outcome, Reason: reason, Digests: digests,
 		})
@@ -240,19 +279,27 @@ func (j *Journal) DecideUpgrade(ctx context.Context, actor, fromDigest, toDigest
 	return plan, nil
 }
 
-// ActiveRuns implements audit.RunActivity: a run is active while it is
-// accepted or uncertain (awaiting reconciliation). It reads in the audit's
+// ActiveRuns implements audit.RunActivity and fails closed: a run is active
+// while it is accepted or uncertain (awaiting reconciliation), and so is a
+// run the journal does not know at all, unless a compaction tombstone proves
+// it ended. An approval for a run held elsewhere (a cluster run, ADR 0019)
+// is therefore never pruned on a guess. It reads in the audit's
 // transaction, so it must share the journal's database.
 func (j *Journal) ActiveRuns(ctx context.Context, tx *sql.Tx, runIDs []string) (map[string]bool, error) {
 	active := map[string]bool{}
 	for start := 0; start < len(runIDs); start += 200 {
 		chunk := runIDs[start:min(start+200, len(runIDs))]
 		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(chunk)), ",")
-		args := make([]any, len(chunk))
-		for i, id := range chunk {
-			args[i] = id
+		args := make([]any, 0, 2*len(chunk))
+		for _, id := range chunk {
+			args = append(args, id)
 		}
-		rows, err := tx.QueryContext(ctx, `SELECT run_id, state FROM journal_runs WHERE run_id IN (`+placeholders+`)`, args...)
+		for _, id := range chunk {
+			args = append(args, id)
+		}
+		known := map[string]bool{}
+		rows, err := tx.QueryContext(ctx, `SELECT run_id, state FROM journal_runs WHERE run_id IN (`+placeholders+`)
+			UNION ALL SELECT run_id, 'compacted' FROM journal_audit WHERE run_id IN (`+placeholders+`)`, args...)
 		if err != nil {
 			return nil, err
 		}
@@ -262,12 +309,18 @@ func (j *Journal) ActiveRuns(ctx context.Context, tx *sql.Tx, runIDs []string) (
 				rows.Close()
 				return nil, err
 			}
+			known[id] = true
 			if state == runAccepted || state == runUncertain {
 				active[id] = true
 			}
 		}
 		if err := rows.Close(); err != nil {
 			return nil, err
+		}
+		for _, id := range chunk {
+			if !known[id] {
+				active[id] = true
+			}
 		}
 	}
 	return active, nil
