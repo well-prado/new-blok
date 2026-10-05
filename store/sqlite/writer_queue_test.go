@@ -106,7 +106,11 @@ func TestWritersTakeTheLockInArrivalOrder(t *testing.T) {
 // naming the handle's write domain.
 func TestUnmarkedTransactionsAreNotQueued(t *testing.T) {
 	ctx := context.Background()
-	db, err := (Backend{BusyTimeout: 200 * time.Millisecond}).Open(ctx, filepath.Join(t.TempDir(), "read.db"))
+	// A read that waited for a turn would wait the busy timeout (5 s here),
+	// whether it then failed or ran: the 2 s read bound catches both and
+	// still leaves a loaded host ample time for a read that did not wait.
+	const readBound = 2 * time.Second
+	db, err := (Backend{BusyTimeout: 5 * time.Second}).Open(ctx, filepath.Join(t.TempDir(), "read.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,26 +145,42 @@ func TestUnmarkedTransactionsAreNotQueued(t *testing.T) {
 		})
 	}()
 	<-holding
-	if nestedErr != nil || nestedCount != 0 || nestedTook > 100*time.Millisecond {
+	if nestedErr != nil || nestedCount != 0 || nestedTook > readBound {
+		close(release)
 		t.Fatalf("a read nested in the queued writer: count=%d after %v, err=%v", nestedCount, nestedTook, nestedErr)
 	}
-	if count, took, err := read(); err != nil || count != 0 || took > 100*time.Millisecond {
-		t.Fatalf("a read beside the queued writer: count=%d after %v, err=%v", count, took, err)
-	}
-	begin := time.Now()
-	err = db.WithTx(store.Writer(ctx), func(*sql.Tx) error { return nil })
-	elapsed := time.Since(begin)
+	count, took, err := read()
 	close(release)
 	if err := <-held; err != nil {
 		t.Fatal(err)
 	}
+	if err != nil || count != 0 || took > readBound {
+		t.Fatalf("a read beside the queued writer: count=%d after %v, err=%v", count, took, err)
+	}
+
+	short, err := (Backend{BusyTimeout: 200 * time.Millisecond}).Open(ctx, filepath.Join(t.TempDir(), "short.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer short.Close()
+	hold, holdingShort := make(chan struct{}), make(chan struct{})
+	go func() {
+		_ = short.WithTx(store.Writer(ctx), func(*sql.Tx) error { close(holdingShort); <-hold; return nil })
+	}()
+	<-holdingShort
+	defer close(hold)
+	begin := time.Now()
+	err = short.WithTx(store.Writer(ctx), func(*sql.Tx) error { return nil })
+	elapsed := time.Since(begin)
 	if !errors.Is(err, store.ErrBusy) {
 		t.Fatalf("a marked writer behind another returned %v; want store.ErrBusy", err)
 	}
-	if domain, named := store.ErrorWriteDomain(err); !named || !store.SameWriteDomain(domain, mustWriteDomain(t, db)) {
+	if domain, named := store.ErrorWriteDomain(err); !named || !store.SameWriteDomain(domain, mustWriteDomain(t, short)) {
 		t.Fatalf("the queue timeout named %v (named=%v); want the handle's domain", domain, named)
 	}
-	if elapsed < 200*time.Millisecond || elapsed > 2*time.Second {
+	// At least the busy timeout; the upper bound only catches a hang, since a
+	// loaded host may wake the waiter late.
+	if elapsed < 200*time.Millisecond || elapsed > 10*time.Second {
 		t.Fatalf("the queued writer gave up after %v; want the 200ms busy timeout", elapsed)
 	}
 }
