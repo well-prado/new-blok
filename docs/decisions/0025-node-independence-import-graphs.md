@@ -77,8 +77,15 @@ A node's `Status` is one of:
 | `violation` | the reachable graph crosses into another node or a workflow, or contains an import cycle |
 | `unverified` | some part of the reachable graph could not be checked: a computed or evaluating form, an unresolved specifier, a link, a case mismatch, a parse failure, an unsupported file type, an invalid resolution config, a bound overrun, or a runtime with no adapter |
 
-`Report.Verified()` is true only when every node is verified and there is
-no diagnostic; `Report.Err()` returns an `*ownership.Error` otherwise.
+**A violation is an error; unverified is a warning.** `Report.Err()`
+returns an `*ownership.Error` carrying the violation-class diagnostics
+only, and nil when there is none; `Report.Violations()` and
+`Report.Warnings()` split the diagnostics by class, and
+`Report.Unverified()` lists the unverified nodes. An unverified node was
+not shown to break independence — with the JavaScript allowlist most real
+code is unverified (below) — so a tool such as `blok check` fails on
+violations and reports unverified nodes as warnings by default.
+`Report.Verified()` is the strict "every node verified, nothing found".
 `Class(code)` maps each code to `violation` or `unverified` so `blok check`
 can report the distinction without a second table. A violation found next
 to an unverified region still reports the violation. A computed import is
@@ -198,7 +205,9 @@ behavior is known.
 The sensitive words are `require`, `module`, `process`, `this`,
 `globalThis`, `global`, `self`, `window`, `eval`, `Function`, `Reflect`,
 `Proxy`, `import`, `arguments`, `constructor`, `__proto__`, `prototype`,
-and the loader names `createRequire`, `getBuiltinModule`, `mainModule`,
+the reflection APIs `getOwnPropertyDescriptor`, `getOwnPropertyDescriptors`,
+`getPrototypeOf`, `setPrototypeOf`, `getOwnPropertyNames`,
+`defineProperty` and `defineProperties`, and the loader names `createRequire`, `getBuiltinModule`, `mainModule`,
 `_load`, `dlopen`, `importScripts`, `ShadowRealm`, `_linkedBinding`,
 `Worker` and `binding` (the last only as a property, `process.binding`, or
 called bare). The safe forms, the complete list, are:
@@ -229,6 +238,17 @@ string literal):
   and as a string or template-without-substitutions literal whose value is
   the word (`"process"`, `` `mainModule` ``, `o["constructor"]`) — import
   specifiers excepted;
+- reflection with a name built at run time:
+  `Object.getOwnPropertyDescriptor(Object.getPrototypeOf(f), "constr" +
+  "uctor").value` is the `Function` constructor without any sensitive
+  string or computed key appearing. It is covered by making the reflection
+  APIs themselves sensitive words (above), not by following the string;
+- every computed property key — `[…]` directly inside braces in a
+  property-name position, in a destructuring pattern (`const { [k]: F } =
+  f`), an object literal or a class body alike, since they are not told
+  apart — whose key is not a number or a non-sensitive string literal
+  (TypeScript index signatures `[k: T]` and mapped types `[K in T]` are
+  types, not keys);
 - every computed member access (`x[…]` after an operand, including `?.[`)
   whose key is not empty (a TypeScript array type), a number, a string
   literal of a non-sensitive word, or an arithmetic expression built only
@@ -263,10 +283,11 @@ unverified, never treated as an inert asset.
 On the 1,381 script files of the Blok TypeScript repository
 (`~/Projects/Deskree/blok`, `.ts .mts .cts .js .mjs .cjs` including
 declaration files, excluding `node_modules`, `dist`, `.git` and `.blok`),
-517 (37.4%) are unverified (the 13 declaration files are exempt; none
-failed to lex). The files containing each form: a computed member access
-311 (the only cause in 170), the string `"module"` 115 (the only cause in
-51), `this` outside `this.<name>` 46, `.prototype` 39, `process` beyond its
+540 (39.1%) are unverified (the 13 declaration files are exempt; none
+failed to lex; 517, 37.4%, before the reflection APIs and computed
+property keys were added). The files containing each form: a computed
+member access 311, the string `"module"` 115, a computed property key
+58, `this` outside `this.<name>` 46, `.prototype` 39, `process` beyond its
 data members 33, `import(expression)` 28, the string `"process"` 28,
 `Function` (mostly the TypeScript type; no file would be rescued by a
 type-position exemption) 26, `arguments` 21, `module` beyond `exports` 21,
@@ -435,7 +456,7 @@ No wire, journal, artifact, worker or manifest contract changes.
 
 ## Verification record
 
-- `internal/tooling/ownership` tests: 30 synthetic `txtar` fixtures under
+- `internal/tooling/ownership` tests: 31 synthetic `txtar` fixtures under
   `testdata/imports` (Apache-2.0, synthetic), each with predeclared node
   statuses and exact sorted `[code, source]` diagnostics, unit counts for
   the positive cases, and output/error/effect counts in
@@ -451,12 +472,16 @@ No wire, journal, artifact, worker or manifest contract changes.
   transitive (ESM → re-export → CommonJS), dynamic/evaluating forms,
   unresolved and cycle, links (shared and `node_modules`), case, workflow,
   JSX and an unsupported runtime.
-- Every probe of both reviews is a node in one of nine `probe-*` fixtures
-  (`probe-lexer`, `probe-loaders`, `probe-files-packages`,
+- Every probe of the three reviews is a node in one of ten `probe-*`
+  fixtures (`probe-lexer`, `probe-loaders`, `probe-files-packages`,
   `probe-go-sources`, `probe-go-replace`, `probe-go-work`,
-  `probe-go-vendor`, `probe-allowlist`, `probe-go-embed`) with its
-  predeclared verdict; none of the 21 routes that were verified is
-  verified any more, and the controls that held still hold.
+  `probe-go-vendor`, `probe-allowlist`, `probe-go-embed`,
+  `probe-reflection`) with its predeclared verdict; none of the 24 routes
+  that were verified is verified any more, and the controls that held
+  still hold.
+- `TestUnverifiedIsAWarning` pins the report contract: an unverified-only
+  report has no error, and a mixed report's error carries the violations
+  only.
 - The real `blok new` starter in both layouts verifies with zero
   diagnostics and a non-empty graph. A Node.js example built from it with
   the repository's actual Node.js SDK source and worker fixture node file
@@ -464,7 +489,10 @@ No wire, journal, artifact, worker or manifest contract changes.
   layout; the workspace package `@blok/nodejs-sdk` for a second node) has
   no violation: the two nodes that reach the SDK are unverified, with
   every finding in the SDK's files, and a third node written in the safe
-  forms verifies.
+  forms verifies. `TestNodeStarterWithDeclaredSDK` is the real shape of
+  a Node.js node: the starter plus a node importing `@blok/nodejs-sdk` as
+  a declared npm dependency, written in the safe forms; it verifies in
+  both layouts.
 - `TestImportForms` pins the lexical cases, including the ambiguous `/`
   positions, a hashbang holding a quote and a byte order mark;
   `TestRepositoryNodeSourcesLex` lexes every Node.js source in the

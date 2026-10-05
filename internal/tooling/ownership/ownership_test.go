@@ -158,8 +158,12 @@ func check(t *testing.T, root string) outcome {
 	if report.Verified() != (len(out.diagnostics) == 0) {
 		t.Fatalf("Verified()=%v with %d diagnostics", report.Verified(), len(out.diagnostics))
 	}
-	if (report.Err() == nil) != report.Verified() {
-		t.Fatalf("Err()=%v disagrees with Verified()=%v", report.Err(), report.Verified())
+	violating := false
+	for _, node := range report.Nodes {
+		violating = violating || node.Status == StatusViolation
+	}
+	if (report.Err() != nil) != violating || len(report.Violations())+len(report.Warnings()) != len(report.Diagnostics) {
+		t.Fatalf("Err()=%v must be non-nil exactly when a node violates; violations=%d warnings=%d", report.Err(), len(report.Violations()), len(report.Warnings()))
 	}
 	return out
 }
@@ -297,5 +301,27 @@ func TestDiagnosticCodesAreClassified(t *testing.T) {
 		if Class(code) == ClassViolation {
 			t.Errorf("%s must leave a node unverified, not claim a verdict", code)
 		}
+	}
+}
+
+// TestUnverifiedIsAWarning pins the report contract (ADR 0025): a
+// violation is an error, an unverified node is a warning. Err fails only on
+// violations, so a tool such as blok check does not fail by default on
+// code the allowlist cannot verify; Warnings and Unverified expose it.
+func TestUnverifiedIsAWarning(t *testing.T) {
+	unverified, err := CheckDir(materialize(t, loadFixture(t, filepath.Join(fixtureDir, "node-dynamic.txtar"))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unverified.Err() != nil || len(unverified.Violations()) != 0 || len(unverified.Warnings()) == 0 || len(unverified.Unverified()) != 4 || unverified.Verified() {
+		t.Fatalf("an unverified-only report must not be an error: err=%v warnings=%d unverified=%d verified=%v", unverified.Err(), len(unverified.Warnings()), len(unverified.Unverified()), unverified.Verified())
+	}
+	mixed, err := CheckDir(materialize(t, loadFixture(t, filepath.Join(fixtureDir, "node-unresolved.txtar"))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ownershipErr *Error
+	if !errors.As(mixed.Err(), &ownershipErr) || !slices.Equal(ownershipErr.Codes(), []string{CodeImportCycle}) || len(mixed.Warnings()) != 4 {
+		t.Fatalf("Err must carry the violations and only them: err=%v warnings=%d", mixed.Err(), len(mixed.Warnings()))
 	}
 }

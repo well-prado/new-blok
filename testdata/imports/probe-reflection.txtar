@@ -1,0 +1,85 @@
+Review probes, round 3 (PR #314): reflection with a built-up name, and
+computed keys in patterns. Object.getOwnPropertyDescriptor(Object.
+getPrototypeOf(f), "constr" + "uctor").value is the Function constructor,
+called directly or as a tagged template; { [k]: F } = f and
+{ [`constr${"uctor"}`]: F } = f destructure it. The reflection APIs
+(getOwnPropertyDescriptor(s), getPrototypeOf, setPrototypeOf,
+getOwnPropertyNames, defineProperty/ies) are sensitive words, and every
+computed property key that is not a number or a non-sensitive string is
+unverified, in a pattern, an object literal or a class body alike (they
+are not told apart). TypeScript index signatures and mapped types are
+types, not keys, and stay verified. Controls already held: a computed
+process.env key, import.meta.resolve then import(u), vm, and an escaped
+eval.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+-- nodes/nodejs/b/index.js --
+module.exports = 1;
+-- nodes/nodejs/b/node.json --
+{"name":"shop/b","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/class-computed-member/index.js --
+class Bag { *[Symbol.iterator]() { yield 1; } }
+module.exports = Bag;
+-- nodes/nodejs/class-computed-member/node.json --
+{"name":"probe/class-computed-member","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/define-property/index.js --
+const o = {};
+Object.defineProperty(o, "x", { get: () => 1 });
+module.exports = Object.getOwnPropertyNames(o);
+-- nodes/nodejs/define-property/node.json --
+{"name":"probe/define-property","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/descriptor-ctor/index.js --
+const k = "constr" + "uctor";
+const F = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(() => 0), k).value;
+module.exports = F("return process.mainModule.require")()(__dirname + "/../b/index.js");
+-- nodes/nodejs/descriptor-ctor/node.json --
+{"name":"probe/descriptor-ctor","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/destructure-computed/index.js --
+const k = "constr" + "uctor";
+const { [k]: F } = () => 0;
+module.exports = F("return process.mainModule.require")()(__dirname + "/../b/index.js");
+-- nodes/nodejs/destructure-computed/node.json --
+{"name":"probe/destructure-computed","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/destructure-template/index.js --
+const { [`constr${"uctor"}`]: F } = () => 0;
+module.exports = F("return process.mainModule.require")()(__dirname + "/../b/index.js");
+-- nodes/nodejs/destructure-template/node.json --
+{"name":"probe/destructure-template","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/meta-resolve-import/index.mjs --
+const u = import.meta.resolve("../b/index.js");
+export default await import(u);
+-- nodes/nodejs/meta-resolve-import/node.json --
+{"name":"probe/meta-resolve-import","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/process-env-computed/index.js --
+const k = "X"; module.exports = process.env[k];
+-- nodes/nodejs/process-env-computed/node.json --
+{"name":"probe/process-env-computed","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/safe-keys/index.ts --
+type Counts = { [name: string]: number };
+type Flags<T> = { [K in keyof T]: boolean };
+const counts: Counts = { ["apples"]: 1, [2]: 2 };
+export const total: number = counts.apples ?? 0;
+export type F = Flags<Counts>;
+-- nodes/nodejs/safe-keys/node.json --
+{"name":"probe/safe-keys","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/tagged-template/index.js --
+const k = "constr" + "uctor";
+const F = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(() => 0), k).value;
+module.exports = F`a`;
+-- nodes/nodejs/tagged-template/node.json --
+{"name":"probe/tagged-template","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/unicode-eval/index.js --
+\u0065val("1");
+-- nodes/nodejs/unicode-eval/node.json --
+{"name":"probe/unicode-eval","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/vm-run/index.js --
+const fs = require("fs"); const vm = require("node:vm");
+vm.runInThisContext(fs.readFileSync(require.resolve("../../../shared/c.txt"), "utf8"));
+-- nodes/nodejs/vm-run/node.json --
+{"name":"probe/vm-run","version":"1.0.0","runtime":"nodejs"}
+-- shared/c.txt --
+x
+-- @expect --
+{"diagnostics":[["ownership_dynamic_import","nodes/nodejs/meta-resolve-import/index.mjs:2"],["ownership_node_imports_node","nodes/nodejs/meta-resolve-import/index.mjs:1"],["ownership_unsupported_form","nodes/nodejs/class-computed-member/index.js:1"],["ownership_unsupported_form","nodes/nodejs/define-property/index.js:2"],["ownership_unsupported_form","nodes/nodejs/define-property/index.js:3"],["ownership_unsupported_form","nodes/nodejs/descriptor-ctor/index.js:2"],["ownership_unsupported_form","nodes/nodejs/descriptor-ctor/index.js:2"],["ownership_unsupported_form","nodes/nodejs/destructure-computed/index.js:2"],["ownership_unsupported_form","nodes/nodejs/destructure-template/index.js:1"],["ownership_unsupported_form","nodes/nodejs/process-env-computed/index.js:1"],["ownership_unsupported_form","nodes/nodejs/tagged-template/index.js:2"],["ownership_unsupported_form","nodes/nodejs/tagged-template/index.js:2"],["ownership_unsupported_form","nodes/nodejs/unicode-eval/index.js:1"],["ownership_unsupported_form","nodes/nodejs/vm-run/index.js:1"]],"nodes":[["nodes/nodejs/b","verified"],["nodes/nodejs/class-computed-member","unverified"],["nodes/nodejs/define-property","unverified"],["nodes/nodejs/descriptor-ctor","unverified"],["nodes/nodejs/destructure-computed","unverified"],["nodes/nodejs/destructure-template","unverified"],["nodes/nodejs/meta-resolve-import","violation"],["nodes/nodejs/process-env-computed","unverified"],["nodes/nodejs/safe-keys","verified"],["nodes/nodejs/tagged-template","unverified"],["nodes/nodejs/unicode-eval","unverified"],["nodes/nodejs/vm-run","unverified"]]}

@@ -1,5 +1,5 @@
 {
-  "source": "synthetic import-graph fixtures authored for E12-T02 (#68), including the Review R probes of PR #314 (rounds 1 and 2); no application, customer or private data",
+  "source": "synthetic import-graph fixtures authored for E12-T02 (#68), including the Review R probes of PR #314 (rounds 1 to 3); no application, customer or private data",
   "license": "Apache-2.0",
   "privateData": false,
   "expected": {
@@ -138,7 +138,7 @@
     "probe-loaders": {
       "runtime": "nodejs",
       "outputRecords": 18,
-      "errorRecords": 29,
+      "errorRecords": 30,
       "effectRecords": 0
     },
     "probe-files-packages": {
@@ -181,6 +181,12 @@
       "runtime": "go",
       "outputRecords": 3,
       "errorRecords": 2,
+      "effectRecords": 0
+    },
+    "probe-reflection": {
+      "runtime": "nodejs",
+      "outputRecords": 12,
+      "errorRecords": 14,
       "effectRecords": 0
     }
   }

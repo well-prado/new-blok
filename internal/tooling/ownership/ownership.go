@@ -205,15 +205,45 @@ func (e *Error) Codes() []string {
 	return codes
 }
 
-// Err returns nil for a verified report, or an *Error.
+// Violations returns the violation-class diagnostics: a node reaching
+// another node or a workflow, or an import cycle. These are errors.
+func (r *Report) Violations() []diagnostic.Diagnostic { return r.byClass(ClassViolation) }
+
+// Warnings returns the unverified-class diagnostics: parts of a graph the
+// check could not verify. They are warnings, not errors: an unverified node
+// was not shown to break independence (ADR 0025).
+func (r *Report) Warnings() []diagnostic.Diagnostic { return r.byClass(ClassUnverified) }
+
+// Unverified returns the nodes whose status is unverified.
+func (r *Report) Unverified() []NodeResult {
+	var out []NodeResult
+	for _, node := range r.Nodes {
+		if node.Status == StatusUnverified {
+			out = append(out, node)
+		}
+	}
+	return out
+}
+
+func (r *Report) byClass(class string) []diagnostic.Diagnostic {
+	var out []diagnostic.Diagnostic
+	for _, d := range r.Diagnostics {
+		if Class(d.Code) == class {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// Err returns an *Error carrying the violations only, or nil when there is
+// none. Unverified nodes do not make it fail: they are warnings, read with
+// Warnings and Unverified. Verified reports the stricter "everything was
+// verified".
 func (r *Report) Err() error {
-	if r.Verified() {
-		return nil
+	if violations := r.Violations(); len(violations) > 0 {
+		return &Error{Diagnostics: violations}
 	}
-	if len(r.Diagnostics) == 0 {
-		return &Error{Diagnostics: []diagnostic.Diagnostic{{Code: CodeRuntimeUnsupported, Message: "a node is not verified", Remediation: remediations[CodeRuntimeUnsupported]}}}
-	}
-	return &Error{Diagnostics: r.Diagnostics}
+	return nil
 }
 
 // CheckDir discovers the project at root (ADR 0023) and checks it. A failed

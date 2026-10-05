@@ -45,6 +45,8 @@ type jsScan struct {
 // Function constructor.
 var sensitiveWords = setOf(`require module process this globalThis global self window eval Function
 	Reflect Proxy import arguments constructor __proto__ prototype
+	getOwnPropertyDescriptor getOwnPropertyDescriptors getPrototypeOf setPrototypeOf
+	getOwnPropertyNames defineProperty defineProperties
 	createRequire getBuiltinModule mainModule _load dlopen importScripts ShadowRealm _linkedBinding Worker binding`)
 
 // processProperties are the process members a node may read without
@@ -176,11 +178,29 @@ func (r *recognizer) scan() {
 	}
 	// Second pass: every remaining sensitive token, sensitive string and
 	// unsafe computed member access.
+	var open []string // innermost-last open brackets: "{", "[", "(", "${"
 	for i, t := range r.toks {
+		innermost := ""
+		if len(open) > 0 {
+			innermost = open[len(open)-1]
+		}
+		switch {
+		case isPunct(t, "{") || isPunct(t, "[") || isPunct(t, "("):
+			open = append(open, t.text)
+		case t.kind == tokTemplateHead:
+			open = append(open, "${")
+		case (isPunct(t, "}") || isPunct(t, "]") || isPunct(t, ")") || t.kind == tokTemplateTail) && len(open) > 0:
+			open = open[:len(open)-1]
+		}
 		if r.safe[i] {
 			continue
 		}
 		switch {
+		case isPunct(t, "[") && innermost == "{" && r.computedKey(i) && !r.indexSignature(i) && !r.safeKey(i):
+			// { [k]: F } = () => 0 reads any property by a built name, as
+			// a computed member access does; an object literal or class
+			// member with a computed name is not told apart from a pattern
+			r.unverified(t.line, CodeUnsupportedForm, "computed property key")
 		case t.kind == tokIdent && t.text == "binding" && !r.member(i) && !isPunct(r.at(i+1), "("):
 			// a variable named binding; process.binding and binding(…) are not
 		case t.kind == tokIdent && sensitiveWords[t.text]:
@@ -197,6 +217,28 @@ func (r *recognizer) scan() {
 			r.unverified(t.line, CodeUnsupportedForm, "computed member access")
 		}
 	}
+}
+
+// keyModifiers may precede a computed class member name.
+var keyModifiers = setOf(`static get set async readonly public private protected override declare abstract accessor`)
+
+// computedKey reports a "[" directly inside braces in a property-name
+// position: after "{", ",", ";", "}", "*" or a member modifier.
+func (r *recognizer) computedKey(i int) bool {
+	p := r.at(i - 1)
+	switch {
+	case isPunct(p, "{"), isPunct(p, ","), isPunct(p, ";"), isPunct(p, "}"), isPunct(p, "*"):
+		return true
+	case p.kind == tokIdent:
+		return keyModifiers[p.text]
+	}
+	return false
+}
+
+// indexSignature reports a TypeScript index signature or mapped type,
+// [k: T] or [K in T]: a type, never a property read.
+func (r *recognizer) indexSignature(i int) bool {
+	return r.at(i+1).kind == tokIdent && (isPunct(r.at(i+2), ":") || isIdent(r.at(i+2), "in"))
 }
 
 // operandEnd reports whether a token ends an operand, so a "[" after it is

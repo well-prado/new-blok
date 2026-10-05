@@ -132,3 +132,34 @@ func TestNodeExample(t *testing.T) {
 		})
 	}
 }
+
+// TestNodeStarterWithDeclaredSDK is the real shape of a Node.js node in an
+// application: the starter plus a node that depends on @blok/nodejs-sdk as
+// a declared npm dependency (not installed: declared third-party packages
+// are external, ADR 0025) and is written in the safe forms. It verifies,
+// in both layouts, alongside the native node.
+func TestNodeStarterWithDeclaredSDK(t *testing.T) {
+	for _, name := range []string{layout.Classic, layout.Unified} {
+		t.Run(name, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "shop")
+			if _, err := scaffold.Create(scaffold.Options{Directory: root, Module: "example.com/shop", Layout: name, Framework: scaffold.Framework{Version: "v0.1.0"}}); err != nil {
+				t.Fatal(err)
+			}
+			dir := layout.NodeDir(name, "nodejs", "format-receipt")
+			writeFiles(t, root, map[string]string{
+				"package.json":        `{"name":"shop","private":true,"type":"module","dependencies":{"@blok/nodejs-sdk":"0.1.0"},"devDependencies":{"typescript":"5.9.3","@types/node":"22.18.10"}}`,
+				"tsconfig.json":       `{"compilerOptions":{"target":"ES2023","module":"NodeNext","moduleResolution":"NodeNext","strict":true}}`,
+				dir + "/node.json":    `{"name":"shop/format-receipt","version":"1.0.0","runtime":"nodejs"}`,
+				dir + "/index.ts":     "import { defineNode } from \"@blok/nodejs-sdk\";\nimport { cents } from \"./money.js\";\n\nconst amount = { type: \"object\", properties: { total: { type: \"integer\" } }, required: [\"total\"] } as const;\nconst text = { type: \"object\", properties: { text: { type: \"string\" } }, required: [\"text\"] } as const;\n\nexport const formatReceipt = defineNode<{ total: number }, { text: string }, null>({\n  name: \"shop/format-receipt\", version: \"1.0.0\", description: \"Formats a receipt\",\n  input: amount, output: text, dependencies: null, deterministic: true,\n  execute: (_ctx, input) => ({ text: cents(input.total) }),\n});\n",
+				dir + "/money.ts":     "export const cents = (total: number): string => `${(total / 100).toFixed(2)} USD`;\n",
+				"app/worker/nodes.ts": "import { formatReceipt } from \"../../" + dir + "/index.js\";\nexport const nodes = [formatReceipt];\n",
+			})
+			report := requireVerified(t, root, 2)
+			for _, node := range report.Nodes {
+				if node.Dir == dir && node.Units != 2 {
+					t.Fatalf("node %+v; want its two files (the SDK is an external package)", node)
+				}
+			}
+		})
+	}
+}
