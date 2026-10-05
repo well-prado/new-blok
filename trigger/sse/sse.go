@@ -123,6 +123,10 @@ type Endpoint struct {
 	// StreamSubscribers those of one stream.
 	MaxSubscribers    int
 	StreamSubscribers int
+	// Trace opts in to reading a start's traceparent/tracestate and
+	// submitting it as the parent of the run the start queues (ADR 0020).
+	// It is never part of the submission key. Off by default.
+	Trace trigger.TraceIngress
 }
 
 // Tracker reports whether the work submitted under a key has settled
@@ -172,6 +176,9 @@ func New(application *app.Application, hub *Hub, endpoints []Endpoint) (*Server,
 		parsed, err := schema.Parse(e.InputSchema)
 		if err != nil {
 			return nil, fmt.Errorf("sse: endpoint %s schema: %w", e.Name, err)
+		}
+		if err := e.Trace.Validate(); err != nil {
+			return nil, fmt.Errorf("sse: endpoint %s: %w", e.Name, err)
 		}
 		if e.Authorize == nil {
 			e.Authorize = SamePrincipal
@@ -347,7 +354,12 @@ func (s *Server) start(writer http.ResponseWriter, request *http.Request, e *end
 	defer unbind()
 	ctx, cancel := context.WithTimeout(submitting, e.SubmitTimeout)
 	defer cancel()
-	accepted, err := e.Submit.Submit(ctx, trigger.Submission{Key: submissionKey, Kind: e.Kind, Payload: payload, Principal: principal})
+	// The trace context is read after authentication and validation, and is
+	// not part of the key: a repeated start with another traceparent is the
+	// same work.
+	submission := trigger.Submission{Key: submissionKey, Kind: e.Kind, Payload: payload, Principal: principal}
+	submission.Trace, _ = e.Trace.Parent(s.application.TracePolicy(), request.Header.Values(trigger.TraceparentField), request.Header.Values(trigger.TracestateField))
+	accepted, err := e.Submit.Submit(ctx, submission)
 	committed := err == nil || errors.Is(err, trigger.ErrConflict)
 	switch {
 	case err == nil && accepted:

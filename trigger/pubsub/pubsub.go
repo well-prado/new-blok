@@ -27,6 +27,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/well-prado/new-blok/contract/observe"
 	"github.com/well-prado/new-blok/contract/schema"
 	"github.com/well-prado/new-blok/trigger"
 )
@@ -50,6 +51,11 @@ const (
 	// MaxMessageIDBytes bounds the stable message identity.
 	MaxMessageIDBytes = 256
 )
+
+// ErrTracePolicyRequired refuses a subscription that sets Trace.Extract
+// without an enabled TracePolicy: pass app.Application.TracePolicy(), and
+// leave Extract off when the application does not trace.
+var ErrTracePolicyRequired = errors.New("trace extraction needs an enabled Subscription.TracePolicy (app.Application.TracePolicy()); leave Trace.Extract off when the application does not trace")
 
 // Dead-letter reasons recorded with a terminated message.
 const (
@@ -82,6 +88,15 @@ type Message interface {
 	Term(ctx context.Context, reason string) error
 }
 
+// TraceCarrier is implemented by a Message whose broker carries headers. It
+// returns every traceparent and tracestate value the message carries, one
+// entry per header value as stored, so a duplicated header is visible as
+// two entries. A driver whose messages carry no headers does not implement
+// it, and its messages start runs without an inbound parent.
+type TraceCarrier interface {
+	TraceHeaders() (traceparent, tracestate []string)
+}
+
 // Source is a broker subscription. Fetch must never return more than max
 // messages; a driver also enforces the bound broker-side (outstanding
 // unacknowledged messages), so a slow consumer cannot accumulate work.
@@ -112,6 +127,17 @@ type Subscription struct {
 	MaxDeliver    int
 	FetchWait     time.Duration
 	SubmitTimeout time.Duration
+	// Trace opts in to reading a message's traceparent/tracestate headers
+	// (TraceCarrier) and submitting them as the parent of the run the
+	// message starts (ADR 0020). It is never part of the message identity.
+	// Off by default.
+	Trace trigger.TraceIngress
+	// TracePolicy is the application's head-sampling policy
+	// (app.Application.TracePolicy). The consumer has no application, so
+	// it is passed here. New refuses Trace.Extract without an enabled
+	// policy (ErrTracePolicyRequired) rather than silently extracting
+	// nothing.
+	TracePolicy observe.TracePolicy
 }
 
 // Outcome reports what happened to one message.
@@ -146,6 +172,14 @@ func New(source Source, sub Subscription) (*Consumer, error) {
 	parsed, err := schema.Parse(sub.InputSchema)
 	if err != nil {
 		return nil, fmt.Errorf("pubsub: subscription %s schema: %w", sub.Name, err)
+	}
+	if err := errors.Join(sub.Trace.Validate(), sub.TracePolicy.Validate()); err != nil {
+		return nil, fmt.Errorf("pubsub: subscription %s: %w", sub.Name, err)
+	}
+	if sub.Trace.Extract && !sub.TracePolicy.Enabled() {
+		// The consumer has no application to read the policy from, so a
+		// forgotten TracePolicy would silently extract nothing (#285 review).
+		return nil, fmt.Errorf("pubsub: subscription %s: %w", sub.Name, ErrTracePolicyRequired)
 	}
 	if sub.MaxInFlight <= 0 {
 		sub.MaxInFlight = DefaultMaxInFlight
@@ -249,7 +283,15 @@ func (c *Consumer) process(parent context.Context, message Message) error {
 	if _, err := c.input.Normalize(candidate); err != nil {
 		return reject(ReasonInvalidInput)
 	}
-	accepted, err := c.sub.Submit.Submit(ctx, trigger.Submission{Key: SubmissionKey(c.sub.Name, message.ID()), Kind: c.sub.Kind, Payload: message.Data(), Principal: c.sub.Principal})
+	// The trace headers are read after every admission check and are not
+	// part of the key: a redelivery with another traceparent is the same
+	// message.
+	submission := trigger.Submission{Key: SubmissionKey(c.sub.Name, message.ID()), Kind: c.sub.Kind, Payload: message.Data(), Principal: c.sub.Principal}
+	if carrier, ok := message.(TraceCarrier); ok && c.sub.Trace.Extract {
+		traceparent, tracestate := carrier.TraceHeaders()
+		submission.Trace, _ = c.sub.Trace.Parent(c.sub.TracePolicy, traceparent, tracestate)
+	}
+	accepted, err := c.sub.Submit.Submit(ctx, submission)
 	switch {
 	case errors.Is(err, trigger.ErrConflict):
 		return reject(ReasonConflict)

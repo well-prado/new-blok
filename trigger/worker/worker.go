@@ -16,6 +16,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/well-prado/new-blok/contract/observe"
 	"github.com/well-prado/new-blok/contract/schema"
 	"github.com/well-prado/new-blok/internal/migration"
 	"github.com/well-prado/new-blok/store"
@@ -61,8 +62,13 @@ type Job struct {
 	Deferrals int
 	// Principal was established by the trusted producer at enqueue time.
 	Principal trigger.Principal
-	State     string
-	Error     string
+	// Trace is the parent trace context the producer supplied, if any
+	// (EnqueueRequest.Trace). ProcessOnce hands it to the handler as the
+	// context's active trace (observe.TraceFrom), so a run the handler
+	// starts joins it.
+	Trace observe.TraceContext
+	State string
+	Error string
 }
 
 const (
@@ -113,6 +119,13 @@ type EnqueueRequest struct {
 	// part of the request identity: the same key with another principal
 	// conflicts.
 	Principal trigger.Principal
+	// Trace is the optional parent trace context of the run the job
+	// starts. It travels with the job record and is correlation data, not
+	// identity: it is excluded from the payload digest and from the
+	// duplicate comparison, so the same key with another (or no) trace is a
+	// duplicate that keeps the first committed trace. An invalid context is
+	// not stored; an invalid tracestate is dropped.
+	Trace observe.TraceContext
 }
 
 type EnqueueResult struct {
@@ -415,8 +428,15 @@ func New(ctx context.Context, database store.Database, clock func() time.Time, o
 			if err := ensureColumn(ctx, tx, "enqueue_seq", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 				return err
 			}
-			_, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS worker_jobs_enqueue_seq ON worker_jobs (enqueue_seq)`)
-			return err
+			if _, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS worker_jobs_enqueue_seq ON worker_jobs (enqueue_seq)`); err != nil {
+				return err
+			}
+			// The trace context a job's run joins (#276). Jobs from before
+			// the columns existed carry none.
+			if err := ensureColumn(ctx, tx, "traceparent", "TEXT NOT NULL DEFAULT ''"); err != nil {
+				return err
+			}
+			return ensureColumn(ctx, tx, "tracestate", "TEXT NOT NULL DEFAULT ''")
 		})
 	}); err != nil {
 		return nil, fmt.Errorf("worker: schema: %w", err)
@@ -441,7 +461,9 @@ func createJobs(ctx context.Context, tx *sql.Tx) error {
 		error_text TEXT NOT NULL DEFAULT '',
 		created_at INTEGER NOT NULL,
 		updated_at INTEGER NOT NULL,
-		enqueue_seq INTEGER NOT NULL DEFAULT 0
+		enqueue_seq INTEGER NOT NULL DEFAULT 0,
+		traceparent TEXT NOT NULL DEFAULT '',
+		tracestate TEXT NOT NULL DEFAULT ''
 	)`)
 	return err
 }
@@ -529,6 +551,7 @@ func (q *Queue) Enqueue(ctx context.Context, request EnqueueRequest) (EnqueueRes
 	// The request key is unique, so it alone identifies the job. Deriving the
 	// ID from the clock let equal payloads collide under a coarse clock.
 	jobID := "job:" + digest([]byte(request.RequestKey))[:32]
+	traceparent, tracestate := encodeTrace(request.Trace)
 	var result EnqueueResult
 	err = q.withTx(store.Writer(ctx), func(tx *sql.Tx) error {
 		// enqueue_seq is one past the highest so far, read under this
@@ -536,9 +559,9 @@ func (q *Queue) Enqueue(ctx context.Context, request EnqueueRequest) (EnqueueRes
 		// rather than taken from SQLite's rowid, which SQLite documents VACUUM
 		// may renumber for tables without an INTEGER PRIMARY KEY.
 		res, err := tx.ExecContext(ctx, `INSERT INTO worker_jobs
-			(job_id, request_key, kind, payload_json, payload_digest, max_attempts, principal_json, state, available_at, created_at, updated_at, enqueue_seq)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(enqueue_seq), 0) + 1 FROM worker_jobs)) ON CONFLICT(request_key) DO NOTHING`,
-			jobID, request.RequestKey, request.Kind, []byte(request.Payload), payloadDigest, request.MaxAttempts, principal, StatePending, q.now(), q.now(), q.now())
+			(job_id, request_key, kind, payload_json, payload_digest, max_attempts, principal_json, state, available_at, created_at, updated_at, enqueue_seq, traceparent, tracestate)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(enqueue_seq), 0) + 1 FROM worker_jobs), ?, ?) ON CONFLICT(request_key) DO NOTHING`,
+			jobID, request.RequestKey, request.Kind, []byte(request.Payload), payloadDigest, request.MaxAttempts, principal, StatePending, q.now(), q.now(), q.now(), traceparent, tracestate)
 		if err != nil {
 			return err
 		}
@@ -547,7 +570,7 @@ func (q *Queue) Enqueue(ctx context.Context, request EnqueueRequest) (EnqueueRes
 			return err
 		}
 		if count == 0 {
-			job, err := scanJob(tx.QueryRowContext(ctx, `SELECT job_id, request_key, kind, payload_json, attempt, max_attempts, deferrals, principal_json, state, error_text FROM worker_jobs WHERE request_key = ?`, request.RequestKey))
+			job, err := scanJob(tx.QueryRowContext(ctx, `SELECT `+jobColumns+` FROM worker_jobs WHERE request_key = ?`, request.RequestKey))
 			if err != nil {
 				return err
 			}
@@ -561,7 +584,7 @@ func (q *Queue) Enqueue(ctx context.Context, request EnqueueRequest) (EnqueueRes
 			result = EnqueueResult{Job: job, Accepted: false}
 			return nil
 		}
-		result = EnqueueResult{Job: Job{ID: jobID, RequestKey: request.RequestKey, Kind: request.Kind, Payload: append([]byte(nil), request.Payload...), MaxAttempts: request.MaxAttempts, Principal: request.Principal, State: StatePending}, Accepted: true}
+		result = EnqueueResult{Job: Job{ID: jobID, RequestKey: request.RequestKey, Kind: request.Kind, Payload: append([]byte(nil), request.Payload...), MaxAttempts: request.MaxAttempts, Principal: request.Principal, Trace: decodeTrace(traceparent, tracestate), State: StatePending}, Accepted: true}
 		return nil
 	})
 	if err != nil {
@@ -837,10 +860,13 @@ func (q *Queue) handle(ctx, txCtx context.Context, handler Handler, job Job, lea
 			return ended(err)
 		}
 		handlerCtx := ctx
+		if job.Trace.Valid() {
+			handlerCtx = observe.WithTrace(handlerCtx, job.Trace)
+		}
 		if q.writeDomain != nil {
 			activeDomain = &claimedWriteDomain{domain: q.writeDomain}
 			activeDomain.active.Store(true)
-			handlerCtx = context.WithValue(ctx, claimedWriteDomainKey{}, activeDomain)
+			handlerCtx = context.WithValue(handlerCtx, claimedWriteDomainKey{}, activeDomain)
 		}
 		ran, inHandler = true, true
 		handlerErr := handler(handlerCtx, Tx{claim: claimed}, job)
@@ -1012,7 +1038,7 @@ func (q *Queue) release(ctx context.Context, job Job, lease int64) error {
 // Submit implements trigger.Submitter on the durable queue: the submission
 // is committed (or found already committed) before Submit returns.
 func (q *Queue) Submit(ctx context.Context, submission trigger.Submission) (bool, error) {
-	result, err := q.Enqueue(ctx, EnqueueRequest{RequestKey: submission.Key, Kind: submission.Kind, Payload: submission.Payload, Principal: submission.Principal})
+	result, err := q.Enqueue(ctx, EnqueueRequest{RequestKey: submission.Key, Kind: submission.Kind, Payload: submission.Payload, Principal: submission.Principal, Trace: submission.Trace})
 	if err != nil {
 		return false, err
 	}
@@ -1020,6 +1046,31 @@ func (q *Queue) Submit(ctx context.Context, submission trigger.Submission) (bool
 }
 
 var _ trigger.Submitter = (*Queue)(nil)
+
+// encodeTrace stores a valid trace context as its canonical traceparent and
+// tracestate, and anything else as empty. An invalid tracestate, or a member
+// of it the redaction boundary flags, is dropped rather than discarding the
+// context.
+func encodeTrace(trace observe.TraceContext) (traceparent, tracestate string) {
+	if !trace.TraceID.IsValid() || !trace.SpanID.IsValid() {
+		return "", ""
+	}
+	trace.Flags &= observe.FlagSampled
+	trace.State = trigger.SafeTracestate(trace.State)
+	return trace.Traceparent(), trace.State
+}
+
+// decodeTrace reads a stored trace context. A value that does not parse (a
+// row written by something other than encodeTrace) is ignored, never an
+// error: a job is never refused for its correlation data.
+func decodeTrace(traceparent, tracestate string) observe.TraceContext {
+	trace, ok := observe.ExtractTrace([]string{traceparent}, []string{tracestate})
+	if !ok {
+		return observe.TraceContext{}
+	}
+	trace.State = trigger.SafeTracestate(trace.State)
+	return trace
+}
 
 // encodePrincipal stores an empty principal as "" so jobs from producers that
 // establish none compare equal, and sorts roles so the same principal always
@@ -1056,7 +1107,7 @@ func (q *Queue) Get(ctx context.Context, requestKey string) (Job, error) {
 	var job Job
 	err := q.withTx(ctx, func(tx *sql.Tx) error {
 		var err error
-		job, err = scanJob(tx.QueryRowContext(ctx, `SELECT job_id, request_key, kind, payload_json, attempt, max_attempts, deferrals, principal_json, state, error_text FROM worker_jobs WHERE request_key = ?`, requestKey))
+		job, err = scanJob(tx.QueryRowContext(ctx, `SELECT `+jobColumns+` FROM worker_jobs WHERE request_key = ?`, requestKey))
 		return err
 	})
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1079,7 +1130,7 @@ func (q *Queue) claim(ctx context.Context, tx *sql.Tx) (Job, int64, error) {
 	job, err := scanJob(tx.QueryRowContext(ctx, `UPDATE worker_jobs SET state = ?, attempt = attempt + 1, lease_until = ?, updated_at = ?
 		WHERE job_id = (SELECT job_id FROM worker_jobs
 			WHERE (state = ? OR (state = ? AND lease_until <= ?)) AND available_at <= ? ORDER BY created_at, enqueue_seq, job_id LIMIT 1)
-		RETURNING job_id, request_key, kind, payload_json, attempt, max_attempts, deferrals, principal_json, state, error_text`,
+		RETURNING `+jobColumns,
 		StateProcessing, leaseUntil, now, StatePending, StateProcessing, now, now))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Job{}, 0, ErrNotFound
@@ -1090,13 +1141,17 @@ func (q *Queue) claim(ctx context.Context, tx *sql.Tx) (Job, int64, error) {
 	return job, leaseUntil, nil
 }
 
+// jobColumns are the columns scanJob reads, in its order.
+const jobColumns = `job_id, request_key, kind, payload_json, attempt, max_attempts, deferrals, principal_json, state, error_text, traceparent, tracestate`
+
 func scanJob(row interface{ Scan(...any) error }) (Job, error) {
 	var job Job
 	var payload []byte
-	var principal string
-	if err := row.Scan(&job.ID, &job.RequestKey, &job.Kind, &payload, &job.Attempt, &job.MaxAttempts, &job.Deferrals, &principal, &job.State, &job.Error); err != nil {
+	var principal, traceparent, tracestate string
+	if err := row.Scan(&job.ID, &job.RequestKey, &job.Kind, &payload, &job.Attempt, &job.MaxAttempts, &job.Deferrals, &principal, &job.State, &job.Error, &traceparent, &tracestate); err != nil {
 		return Job{}, err
 	}
+	job.Trace = decodeTrace(traceparent, tracestate)
 	if principal != "" {
 		if err := json.Unmarshal([]byte(principal), &job.Principal); err != nil {
 			return Job{}, fmt.Errorf("worker: stored principal: %w", err)

@@ -41,6 +41,10 @@ dependency. It defines:
   publisher as a `caller`. Every other kind must authenticate its caller, so
   a caller-facing adapter cannot opt out of the authentication cases.
 - `Principal`: produced only by an adapter's authenticator.
+- `TraceIngress`: an adapter's opt-in policy for an inbound W3C trace
+  context (#276, ADR 0020). It is read only after admission,
+  authentication and validation, and never feeds a principal, a key or a
+  route.
 - `ErrSaturated` (the same value as `capacity.ErrSaturated`): returned by an
   admission handler without capacity, or by anything a handler calls that
   ran out of capacity: a busy store's `store.ErrBusy` matches it (#190). It
