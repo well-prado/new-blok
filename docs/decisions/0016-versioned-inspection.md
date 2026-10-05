@@ -232,7 +232,9 @@ steps that had not yet written a journal fact are not reconstructed.
 publication continues, so stopping the stream never affects a run.
 
 **Limits.** One hub per process: a reader connected to another replica sees
-nothing from this one. The engine serializes observation payloads whenever
+nothing from this one. Journaled execution (`RunJournaled`, ADR 0019) emits no
+inspection events, so a durably executed run produces no live frames; a
+reader with `Source` configured sees it only as its journal reconstruction. The engine serializes observation payloads whenever
 any observer is selected, including when the stream discards them; that costs
 CPU, not retention. Measured overhead and latency in the PR are one
 developer machine's figures, not performance claims.
