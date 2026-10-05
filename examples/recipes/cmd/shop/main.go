@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/well-prado/new-blok/examples/recipes/shop"
+	"github.com/well-prado/new-blok/observe/redact"
 	"github.com/well-prado/new-blok/store"
 	"github.com/well-prado/new-blok/store/sqlite"
 )
@@ -131,6 +133,7 @@ func serve(parent context.Context, database store.Database) error {
 		for workerCtx.Err() == nil {
 			processed, processErr := processAvailable(workerCtx, application)
 			if processErr != nil && workerCtx.Err() == nil {
+				logIterationError(os.Stderr, processErr)
 				time.Sleep(100 * time.Millisecond)
 				continue
 			}
@@ -164,6 +167,13 @@ func processAvailable(ctx context.Context, application *shop.Application) (bool,
 	processed, processErr := application.ProcessOne(ctx)
 	drained, drainErr := application.DrainOutbox(ctx)
 	return processed || drained, errors.Join(processErr, drainErr)
+}
+
+// logIterationError reports a failed worker or outbox iteration instead of
+// dropping it. The message passes the framework's redaction boundary (#80)
+// first: an error can quote a header, a payload or a provider response.
+func logIterationError(w io.Writer, err error) {
+	_, _ = fmt.Fprintln(w, "shop: worker iteration failed: "+redact.Message(err.Error()))
 }
 
 func required(name string) (string, error) {

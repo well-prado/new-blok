@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/well-prado/new-blok/examples/recipes/shop"
+	"github.com/well-prado/new-blok/observe/redact"
 	"github.com/well-prado/new-blok/store/sqlite"
 )
 
@@ -45,7 +49,7 @@ func TestFreshMigrationReplayStatusAndTeardownCommands(t *testing.T) {
 	if err := database.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if version != 3 || count != 3 {
+	if version != 4 || count != 4 {
 		t.Fatalf("migration version=%d rows=%d", version, count)
 	}
 	if err := run([]string{"teardown"}); err != nil {
@@ -116,5 +120,20 @@ func TestServePollIterationPublishesCommittedOutboxEvent(t *testing.T) {
 	}
 	if event.Type != "shop.record.changed" || event.Record.ID != "serve-outbox" {
 		t.Fatalf("serve published event=%+v", event)
+	}
+}
+
+// The serve loop reports iteration failures, and a credential quoted in one
+// does not reach the log.
+func TestServeLoopLogsIterationErrorsThroughRedaction(t *testing.T) {
+	var log bytes.Buffer
+	logIterationError(&log, fmt.Errorf("%w: event-1", shop.ErrOutboxDead))
+	if !strings.Contains(log.String(), "exhausted its delivery attempts: event-1") {
+		t.Fatalf("plain iteration error not logged verbatim: %q", log.String())
+	}
+	log.Reset()
+	logIterationError(&log, errors.New("publish rejected: Authorization: Bearer "+aliceToken))
+	if strings.Contains(log.String(), aliceToken) || !strings.Contains(log.String(), redact.MessageMarker) {
+		t.Fatalf("credential-shaped iteration error was not redacted: %q", log.String())
 	}
 }

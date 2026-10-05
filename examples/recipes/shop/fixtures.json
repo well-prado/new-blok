@@ -16,6 +16,12 @@
     { "id": "outbox-atomic-claim", "expectedMaxClaims": 1 },
     { "id": "concurrent-storage", "expectedRecords": 16, "expectedOutbox": 16 },
     { "id": "external-module-composition", "expectedEffects": 1 },
-    { "id": "slow-subscriber", "expectedCloseReason": "slow_subscriber", "maxSubscriberQueue": 1 }
+    { "id": "slow-subscriber", "expectedCloseReason": "slow_subscriber", "maxSubscriberQueue": 1 },
+    { "id": "job-key-squats-webhook", "expectedStatus": 202, "expectedAcceptedJobs": 1 },
+    { "id": "job-key-squats-stream", "expectedStatus": 202, "expectedEffects": 0 },
+    { "id": "create-existing-elsewhere", "expectedStatus": 200, "expectedRecords": 3 },
+    { "id": "recreate-after-delete", "expectedStatus": 200, "expectedOutbox": 2, "expectedEffects": 2 },
+    { "id": "update-key-per-principal", "expectedStatus": 200, "expectedValue": "alice-updated" },
+    { "id": "outbox-dead", "expectedPublishAttempts": 2, "expectedOutboxState": "dead", "expectedEffects": 0 }
   ]
 }

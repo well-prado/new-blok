@@ -37,7 +37,24 @@ const (
 	JobKind            = "shop.record"
 	defaultOutboxLease = 30 * time.Second
 	maxOutboxLease     = 5 * time.Minute
+	// DefaultOutboxMaxAttempts bounds how often one outbox event is claimed
+	// for delivery before it is parked as dead.
+	DefaultOutboxMaxAttempts = 8
+	maxOutboxAttempts        = 100
+	// streamEndpoint names the SSE endpoint whose submission keys
+	// (sse.SubmissionKey) carry the starting principal's digest.
+	streamEndpoint = "jobs"
+	// streamQueueDepth bounds the events waiting for one SSE subscriber.
+	streamQueueDepth = 1
+	// httpJobKeyPrefix keeps caller-chosen /jobs keys in their own key
+	// space, apart from webhook ("webhook:") and SSE ("sse:") identities.
+	httpJobKeyPrefix = "http:"
 )
+
+// ErrOutboxDead reports outbox events that used every delivery attempt and
+// were parked in state 'dead'. They are no longer retried; the receiver may
+// still have accepted one of the attempts, so reconcile before replaying.
+var ErrOutboxDead = errors.New("shop: outbox event exhausted its delivery attempts")
 
 type Config struct {
 	Database    store.Database
@@ -45,6 +62,50 @@ type Config struct {
 	WebhookKey  []byte
 	Publisher   OutboxPublisher
 	OutboxLease time.Duration
+	// OutboxMaxAttempts bounds delivery claims per event
+	// (DefaultOutboxMaxAttempts when zero).
+	OutboxMaxAttempts int
+}
+
+// principalDigest is the stable, non-reversible principal component of the
+// recipe's key spaces. It is the same digest sse.SubmissionKey uses.
+func principalDigest(principal string) string {
+	digest := sha256.Sum256([]byte(principal))
+	return hex.EncodeToString(digest[:])
+}
+
+// HTTPJobKey is the durable worker identity of a POST /jobs request: the
+// caller's key, scoped to the authenticated caller and to the HTTP key
+// space. A caller therefore cannot occupy a webhook event's identity, an SSE
+// stream's identity, or another caller's key.
+func HTTPJobKey(principal trigger.Principal, key string) string {
+	return httpJobKeyPrefix + principalDigest(principal.ID) + ":" + key
+}
+
+// ownedStreamID returns the SSE stream a job reports to, and only when the
+// job's request key is an SSE submission key that the job's own stored
+// principal started. Any other key, or a key naming another principal, has
+// no stream to finish.
+func ownedStreamID(job worker.Job) (string, bool) {
+	rest, ok := strings.CutPrefix(job.RequestKey, "sse:"+streamEndpoint+":")
+	if !ok {
+		return "", false
+	}
+	_, key, ok := strings.Cut(rest, ":")
+	if !ok || sse.SubmissionKey(streamEndpoint, job.Principal, key) != job.RequestKey {
+		return "", false
+	}
+	return sse.StreamID(job.RequestKey), true
+}
+
+// newIncarnation identifies one lifetime of a record ID, so a deleted ID can
+// be created again with a fresh, still deduplicable, outbox event identity.
+func newIncarnation() (string, error) {
+	random := make([]byte, 16)
+	if _, err := rand.Read(random); err != nil {
+		return "", fmt.Errorf("shop: create record incarnation: %w", err)
+	}
+	return hex.EncodeToString(random), nil
 }
 
 // OutboxPublisher is the explicit external delivery port used by the recipe.
@@ -100,6 +161,7 @@ type Application struct {
 	streamClosures chan string
 	publisher      OutboxPublisher
 	outboxLease    time.Duration
+	outboxAttempts int
 }
 
 // Migrate applies the recipe's ordered, application-owned schema migrations.
@@ -134,6 +196,18 @@ var migrations = [][]string{
 	{`CREATE TABLE shop_records (record_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, value TEXT NOT NULL, created_at INTEGER NOT NULL)`},
 	{`ALTER TABLE shop_records ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0`, `CREATE TABLE shop_outbox (event_id TEXT PRIMARY KEY, record_id TEXT NOT NULL, payload_json BLOB NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL)`},
 	{`ALTER TABLE shop_outbox ADD COLUMN claimed_until INTEGER NOT NULL DEFAULT 0`, `ALTER TABLE shop_outbox ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''`},
+	// v4: record IDs are scoped by owner, so one principal's IDs reveal
+	// nothing about another's, and each lifetime of an ID has its own
+	// incarnation for its outbox identity. Existing rows are kept, each with
+	// a fresh incarnation. Outbox delivery claims are counted so an event is
+	// parked as 'dead' after a bounded number of attempts.
+	{
+		`CREATE TABLE shop_records_v4 (owner_id TEXT NOT NULL, record_id TEXT NOT NULL, incarnation TEXT NOT NULL, value TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (owner_id, record_id))`,
+		`INSERT INTO shop_records_v4(owner_id, record_id, incarnation, value, created_at, updated_at) SELECT owner_id, record_id, lower(hex(randomblob(16))), value, created_at, updated_at FROM shop_records`,
+		`DROP TABLE shop_records`,
+		`ALTER TABLE shop_records_v4 RENAME TO shop_records`,
+		`ALTER TABLE shop_outbox ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0`,
+	},
 }
 
 // Teardown removes only this recipe's tables and the worker queue table it
@@ -165,6 +239,12 @@ func New(ctx context.Context, config Config) (*Application, error) {
 	if config.OutboxLease < 100*time.Millisecond || config.OutboxLease > maxOutboxLease {
 		return nil, fmt.Errorf("shop: outbox lease must be between 100ms and %s", maxOutboxLease)
 	}
+	if config.OutboxMaxAttempts == 0 {
+		config.OutboxMaxAttempts = DefaultOutboxMaxAttempts
+	}
+	if config.OutboxMaxAttempts < 1 || config.OutboxMaxAttempts > maxOutboxAttempts {
+		return nil, fmt.Errorf("shop: outbox max attempts must be between 1 and %d", maxOutboxAttempts)
+	}
 	if err := Migrate(ctx, config.Database); err != nil {
 		return nil, err
 	}
@@ -191,7 +271,7 @@ func New(ctx context.Context, config Config) (*Application, error) {
 	if err := queue.RegisterKind(JobKind, []byte(JobSchema)); err != nil {
 		return nil, err
 	}
-	service := &Application{Database: config.Database, Queue: queue, streamClosures: make(chan string, 64), publisher: config.Publisher, outboxLease: config.OutboxLease}
+	service := &Application{Database: config.Database, Queue: queue, streamClosures: make(chan string, 64), publisher: config.Publisher, outboxLease: config.OutboxLease, outboxAttempts: config.OutboxMaxAttempts}
 	commandSchema := []byte(`{"type":"object","additionalProperties":false,"properties":{"record":{"type":"object","additionalProperties":false,"properties":{"id":{"type":"string"},"value":{"type":"string"},"owner":{"type":"string"}},"required":["id","value","owner"]},"eventId":{"type":"string"}},"required":["record","eventId"]}`)
 	recordNode, err := node.Define("recipes/validate-record", "1.0.0", func(_ context.Context, command recordCommand) (recordCommand, error) {
 		record := command.Record
@@ -274,9 +354,9 @@ func New(ctx context.Context, config Config) (*Application, error) {
 		return nil, err
 	}
 	service.SSE, err = sse.New(service.app, service.Hub, []sse.Endpoint{{
-		Name: "jobs", Path: "/jobs/stream", Kind: JobKind, Submit: queue, Tracker: queue,
+		Name: streamEndpoint, Path: "/jobs/stream", Kind: JobKind, Submit: queue, Tracker: queue,
 		Authenticate: authenticate, InputSchema: []byte(JobSchema), MaxBodyBytes: 8 << 10,
-		QueueDepth: 1, MaxSubscribers: 32, StreamSubscribers: 4,
+		QueueDepth: streamQueueDepth, MaxSubscribers: 32, StreamSubscribers: 4,
 		Heartbeat: 10 * time.Second, WriteTimeout: 2 * time.Second, MaxDuration: 2 * time.Minute,
 		OnClose: func(_, reason string) {
 			select {
@@ -318,19 +398,39 @@ func (a *Application) createRecord(ctx context.Context, input blokhttp.Input) (a
 	if err := json.Unmarshal(input.Body, &request); err != nil {
 		return nil, &node.DomainError{Code: "invalid_record", Class: "validation", Err: err}
 	}
-	event, err := a.prepareRecordEvent(ctx, Record{ID: request.ID, Value: request.Value, Owner: input.Principal.ID}, "record.created:"+request.ID)
+	incarnation, err := newIncarnation()
+	if err != nil {
+		return nil, err
+	}
+	// The event identity names this owner, ID and incarnation: stable for
+	// every delivery attempt of this create, distinct from any earlier
+	// lifetime of the same ID and from another owner's same ID.
+	event, err := a.prepareRecordEvent(ctx, Record{ID: request.ID, Value: request.Value, Owner: input.Principal.ID}, "record.created:"+principalDigest(input.Principal.ID)+":"+request.ID+":"+incarnation)
 	if err != nil {
 		return nil, err
 	}
 	record := event.Record
-	err = a.Database.WithTx(ctx, func(tx *sql.Tx) error {
+	payload, err := json.Marshal(event)
+	if err != nil {
+		return nil, err
+	}
+	// The first statement writes and nothing slow runs inside, so the
+	// transaction is marked for the store's first-come writer queue (#214).
+	err = a.Database.WithTx(store.Writer(ctx), func(tx *sql.Tx) error {
 		now := time.Now().UTC().UnixNano()
-		if _, err := tx.ExecContext(ctx, `INSERT INTO shop_records(record_id, owner_id, value, created_at, updated_at) VALUES(?, ?, ?, ?, ?)`, record.ID, record.Owner, record.Value, now, now); err != nil {
-			return err
-		}
-		payload, err := json.Marshal(event)
+		// IDs are scoped by owner: another principal's identical ID neither
+		// conflicts nor changes the response.
+		inserted, err := tx.ExecContext(ctx, `INSERT INTO shop_records(owner_id, record_id, incarnation, value, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT(owner_id, record_id) DO NOTHING`, record.Owner, record.ID, incarnation, record.Value, now, now)
 		if err != nil {
 			return err
+		}
+		count, err := inserted.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if count == 0 {
+			// Only the caller's own record can be here.
+			return &node.DomainError{Code: "record_exists", Class: "validation"}
 		}
 		_, err = tx.ExecContext(ctx, `INSERT INTO shop_outbox(event_id, record_id, payload_json, state, created_at) VALUES(?, ?, ?, 'pending', ?)`, event.EventID, record.ID, payload, now)
 		return err
@@ -367,7 +467,9 @@ func (a *Application) updateRecord(ctx context.Context, input blokhttp.Input) (a
 		return nil, &node.DomainError{Code: "invalid_update", Class: "validation"}
 	}
 	record := Record{ID: input.Params["id"], Value: request.Value, Owner: input.Principal.ID}
-	event, err := a.prepareRecordEvent(ctx, record, "record.updated:"+request.RequestKey)
+	// Idempotency keys belong to the caller: the same key from another
+	// principal is a different operation.
+	event, err := a.prepareRecordEvent(ctx, record, "record.updated:"+principalDigest(input.Principal.ID)+":"+request.RequestKey)
 	if err != nil {
 		return nil, err
 	}
@@ -376,7 +478,7 @@ func (a *Application) updateRecord(ctx context.Context, input blokhttp.Input) (a
 	if err != nil {
 		return nil, err
 	}
-	err = a.Database.WithTx(ctx, func(tx *sql.Tx) error {
+	err = a.Database.WithTx(store.Writer(ctx), func(tx *sql.Tx) error {
 		eventID := event.EventID
 		insert, err := tx.ExecContext(ctx, `INSERT INTO shop_outbox(event_id, record_id, payload_json, state, created_at) VALUES(?, ?, ?, 'pending', ?) ON CONFLICT(event_id) DO NOTHING`, eventID, validated.ID, payload, time.Now().UTC().UnixNano())
 		if err != nil {
@@ -418,7 +520,7 @@ func (a *Application) updateRecord(ctx context.Context, input blokhttp.Input) (a
 
 func (a *Application) deleteRecord(ctx context.Context, input blokhttp.Input) (any, error) {
 	deleted := false
-	err := a.Database.WithTx(ctx, func(tx *sql.Tx) error {
+	err := a.Database.WithTx(store.Writer(ctx), func(tx *sql.Tx) error {
 		result, err := tx.ExecContext(ctx, `DELETE FROM shop_records WHERE record_id = ? AND owner_id = ?`, input.Params["id"], input.Principal.ID)
 		if err != nil {
 			return err
@@ -444,7 +546,10 @@ func (a *Application) submitJob(ctx context.Context, input blokhttp.Input) (any,
 	if job.RequestKey == "" || len(job.RequestKey) > 256 || job.RecordID == "" || len(job.RecordID) > 128 || len(job.Value) > 4096 {
 		return nil, &node.DomainError{Code: "invalid_job", Class: "validation"}
 	}
-	return a.Queue.Enqueue(ctx, worker.EnqueueRequest{RequestKey: job.RequestKey, Kind: JobKind, Payload: input.Body, Principal: input.Principal})
+	// The caller's key is stored only inside its own namespace (HTTPJobKey),
+	// never raw: a raw key could occupy a webhook event's or another
+	// principal's SSE stream's durable identity.
+	return a.Queue.Enqueue(ctx, worker.EnqueueRequest{RequestKey: HTTPJobKey(input.Principal, job.RequestKey), Kind: JobKind, Payload: input.Body, Principal: input.Principal})
 }
 
 // ProcessOne runs one accepted job in the real worker queue. The business row,
@@ -467,8 +572,12 @@ func (a *Application) ProcessOne(ctx context.Context) (bool, error) {
 			return runErr
 		}
 		record = event.Record
+		incarnation, err := newIncarnation()
+		if err != nil {
+			return err
+		}
 		now := time.Now().UTC().UnixNano()
-		inserted, err := tx.ExecContext(ctx, `INSERT INTO shop_records(record_id, owner_id, value, created_at, updated_at) VALUES(?, ?, ?, ?, ?) ON CONFLICT(record_id) DO NOTHING`, record.ID, record.Owner, record.Value, now, now)
+		inserted, err := tx.ExecContext(ctx, `INSERT INTO shop_records(owner_id, record_id, incarnation, value, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT(owner_id, record_id) DO NOTHING`, record.Owner, record.ID, incarnation, record.Value, now, now)
 		if err != nil {
 			return err
 		}
@@ -477,11 +586,12 @@ func (a *Application) ProcessOne(ctx context.Context) (bool, error) {
 			return err
 		}
 		if count == 0 {
-			var owner, value string
-			if err := tx.QueryRowContext(ctx, `SELECT owner_id, value FROM shop_records WHERE record_id = ?`, record.ID).Scan(&owner, &value); err != nil {
+			// Only this job principal's own record can conflict.
+			var value string
+			if err := tx.QueryRowContext(ctx, `SELECT value FROM shop_records WHERE owner_id = ? AND record_id = ?`, record.Owner, record.ID).Scan(&value); err != nil {
 				return err
 			}
-			if owner != record.Owner || value != record.Value {
+			if value != record.Value {
 				return &worker.HandlerError{Message: "record key conflicts with existing data"}
 			}
 		}
@@ -499,7 +609,13 @@ func (a *Application) ProcessOne(ctx context.Context) (bool, error) {
 	if err != nil {
 		return processed, err
 	}
-	streamID := sse.StreamID(key)
+	// Report only to a stream the job's stored principal started. A job
+	// whose key merely looks like another principal's stream key has no
+	// stream to finish.
+	streamID, owned := ownedStreamID(job)
+	if !owned {
+		return true, nil
+	}
 	switch job.State {
 	case worker.StateCompleted:
 		data, _ := json.Marshal(record)
@@ -527,7 +643,9 @@ func (a *Application) prepareRecordEvent(ctx context.Context, record Record, eve
 
 // DrainOutbox atomically claims one row, commits the claim, then publishes
 // outside the SQLite write transaction. Failed or ambiguous delivery remains
-// leased until expiry; the publisher deduplicates by stable EventID.
+// leased until expiry; the publisher deduplicates by stable EventID. Each
+// claim counts one attempt; an event whose lease expired after its last
+// attempt is parked as 'dead' and reported with ErrOutboxDead.
 func (a *Application) DrainOutbox(ctx context.Context) (bool, error) {
 	tokenBytes := make([]byte, 16)
 	if _, err := rand.Read(tokenBytes); err != nil {
@@ -540,18 +658,43 @@ func (a *Application) DrainOutbox(ctx context.Context) (bool, error) {
 		payload []byte
 	}{}
 	claimed := false
-	claimErr := a.Database.WithTx(ctx, func(tx *sql.Tx) error {
+	var dead []string
+	// Both statements write first and nothing slow runs inside, so the claim
+	// is marked for the store's first-come writer queue (#214).
+	claimErr := a.Database.WithTx(store.Writer(ctx), func(tx *sql.Tx) error {
 		// UPDATE is the transaction's first statement: SQLite obtains the write
 		// reservation before selecting, so competing drainers cannot both claim.
-		err := tx.QueryRowContext(ctx, `UPDATE shop_outbox
-			SET state = 'claimed', claim_token = ?, claimed_until = ?
+		// An expired claim that used its last attempt is parked first.
+		rows, err := tx.QueryContext(ctx, `UPDATE shop_outbox
+			SET state = 'dead', claim_token = '', claimed_until = 0
+			WHERE state = 'claimed' AND claimed_until <= ? AND attempts >= ?
+			RETURNING event_id`, now, a.outboxAttempts)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var eventID string
+			if err := rows.Scan(&eventID); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			dead = append(dead, eventID)
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		err = tx.QueryRowContext(ctx, `UPDATE shop_outbox
+			SET state = 'claimed', claim_token = ?, claimed_until = ?, attempts = attempts + 1
 			WHERE event_id = (
 				SELECT event_id FROM shop_outbox
-				WHERE state = 'pending' OR (state = 'claimed' AND claimed_until <= ?)
+				WHERE attempts < ? AND (state = 'pending' OR (state = 'claimed' AND claimed_until <= ?))
 				ORDER BY created_at, event_id LIMIT 1
 			)
-			AND (state = 'pending' OR (state = 'claimed' AND claimed_until <= ?))
-			RETURNING event_id, payload_json`, token, now+int64(a.outboxLease), now, now).Scan(&claim.eventID, &claim.payload)
+			AND attempts < ? AND (state = 'pending' OR (state = 'claimed' AND claimed_until <= ?))
+			RETURNING event_id, payload_json`, token, now+int64(a.outboxLease), a.outboxAttempts, now, a.outboxAttempts, now).Scan(&claim.eventID, &claim.payload)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
@@ -561,20 +704,24 @@ func (a *Application) DrainOutbox(ctx context.Context) (bool, error) {
 		claimed = true
 		return nil
 	})
+	var deadErr error
+	if claimErr == nil && len(dead) > 0 {
+		deadErr = fmt.Errorf("%w: %s", ErrOutboxDead, strings.Join(dead, ", "))
+	}
 	if claimErr != nil || !claimed {
-		return claimed, claimErr
+		return claimed || len(dead) > 0, errors.Join(claimErr, deadErr)
 	}
 	publishCtx, cancel := context.WithTimeout(ctx, a.outboxLease/2)
 	err := a.publisher.Publish(publishCtx, claim.eventID, append([]byte(nil), claim.payload...))
 	cancel()
 	if err != nil {
-		return true, err
+		return true, errors.Join(err, deadErr)
 	}
 	// Once accepted by the sink, finish the local acknowledgment even if the
 	// consumer context was canceled; this SQL remains bounded by store limits.
 	ackCtx, cancelAck := context.WithTimeout(context.WithoutCancel(ctx), a.outboxLease/4)
 	defer cancelAck()
-	return true, a.Database.WithTx(ackCtx, func(tx *sql.Tx) error {
+	return true, errors.Join(deadErr, a.Database.WithTx(store.Writer(ackCtx), func(tx *sql.Tx) error {
 		result, err := tx.ExecContext(ackCtx, `UPDATE shop_outbox SET state = 'sent', claim_token = '', claimed_until = 0 WHERE event_id = ? AND state = 'claimed' AND claim_token = ?`, claim.eventID, token)
 		if err != nil {
 			return err
@@ -587,5 +734,5 @@ func (a *Application) DrainOutbox(ctx context.Context) (bool, error) {
 			return errors.New("shop: outbox claim expired or was replaced after publish")
 		}
 		return nil
-	})
+	}))
 }

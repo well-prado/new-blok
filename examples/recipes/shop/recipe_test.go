@@ -41,6 +41,7 @@ type expectedCase struct {
 	ExpectedStableEventID   bool   `json:"expectedStableEventId"`
 	ExpectedValue           string `json:"expectedValue"`
 	ExpectedMaxClaims       int    `json:"expectedMaxClaims"`
+	ExpectedOutboxState     string `json:"expectedOutboxState"`
 }
 
 func fixture(t testing.TB, id string) expectedCase {
@@ -117,6 +118,11 @@ func TestMigrationsReplayUpgradeAndTeardown(t *testing.T) {
 		if _, err := tx.Exec(migrations[0][0]); err != nil {
 			return err
 		}
+		// A v1 row must survive every later migration, including the v4
+		// owner-scoped rebuild of shop_records.
+		if _, err := tx.Exec(`INSERT INTO shop_records(record_id, owner_id, value, created_at) VALUES('legacy-1', 'alice', 'kept', 1)`); err != nil {
+			return err
+		}
 		_, err := tx.Exec(`INSERT INTO shop_schema_migrations(version, applied_at) VALUES(1, 1)`)
 		return err
 	}); err != nil {
@@ -156,12 +162,33 @@ func TestMigrationsReplayUpgradeAndTeardown(t *testing.T) {
 		if updatedAtColumn != 1 {
 			return fmt.Errorf("updated_at columns=%d", updatedAtColumn)
 		}
+		var owner, value, incarnation string
+		if err := tx.QueryRow(`SELECT owner_id, value, incarnation FROM shop_records WHERE record_id = 'legacy-1'`).Scan(&owner, &value, &incarnation); err != nil {
+			return fmt.Errorf("v1 row after upgrade: %w", err)
+		}
+		if owner != "alice" || value != "kept" || len(incarnation) != 32 {
+			return fmt.Errorf("v1 row after upgrade owner=%q value=%q incarnation=%q", owner, value, incarnation)
+		}
+		// The same ID under another owner is a separate record (owner-scoped key).
+		if _, err := tx.Exec(`INSERT INTO shop_records(owner_id, record_id, incarnation, value, created_at) VALUES('bob', 'legacy-1', 'x', 'other', 2)`); err != nil {
+			return fmt.Errorf("owner-scoped key: %w", err)
+		}
+		if _, err := tx.Exec(`INSERT INTO shop_records(owner_id, record_id, incarnation, value, created_at) VALUES('alice', 'legacy-1', 'y', 'dup', 3)`); err == nil {
+			return errors.New("duplicate (owner, record) accepted")
+		}
+		var attemptsColumn int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('shop_outbox') WHERE name = 'attempts'`).Scan(&attemptsColumn); err != nil {
+			return err
+		}
+		if attemptsColumn != 1 {
+			return fmt.Errorf("outbox attempts columns=%d", attemptsColumn)
+		}
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if version != 3 || migrationsApplied != 3 {
-		t.Fatalf("version=%d migration rows=%d, want 3 and 3", version, migrationsApplied)
+	if version != len(migrations) || version != 4 || migrationsApplied != 4 {
+		t.Fatalf("version=%d migration rows=%d, want 4 and 4", version, migrationsApplied)
 	}
 	if _, err := worker.New(context.Background(), database, nil); err != nil {
 		t.Fatal(err)
@@ -691,7 +718,7 @@ func TestRecipeWorkerProcess(t *testing.T) {
 	}
 }
 
-func TestSSESlowReaderIsDisconnectedAtConfiguredQueueBound(t *testing.T) {
+func TestSSESlowReaderOverTCPIsDisconnected(t *testing.T) {
 	application, closeDatabase := openRecipe(t, filepath.Join(t.TempDir(), "stream.db"))
 	defer closeDatabase()
 	if err := application.Start(context.Background()); err != nil {
