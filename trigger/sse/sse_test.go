@@ -535,38 +535,47 @@ func stalled(t *testing.T, f *fixture, stream string) net.Conn {
 	return conn
 }
 
-// flood publishes large events as fast as possible and returns the longest
-// time a single Publish took.
-func flood(t *testing.T, hub *sse.Hub, stream string, events int) time.Duration {
-	t.Helper()
+// flood publishes large events as fast as possible.
+func flood(hub *sse.Hub, stream string, events int) error {
 	data := json.RawMessage(`"` + strings.Repeat("x", 60<<10) + `"`)
-	var longest time.Duration
 	for i := 0; i < events; i++ {
-		began := time.Now()
 		if _, err := hub.Publish(stream, sse.Event{Type: "progress", Data: data}); err != nil {
-			t.Fatal(err)
+			return err
 		}
-		longest = max(longest, time.Since(began))
 	}
-	return longest
+	return nil
 }
 
 // TestSlowSubscriberIsDisconnectedNotBuffered: a subscriber that stops
 // reading lets its bounded queue fill, and is then disconnected; publishing
 // never waits for it, and the hub retains only its replay bound.
+//
+// No single publish is timed (#310): under load one could be descheduled
+// for longer than any bound that still meant something. The stalled
+// subscriber's write may block for an hour, so a publisher that waited for
+// it would not finish within that hour, or ever. The flood is awaited under
+// a safety bound far below that, and the subscriber must have been cut off
+// as slow, not released by its write timeout.
 func TestSlowSubscriberIsDisconnectedNotBuffered(t *testing.T) {
+	const writeTimeout, safety = time.Hour, 2 * time.Minute
 	f := newFixture(t, sse.HubConfig{RetainBytes: 1 << 20, MaxEventBytes: 64 << 10}, func(e *sse.Endpoint) {
 		e.QueueDepth = 4
-		e.WriteTimeout = time.Minute
+		e.WriteTimeout = writeTimeout
 	})
 	stream := f.started(t, "alice", "k1")
 	conn := stalled(t, f, stream)
 	defer conn.Close()
-	longest := flood(t, f.hub, stream, 600)
-	f.closed.wait(t, sse.ReasonSlow)
-	if longest > publishBound {
-		t.Fatalf("a publish waited %v for a slow subscriber", longest)
+	done := make(chan error, 1)
+	go func() { done <- flood(f.hub, stream, 600) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(safety):
+		t.Fatalf("publishing did not finish while a subscriber stalled: it waited for the subscriber")
 	}
+	f.closed.wait(t, sse.ReasonSlow)
 	if stats := f.hub.Stats(); stats.SlowSubscribers != 1 || stats.EvictedEvents == 0 {
 		t.Fatalf("stats %+v", stats)
 	}

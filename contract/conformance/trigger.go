@@ -203,7 +203,11 @@ type TriggerOptions struct {
 	// CancelTimeout bounds how long a blocked workflow waits for
 	// cancellation before the case fails.
 	CancelTimeout time.Duration
-	// SettleTimeout bounds how long goroutines may take to exit after Stop.
+	// SettleTimeout bounds how long goroutines may take to exit, both those
+	// left by constructing the adapter and those left after Stop. The check
+	// is for a goroutine that stays; one already on its way out (database/sql
+	// ends each transaction's watcher goroutine just after the commit, #310)
+	// gets this long, not a fixed 50 ms, to be scheduled and exit.
 	SettleTimeout time.Duration
 }
 
@@ -275,7 +279,7 @@ func RunTrigger(ctx context.Context, driver TriggerDriver, corpus TriggerCorpus,
 	if err := driver.Open(ctx, env); err != nil {
 		return report, fmt.Errorf("open: %w", err)
 	}
-	if extra := settle(baseline, 50*time.Millisecond); extra != "" {
+	if extra := settle(baseline, options.SettleTimeout); extra != "" {
 		return report, &TriggerFailure{Code: "construction_side_effect", Message: "constructing the adapter started a goroutine: " + extra}
 	}
 	if endpoint, ok := driver.(Endpoint); ok && endpoint.Endpoint() != "" {
