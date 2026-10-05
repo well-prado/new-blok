@@ -156,8 +156,12 @@ This is a behavioral validation tightening plus one additive exported constant
 (`flow.OutputID`), linked to
 [#247](https://github.com/well-prado/new-blok/issues/247). It is not a
 wire-shape or document-version change, and the lowered output id is unchanged.
-Only definitions using the id `output` for an authored step are affected; they
-already lowered to a program with duplicate ids. Migration: rename the step.
+Only definitions using the id `output` for an authored step are affected.
+Those made of plain calls already lowered to a program with duplicate ids;
+a control construct named `output`, or a definition used only through
+`Program()` or `agent.RegisterWorkflow`, used to fail in `Lower` or be
+refused by the catalog, and now panics when the flow is defined instead.
+Migration: rename the step.
 `flow/reserved_output_test.go` proves rejection for every id-taking builder and
 that resembling ids (`outputs`, `output-step`, `result`) still lower to the
 canonical compiler's program; `internal/compile` and `contract` tests prove a
