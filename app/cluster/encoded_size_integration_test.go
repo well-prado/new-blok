@@ -8,14 +8,13 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"os/exec"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/well-prado/new-blok/contract"
 	"github.com/well-prado/new-blok/internal/cluster"
+	"github.com/well-prado/new-blok/internal/clustertest"
 	"github.com/well-prado/new-blok/internal/engine"
 	"github.com/well-prado/new-blok/node"
 	"github.com/well-prado/new-blok/store/distributed"
@@ -33,6 +32,9 @@ type distributedTextInput struct {
 // would retry forever. A genuine quorum loss on the same wait must still be a
 // retryable 503 + Retry-After.
 func TestDistributedEncodedOversizeIsDefiniteNotUnavailable(t *testing.T) {
+	// Its genuine-outage subtest pauses voters: the test runs alone on the
+	// shared cluster.
+	clustertest.Disrupt(t)
 	store := namespacedDistributedStore(t)
 	decode := func(raw json.RawMessage) (any, error) {
 		var input distributedTextInput
@@ -178,7 +180,7 @@ func TestDistributedEncodedOversizeIsDefiniteNotUnavailable(t *testing.T) {
 	})
 
 	t.Run("genuine outage stays retryable", func(t *testing.T) {
-		restore := pauseQuorum(t)
+		restore := clustertest.PauseQuorum(t)
 		outageCtx, stop := context.WithTimeout(ctx, 3*time.Second)
 		during := signal(outageCtx, waitingID, "waiting-small", []byte(`{"approved":true}`))
 		stop()
@@ -199,34 +201,6 @@ func TestDistributedEncodedOversizeIsDefiniteNotUnavailable(t *testing.T) {
 			t.Fatalf("waiting signal after recovery status=%d body=%s, want 202 accepted", after.Code, after.Body.String())
 		}
 	})
-}
-
-// pauseQuorum pauses two of the three etcd voters and returns an idempotent
-// restore, also registered as cleanup.
-func pauseQuorum(t *testing.T) func() {
-	t.Helper()
-	voters := strings.Split(os.Getenv("BLOK_DISTRIBUTED_ETCD_VOTERS"), ",")
-	if len(voters) != 3 || voters[0] == "" {
-		t.Fatal("BLOK_DISTRIBUTED_ETCD_VOTERS must name the three voter containers")
-	}
-	paused := make([]string, 0, 2)
-	restore := func() {
-		for index := len(paused) - 1; index >= 0; index-- {
-			if output, err := exec.Command("docker", "unpause", paused[index]).CombinedOutput(); err != nil {
-				t.Errorf("restore voter %s: %v: %s", paused[index], err, output)
-			}
-		}
-		paused = paused[:0]
-	}
-	t.Cleanup(restore)
-	for _, voter := range voters[1:] {
-		if output, err := exec.Command("docker", "pause", voter).CombinedOutput(); err != nil {
-			restore()
-			t.Fatalf("pause voter %s: %v: %s", voter, err, output)
-		}
-		paused = append(paused, voter)
-	}
-	return restore
 }
 
 // encodedSizeFixture is a runtime with one indefinite-wait workflow whose

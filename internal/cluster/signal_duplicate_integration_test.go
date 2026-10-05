@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/well-prado/new-blok/contract"
+	"github.com/well-prado/new-blok/internal/clustertest"
 	"github.com/well-prado/new-blok/node"
 	"github.com/well-prado/new-blok/store/distributed"
 )
@@ -22,6 +23,8 @@ import (
 // the store HTML-escapes, the loser must still see a duplicate of its own
 // signal, not a conflict; a reordered payload is a different signal.
 func TestSignalRaceReconcilesAnHTMLDuplicate(t *testing.T) {
+	// Wait for the cluster lock before this test's deadlines start.
+	clustertest.Endpoints(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 	testID := fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())

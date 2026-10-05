@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/well-prado/new-blok/contract"
+	"github.com/well-prado/new-blok/internal/clustertest"
 	"github.com/well-prado/new-blok/internal/engine"
 	"github.com/well-prado/new-blok/node"
 	"github.com/well-prado/new-blok/store/distributed"
@@ -23,6 +24,8 @@ import (
 // revision through a second real store client, making only the run comparison
 // fail while leaving the wait projection open.
 func TestSignalRetriesAWaitRunCASConflict(t *testing.T) {
+	// Wait for the cluster lock before this test's deadlines start.
+	clustertest.Endpoints(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 	testID := fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
