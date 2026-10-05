@@ -3,7 +3,8 @@
 - Status: implementation in review for E16-T01 (#79)
 - Date: 2026-10-05
 - Roadmap: E16-T01 (#79); builds on ADR 0016 (E15-T01 #76, E15-T02 #77) and
-  ADR 0004 (worker protocol, hardened by E08-T04 #53)
+  ADR 0004 (worker protocol, hardened by E08-T04 #53). Inbound trace context
+  at the trigger boundary: #276.
 - Owners: observation port (`contract/observe`), engine instrumentation
   (`internal/engine`), OpenTelemetry exporter module (`observe/otel`)
 
@@ -77,6 +78,97 @@ exporter makes the OpenTelemetry SDK use exactly these ids (a custom
    guard deliberately keeps observers out of it); they emit no spans of
    their own (#275), though the dispatching step's context reaches their
    tools and workers unchanged.
+
+### Inbound trace context at the trigger boundary (#276)
+
+A fourth boundary: an upstream service's `traceparent`/`tracestate`. Every
+adapter that has a carrier can read it, through one shared policy,
+`trigger.TraceIngress{Extract, Sampling}`, over one parser,
+`observe.ExtractTrace`, and one sampling rule, `TracePolicy.Inbound`.
+
+**Default: off.** The zero `TraceIngress` reads nothing. The alternative,
+on by default with the inbound sampled flag ignored, was rejected for three
+reasons. An inbound trace id is caller data: an edge application that joins
+it lets any caller place its runs inside a trace of the caller's choosing
+(or collide with someone else's), which is the application's decision to
+make, not the framework's; `Invocation.Trace` already meant "a parent the
+application chose to trust", and opt-in keeps that meaning. It keeps
+today's behaviour for every existing application (a run behind a trigger is
+a root). And "on, ignore sampling" still lets the caller pick the trace id;
+only "off" means nothing the caller sent reaches telemetry. Extraction is
+also a no-op when the application does not trace (`TracePolicy` zero), so
+"zero disables tracing, no propagation" stays true for inbound context.
+
+**Sampling policy.** `Sampling` is explicit:
+
+| `observe.InboundSampling` | The run's sampled flag |
+| --- | --- |
+| `IgnoreInboundSampling` (zero, the default once `Extract` is set) | Decided locally: sampled with probability `Ratio`, from a fresh random draw. The run still joins the inbound trace id and parent span. |
+| `HonorInboundSampling` | The caller's flag, as OpenTelemetry `ParentBased` does. For callers trusted to decide how much the application records. |
+
+Under the ignore policy the draw is deliberately **not** `Samples(inbound
+trace id)`: that arithmetic is deterministic in an id the caller chooses, so
+a caller could pick ids under the ratio and be sampled every time. The cost
+is that two Blok ingresses that see the same foreign trace may decide
+differently; under the honor policy they agree. This answers the #271 review
+note: an inbound sampled flag cannot force 100% sampling unless the
+application chose `HonorInboundSampling`. An inbound `00` cannot opt out of
+the local ratio either.
+
+**What a carrier must look like** (`observe.ExtractTrace`). It never
+fails; anything it cannot use is ignored and the work proceeds as a root
+run.
+
+- Exactly one `traceparent` value (one header line, metadata value or
+  message header). None, two (even identical ones) or a comma-joined pair
+  yields no context: W3C defines a single field, and picking one of several
+  would let an intermediary choose. Values are never merged.
+- At most `MaxTraceparentBytes` (256) of printable ASCII, then
+  `ParseTraceparent`: version `ff`, upper-case hex, zero ids and a version-00
+  value that is not exactly 55 bytes are rejected; a later version's extra
+  fields are ignored.
+- Exactly one `tracestate` value of at most 256 printable bytes is kept.
+  More than one, an oversized or a non-printable one is dropped and the
+  `traceparent` is still used, as W3C allows.
+
+**Where each adapter reads it, and where it goes.** Always after routing,
+admission, authentication, authorization and input validation, so it
+cannot change any of them:
+
+| Trigger | Carrier | Run parent travels via |
+| --- | --- | --- |
+| HTTP | request headers | the handler's context (`observe.WithTrace`); the engine already joins `TraceFrom(ctx)` when `Invocation.Trace` is not set |
+| gRPC | incoming metadata | the handler's context |
+| WebSocket | upgrade request headers, resolved once per connection | the context of `OnConnect`, every `OnMessage` and `OnDisconnect` |
+| MCP | headers of the HTTP request carrying the `tools/call` | the context given to `Catalog.Invoke` |
+| Webhook | request headers (not covered by the provider signature) | `Submission.Trace` → job record |
+| SSE start | request headers | `Submission.Trace` → job record |
+| Pub/sub | message headers, when the driver's message implements `pubsub.TraceCarrier` (`natsjs` does, collecting every spelling of the case-sensitive NATS names) | `Submission.Trace` → job record. The consumer has no application, so `Subscription.TracePolicy` carries the policy |
+| Worker | `EnqueueRequest.Trace` / `Submission.Trace`, stored with the job | the handler's context (`observe.TraceFrom`) and `Job.Trace` |
+| Cron | none: an occurrence has no upstream | deliberately nothing. A tick's own context is never captured; the run is a root |
+
+**Queue: the trace travels with the job record.** `worker.New` adds two
+columns, `traceparent` and `tracestate` (`TEXT NOT NULL DEFAULT ''`), with
+the same idempotent in-place migration as `principal_json` and
+`enqueue_seq` (ADR 0006; `migration.Retry`). Jobs from before the columns
+have no trace. The trace is correlation, not identity: it is not in the
+payload digest or the duplicate comparison, so a provider redelivery with
+a new `traceparent` is a duplicate (never a conflict), and the first
+committed trace is kept. An invalid context is not stored, an invalid
+tracestate is dropped, and a stored value that does not parse is ignored
+when the job runs. The queue keeps the stored sampled flag: its producers
+are trusted application code (ADR 0005), and an ingress adapter in front of
+it has already applied its policy.
+
+**Never authority.** Admission, authorization, idempotency keys, payload
+digests and routing are decided before the carrier is read, and none of
+them reads it. `trace_ingress_test.go` checks this differentially: the same
+request with and without a forged context (a crafted sampled id with
+`tracestate: admin=true,role=root`, an unsampled flag, duplicated
+traceparents, an oversized tracestate) is answered the same, runs the same
+input to the same output under the same principal, is refused the same when
+its credentials are wrong, gets the same durable key, and a repeat that
+differs only in its trace is a duplicate that changes nothing.
 
 ### Worker protocol: additive field, no minor bump
 
@@ -170,6 +262,13 @@ Additive throughout. `inspection.Event` and `Invocation` gain fields with no
 wire form; `app.Config` gains `Trace` (zero keeps today's behaviour);
 `engine.Result` gains `Trace`; the worker `Call` gains two optional fields
 inside protocol 1.1, and the Node SDK's context gains an optional `trace`.
+#276 adds, all additively: `observe.ExtractTrace`, `MaxTraceparentBytes`,
+`InboundSampling` and `TracePolicy.Inbound`; `trigger.TraceIngress` and the
+`Trace` field on every adapter's endpoint, binding, config or subscription
+(zero keeps today's behaviour); `trigger.Submission.Trace`,
+`worker.EnqueueRequest.Trace` and `worker.Job.Trace` with two queue columns
+(ADR 0006); and the optional `pubsub.TraceCarrier`, which existing drivers
+need not implement.
 The engine's behaviour without a trace policy and without a payload-free
 observer is unchanged. The proto change regenerates the Go bindings (Buf
 v1.57.2, protoc-gen-go v1.36.10, protoc-gen-go-grpc v1.5.1) and the Node
@@ -203,6 +302,22 @@ digest; tests compute it from discovery.
   the Observe/Shutdown race (`handshake_test.go`: four producers against
   Shutdown with expired, 1 ms, 10 ms and unbounded deadlines, 300 times), and
   the release-readiness check (`release_test.go`).
+- Inbound trace context (#276): `trigger/trace_ingress_test.go` drives a
+  real request through HTTP, gRPC, WebSocket, MCP, webhook, SSE and pub/sub
+  (durable ones through the real `worker.Queue`) into `execution.Runner`
+  with an observer and a `TracePolicy`, and checks the engine's root span:
+  it is a child of the inbound span with its tracestate; a fresh root with
+  extraction off, with no `TracePolicy`, for cron and for every malformed
+  carrier (duplicated, comma-joined, version `ff`, upper-case, zero ids,
+  non-ASCII, oversized, truncated, empty, tracestate alone; an oversized,
+  duplicated or non-ASCII tracestate drops only the tracestate). Under the
+  ignore policy a forced-sampled crafted id at ratio 1e-12 is never sampled
+  and 400 forced-sampled requests at ratio 0.25 sample about a quarter; the
+  honor policy samples all of them, so the check can fail. The differential
+  check is described above. `contract/observe/ingress_test.go` covers the
+  parser and the policy, and `trigger/worker/trace_test.go` the job record,
+  its identity, malformed stored values and the migration of a pre-#276
+  queue.
 - Cardinality, queue saturation and collector outage; trace lineage across Go
   steps, the actual Node worker and a child workflow; approval-gate and
   validation independence; and per-mode latency/RSS (`TestMeasureMode`) are
@@ -210,8 +325,15 @@ digest; tests compute it from discovery.
 
 ## Limits
 
-- No trigger extracts an inbound `traceparent`/`tracestate` yet (#276); an
-  application that trusts one passes it as `Invocation.Trace`.
+- Inbound trace extraction is opt-in per endpoint (#276). MCP reads the
+  carrying HTTP request's headers, not a `traceparent` in the call's
+  `_meta`. A job enqueued from inside a traced step does not capture that
+  step's context by itself; the producer passes `EnqueueRequest.Trace`.
+  Workers from before #276 on the same store neither write nor read the
+  trace columns, so jobs they enqueue start root runs.
+- The NATS driver's header reading is tested against a fake JetStream
+  message; the end-to-end pub/sub ingress test uses the in-memory source,
+  because no NATS server was available where #276 was measured.
 - Journaled and cluster runs emit no observation events (ADR 0016, #263), so
   they are neither traced nor counted by the exporter.
 - Agent catalog child workflows produce no spans of their own (#275); only

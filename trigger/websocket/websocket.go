@@ -32,6 +32,7 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/well-prado/new-blok/app"
+	"github.com/well-prado/new-blok/contract/observe"
 	"github.com/well-prado/new-blok/contract/schema"
 	"github.com/well-prado/new-blok/trigger"
 )
@@ -118,6 +119,11 @@ type Endpoint struct {
 	PingInterval   time.Duration
 	PongTimeout    time.Duration
 	MessageTimeout time.Duration
+	// Trace opts in to reading the upgrade request's traceparent/tracestate
+	// as the parent of every run the connection's workflows start
+	// (OnConnect, OnMessage, OnDisconnect). Sampling is decided once per
+	// connection (ADR 0020). Off by default.
+	Trace trigger.TraceIngress
 }
 
 type Server struct {
@@ -143,6 +149,9 @@ func New(application *app.Application, e Endpoint) (*Server, error) {
 	parsed, err := schema.Parse(e.InputSchema)
 	if err != nil {
 		return nil, fmt.Errorf("websocket: schema: %w", err)
+	}
+	if err := e.Trace.Validate(); err != nil {
+		return nil, fmt.Errorf("websocket: %w", err)
 	}
 	defaults := []struct {
 		value    *time.Duration
@@ -214,6 +223,10 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	c.info.Principal = principal
+	// Read after admission, the origin check and authentication, so it
+	// changes none of them. It is set before the connection's goroutine
+	// starts and only read on it.
+	c.trace, c.traced = s.endpoint.Trace.Parent(s.application.TracePolicy(), request.Header.Values(trigger.TraceparentField), request.Header.Values(trigger.TracestateField))
 	socket, err := websocket.Accept(writer, request, &websocket.AcceptOptions{OriginPatterns: s.endpoint.Origins})
 	if err != nil {
 		// Accept has already written the refusal (for example 403 for a
@@ -320,6 +333,17 @@ type conn struct {
 	stopOnce   sync.Once
 	closed     chan struct{}
 	notifyOnce sync.Once
+	// trace is the connection's inbound parent, when traced (Trace).
+	trace  observe.TraceContext
+	traced bool
+}
+
+// traceContext gives a workflow's context the connection's inbound parent.
+func (c *conn) traceContext(ctx context.Context) context.Context {
+	if !c.traced {
+		return ctx
+	}
+	return observe.WithTrace(ctx, c.trace)
 }
 
 // close ends the connection once; the first cause becomes the disconnect
@@ -519,7 +543,7 @@ func (c *conn) handle(r request) reply {
 	defer unbind()
 	ctx, cancel := context.WithTimeout(bound, s.endpoint.MessageTimeout)
 	defer cancel()
-	output, err := s.endpoint.OnMessage(ctx, Message{Connection: c.info, RequestID: r.ID, Input: append(json.RawMessage(nil), r.Input...)})
+	output, err := s.endpoint.OnMessage(c.traceContext(ctx), Message{Connection: c.info, RequestID: r.ID, Input: append(json.RawMessage(nil), r.Input...)})
 	switch {
 	case err == nil:
 		return reply{ID: r.ID, Output: output}
@@ -585,7 +609,7 @@ func (c *conn) connect() error {
 	defer unbind()
 	ctx, cancel := context.WithTimeout(bound, e.MessageTimeout)
 	defer cancel()
-	if err := e.OnConnect(ctx, c.info); err != nil {
+	if err := e.OnConnect(c.traceContext(ctx), c.info); err != nil {
 		if app.Aborted(ctx) {
 			return errConnectAborted
 		}
@@ -621,6 +645,6 @@ func (c *conn) disconnected() {
 		}
 		ctx, cancel := context.WithTimeout(ctx, e.MessageTimeout)
 		defer cancel()
-		e.OnDisconnect(ctx, Disconnected{Connection: c.info, Reason: c.reason})
+		e.OnDisconnect(c.traceContext(ctx), Disconnected{Connection: c.info, Reason: c.reason})
 	})
 }
