@@ -291,17 +291,34 @@ func (r *Runtime) FireDueWaits(ctx context.Context, owner distributed.Owner, now
 			if readErr != nil {
 				return fired, readErr
 			}
+			closeWaitOnly := run.State == "accepted" || isTerminal(run.State)
 			if run.State == "waiting" || run.State == "running" {
-				run.State, run.OwnerID, run.Fence = "accepted", owner.ID, owner.Token
-				encodedRun, _ := json.Marshal(run)
+				readmitted := run
+				readmitted.State, readmitted.OwnerID, readmitted.Fence = "accepted", owner.ID, owner.Token
+				encodedRun, _ := json.Marshal(readmitted)
 				_, commitErr = r.store.CommitFencedWaitStates(ctx, owner, []distributed.StateMutation{
 					{StateID: timer.StateID, ExpectedRevision: revision, State: encoded},
 					{StateID: run.RunID, ExpectedRevision: runRevision, State: encodedRun},
 				}, timerMutation, eventID, "wait.timed_out", encoded)
-			} else if run.State == "accepted" {
-				_, commitErr = r.store.CommitFencedWaitStates(ctx, owner, []distributed.StateMutation{{StateID: timer.StateID, ExpectedRevision: revision, State: encoded}}, timerMutation, eventID, "wait.timed_out", encoded)
-			} else {
+				if errors.Is(commitErr, distributed.ErrRecordTooLarge) {
+					// The timed-out wait record is small, so the run record
+					// is what overflows: a run stored without #254's
+					// headroom that this owner's ID pushes over the bound.
+					// It can never be re-admitted, so it fails (releasing
+					// its slots) and its wait closes below (#265).
+					if _, err := r.finish(ctx, owner, run, "failed", recordTooLargeCode, nil); err != nil {
+						return fired, err
+					}
+					closeWaitOnly = true
+				}
+			} else if !closeWaitOnly {
 				continue
+			}
+			if closeWaitOnly {
+				// The run is already runnable or terminal: only the wait
+				// closes. A terminal run's open wait is the remainder of a
+				// failure above interrupted before this commit.
+				_, commitErr = r.store.CommitFencedWaitStates(ctx, owner, []distributed.StateMutation{{StateID: timer.StateID, ExpectedRevision: revision, State: encoded}}, timerMutation, eventID, "wait.timed_out", encoded)
 			}
 		} else {
 			_, commitErr = r.store.CommitFencedWaitStates(ctx, owner, []distributed.StateMutation{{StateID: timer.StateID, ExpectedRevision: revision, State: encoded}}, timerMutation, eventID, "wait.timed_out", encoded)
