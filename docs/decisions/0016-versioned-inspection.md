@@ -303,7 +303,9 @@ nothing from this one, and a cluster run is visible only through its durable
 reconstruction, at most `RecoveredPoll` late, never as live frames (#263,
 above). The engine serializes observation payloads whenever
 any observer is selected, including when the stream discards them; that costs
-CPU, not retention. Measured overhead and latency in the PR are one
+CPU, not retention. (ADR 0020 adds `observe.PayloadObserver`, which lets a
+payload-free observer such as the telemetry exporter avoid that cost; the
+stream does not declare it yet.) Measured overhead and latency in the PR are one
 developer machine's figures, not performance claims.
 
 ## Compatibility and limits

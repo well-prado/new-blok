@@ -45,6 +45,12 @@ message Call {
   repeated BlobRef blobs = 9;
   string principal = 10;
   repeated string capabilities = 11;
+  // Optional W3C trace context of the step attempt that dispatched this call
+  // (ADR 0020). Correlation only: it never changes the call's outcome, a
+  // worker that ignores it is conformant, and tracestate is at most 256
+  // bytes. Additive within protocol 1.1: proto3 peers ignore unknown fields.
+  string traceparent = 12;
+  string tracestate = 13;
 }
 
 message Cancel { string call_id = 1; string attempt_id = 2; uint64 generation = 3; }

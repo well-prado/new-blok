@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/well-prado/new-blok/contract/inspection"
+	"github.com/well-prado/new-blok/contract/observe"
 )
 
 var (
@@ -40,6 +41,11 @@ type Config struct {
 	// DrainTimeout bounds how long Shutdown waits for admitted work.
 	DrainTimeout time.Duration
 	Inspection   inspection.Observer
+	// Trace is the head-sampling policy for observed runs (ADR 0020). The
+	// zero value disables tracing. A non-zero policy requires Inspection:
+	// spans exist only as observations, so without an observer there would
+	// be nothing to record them.
+	Trace observe.TracePolicy
 	// RunOutcomes optionally persists terminal outcomes for trusted invocation
 	// IDs supplied to execution.Runner. It is an application-owned port; the
 	// engine remains independent of durable stores and absent ports promise no
@@ -125,6 +131,12 @@ func New(config Config) (*Application, error) {
 		}
 		dependencies[dependency.Name] = true
 	}
+	if err := config.Trace.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid_trace_policy: %w", err)
+	}
+	if config.Trace.Enabled() && config.Inspection == nil {
+		return nil, errors.New("invalid_trace_policy: tracing requires an inspection observer")
+	}
 	abort, abortWork := context.WithCancelCause(context.Background())
 	return &Application{config: config, state: NewState, changed: make(chan struct{}, 1), abort: abort, abortWork: abortWork}, nil
 }
@@ -173,6 +185,14 @@ func (a *Application) AbortGrace() time.Duration { return a.config.AbortGrace }
 
 // RunOutcomePort exposes the optional terminal-outcome writer to the public
 // execution composition package without importing a concrete journal/store.
+// TracePolicy returns the application's validated head-sampling policy.
+func (a *Application) TracePolicy() observe.TracePolicy {
+	if a == nil {
+		return observe.TracePolicy{}
+	}
+	return a.config.Trace
+}
+
 func (a *Application) RunOutcomePort() RunOutcomePort {
 	if a == nil {
 		return nil

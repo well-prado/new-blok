@@ -99,6 +99,22 @@ type hookedClient struct {
 	*clientv3.Client
 	hook  atomic.Pointer[txnHook]
 	grant atomic.Int64
+
+	acquiredMu sync.Mutex
+	acquired   []time.Time
+}
+
+// acquisitions returns, in commit order, when this client's partition-owner
+// acquisitions committed. Only a transaction that actually wrote the owner key
+// counts; a rejected acquisition (partition held elsewhere) does not.
+func (c *hookedClient) acquisitions() []time.Time {
+	c.acquiredMu.Lock()
+	defer c.acquiredMu.Unlock()
+	return append([]time.Time(nil), c.acquired...)
+}
+
+func isOwnerKey(key string) bool {
+	return strings.Contains(key, "/incarnations/") && strings.HasSuffix(key, "/owner")
 }
 
 type txnHook struct {
@@ -183,6 +199,16 @@ func (t *hookedTxn) Commit() (*clientv3.TxnResponse, error) {
 		hook.fire(t.puts)
 	}
 	response, err := t.Txn.Commit()
+	if err == nil && response.Succeeded {
+		for _, key := range t.puts {
+			if isOwnerKey(key) {
+				t.client.acquiredMu.Lock()
+				t.client.acquired = append(t.client.acquired, time.Now())
+				t.client.acquiredMu.Unlock()
+				break
+			}
+		}
+	}
 	if selected && hook.after && err == nil && response.Succeeded && hook.fired.CompareAndSwap(false, true) {
 		hook.fire(t.puts)
 	}

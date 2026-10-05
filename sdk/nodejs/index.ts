@@ -24,6 +24,14 @@ export interface ExecutionContext {
   readonly callId: string;
   readonly attemptId: string;
   readonly logger: NodeLogger;
+  /** W3C trace context of the step attempt that dispatched this call, when the
+   * application traces it. Correlation only: forward it on outbound requests;
+   * it never grants authority and never changes the call's outcome. */
+  readonly trace?: TraceContext;
+}
+export interface TraceContext {
+  readonly traceparent: string;
+  readonly tracestate: string;
 }
 export interface NodeLogger {
   debug(message: string, attrs?: Readonly<Record<string, unknown>>): void;

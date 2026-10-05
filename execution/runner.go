@@ -76,7 +76,7 @@ func NewRunner(application *app.Application, nodes map[string]node.Any) *Runner 
 	}
 	interpreter := engine.New(nodes)
 	if observer != nil {
-		interpreter = interpreter.WithObserver(observer)
+		interpreter = interpreter.WithObserver(observer).WithTracing(application.TracePolicy())
 	}
 	return &Runner{application: application, engine: interpreter, inspecting: observer != nil, outcomes: outcomes}
 }

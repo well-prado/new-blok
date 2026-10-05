@@ -7,11 +7,13 @@ import (
 	"time"
 
 	"github.com/well-prado/new-blok/contract/inspection"
+	"github.com/well-prado/new-blok/contract/observe"
 )
 
 type inspectionLogHandler struct {
 	emit  func(inspection.Event)
 	step  string
+	trace observe.Span
 	attrs []slog.Attr
 }
 
@@ -42,7 +44,7 @@ func (h *inspectionLogHandler) Handle(_ context.Context, record slog.Record) err
 		values[attr.Key] = safeLogValue(attr.Value, 0, &nodes)
 	}
 	raw, _ := json.Marshal(values)
-	h.emit(inspection.Event{Kind: inspection.StepLog, StepID: h.step, At: record.Time, LogLevel: record.Level.String(), LogMessage: record.Message, LogAttrs: raw})
+	h.emit(inspection.Event{Kind: inspection.StepLog, StepID: h.step, At: record.Time, LogLevel: record.Level.String(), LogMessage: record.Message, LogAttrs: raw, Trace: h.trace})
 	return nil
 }
 

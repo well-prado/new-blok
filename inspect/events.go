@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/well-prado/new-blok/contract/inspection"
+	"github.com/well-prado/new-blok/contract/observe"
 	"github.com/well-prado/new-blok/observe/event"
 )
 
@@ -156,4 +157,16 @@ func (group observerGroup) Observe(value inspection.Event) {
 	for _, observer := range group {
 		observer.Observe(cloneEvent(value))
 	}
+}
+
+// ObservesPayloads reports whether any member reads payloads, so the engine
+// skips serializing them only when no member would see them (ADR 0020).
+func (group observerGroup) ObservesPayloads() bool {
+	for _, member := range group {
+		declared, ok := member.(observe.PayloadObserver)
+		if !ok || declared.ObservesPayloads() {
+			return true
+		}
+	}
+	return false
 }
