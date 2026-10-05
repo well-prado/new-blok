@@ -412,6 +412,20 @@ func TestCheckAndTestAgree(t *testing.T) {
 		t.Fatalf("check=%+v\ntest=%+v", checked.Diagnostics, tested.Diagnostics)
 	}
 
+	// go vet prefixes errors in packages nothing imports with "vet: ";
+	// the diagnostic must still be the one go test gives.
+	for _, edit := range []fixtureEdit{
+		{File: "cmd/shop/main.go", Append: "\nvar x int = undefinedThing\n"},
+		{File: "internal/app/x_test.go", Write: ptr("package app\n\nvar x int = undefinedThing\n")},
+	} {
+		dir := scaffolded(t, "classic")
+		applyEdits(t, dir, []fixtureEdit{edit}, placeholders("classic"))
+		checked, tested := Check(context.Background(), Options{Root: dir}), Test(context.Background(), TestOptions{Options: Options{Root: dir}})
+		if len(checked.Diagnostics) != 1 || len(tested.Diagnostics) != 1 || checked.Diagnostics[0] != tested.Diagnostics[0] || checked.Diagnostics[0].Code != "go_compile_error" {
+			t.Fatalf("%s: check=%+v\ntest=%+v", edit.File, checked.Diagnostics, tested.Diagnostics)
+		}
+	}
+
 	dir = scaffolded(t, "classic")
 	applyEdits(t, dir, []fixtureEdit{{File: "workflows/quotes/quotes.go", Replace: [2]string{"\t\treturn quote.OutputFields(result).TotalCents()", "\t\t_ = flow.Call(builder, \"calculate\", calculate, input)\n\t\treturn quote.OutputFields(result).TotalCents()"}}}, placeholders("classic"))
 	checked, tested = Check(context.Background(), Options{Root: dir}), Test(context.Background(), TestOptions{Options: Options{Root: dir}})

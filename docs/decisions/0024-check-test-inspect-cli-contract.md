@@ -192,7 +192,7 @@ whose `exitCode` is the process exit code. `blok new`, `blok generate` and
 | `project_unreadable` | all | the project directory cannot be opened |
 | `bindings_types_missing`, `bindings_generate_failed`, `bindings_missing`, `bindings_not_generated`, `bindings_stale` | check | generated bindings absent, hand-written or out of date |
 | `workflow_step_id_invalid`, `workflow_step_id_reserved`, `workflow_step_id_duplicate` | check | the step-id rules of `flow.Define` |
-| `go_compile_error` | check, test | a positioned compiler error (identical from `go vet` and `go test`) |
+| `go_compile_error` | check, test | a positioned compiler error, identical from `go vet` and `go test`: go vet's `vet: ` prefix (on errors in packages nothing imports, such as a main package or a `_test.go` file) is stripped first |
 | `go_vet_finding` | check | a `go vet` analyzer finding; `field` names the analyzer |
 | `go_module_not_in_cache` | check, test | a required module is not in the module cache; `actual` names it ("run go mod download") |
 | `go_module_missing` | check, test | no module in `go.mod` provides an imported package |
@@ -201,6 +201,7 @@ whose `exitCode` is the process exit code. `blok new`, `blok generate` and
 | `go_toolchain_too_old` | check, test | the `go` directive needs a newer toolchain than the installed one |
 | `go_toolchain_error` | check, test | any other unpositioned go command failure |
 | `go_toolchain_unavailable` | check, test | the go command could not start (exit 3) |
+| `process_guard_unavailable` | check, test | the pipe guard (`/bin/sh`) could not start, so the go command was not run (exit 3) |
 | `test_failed` | test | a failing leaf test; `source` is the first `file:line` it reported |
 | `test_package_failed` | test | a package failed outside any test (panic, `TestMain`, timeout) |
 | `no_tests_ran` | test | go test passed but ran no test: nothing was verified |
@@ -263,8 +264,9 @@ included. When the go command finishes normally blok kills the guard before
 closing the pipe, so the guard never signals a group id the system may have
 reused. One mechanism serves macOS and Linux. Linux's `Pdeathsig` was not
 chosen: it would stop only the direct child, `go`, and never the test binary
-that `go` starts. The guard needs `/bin/sh`; if it cannot start, the command
-does not run (`go_toolchain_unavailable`, exit 3). The one window left open
+that `go` starts. The guard needs `/bin/sh`; if it cannot start, the go command is stopped
+before it does any work and the report says so (`process_guard_unavailable`,
+exit 3). The one window left open
 is the moment between starting the go command and starting its guard.
 
 ## Compatibility
@@ -290,7 +292,7 @@ is the moment between starting the go command and starting its guard.
 
 ## Evidence
 
-- `testdata/tooling/fixtures.json` predeclares 29 cases (35 runs across the
+- `testdata/tooling/fixtures.json` predeclares 33 cases (41 runs across the
   two layouts) against real applications created by `scaffold.Create` and
   tidied: exit code, status, every diagnostic's code and position, output,
   error and effect counts (effects: project files created, changed or
@@ -303,7 +305,8 @@ is the moment between starting the go command and starting its guard.
   each command's `--json` stdout to equal `WriteJSON` of the API's report,
   and the broken project's CLI output to equal the API golden.
   `TestCheckAndTestAgree` requires the same compile-error diagnostic from
-  check and test, and a statically reported duplicate step to fail the
+  check and test (including errors in a main package and in a `_test.go`
+  file, which go vet prefixes with `vet: `), and a statically reported duplicate step to fail the
   application's test through `flow.Define`.
 - Repair: `TestRepairWithOneDiagnostic` (both layouts) breaks the
   application three ways; each yields exactly one diagnostic, and doing only

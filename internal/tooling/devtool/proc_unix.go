@@ -31,6 +31,9 @@ func killGroup(process *os.Process) error {
 // rejects "--" there as an illegal number, bash (macOS's) accepts both.
 const guardScript = `read line; kill -KILL "-$1" 2>/dev/null`
 
+// guardShell runs the guard; a variable only so a test can make it absent.
+var guardShell = "/bin/sh"
+
 // processGuard is the /bin/sh process watching blok on the go command's
 // behalf. It runs in its own process group, so neither a terminal's Ctrl+C
 // nor the interrupt sent to the go command's group reaches it.
@@ -44,7 +47,7 @@ func startGuard(target *os.Process) (*processGuard, error) {
 	if err != nil {
 		return nil, err
 	}
-	command := exec.Command("/bin/sh", "-c", guardScript, "blok-guard", strconv.Itoa(target.Pid))
+	command := exec.Command(guardShell, "-c", guardScript, "blok-guard", strconv.Itoa(target.Pid))
 	command.Stdin = reader
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	err = command.Start()

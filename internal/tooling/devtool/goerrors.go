@@ -51,7 +51,10 @@ func (g *goDiagnostics) line(raw string) {
 			return
 		}
 	}
-	if match := positioned.FindStringSubmatch(text); match != nil {
+	// go vet prefixes the compile errors of a package nothing else imports
+	// (a main package, a _test.go file) with "vet: "; go test does not. The
+	// same error must be the same diagnostic from either (ADR 0024).
+	if match := positioned.FindStringSubmatch(strings.TrimPrefix(text, "vet: ")); match != nil {
 		g.flush()
 		g.problems = append(g.problems, g.positionedProblem(match))
 		return

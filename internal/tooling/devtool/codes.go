@@ -63,6 +63,7 @@ var Codes = []Code{
 	{"go_toolchain_too_old", checkAndTest},
 	{"go_toolchain_error", checkAndTest},
 	{"go_toolchain_unavailable", checkAndTest},
+	{"process_guard_unavailable", checkAndTest},
 	{"test_failed", testOnly},
 	{"test_package_failed", testOnly},
 	{"no_tests_ran", testOnly},

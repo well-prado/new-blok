@@ -151,6 +151,16 @@ func interruptedDiagnostic(command string) diagnostic.Diagnostic {
 var errToolUnavailable = errors.New("go toolchain unavailable")
 
 func toolUnavailable(goBinary string, err error) diagnostic.Diagnostic {
+	var start *startError
+	if errors.As(err, &start) && start.guard {
+		return diagnostic.Diagnostic{
+			Code:        "process_guard_unavailable",
+			Expected:    "a runnable " + guardShell,
+			Actual:      err.Error(),
+			Remediation: "make " + guardShell + " available; blok runs the go command only under a guard that stops it if blok dies",
+			Message:     "the process guard could not be started, so the go command was not run",
+		}
+	}
 	return diagnostic.Diagnostic{
 		Code:        "go_toolchain_unavailable",
 		Expected:    "a runnable go command",

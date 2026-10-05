@@ -789,6 +789,112 @@
           }
         ]
       }
+    },
+    {
+      "id": "check-compile-error-unimported-main",
+      "command": "check",
+      "layouts": [
+        "classic",
+        "unified"
+      ],
+      "edits": [
+        {
+          "file": "cmd/shop/main.go",
+          "append": "\nvar x int = undefinedThing\n"
+        }
+      ],
+      "expected": {
+        "exitCode": 1,
+        "status": "failed",
+        "outputRecords": 3,
+        "errorRecords": 1,
+        "effectRecords": 0,
+        "diagnostics": [
+          {
+            "code": "go_compile_error",
+            "source": "cmd/shop/main.go:48:13"
+          }
+        ]
+      }
+    },
+    {
+      "id": "test-compile-error-unimported-main",
+      "command": "test",
+      "layouts": [
+        "classic"
+      ],
+      "edits": [
+        {
+          "file": "cmd/shop/main.go",
+          "append": "\nvar x int = undefinedThing\n"
+        }
+      ],
+      "expected": {
+        "exitCode": 1,
+        "status": "failed",
+        "outputRecords": 5,
+        "errorRecords": 1,
+        "effectRecords": 0,
+        "diagnostics": [
+          {
+            "code": "go_compile_error",
+            "source": "cmd/shop/main.go:48:13"
+          }
+        ]
+      }
+    },
+    {
+      "id": "check-compile-error-test-file",
+      "command": "check",
+      "layouts": [
+        "classic",
+        "unified"
+      ],
+      "edits": [
+        {
+          "file": "internal/app/x_test.go",
+          "write": "package app\n\nvar x int = undefinedThing\n"
+        }
+      ],
+      "expected": {
+        "exitCode": 1,
+        "status": "failed",
+        "outputRecords": 3,
+        "errorRecords": 1,
+        "effectRecords": 0,
+        "diagnostics": [
+          {
+            "code": "go_compile_error",
+            "source": "internal/app/x_test.go:3:13"
+          }
+        ]
+      }
+    },
+    {
+      "id": "test-compile-error-test-file",
+      "command": "test",
+      "layouts": [
+        "unified"
+      ],
+      "edits": [
+        {
+          "file": "internal/app/x_test.go",
+          "write": "package app\n\nvar x int = undefinedThing\n"
+        }
+      ],
+      "expected": {
+        "exitCode": 1,
+        "status": "failed",
+        "outputRecords": 0,
+        "errorRecords": 1,
+        "effectRecords": 0,
+        "diagnostics": [
+          {
+            "code": "go_compile_error",
+            "source": "internal/app/x_test.go:3:13"
+          }
+        ]
+      }
     }
   ]
 }

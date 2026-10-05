@@ -111,7 +111,7 @@ func runGo(ctx context.Context, spec goCommand) (goRun, error) {
 	if err != nil {
 		_ = killGroup(command.Process)
 		_ = command.Wait()
-		return goRun{}, &startError{err: fmt.Errorf("start the process guard: %w", err)}
+		return goRun{}, &startError{err: fmt.Errorf("start the process guard: %w", err), guard: true}
 	}
 	defer guard.release()
 
@@ -150,8 +150,12 @@ func runGo(ctx context.Context, spec goCommand) (goRun, error) {
 	return run, nil
 }
 
-// startError is a go command that could not be started.
-type startError struct{ err error }
+// startError is a go command, or its process guard, that could not be
+// started. Either way the command does not run (exit 3).
+type startError struct {
+	err   error
+	guard bool
+}
 
 func (e *startError) Error() string        { return e.err.Error() }
 func (e *startError) Unwrap() error        { return e.err }

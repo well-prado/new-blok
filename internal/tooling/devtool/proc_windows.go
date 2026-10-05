@@ -17,6 +17,9 @@ func interruptGroup(process *os.Process) error { return process.Kill() }
 
 func killGroup(process *os.Process) error { return process.Kill() }
 
+// guardShell is unused on Windows, which has no guard.
+var guardShell = ""
+
 // processGuard is absent on Windows; see isolate.
 type processGuard struct{}
 

@@ -174,3 +174,19 @@ wait
 		}
 	}
 }
+
+// TestMissingGuardShellIsItsOwnFailure: without /bin/sh the go command does
+// not run, and the report names the guard, not the Go toolchain.
+func TestMissingGuardShellIsItsOwnFailure(t *testing.T) {
+	saved := guardShell
+	guardShell = filepath.Join(t.TempDir(), "no-sh")
+	t.Cleanup(func() { guardShell = saved })
+	dir := fakeProject(t)
+	marker := filepath.Join(t.TempDir(), "ran")
+	never := fakeGo(t, "touch "+marker+"\nsleep 600\n")
+	for _, report := range []Report{Check(context.Background(), Options{Root: dir, Go: never}), Test(context.Background(), TestOptions{Options: Options{Root: dir, Go: never}})} {
+		if report.ExitCode != ExitTool || len(report.Diagnostics) != 1 || report.Diagnostics[0].Code != "process_guard_unavailable" || !strings.Contains(report.Diagnostics[0].Remediation, "no-sh") {
+			t.Fatalf("%s: %s", report.Command, encode(t, report))
+		}
+	}
+}
