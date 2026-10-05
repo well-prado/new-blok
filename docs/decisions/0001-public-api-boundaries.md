@@ -438,6 +438,55 @@ construct remains unsupported for agent tools; and a literal remains
 invisible in the stored program, so the engine sees that call as taking the
 workflow input until dispatch substitutes it.
 
+#### Catalog literals are checked against the tool's input schema (#261)
+
+After #249 a literal call input was still only checked when dispatch reached
+its call: `RegisterWorkflow` stored it without looking at it, so a literal
+the tool's input schema refuses registered, and every invocation ran the
+earlier calls' effects before failing on it. `RegisterWorkflow` now runs on
+each literal, at registration, the same admission dispatch runs on it: the
+1 MiB input bound, then the receiving tool's own `schema.Schema.Normalize`
+(the binding's `in`, the one dispatch uses), then the bound again on the
+normalized value. The two cannot diverge because they call the same
+function on the same schema value.
+
+**Decision: validate, do not rewrite.** `Normalize` rewrites values — it
+applies defaults, puts `int64-string` integers in wire form, and re-encodes
+keys in order. The catalog keeps the literal exactly as `flow` recorded it and
+discards the normalized copy; dispatch normalizes it as before. The node and
+the approval gate therefore receive byte-for-byte what they received before
+#261, and the artifact digest (which hashes `flow.Program`) is unchanged.
+
+Compatibility: a behavioral validation tightening and a diagnostic addition
+in `agent.RegisterWorkflow`, linked to
+[#261](https://github.com/well-prado/new-blok/issues/261). No public API,
+wire shape, document version, artifact digest or dispatch input changes.
+Affected registrations — each one could only ever fail at invocation, after
+its earlier calls' effects:
+
+- a literal the tool's input schema refuses (missing required field, wrong
+  type, unknown field, null, range, format, union) now fails registration
+  with `errors.Is(err, agent.ErrNotAgentSafe)`, naming the step and tool, for
+  example `agent: tool is not agent-safe: call "commit": literal input does
+  not satisfy the input schema of conf/commit@1.0.0: missing_required at
+  $.quantity: required field is absent`. Migration: fix the `flow.Lit` value.
+- a literal over 1 MiB, before or after normalization, now fails
+  registration with `errors.Is(err, agent.ErrBudget)`, naming the step. It
+  was already unadmittable: `tool.Budget` caps `MaxInputBytes` at 1 MiB, so
+  dispatch refused it with `ErrBudget` on every invocation. The error class
+  is kept; only the moment moves.
+- a literal within 1 MiB but over one invocation's `MaxInputBytes` still
+  registers and still trips `ErrBudget` at that invocation, as before: the
+  budget is per invocation, so registration cannot know it.
+
+A child workflow's literals are checked when that child registers, so a
+parent can only compose a child whose literals passed; `flow.Child` records
+no literal, so a child call cannot take one (the lowering refuses it). The
+check covers any literal the lowering returns, whatever the instruction kind.
+`agent/literal_validation_test.go` holds the cases; each rejection case is
+red on the pre-#261 catalog, which registers the workflow and then, on
+invocation, runs the reserve effect before failing.
+
 The initial portable contract is a bounded, JSON-compatible value subset with
 explicit semantics for missing, null, optional fields, objects, arrays, string,
 boolean, signed integer, exact decimal/money, timestamp, bytes/blob reference

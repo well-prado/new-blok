@@ -162,6 +162,10 @@ type connection struct {
 
 func (c *connection) WriteDomain() *store.WriteDomain { return c.writeDomain }
 
+// BusyTimeout reports how long a writer waits for the write lock, in the
+// writer queue and in SQLite's busy handler, before store.ErrBusy.
+func (c *connection) BusyTimeout() time.Duration { return c.busyTimeout }
+
 func (c *connection) WithTx(ctx context.Context, fn func(*sql.Tx) error) error {
 	if fn == nil {
 		return errors.New("sqlite: transaction callback is required")

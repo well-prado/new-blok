@@ -184,3 +184,23 @@ func TestUnmarkedTransactionsAreNotQueued(t *testing.T) {
 		t.Fatalf("the queued writer gave up after %v; want the 200ms busy timeout", elapsed)
 	}
 }
+
+// TestBusyTimeoutIsReported: a handle reports the busy timeout it waits for
+// the write lock, its configured one or the five-second default, so a caller
+// such as the worker queue can bound its own waits by it (#245).
+func TestBusyTimeoutIsReported(t *testing.T) {
+	ctx := context.Background()
+	for _, test := range []struct {
+		configured, want time.Duration
+	}{{0, 5 * time.Second}, {250 * time.Millisecond, 250 * time.Millisecond}} {
+		db, err := (Backend{BusyTimeout: test.configured}).Open(ctx, filepath.Join(t.TempDir(), "timeout.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, ok := store.BusyTimeoutOf(db)
+		_ = db.Close()
+		if !ok || got != test.want {
+			t.Fatalf("BusyTimeout configured %v reported %v (%v); want %v", test.configured, got, ok, test.want)
+		}
+	}
+}

@@ -176,23 +176,22 @@ func observeWorkerCrash(t *testing.T, phase string) faultSample {
 		}
 		done <- err
 	}()
-	if phase == "late" {
+	// The provider parks the request at a barrier (see Provider), so the kill
+	// below lands inside the effect window however long the wait takes: before
+	// the effect for "delay", after commit but before the response for "late".
+	// The generous timeouts only detect a request that never arrived.
+	switch phase {
+	case "late":
 		select {
 		case <-p.Committed():
-		case <-time.After(2 * time.Second):
+		case <-time.After(10 * time.Second):
 			t.Fatal("effect not committed")
 		}
-	} else {
-		deadline := time.Now().Add(2 * time.Second)
-		for {
-			requests, _ := p.Counts()
-			if requests > 0 {
-				break
-			}
-			if time.Now().After(deadline) {
-				t.Fatal("read not dispatched")
-			}
-			time.Sleep(time.Millisecond)
+	default:
+		select {
+		case <-p.Held():
+		case <-time.After(10 * time.Second):
+			t.Fatal("read not dispatched")
 		}
 	}
 	process, err := os.FindProcess(pid)
@@ -204,15 +203,29 @@ func observeWorkerCrash(t *testing.T, phase string) faultSample {
 		t.Fatal(err)
 	}
 	var failure *engine.Error
+	var killToTerminal time.Duration
 	select {
 	case err := <-done:
+		killToTerminal = time.Since(killed)
 		if !errors.As(err, &failure) || failure.Class != "uncertain" {
 			t.Fatalf("lost worker effect not uncertain: %v", err)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("lost worker call hung")
+	case <-time.After(5 * time.Second):
+		// A retried call parks at the same barrier and never completes; the
+		// Node fetch timeout (2s, nodes.mjs) usually fails it before this
+		// fires. Either way the request count the caller asserts is what exposes
+		// a hidden retry: more than one request means the call was re-sent.
+		requests, effects := p.Counts()
+		t.Fatalf("lost worker call hung (requests/effects %d/%d; requests above 1 means an automatic retry)", requests, effects)
 	}
-	s := faultSample{Phase: phase, ObservedAtUTC: time.Now().UTC().Format(time.RFC3339Nano), ErrorClass: failure.Class, StartupNanoseconds: startup.Nanoseconds(), KillToTerminalNanoseconds: time.Since(killed).Nanoseconds()}
+	// The kill must have severed the parked request: it never committed (delay)
+	// or answered (late), and a still-live request would surface here.
+	select {
+	case <-p.Abandoned():
+	case <-time.After(5 * time.Second):
+		t.Fatal("provider request survived the worker kill")
+	}
+	s := faultSample{Phase: phase, ObservedAtUTC: time.Now().UTC().Format(time.RFC3339Nano), ErrorClass: failure.Class, StartupNanoseconds: startup.Nanoseconds(), KillToTerminalNanoseconds: killToTerminal.Nanoseconds()}
 	s.Requests, s.Effects = p.Counts()
 	want := 0
 	if phase == "late" {
