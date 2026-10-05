@@ -89,8 +89,8 @@
     },
     "node-package": {
       "runtime": "nodejs",
-      "outputRecords": 4,
-      "errorRecords": 3,
+      "outputRecords": 5,
+      "errorRecords": 4,
       "effectRecords": 0
     },
     "node-positive": {

@@ -3,10 +3,26 @@ package name (its exports select the file; every condition counts, so the
 runtime and declaration targets are both checked). Node c declares it as
 a file: dependency under another name and imports an exported pattern
 subpath. Node d maps a package.json imports specifier to the package.
+Node e imports a shared workspace package whose "default" condition is
+harmless but whose "require" condition reaches node b: every condition is
+checked, so e fails transitively.
 -- blok.json --
 {"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
 -- go.mod --
 module example.com/shop
+-- package.json --
+{"private":true,"workspaces":["packages/*"]}
+-- packages/facade/package.json --
+{"name":"@shop/facade","exports":{".":{"default":"./index.js","require":"./index.cjs"}}}
+-- packages/facade/index.js --
+export const facade = 1;
+-- packages/facade/index.cjs --
+module.exports = require("../../nodes/nodejs/b/index.js");
+-- nodes/nodejs/e/node.json --
+{"name":"shop/e","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/e/index.ts --
+import { facade } from "@shop/facade";
+export const e = facade;
 -- nodes/nodejs/a/node.json --
 {"name":"shop/a","version":"1.0.0","runtime":"nodejs"}
 -- nodes/nodejs/a/index.ts --
@@ -37,4 +53,4 @@ export const c = fmt;
 import { b } from "#billing";
 export const d = b;
 -- @expect --
-{"nodes":[["nodes/nodejs/a","violation"],["nodes/nodejs/b","verified"],["nodes/nodejs/c","violation"],["nodes/nodejs/d","violation"]],"diagnostics":[["ownership_node_imports_node","nodes/nodejs/a/index.ts:1"],["ownership_node_imports_node","nodes/nodejs/c/index.ts:1"],["ownership_node_imports_node","nodes/nodejs/d/index.ts:1"]]}
+{"nodes":[["nodes/nodejs/a","violation"],["nodes/nodejs/b","verified"],["nodes/nodejs/c","violation"],["nodes/nodejs/d","violation"],["nodes/nodejs/e","violation"]],"diagnostics":[["ownership_node_imports_node","nodes/nodejs/a/index.ts:1"],["ownership_node_imports_node","nodes/nodejs/c/index.ts:1"],["ownership_node_imports_node","nodes/nodejs/d/index.ts:1"],["ownership_transitive_node_import","nodes/nodejs/e/index.ts:1"]]}
