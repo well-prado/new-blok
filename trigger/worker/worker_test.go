@@ -490,12 +490,19 @@ func TestPrincipalIsPersistedAndPartOfRequestIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var seen trigger.Principal
-	if _, err := queue.ProcessOnce(context.Background(), func(_ context.Context, _ Tx, job Job) error { seen = job.Principal; return nil }); err != nil {
-		t.Fatal(err)
+	// Jobs tied on created_at are claimed in enqueue order (#217); this test
+	// is about principals, so it reads them by key either way.
+	seen := map[string]trigger.Principal{}
+	for range 2 {
+		if _, err := queue.ProcessOnce(context.Background(), func(_ context.Context, _ Tx, job Job) error { seen[job.RequestKey] = job.Principal; return nil }); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if seen.ID != owner.ID || len(seen.Roles) != 1 || seen.Roles[0] != "orders" {
-		t.Fatalf("handler principal=%+v, want %+v", seen, owner)
+	if got := seen["evt-1"]; got.ID != owner.ID || len(got.Roles) != 1 || got.Roles[0] != "orders" {
+		t.Fatalf("handler principal for evt-1=%+v, want %+v", got, owner)
+	}
+	if got := seen["evt-3"]; got.ID != "multi" || len(got.Roles) != 2 {
+		t.Fatalf("handler principal for evt-3=%+v, want multi with two roles", got)
 	}
 }
 
@@ -614,8 +621,10 @@ func TestClaimPredicateAndOrder(t *testing.T) {
 		{"live-lease", "job:l", StateProcessing, at(-time.Minute), at(10 * time.Second), 2},
 		{"expired-lease", "job:0", StateProcessing, at(-time.Minute), at(-time.Second), 10},
 		{"lease-ends-now", "job:9", StateProcessing, at(-time.Minute), at(0), 11},
-		{"tie-second", "job:b", StatePending, at(0), nil, 5},
-		{"tie-first", "job:a", StatePending, at(-time.Second), nil, 5},
+		// Tied on created_at: the one enqueued first is claimed first, even
+		// though its job_id sorts after the other's (#217).
+		{"tie-enqueued-first", "job:b", StatePending, at(0), nil, 5},
+		{"tie-enqueued-second", "job:a", StatePending, at(-time.Second), nil, 5},
 		{"completed", "job:c", StateCompleted, at(-time.Minute), nil, 0},
 		{"dead", "job:d", StateDead, at(-time.Minute), nil, 0},
 	}
@@ -643,7 +652,7 @@ func TestClaimPredicateAndOrder(t *testing.T) {
 			break
 		}
 	}
-	if want := []string{"tie-first", "tie-second", "expired-lease", "lease-ends-now"}; fmt.Sprint(claimed) != fmt.Sprint(want) {
+	if want := []string{"tie-enqueued-first", "tie-enqueued-second", "expired-lease", "lease-ends-now"}; fmt.Sprint(claimed) != fmt.Sprint(want) {
 		t.Fatalf("claimed %v, want %v", claimed, want)
 	}
 }
@@ -651,8 +660,9 @@ func TestClaimPredicateAndOrder(t *testing.T) {
 // TestCanceledClaimWaitReportsConsumerLost: a worker waiting for the write
 // lock held by another worker's handler, whose consumer is canceled
 // meanwhile, reports ErrConsumerLost (not SQLITE_BUSY) within the busy
-// timeout, and leaves the job untouched. The SQLite driver does not
-// interrupt a busy wait, so it cannot return sooner.
+// timeout, and leaves the job untouched. Its transaction is not canceled
+// with the consumer, so the wait for its write turn runs out the busy
+// timeout before it can report.
 func TestCanceledClaimWaitReportsConsumerLost(t *testing.T) {
 	ctx := context.Background()
 	database, err := (sqlite.Backend{}).Open(ctx, filepath.Join(t.TempDir(), "cancel.db"))
@@ -672,10 +682,15 @@ func TestCanceledClaimWaitReportsConsumerLost(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// The two jobs may tie on created_at (Windows' clock steps in
+	// milliseconds), so whichever the first worker claims, the other is the
+	// one the canceled worker must leave untouched.
 	holding, release := make(chan struct{}), make(chan struct{})
 	first := make(chan error, 1)
+	var held string
 	go func() {
-		_, err := queue.ProcessOnce(ctx, func(context.Context, Tx, Job) error {
+		_, err := queue.ProcessOnce(ctx, func(_ context.Context, _ Tx, job Job) error {
+			held = job.RequestKey
 			close(holding)
 			<-release
 			return nil
@@ -692,10 +707,18 @@ func TestCanceledClaimWaitReportsConsumerLost(t *testing.T) {
 	if !errors.Is(err, ErrConsumerLost) || elapsed > 7*time.Second {
 		t.Fatalf("a canceled worker waited %v for the lock and returned %v", elapsed, err)
 	}
+	// The report keeps what the wait itself ended with.
+	if !errors.Is(err, store.ErrBusy) {
+		t.Fatalf("the consumer-lost report %v dropped the busy wait it replaced", err)
+	}
 	if err := <-first; err != nil {
 		t.Fatal(err)
 	}
-	if job, err := queue.Get(ctx, "waiting"); err != nil || job.State != StatePending || job.Attempt != 0 {
+	untouched := "waiting"
+	if held == "waiting" {
+		untouched = "held"
+	}
+	if job, err := queue.Get(ctx, untouched); err != nil || job.State != StatePending || job.Attempt != 0 {
 		t.Fatalf("the canceled claim left %+v %v", job, err)
 	}
 }
@@ -1015,7 +1038,9 @@ func TestHandlerSubmittingAcrossSharedMemoryHandlesFails(t *testing.T) {
 	}
 	var nested error
 	started := time.Now()
-	processed, err := outer.ProcessOnce(ctx, func(ctx context.Context, tx Tx, _ Job) error {
+	// Bounded: an undiagnosed shared-memory self-submit once blocked forever
+	// (#207).
+	processed, err := processBounded(outer, func(ctx context.Context, tx Tx, _ Job) error {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO nested_memory_effects VALUES ('rolled-back')`); err != nil {
 			return err
 		}
@@ -1450,5 +1475,168 @@ func TestHandlerCannotControlTheClaimTransaction(t *testing.T) {
 	}
 	if rows := businessRows(t, database); rows != 1 {
 		t.Fatalf("%d business rows; want the handler's one", rows)
+	}
+}
+
+// TestJobsEnqueuedInOneClockStepAreClaimedInOrder: Windows' clock advances in
+// steps of about 2 ms, so jobs enqueued back to back often share a
+// created_at. A frozen clock makes every job tie; they must still be claimed
+// in the order they were enqueued, not in job_id (hash) order (#217).
+func TestJobsEnqueuedInOneClockStepAreClaimedInOrder(t *testing.T) {
+	ctx := context.Background()
+	database, err := (sqlite.Backend{}).Open(ctx, filepath.Join(t.TempDir(), "fifo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	tick := time.Unix(2_000, 0)
+	queue, err := New(ctx, database, func() time.Time { return tick })
+	if err != nil {
+		t.Fatal(err)
+	}
+	const jobs = 50
+	var want []string
+	for i := range jobs {
+		key := fmt.Sprintf("order-%02d", i)
+		want = append(want, key)
+		if _, err := queue.Enqueue(ctx, EnqueueRequest{RequestKey: key, Kind: "fifo", Payload: []byte(`{}`)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var claimed []string
+	for {
+		processed, err := queue.ProcessOnce(ctx, func(_ context.Context, _ Tx, job Job) error {
+			claimed = append(claimed, job.RequestKey)
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !processed {
+			break
+		}
+	}
+	if fmt.Sprint(claimed) != fmt.Sprint(want) {
+		t.Fatalf("claimed %v; want enqueue order %v", claimed, want)
+	}
+}
+
+// TestEnqueueOrderSurvivesBackup: a queue restored from a backup (VACUUM
+// INTO) claims tied jobs in enqueue order (#217). The order is stored in
+// enqueue_seq; this test does not distinguish that from rowid, whose
+// renumbering by VACUUM is a documented SQLite caveat, not observed here.
+func TestEnqueueOrderSurvivesBackup(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	database, err := (sqlite.Backend{}).Open(ctx, filepath.Join(dir, "live.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	tick := time.Unix(3_000, 0)
+	queue, err := New(ctx, database, func() time.Time { return tick })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var want []string
+	for i := range 20 {
+		key := fmt.Sprintf("backup-%02d", i)
+		want = append(want, key)
+		if _, err := queue.Enqueue(ctx, EnqueueRequest{RequestKey: key, Kind: "fifo", Payload: []byte(`{}`)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	backup := filepath.Join(dir, "backup.db")
+	if err := database.Backup(ctx, backup); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := (sqlite.Backend{}).Open(ctx, backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	again, err := New(ctx, restored, func() time.Time { return tick })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var claimed []string
+	for {
+		processed, err := again.ProcessOnce(ctx, func(_ context.Context, _ Tx, job Job) error {
+			claimed = append(claimed, job.RequestKey)
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !processed {
+			break
+		}
+	}
+	if fmt.Sprint(claimed) != fmt.Sprint(want) {
+		t.Fatalf("restored queue claimed %v; want enqueue order %v", claimed, want)
+	}
+}
+
+// TestConcurrentOpensMigrateWithoutFailing: several processes opening a queue
+// that still needs a column added must all start. The migration reads the
+// schema before it writes, so SQLite cannot make a second opener wait for the
+// first; it fails busy at once (#233). Six handles on one file open together,
+// round after round, each round on a queue missing every added column.
+func TestConcurrentOpensMigrateWithoutFailing(t *testing.T) {
+	ctx := context.Background()
+	const handles, rounds = 6, 10
+	failures := 0
+	var first error
+	for round := range rounds {
+		path := filepath.Join(t.TempDir(), fmt.Sprintf("migrate-%d.db", round))
+		seed, err := (sqlite.Backend{}).Open(ctx, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := seed.WithTx(ctx, func(tx *sql.Tx) error {
+			_, err := tx.ExecContext(ctx, `CREATE TABLE worker_jobs (
+				job_id TEXT PRIMARY KEY, request_key TEXT NOT NULL UNIQUE, kind TEXT NOT NULL, payload_json BLOB NOT NULL,
+				payload_digest TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 0, max_attempts INTEGER NOT NULL, state TEXT NOT NULL,
+				available_at INTEGER NOT NULL, lease_until INTEGER, error_text TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		_ = seed.Close()
+		databases := make([]store.Database, handles)
+		for i := range databases {
+			if databases[i], err = (sqlite.Backend{}).Open(ctx, path); err != nil {
+				t.Fatal(err)
+			}
+		}
+		start := make(chan struct{})
+		errs := make(chan error, handles)
+		var group sync.WaitGroup
+		for _, database := range databases {
+			group.Add(1)
+			go func() {
+				defer group.Done()
+				<-start
+				_, err := New(ctx, database, nil)
+				errs <- err
+			}()
+		}
+		close(start)
+		group.Wait()
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				failures++
+				if first == nil {
+					first = err
+				}
+			}
+		}
+		for _, database := range databases {
+			_ = database.Close()
+		}
+	}
+	if failures != 0 {
+		t.Fatalf("%d of %d concurrent opens failed; first: %v", failures, handles*rounds, first)
 	}
 }

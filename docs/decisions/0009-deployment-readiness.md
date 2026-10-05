@@ -74,7 +74,11 @@ cannot silently repair missing retained artifacts. After registration, readiness
 also requires the current artifact record. Store/worker probes wait for the
 application's initialized state, preventing reads of partially opened resources.
 Failure before listener binding rejects startup; faults after binding keep
-health available and make readiness and business admission return 503.
+health available and make readiness and business admission return 503. A
+shutdown request that arrives while startup is still running is a shutdown,
+not a readiness failure: the startup probe judges the dependencies on a
+context the request cannot cancel, and the drain then handles it (#156).
+On Windows, Ctrl+C and Ctrl+Break on the console are the shutdown request.
 
 Orders commit journal admission, the existing queue handoff and a checkpoint
 before returning 202. These are separate commits: a pre-acknowledgment interruption

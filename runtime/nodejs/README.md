@@ -38,6 +38,11 @@ principal are bound to transport metadata, not user input. The local listener
 does not implement remote TLS; remote exposure is refused. No credentials are
 included in descriptors, errors, or discovery. SIGTERM/SIGINT cancel the session
 and active cooperative work; a selected process supervisor reaps the process.
+Windows has no signal the supervisor can send. There it starts the worker with
+its own hidden console, so the host's Ctrl+C or Ctrl+Break does not reach it,
+inside a job object it joins before its first instruction runs, and after the
+drain terminates the worker's whole process tree; the worker's abort handlers
+do not run on that path.
 
 One persistent Connect stream negotiates protocol 1.1, exact catalog/artifact/
 generation and intersected bounds. Production does not implement unary Invoke.

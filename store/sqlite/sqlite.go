@@ -10,6 +10,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
+	"strings"
+	"time"
 
 	"github.com/well-prado/new-blok/store"
 	driver "modernc.org/sqlite"
@@ -19,11 +22,13 @@ import (
 const sqliteBusy = 5
 
 // busy marks an error caused by SQLITE_BUSY as store.ErrBusy, so callers can
-// tell a saturated store from a failure.
-func busy(err error) error {
+// tell a saturated store from a failure, and names the write domain whose
+// lock was not available. An error that already is store.ErrBusy, such as
+// another store's busy error returned through a callback, keeps its domain.
+func busy(err error, domain *store.WriteDomain) error {
 	var failure *driver.Error
 	if err != nil && errors.As(err, &failure) && failure.Code()&0xff == sqliteBusy && !errors.Is(err, store.ErrBusy) {
-		return fmt.Errorf("%w: %w", store.ErrBusy, err)
+		return store.WithWriteDomain(fmt.Errorf("%w: %w", store.ErrBusy, err), domain)
 	}
 	return err
 }
@@ -31,20 +36,36 @@ func busy(err error) error {
 const (
 	journalMode = "WAL"
 	synchronous = "FULL"
-	busyTimeout = 5000
+	// defaultBusyTimeout bounds how long a writer waits for the write lock,
+	// in the writer queue and in SQLite's busy handler, before ErrBusy.
+	defaultBusyTimeout = 5 * time.Second
 )
 
-// dsn uses one named shared-cache URI for every :memory: open, so each handle
-// participates in the same SQLite writer domain.
-var sharedMemoryWriteDomain = store.NewWriteDomain()
+// sharedMemoryWriteDomain is the one writer domain of every :memory: handle,
+// and sharedMemoryWriters its one writer queue.
+var (
+	sharedMemoryWriteDomain = store.NewWriteDomain()
+	sharedMemoryWriters     = make(chan struct{}, 1)
+)
 
 // Backend opens SQLite databases with the durability settings required by the
 // journal. It is the only package that imports the SQLite driver.
-type Backend struct{}
+type Backend struct {
+	// BusyTimeout bounds how long a writer waits for the write lock before
+	// the transaction fails with store.ErrBusy. Zero means five seconds.
+	BusyTimeout time.Duration
+}
 
 var _ store.Backend = Backend{}
 
-func (Backend) Open(ctx context.Context, path string) (store.Database, error) {
+func (b Backend) busyTimeout() time.Duration {
+	if b.BusyTimeout > 0 {
+		return b.BusyTimeout
+	}
+	return defaultBusyTimeout
+}
+
+func (b Backend) Open(ctx context.Context, path string) (store.Database, error) {
 	if path == "" {
 		return nil, errors.New("sqlite: database path is required")
 	}
@@ -53,33 +74,34 @@ func (Backend) Open(ctx context.Context, path string) (store.Database, error) {
 			return nil, fmt.Errorf("sqlite: create parent: %w", err)
 		}
 	}
-	database, err := sql.Open("sqlite", dsn(path))
+	timeout := b.busyTimeout()
+	database, err := sql.Open("sqlite", dsn(path, timeout))
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: open: %w", err)
 	}
 	database.SetMaxOpenConns(8)
 	database.SetMaxIdleConns(8)
-	if err := configure(ctx, database); err != nil {
+	if err := configure(ctx, database, timeout); err != nil {
 		_ = database.Close()
 		return nil, err
 	}
-	writeDomain := sharedMemoryWriteDomain
+	writeDomain, writers := sharedMemoryWriteDomain, sharedMemoryWriters
 	if path != ":memory:" {
 		file, err := os.Stat(path)
 		if err != nil {
 			_ = database.Close()
 			return nil, fmt.Errorf("sqlite: identify write domain: %w", err)
 		}
-		writeDomain = store.NewFileWriteDomain(file)
+		writeDomain, writers = store.NewFileWriteDomain(file), make(chan struct{}, 1)
 	}
-	return &connection{database: database, writeDomain: writeDomain}, nil
+	return &connection{database: database, writeDomain: writeDomain, writers: writers, busyTimeout: timeout}, nil
 }
 
-func configure(ctx context.Context, database *sql.DB) error {
+func configure(ctx context.Context, database *sql.DB, timeout time.Duration) error {
 	settings := []string{
 		"PRAGMA journal_mode=" + journalMode,
 		"PRAGMA synchronous=" + synchronous,
-		fmt.Sprintf("PRAGMA busy_timeout=%d", busyTimeout),
+		fmt.Sprintf("PRAGMA busy_timeout=%d", timeout.Milliseconds()),
 		"PRAGMA foreign_keys=ON",
 	}
 	for _, statement := range settings {
@@ -90,20 +112,50 @@ func configure(ctx context.Context, database *sql.DB) error {
 	return nil
 }
 
-func dsn(path string) string {
+// dsn opens every :memory: path as one named database on SQLite's memdb VFS,
+// so each handle shares the database and participates in one writer domain.
+func dsn(path string, timeout time.Duration) string {
 	if path == ":memory:" {
-		return "file::memory:?cache=shared&_busy_timeout=5000&_journal_mode=MEMORY&_synchronous=FULL&_foreign_keys=ON"
+		return fmt.Sprintf("file:/new-blok-memory?vfs=memdb&_busy_timeout=%d&_journal_mode=MEMORY&_synchronous=FULL&_foreign_keys=ON", timeout.Milliseconds())
 	}
 	return (&url.URL{
 		Scheme:   "file",
-		Path:     path,
-		RawQuery: "_busy_timeout=5000&_journal_mode=WAL&_synchronous=FULL&_foreign_keys=ON",
+		Path:     uriPath(path),
+		RawQuery: fmt.Sprintf("_busy_timeout=%d&_journal_mode=WAL&_synchronous=FULL&_foreign_keys=ON", timeout.Milliseconds()),
 	}).String()
 }
 
+// uriPath turns a filesystem path into the path of a SQLite file: URI. It
+// must be absolute with forward slashes; a Windows drive path also gains a
+// leading slash (file:///C:/data/app.db). Otherwise "C:\data" or a relative
+// "app.db" lands in the URI's authority and SQLite refuses to open it.
+func uriPath(path string) string {
+	if goruntime.GOOS == "windows" {
+		// An extended-length prefix would turn into a literal "/?/" path
+		// segment; SQLite applies long-path handling itself.
+		if unc, ok := strings.CutPrefix(path, `\\?\UNC\`); ok {
+			path = `\\` + unc
+		} else {
+			path = strings.TrimPrefix(path, `\\?\`)
+		}
+	}
+	if absolute, err := filepath.Abs(path); err == nil {
+		path = absolute
+	}
+	path = filepath.ToSlash(path)
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return path
+}
+
 type connection struct {
-	database     *sql.DB
-	writeDomain  *store.WriteDomain
+	database    *sql.DB
+	writeDomain *store.WriteDomain
+	// writers queues this handle's marked writers (store.Writer), one at a
+	// time, in arrival order.
+	writers      chan struct{}
+	busyTimeout  time.Duration
 	beforeCommit func()
 	afterCommit  func()
 }
@@ -114,24 +166,63 @@ func (c *connection) WithTx(ctx context.Context, fn func(*sql.Tx) error) error {
 	if fn == nil {
 		return errors.New("sqlite: transaction callback is required")
 	}
+	if store.IsWriter(ctx) {
+		release, err := c.queueWriter(ctx)
+		if err != nil {
+			return err
+		}
+		defer release()
+	}
 	tx, err := c.database.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
-		return busy(fmt.Errorf("sqlite: begin: %w", err))
+		return busy(fmt.Errorf("sqlite: begin: %w", err), c.writeDomain)
 	}
 	if err := fn(tx); err != nil {
 		_ = tx.Rollback()
-		return busy(err)
+		return busy(err, c.writeDomain)
 	}
 	if c.beforeCommit != nil {
 		c.beforeCommit()
 	}
 	if err := tx.Commit(); err != nil {
-		return busy(fmt.Errorf("sqlite: commit: %w", err))
+		return busy(fmt.Errorf("sqlite: commit: %w", err), c.writeDomain)
 	}
 	if c.afterCommit != nil {
 		c.afterCommit()
 	}
 	return nil
+}
+
+// queueWriter waits for this handle's earlier marked writers (store.Writer),
+// first come first served, and returns the release for the writer's turn
+// (#214). Left to
+// SQLite, contending writers poll the lock with ever longer sleeps, so the
+// writers that have waited longest poll least often and newcomers keep
+// overtaking them: a writer can wait out the whole busy timeout behind
+// transactions that each hold the lock for microseconds. Queued here, a
+// writer waits only for those ahead of it. The wait is bounded by the busy
+// timeout and fails as SQLite's would, with ErrBusy naming the write domain,
+// so a handler that submits to the store its own claim holds still fails
+// after one busy wait (#207). SQLite's busy handler still governs unmarked
+// writers and writers on other handles and in other processes; a marked
+// writer that meets one waits up to the busy timeout again there.
+func (c *connection) queueWriter(ctx context.Context) (func(), error) {
+	release := func() { <-c.writers }
+	select {
+	case c.writers <- struct{}{}:
+		return release, nil
+	default:
+	}
+	timer := time.NewTimer(c.busyTimeout)
+	defer timer.Stop()
+	select {
+	case c.writers <- struct{}{}:
+		return release, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("sqlite: begin: %w", ctx.Err())
+	case <-timer.C:
+		return nil, store.WithWriteDomain(fmt.Errorf("sqlite: begin: %w: no write turn within %v", store.ErrBusy, c.busyTimeout), c.writeDomain)
+	}
 }
 
 func (c *connection) Backup(ctx context.Context, destination string) error {

@@ -108,7 +108,7 @@ same on every trigger.
 
 | Workflow error | Status | Reason |
 | --- | --- | --- |
-| the deadline passed | DeadlineExceeded | `deadline_exceeded` |
+| the deadline passed | DeadlineExceeded | `deadline_exceeded` (see below) |
 | the client canceled | Canceled | `canceled` |
 | `trigger.ErrSaturated` | ResourceExhausted | `saturated` |
 | classified `validation` | InvalidArgument | its code |
@@ -117,6 +117,13 @@ same on every trigger.
 | classified `configuration` | Internal | `internal` |
 | any other classified class | FailedPrecondition | its code |
 | unclassified | Internal | `internal` |
+
+When the client's deadline is the shorter, the server may record Canceled
+instead of DeadlineExceeded. The server's deadline starts when the request
+arrives, slightly after the client's, and the client resets the stream with
+the same code whether its deadline passed or it canceled. If that reset
+arrives first, nothing on the wire tells them apart (#230). The client still
+sees DeadlineExceeded, and the workflow is canceled either way.
 
 ### Bounds
 

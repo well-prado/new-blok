@@ -88,7 +88,7 @@ func (s *JournalStore) Record(ctx context.Context, id string, p Proposal, grant 
 	if len(encoded) > MaxRecordBytes || len(proposalJSON) > MaxRecordBytes {
 		return Decision{}, ErrCapacity
 	}
-	err = s.database.WithTx(ctx, func(tx *sql.Tx) error {
+	err = s.database.WithTx(store.Writer(ctx), func(tx *sql.Tx) error {
 		// Reserve the write lock before reading limits or detecting duplicates;
 		// concurrent writers cannot both consume the last capacity slot.
 		if _, err := tx.ExecContext(ctx, `UPDATE approval_decisions_v1 SET id=id WHERE id=?`, id); err != nil {
