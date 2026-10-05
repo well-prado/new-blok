@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/well-prado/new-blok/internal/tooling/layout"
 )
 
 type Diagnostic struct {
@@ -40,6 +42,8 @@ type Package struct {
 type Graph struct {
 	Module   string
 	Packages map[string]Package
+	// Root is the directory Analyze read; node ownership is anchored here.
+	Root string
 }
 
 func Analyze(root string) (Graph, error) {
@@ -47,7 +51,7 @@ func Analyze(root string) (Graph, error) {
 	if err != nil {
 		return Graph{}, err
 	}
-	g := Graph{Module: module, Packages: map[string]Package{}}
+	g := Graph{Module: module, Packages: map[string]Package{}, Root: root}
 	err = filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -137,7 +141,7 @@ func Check(root string) ([]Diagnostic, error) {
 				diagnostics = append(diagnostics, Diagnostic{Code: "trigger_conformance_missing", Package: path, Message: "trigger adapter tests must run contract/conformance.RunTrigger"})
 			}
 		}
-		if nodeRoot := nodeOwnerRoot(p.Dir); nodeRoot != "" {
+		if nodeRoot := nodeOwnerRoot(g, p.Dir); nodeRoot != "" {
 			for _, imported := range p.Imports {
 				if importedRoot, ok := packageNodeRoot(g, imported); ok && importedRoot != nodeRoot {
 					diagnostics = append(diagnostics, Diagnostic{Code: "node_import_forbidden", Package: path, Import: imported, Message: "a node cannot import another node; workflows own composition"})
@@ -347,19 +351,16 @@ func callsRunTrigger(file *ast.File, conformancePath string) bool {
 	return found
 }
 
-func nodeOwnerRoot(dir string) string {
-	parts := strings.Split(filepath.ToSlash(dir), "/")
-	for i, part := range parts {
-		if part != "nodes" || i+1 >= len(parts) {
-			continue
-		}
-		// Unified: nodes/<runtime>/<node>; classic: runtimes/<runtime>/nodes/<node>.
-		if i+2 < len(parts) {
-			return strings.Join(parts[:i+3], "/")
-		}
-		return strings.Join(parts[:i+2], "/")
+// nodeOwnerRoot is the node directory that owns dir, relative to the
+// analyzed root, under either layout (internal/tooling/layout.NodeRoot).
+// Every package nested below a node directory belongs to that node.
+func nodeOwnerRoot(g Graph, dir string) string {
+	rel, err := filepath.Rel(g.Root, dir)
+	if err != nil {
+		return ""
 	}
-	return ""
+	root, _ := layout.NodeRoot(filepath.ToSlash(rel))
+	return root
 }
 
 func packageNodeRoot(g Graph, importPath string) (string, bool) {
@@ -367,6 +368,6 @@ func packageNodeRoot(g Graph, importPath string) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	root := nodeOwnerRoot(p.Dir)
+	root := nodeOwnerRoot(g, p.Dir)
 	return root, root != ""
 }

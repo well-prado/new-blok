@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/well-prado/new-blok/internal/generate"
+	"github.com/well-prado/new-blok/internal/tooling/layout"
 )
 
 // FrameworkModule is the module every starter depends on.
@@ -41,23 +42,13 @@ type Options struct {
 	Framework Framework
 }
 
-type Manifest struct {
-	Name     string   `json:"name"`
-	Module   string   `json:"module"`
-	Runtime  string   `json:"runtime"`
-	Layout   string   `json:"layout"`
-	Triggers []string `json:"triggers"`
-	// Types is the Go source blok generate reads by default; its bindings
-	// are written beside it.
-	Types string `json:"types"`
-}
+// Manifest is blok.json. Its schema and validation belong to layout
+// discovery, which reads it back (internal/tooling/layout).
+type Manifest = layout.Manifest
 
 // NodeDir is where a layout keeps a Go node's package (architecture §3).
-func NodeDir(layout, node string) string {
-	if layout == "unified" {
-		return "nodes/go/" + node
-	}
-	return "runtimes/go/nodes/" + node
+func NodeDir(layoutName, node string) string {
+	return layout.NodeDir(layoutName, layout.GoRuntime, node)
 }
 
 func Create(options Options) ([]string, error) {
@@ -129,7 +120,7 @@ func normalize(options Options) (Options, error) {
 	if options.Layout == "" {
 		options.Layout = "classic"
 	}
-	if options.Layout != "classic" && options.Layout != "unified" {
+	if options.Layout != layout.Classic && options.Layout != layout.Unified {
 		return Options{}, fmt.Errorf("new: layout %q is unsupported; choose classic or unified", options.Layout)
 	}
 	if len(options.Triggers) == 0 {

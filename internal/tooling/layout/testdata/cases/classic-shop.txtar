@@ -1,0 +1,76 @@
+Classic layout. The Go node's directory (pricing) is not its identity
+(shop/calculate-quote); it spans nested files (rates/) and imports a shared
+domain package. A nodejs node sits beside it (mixed runtimes). unified-shop
+is the same application and must produce the same catalog and digest.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"classic","triggers":["http"],"types":"runtimes/go/nodes/pricing/types.go"}
+-- go.mod --
+module example.com/shop
+
+go 1.27.0
+-- internal/money/money.go --
+package money
+
+// Cents is a shared domain utility nodes may import.
+func Cents(units, price int64) int64 { return units * price }
+-- runtimes/go/nodes/pricing/quote.go --
+package quote
+
+import (
+	"context"
+
+	blok "github.com/well-prado/new-blok/node"
+
+	"example.com/shop/internal/money"
+	"example.com/shop/runtimes/go/nodes/pricing/rates"
+)
+
+const name = "shop/calculate-quote"
+
+// init would panic if discovery ever executed source.
+func init() { panic("discovery executed source") }
+
+var Node = blok.MustDefine(name, "1.0.0", func(ctx context.Context, in Input) (Output, error) {
+	return Output{TotalCents: money.Cents(int64(in.Quantity), rates.Coffee)}, nil
+})
+-- runtimes/go/nodes/pricing/types.go --
+package quote
+
+type Input struct {
+	Quantity int `json:"quantity"`
+}
+
+type Output struct {
+	TotalCents int64 `json:"totalCents"`
+}
+-- runtimes/go/nodes/pricing/rates/rates.go --
+package rates
+
+const Coffee = 1500
+-- runtimes/go/nodes/pricing/quote_test.go --
+package quote
+
+import blok "github.com/well-prado/new-blok/node"
+
+// Test files are not discovered: this identity must never reach the catalog.
+var testOnly = blok.MustDefine("shop/test-only", "0.0.1", nil)
+-- runtimes/nodejs/nodes/format/node.json --
+{"name":"shop/format-receipt","version":"2.1.0","runtime":"nodejs","description":"Formats a receipt","inputSchema":{"type":"object"},"outputSchema":{"type":"object"}}
+-- runtimes/nodejs/nodes/format/index.mjs --
+export default function format(input) { return { text: String(input.total) }; }
+-- workflows/quotes/quotes.go --
+package quotes
+
+import (
+	"github.com/well-prado/new-blok/flow"
+
+	quote "example.com/shop/runtimes/go/nodes/pricing"
+)
+
+var _ = quote.Node
+
+func New() (flow.Definition[int, int], error) {
+	return flow.Define(flow.Spec{Name: "shop/quote", Version: "1.0.0"}, nil)
+}
+-- @expect --
+{"catalog":{"version":1,"nodes":[{"name":"shop/calculate-quote","version":"1.0.0","runtime":"go","files":["quote.go","quote_test.go","rates/rates.go","types.go"]},{"name":"shop/format-receipt","version":"2.1.0","runtime":"nodejs","files":["index.mjs","node.json"]}],"workflows":[{"name":"shop/quote","version":"1.0.0"}]},"digest":"sha256:1f255e6ce8145ae2eb41650fa25d97942fb321da464285443063fd71f309ca3e"}

@@ -1,0 +1,25 @@
+Workflow paths that cannot own files: missing, inside a node; misplaced definitions.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":"","workflows":["missing","nodes/go/quote/flows","flows"]}
+-- go.mod --
+module example.com/shop
+
+go 1.27.0
+-- nodes/go/quote/quote.go --
+package quote
+
+import (
+	"github.com/well-prado/new-blok/flow"
+	"github.com/well-prado/new-blok/node"
+)
+
+var Node = node.MustDefine("shop/quote", "1.0.0", nil)
+var W = flow.MustDefine[int, int](flow.Spec{Name: "shop/inside", Version: "1.0.0"}, nil)
+-- flows/f.go --
+package flows
+
+import "github.com/well-prado/new-blok/node"
+
+var N = node.MustDefine("shop/stray", "1.0.0", nil)
+-- @expect --
+{"diagnostics":[["layout_descriptor_misplaced","flows/f.go:5"],["layout_descriptor_misplaced","nodes/go/quote/quote.go:9"],["layout_ownership_overlap","nodes/go/quote/flows"],["layout_workflow_path_missing","missing"]]}
