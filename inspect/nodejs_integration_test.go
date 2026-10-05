@@ -48,7 +48,11 @@ func (o *processingObserver) setRunID(runID string) {
 	o.mu.Unlock()
 }
 
-func TestActualNodeWorkerRunProducesInspectionProjection(t *testing.T) {
+// startNodeWorker starts the actual built Node worker as a supervised
+// process and returns it with its discovered descriptors. It skips unless
+// BLOK_NODE_INTEGRATION_ROOT names a checkout with the worker built.
+func startNodeWorker(t *testing.T) (*worker.Supervisor, map[string]node.Descriptor) {
+	t.Helper()
 	root := os.Getenv("BLOK_NODE_INTEGRATION_ROOT")
 	if root == "" {
 		t.Skip("set BLOK_NODE_INTEGRATION_ROOT to run the actual Node worker inspection scenario")
@@ -80,10 +84,6 @@ func TestActualNodeWorkerRunProducesInspectionProjection(t *testing.T) {
 	descriptors := map[string]node.Descriptor{}
 	for _, candidate := range discovery.Nodes {
 		descriptors[candidate.Name] = candidate
-	}
-	descriptor := descriptors["fixture/quote"]
-	if descriptor.Name == "" {
-		t.Fatal("Node worker did not discover fixture/quote")
 	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -119,13 +119,22 @@ func TestActualNodeWorkerRunProducesInspectionProjection(t *testing.T) {
 	if err := supervisor.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	defer func() {
+	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		if err := supervisor.Shutdown(ctx); err != nil {
 			t.Errorf("Node worker shutdown: %v", err)
 		}
-	}()
+	})
+	return supervisor, descriptors
+}
+
+func TestActualNodeWorkerRunProducesInspectionProjection(t *testing.T) {
+	supervisor, descriptors := startNodeWorker(t)
+	descriptor := descriptors["fixture/quote"]
+	if descriptor.Name == "" {
+		t.Fatal("Node worker did not discover fixture/quote")
+	}
 	type input struct {
 		SKU      string `json:"sku"`
 		Quantity int    `json:"quantity"`
