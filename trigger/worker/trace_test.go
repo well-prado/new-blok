@@ -3,8 +3,10 @@ package worker
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/well-prado/new-blok/contract/observe"
@@ -149,6 +151,9 @@ func TestMalformedTraceIsNeitherStoredNorAnError(t *testing.T) {
 		{key: "stored-garbage", trace: valid, overwrite: []string{"not a trace", "vendor=1"}},
 		{key: "stored-bad-state", trace: valid, overwrite: []string{traceA, "vendor=\x01"}, want: valid},
 		{key: "stored-credential", trace: valid, overwrite: []string{traceA, "token=SYNTHETIC-ts-0001,vendor=1"}, want: cleanState},
+		// Only the decoding layer of the redaction boundary finds this one:
+		// a foreign row's tracestate is filtered again when the job is read.
+		{key: "stored-encoded-credential", trace: valid, overwrite: []string{traceA, "enc=" + strings.TrimRight(base64.StdEncoding.EncodeToString([]byte("password=SYNTHETIC-b64-0003")), "=") + ",vendor=1"}, want: cleanState},
 		{key: "enqueued-credential", trace: credential, want: cleanState, wantColumn: [2]string{traceA, "vendor=1"}},
 	}
 	for _, tc := range cases {
