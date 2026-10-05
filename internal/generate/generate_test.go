@@ -78,3 +78,13 @@ func TestAccessorsSelectTheJSONKey(t *testing.T) {
 		t.Fatalf("a field tagged \"-\" got an accessor:\n%s", text)
 	}
 }
+
+// TestDottedKeyIsRejected: a reference path splits on dots, so a json key
+// with one cannot be selected; the generator says so instead of emitting an
+// accessor that fails at run time.
+func TestDottedKeyIsRejected(t *testing.T) {
+	source := []byte("package shop\n\ntype Line struct {\n\tAB string `json:\"a.b\"`\n}\n")
+	if _, err := Source(source, Options{}); err == nil || !strings.Contains(err.Error(), `Line.AB: json key "a.b" contains '.'`) {
+		t.Fatalf("err=%v; want the dotted key rejected", err)
+	}
+}

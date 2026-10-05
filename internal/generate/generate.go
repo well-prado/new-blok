@@ -85,6 +85,11 @@ func Source(source []byte, options Options) ([]byte, error) {
 			if !encoded {
 				continue
 			}
+			if strings.Contains(key, ".") {
+				// A reference path splits on dots, so this key could never be
+				// selected; an accessor would compile and fail at run time.
+				return nil, fmt.Errorf("%s.%s: json key %q contains '.', which a workflow reference cannot select", name, field.Name(), key)
+			}
 			fmt.Fprintf(&output, "func (r %sRef) %s() flow.Ref[%s] { return flow.Select[%s, %s](r.value, %q) }\n\n", name, field.Name(), fieldType, name, fieldType, key)
 		}
 		fmt.Fprintf(&output, "type %sArgs struct {\n", name)
