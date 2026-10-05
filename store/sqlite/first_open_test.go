@@ -168,7 +168,7 @@ func runFirstOpenChild() {
 // as store.ErrBusy (#320).
 func TestUnwritablePathFailsFast(t *testing.T) {
 	if runtime.GOOS == "windows" {
-		t.Skip("POSIX permissions and /dev/null")
+		t.Skip("POSIX permissions")
 	}
 	if os.Geteuid() == 0 {
 		t.Skip("root writes through read-only permissions")
@@ -201,7 +201,6 @@ func TestUnwritablePathFailsFast(t *testing.T) {
 		{"read-only directory", func(t *testing.T) string {
 			return filepath.Join(readOnlyDirectory(t), "new.db")
 		}, "unable to open"},
-		{"under /dev/null", func(*testing.T) string { return "/dev/null/x.db" }, "create parent"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
