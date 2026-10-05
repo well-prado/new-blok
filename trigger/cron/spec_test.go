@@ -117,16 +117,18 @@ func TestBetweenBoundsCatchUp(t *testing.T) {
 	// latest three are kept, and the count of the half million others is
 	// clamped to the cap instead of enumerated.
 	end := start.AddDate(1, 0, 0)
-	began := time.Now()
+	began, cpu := time.Now(), ProcessCPUTime()
 	window, missed := o.Between(start, end, 3, missedCountCap)
-	elapsed := time.Since(began)
+	elapsed, used := time.Since(began), ProcessCPUTime()-cpu
 	if len(window) != 3 || !window[0].Instant.Equal(end.Add(-2*time.Minute)) || !window[2].Instant.Equal(end) || missed != missedCountCap {
 		t.Fatalf("window=%v missed=%d", window, missed)
 	}
-	if elapsed > catchUpBound {
-		t.Fatalf("catch-up over a year took %v", elapsed)
+	// The bound is on CPU time: wall time also counts a contended host's
+	// scheduling delays, which made this fail under parallel suites (#214).
+	if used > catchUpBound {
+		t.Fatalf("catch-up over a year used %v of CPU (%v wall)", used, elapsed)
 	}
-	t.Logf("a year of minutely firings at the production cap: %v", elapsed)
+	t.Logf("a year of minutely firings at the production cap: %v CPU, %v wall", used, elapsed)
 	// Below the cap the count is exact.
 	window, missed = o.Between(start, start.AddDate(0, 0, 1), 3, missedCountCap)
 	if len(window) != 3 || missed != 1437 {

@@ -402,16 +402,16 @@ func TestDenseSchedulesProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	clock.Set(at(10, 35))
-	began := time.Now()
+	began, cpu := time.Now(), cron.ProcessCPUTime()
 	results, err := s.Tick(context.Background())
-	steady := time.Since(began)
+	steady, steadyCPU := time.Since(began), cron.ProcessCPUTime()-cpu
 	if err != nil || len(results) != count {
 		t.Fatalf("steady tick: %d results, err=%v", len(results), err)
 	}
 	clock.Set(at(10, 35).AddDate(0, 0, 3))
-	began = time.Now()
+	began, cpu = time.Now(), cron.ProcessCPUTime()
 	results, err = s.Tick(context.Background())
-	catchUp := time.Since(began)
+	catchUp, catchUpCPU := time.Since(began), cron.ProcessCPUTime()-cpu
 	if err != nil || len(results) != count {
 		t.Fatalf("catch-up tick: %d results, err=%v", len(results), err)
 	}
@@ -424,9 +424,13 @@ func TestDenseSchedulesProfile(t *testing.T) {
 			t.Fatalf("catch-up %s: submitted=%d missed=%d", r.Schedule, len(r.Submitted), r.Missed)
 		}
 	}
-	t.Logf("%d dense schedules (minutely and */5, America/New_York): steady tick %v, tick after 3 days down %v", count, steady, catchUp)
-	if steady > denseTickBound || catchUp > denseTickBound {
-		t.Fatalf("steady %v, catch-up %v, bound %v", steady, catchUp, denseTickBound)
+	t.Logf("%d dense schedules (minutely and */5, America/New_York): steady tick %v CPU (%v wall), tick after 3 days down %v CPU (%v wall)", count, steadyCPU, steady, catchUpCPU, catchUp)
+	// The bound is on CPU time: the catch-up is CPU-bound (walking about
+	// 2.6 million missed occurrences), and wall time also counts a contended
+	// host's scheduling delays, which failed it under parallel suites on
+	// Windows and macOS (#214). An algorithmic slowdown still fails it.
+	if steadyCPU > denseTickBound || catchUpCPU > denseTickBound {
+		t.Fatalf("steady %v CPU, catch-up %v CPU, bound %v", steadyCPU, catchUpCPU, denseTickBound)
 	}
 }
 
