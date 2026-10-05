@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/well-prado/new-blok/agent/internal/catalogprogram"
 	"github.com/well-prado/new-blok/contract"
 	"github.com/well-prado/new-blok/contract/tool"
 	"github.com/well-prado/new-blok/flow"
@@ -125,8 +126,9 @@ func confCatalog(t *testing.T, n confNodes) *Catalog {
 }
 
 // catalogProgram returns the program and literals the catalog stored for a
-// registered workflow tool.
-func catalogProgram(t *testing.T, c *Catalog, name, version string) (contract.InternalProgram, map[string][]byte) {
+// registered workflow tool. The program is opaque (#260): tests compare it
+// with Equal and print it with %#v, and cannot run it.
+func catalogProgram(t *testing.T, c *Catalog, name, version string) (*catalogprogram.Program, map[string][]byte) {
 	t.Helper()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -134,7 +136,7 @@ func catalogProgram(t *testing.T, c *Catalog, name, version string) (contract.In
 	if !ok || b.program == nil {
 		t.Fatalf("workflow tool %s@%s is not registered", name, version)
 	}
-	return *b.program, b.literals
+	return b.program, b.program.Literals()
 }
 
 // canonicalJSON re-encodes a JSON document so two encodings of one value
@@ -331,12 +333,7 @@ func TestCatalogLowersAcceptedWorkflowsExactlyLikeFlowLower(t *testing.T) {
 				t.Fatalf("RegisterWorkflow: %v", err)
 			}
 			program, literals := catalogProgram(t, c, confSpec.Name, confSpec.Version)
-			for index := range program.Instructions {
-				if index < len(lowered.Instructions) && !reflect.DeepEqual(program.Instructions[index].References, lowered.Instructions[index].References) {
-					t.Errorf("instruction %d references: catalog=%#v flow.Lower=%#v", index, program.Instructions[index].References, lowered.Instructions[index].References)
-				}
-			}
-			if !reflect.DeepEqual(program, lowered) {
+			if !program.Equal(lowered) {
 				t.Errorf("catalog program differs from flow.Lower:\n catalog=%#v\n    flow=%#v", program, lowered)
 			}
 			if len(literals) != 0 {
@@ -628,7 +625,7 @@ func TestCatalogLiteralIsTheOnlyDifferenceFromFlowLower(t *testing.T) {
 		t.Fatalf("catalog literal: %v", err)
 	}
 	program, literals := catalogProgram(t, c, confSpec.Name, confSpec.Version)
-	if !reflect.DeepEqual(program, twin) {
+	if !program.Equal(twin) {
 		t.Errorf("catalog program differs from flow.Lower's twin:\n catalog=%#v\n    twin=%#v", program, twin)
 	}
 	encoded, _ := json.Marshal(literal)
@@ -679,8 +676,8 @@ func TestCatalogChildWorkflowLowersUnderFlowReferenceRules(t *testing.T) {
 	}
 	program, _ := catalogProgram(t, c, confSpec.Name, confSpec.Version)
 	want := confIndexed(confCall("reserve", "conf/reserve"), confCall("nested", "conf/child@1.0.0", confRef("reserve", "body")), confOutput(confRef("nested")))
-	if !reflect.DeepEqual(program.Instructions, want) {
-		t.Errorf("child program:\n got=%#v\nwant=%#v", program.Instructions, want)
+	if !program.Equal(contract.InternalProgram{WorkflowID: confSpec.Name, Version: confSpec.Version, Instructions: want}) {
+		t.Errorf("child program:\n got=%#v\nwant=%#v", program, want)
 	}
 	output, err := c.Invoke(context.Background(), confPrincipal(), confSpec.Name, confSpec.Version, []byte(`{"sku":"coffee","quantity":2}`), confBudget())
 	if err != nil {

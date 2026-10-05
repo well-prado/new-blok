@@ -1,0 +1,67 @@
+package agent
+
+// Overlaid into package agent by TestStoredCatalogProgramCannotRunOutsideDispatch
+// (#260). It does what the #257 review did: take the program the catalog
+// stored for a workflow with a literal call input and run it through an
+// observed engine, outside catalog dispatch. Where that compiles, it shows
+// the hazard: the commit step is observed with, and receives, the workflow
+// input instead of its literal. Where the catalog keeps the program behind
+// agent/internal/catalogprogram, it must not compile.
+
+import (
+	"context"
+	"encoding/json"
+	"sync"
+	"testing"
+
+	"github.com/well-prado/new-blok/contract/inspection"
+	"github.com/well-prado/new-blok/internal/engine"
+	"github.com/well-prado/new-blok/node"
+)
+
+type escape260Observer struct {
+	mu     sync.Mutex
+	events []inspection.Event
+}
+
+func (o *escape260Observer) Observe(e inspection.Event) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.events = append(o.events, e)
+}
+
+func TestEscape260RunStoredProgramObserved(t *testing.T) {
+	r := &recorder{}
+	n := newConfNodes(r)
+	c := confCatalog(t, n)
+	if err := RegisterWorkflow(c, literalWorkflow(n, object{"sku": "tea", "quantity": 1}), []byte(confOrderSchema), []byte(confCommitSchema), confManifest(), metadata()); err != nil {
+		t.Fatal(err)
+	}
+	c.mu.RLock()
+	b := c.tools[confSpec.Name+"@"+confSpec.Version]
+	c.mu.RUnlock()
+	nodes := map[string]node.Any{"conf/reserve": n.reserve.Any(), "conf/commit": n.commit.Any()}
+	o := &escape260Observer{}
+	if _, err := engine.New(nodes).WithObserver(o).RunObserved(context.Background(), *b.program, object{"sku": "SECRET", "quantity": 2}, inspection.Invocation{RunID: "run-260", Principal: "reviewer"}); err != nil {
+		t.Fatal(err)
+	}
+	const literal = `{"quantity":1,"sku":"tea"}`
+	for _, e := range o.events {
+		if e.StepID == "commit" && e.Kind == inspection.StepProcessing && canonical260(t, e.Input) != literal {
+			t.Errorf("HAZARD #260: StepProcessing observed commit input %s; the literal is %s", e.Input, literal)
+		}
+	}
+	if got := r.inputs["conf/commit"]; len(got) != 1 || canonical260(t, []byte(got[0])) != literal {
+		t.Errorf("HAZARD #260: the commit node received %v; the literal is %s", got, literal)
+	}
+}
+
+func canonical260(t *testing.T, raw []byte) string {
+	t.Helper()
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		t.Fatalf("decode %s: %v", raw, err)
+	}
+	out, _ := json.Marshal(value)
+	return string(out)
+}

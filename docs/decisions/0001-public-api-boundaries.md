@@ -436,7 +436,8 @@ lowering cannot import `flow`, which imports it), guarded by the conformance
 tests; the catalog still composes only calls and children, so a control
 construct remains unsupported for agent tools; and a literal remains
 invisible in the stored program, so the engine sees that call as taking the
-workflow input until dispatch substitutes it.
+workflow input until dispatch substitutes it; #260 (below) makes that
+program unrunnable outside dispatch.
 
 #### Catalog literals are checked against the tool's input schema (#261)
 
@@ -486,6 +487,119 @@ check covers any literal the lowering returns, whatever the instruction kind.
 `agent/literal_validation_test.go` holds the cases; each rejection case is
 red on the pre-#261 catalog, which registers the workflow and then, on
 invocation, runs the reserve effect before failing.
+
+#### A catalog program runs only through catalog dispatch (#260)
+
+Because the program has no literal form, the stored catalog program is only
+correct while dispatch substitutes the literals. The #257 review showed what
+happens otherwise: it ran the stored program through `engine.RunObserved`
+outside dispatch, the `StepProcessing` event for the literal call recorded
+the workflow input (`{"quantity":2,"sku":"SECRET"}`), and the node ran with
+it instead of the literal. Nothing observed or journaled catalog runs, so the
+hazard was latent, but it was held off only by convention.
+
+**Rule: never run, observe or journal a catalog program except through
+catalog dispatch.** It is now enforced by the package structure, not by
+review. The lowered program and its literals live in the unexported fields of
+`agent/internal/catalogprogram.Program`, which package `agent` cannot read.
+The type exposes `Literals` (copies of the values dispatch hands the calls),
+`Equal` and `GoString` (for tests and diagnostics; `GoString` prints the
+whole `catalogprogram.Program`, literals included), and one `Run`, which
+builds the dispatch nodes, substitutes every literal and runs the engine.
+`Run` takes no observer, journal or engine, so a caller cannot attach one.
+Inside the package, a source test
+(`agent/internal/catalogprogram/source_guard_test.go`) holds the same line.
+It reads the package's syntax, not its types, and it is red on:
+
+- any import outside the set `Run` needs, so `contract/inspection`,
+  `internal/journal`, the event hub and `unsafe` are refused, as are dot
+  and blank imports;
+- any allowed package not imported exactly once and unaliased: a path
+  imported twice in one file, a path taking two local names across the
+  package, or `reflect` or the engine imported under any name but its
+  default. The test still tracks every local name a path takes, so a
+  second name cannot hide uses under the first;
+- any selector naming an engine method other than `WithMaxSteps` and `Run`
+  (`WithObserver`, `RunObserved`, `RunObservedPending`, `RunJournaled`,
+  `EmitRunTerminal`, `RunControl`, or one added later), whether called or
+  taken as a method value, and any string literal equal to such a name;
+- any engine package selector except `New`, and any reference to
+  `engine.New` except as the callee that starts the one chain, so
+  `engine.New` cannot be passed to `reflect` or held in a variable;
+- any `reflect` selector except `reflect.DeepEqual`, so no engine method
+  can be reached by a computed name;
+- anything other than exactly one `engine.New(...).WithMaxSteps(...).Run(...)`
+  chain, in `(*Program).Run`.
+`catalogprogram.Lower` is the only caller of the lowering with
+`Options.Literals`. Package `agent` no longer imports `internal/engine` or
+`internal/lowering`, so it cannot build an engine or lower a literal itself.
+Nothing that leaves the package carries the program: `Listing` and
+`Catalog.List` (what MCP lists) never did, and the artifact digest still
+hashes the recorded `flow.Program`, whose literal is already public through
+`flow.Definition.Program`, and not the lowered one.
+
+**Decision: guard, do not observe.** The other option was substituting the
+literal inside the engine, through a node wrapper or a synthetic step, so
+that observed inputs would equal what the node received. That changes the
+step count, the `WithMaxSteps` budget and the event stream. It is also the
+program-literal-form question #249 deferred. If catalog runs need
+inspection (#77) or a journal later, that is the design to take up then.
+Until then, `Run` refuses both by having no way to accept them.
+
+Compatibility: an internal refactor, linked to
+[#260](https://github.com/well-prado/new-blok/issues/260). No public API,
+wire shape, document version, artifact digest, gate admission, dispatch input
+or result changes. `agent/dispatch_corpus_test.go` compares nine literal and
+non-literal workflows with a golden file generated on origin/main before the
+change. The comparison covers every admission (identity, digests, effects,
+capabilities, budget, input bytes), every published output, every node
+input, the result and error, and every listing digest.
+`agent/program_guard_test.go` runs the review's escape as an overlay file.
+On origin/main it compiles and shows the hazard. Now it fails to compile on
+`catalogprogram.Program`. The same file walks every value package `agent`
+can reach for a `contract.InternalProgram`, and checks the import boundary.
+`agent/internal/catalogprogram` pins its surface and allows only `flow` and
+itself to import the lowering. `source_guard_test.go` is red on the
+review's second escape, which keeps the surface and makes `Run` switch to
+`WithObserver(o).RunObserved` when the context carries an observer. Before
+that test, a probe through `Catalog.Invoke` logged the commit step observed
+with `{"quantity":2,"sku":"SECRET"}` while `go test ./agent/...` stayed
+green. It is also red on importing the journal, on `RunJournaled`, and on
+holding the engine in a variable.
+
+The step bound `Run` passes, `MaxCalls+1`, can never cut a catalog run
+short: registration and `Invoke` already refuse a workflow with more calls
+than the budget, and a program has at most one instruction per call plus
+the output. What the bound does is lift the engine's 10000-step default
+for a workflow at the 10000-call ceiling, whose program has 10001
+instructions. Without the bound, that workflow registers and then always
+fails. Both directions are tested.
+
+The second review found a further escape, inside `(*Program).Run` and in
+front of the untouched chain. It passed `engine.New` to `reflect.ValueOf`
+and called `MethodByName("With"+"Observer")` and
+`MethodByName("Run"+"Observed")`, splitting the names so no forbidden
+string appears. The leak reproduced. The test is now red on it, through
+both the `engine.New` reference rule and the `reflect` rule.
+
+The third review imported `reflect` and the engine a second time, as `rx`
+and `eng`. It built the counted chain on `eng.New` and pointed `Equal` at
+`rx.DeepEqual`, then ran the round-2 attack under the plain names. The test
+had tracked only the last local name per path, so it passed while
+`Catalog.Invoke` leaked. It is now red on that edit through the
+import-once, one-name and unaliased rules. Because every name is tracked,
+the round-2 `reflect` and `engine.New` findings fire as well. An alias
+alone (`eng` for the engine) is red too.
+
+Out of scope, because a syntax check cannot hold them:
+
+- `reflect` or `unsafe` used from another package of the module on
+  `Program`'s unexported fields;
+- edits to the source test itself;
+- code-generation tricks.
+
+Each is a visible change to a file, not a silent one, but none is
+impossible.
 
 The initial portable contract is a bounded, JSON-compatible value subset with
 explicit semantics for missing, null, optional fields, objects, arrays, string,
