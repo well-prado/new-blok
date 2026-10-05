@@ -103,79 +103,104 @@ func stalledClient(t *testing.T, address, path, principal string) net.Conn {
 // that never read to a real HTTP run whose node floods logs while it moves
 // a journaled effect through intent, attempt and commit, and whose terminal
 // outcome is persisted through the journal port. The run and every journal
-// transition complete in about the time they take without readers; the
-// readers are disconnected as slow, and their handlers exit.
+// transition complete although the readers never drain; the readers are
+// disconnected as slow, and their handlers exit.
+//
+// What it guards, and what it does not (#310): a publisher that blocks on a
+// stalled reader for up to the reader's write timeout (MaxEventWriteTimeout,
+// one minute), or for ever. The run must end before any stalled write could
+// have timed out, and every reader must have been cut off by the hub as
+// slow, not released by its write timeout. A brief, bounded wait per publish
+// is not detected: by time it cannot be told apart from load (the run's own
+// duration varied from 3 s to 25 s under load), so the test no longer times
+// the run against a baseline run. One non-timing check remains: an
+// in-process reader that never takes a frame is attached too, and the run
+// must publish past its whole queue while it has consumed nothing.
 func TestStalledSubscribersCannotBlockRunOrJournalTransitions(t *testing.T) {
 	store, closeJournal := openJournal(t, filepath.Join(t.TempDir(), "stalled.db"))
 	defer closeJournal()
-	const logs, stalled = 2000, 4
-	measure := func(name string, readers int) time.Duration {
-		admission, err := store.Admit(context.Background(), journal.AdmissionRequest{Principal: "alice", RequestKey: name, Workflow: "quote", ArtifactDigest: "sha256:" + name, Input: []byte(`{"sku":"coffee","quantity":1}`)})
-		if err != nil {
-			t.Fatal(err)
-		}
-		begin := make(chan struct{})
-		// Paced so a reader that is draining keeps up: the stalled
-		// readers' handlers then fill their sockets and block in a write
-		// before the hub cuts them off.
-		flood := journaledNode(t, store, "test/gate", "flood", "sha256:"+name, func() string { return admission.RunID }, begin, logs, 100*time.Microsecond, nil)
-		live := newLiveApp(t, liveConfig{
-			stream:   inspect.EventStreamConfig{Capture: inspect.Capture{Logs: true}, Hub: event.Config{QueueDepth: 4, LateWindow: 10 * time.Millisecond}},
-			handler:  inspect.EventHandlerConfig{WriteTimeout: time.Minute},
-			outcomes: store.TerminalOutcomes(),
-			nodes:    map[string]node.Any{"test/gate": flood},
-		})
-		result := live.start(admission.RunID, "alice", quote.Input{SKU: "coffee", Quantity: 1})
-		probe := awaitStream(t, context.Background(), live.eventsURL(admission.RunID), "alice")
-		probe.close()
-		waitFor(t, func() bool { return live.stream.Hub().Stats().Subscribers == 0 })
-		address := strings.TrimPrefix(live.server.URL, "http://")
-		conns := make([]net.Conn, 0, readers)
-		for i := 0; i < readers; i++ {
-			conns = append(conns, stalledClient(t, address, "/inspect/runs/"+admission.RunID+"/events", "alice"))
-		}
-		waitFor(t, func() bool { return live.stream.Hub().Stats().Subscribers == readers })
-		started := time.Now()
-		close(begin)
-		got := awaitResult(t, result)
-		elapsed := time.Since(started)
-		if got[0] != "200 OK" {
-			t.Fatalf("%s run=%v", name, got)
-		}
-		run, err := store.Run(context.Background(), admission.RunID)
-		if err != nil || run.State != "completed" {
-			t.Fatalf("%s journal run=%+v err=%v", name, run, err)
-		}
-		operation, err := store.Operation(context.Background(), journal.OperationIdentity{RunID: admission.RunID, ArtifactDigest: "sha256:" + name, InvocationPath: "flood", IterationPath: "root"}.Key())
-		if err != nil || operation.State != "committed" {
-			t.Fatalf("%s journal operation=%+v err=%v", name, operation, err)
-		}
-		if readers > 0 {
-			// Every stalled reader was cut off; none was waited for. Its
-			// handler, blocked writing to a socket nobody drains, is
-			// interrupted at once rather than at its one-minute write
-			// timeout, although the connections are still open.
-			cut := time.Now()
-			waitFor(t, func() bool { return live.stream.Hub().Stats().Subscribers == 0 && live.active.Load() == 0 })
-			if stats := live.stream.Hub().Stats(); stats.SlowSubscribers != uint64(readers) {
-				t.Fatalf("%s stats=%+v", name, stats)
-			}
-			t.Logf("%s: stalled handlers exited %s after the run", name, time.Since(cut))
-		}
-		for _, conn := range conns {
-			_ = conn.Close()
-		}
-		t.Logf("%s: %d stalled readers, %d logs: run %s", name, readers, logs, elapsed)
-		return elapsed
+	const logs, readers, queueDepth = 2000, 4, 4
+	const writeTimeout = inspect.MaxEventWriteTimeout
+	const name = "stalled-readers"
+	admission, err := store.Admit(context.Background(), journal.AdmissionRequest{Principal: "alice", RequestKey: name, Workflow: "quote", ArtifactDigest: "sha256:" + name, Input: []byte(`{"sku":"coffee","quantity":1}`)})
+	if err != nil {
+		t.Fatal(err)
 	}
-	baseline := measure("no-readers", 0)
-	withStalled := measure("stalled-readers", stalled)
-	// The bound is generous on purpose: this asserts "not blocked" (a
-	// blocked publisher would wait for the minute-long write timeout), not a
-	// performance figure. Raw durations are logged above.
-	if withStalled > baseline+5*time.Second {
-		t.Fatalf("stalled readers slowed the run: baseline %s, with %d stalled readers %s", baseline, stalled, withStalled)
+	begin := make(chan struct{})
+	// Paced so a reader that is draining keeps up: the stalled readers'
+	// handlers then fill their sockets and block in a write before the hub
+	// cuts them off.
+	flood := journaledNode(t, store, "test/gate", "flood", "sha256:"+name, func() string { return admission.RunID }, begin, logs, 100*time.Microsecond, nil)
+	live := newLiveApp(t, liveConfig{
+		stream:   inspect.EventStreamConfig{Capture: inspect.Capture{Logs: true}, Hub: event.Config{QueueDepth: queueDepth, LateWindow: 10 * time.Millisecond}},
+		handler:  inspect.EventHandlerConfig{WriteTimeout: writeTimeout},
+		outcomes: store.TerminalOutcomes(),
+		nodes:    map[string]node.Any{"test/gate": flood},
+	})
+	result := live.start(admission.RunID, "alice", quote.Input{SKU: "coffee", Quantity: 1})
+	probe := awaitStream(t, context.Background(), live.eventsURL(admission.RunID), "alice")
+	probe.close()
+	waitFor(t, func() bool { return live.stream.Hub().Stats().Subscribers == 0 })
+	address := strings.TrimPrefix(live.server.URL, "http://")
+	for i := 0; i < readers; i++ {
+		conn := stalledClient(t, address, "/inspect/runs/"+admission.RunID+"/events", "alice")
+		defer conn.Close()
 	}
+	quiet, err := live.stream.Hub().Subscribe(admission.RunID, "alice", "", nil)
+	if err != nil || quiet.Subscriber == nil {
+		t.Fatalf("quiet reader=%+v err=%v", quiet, err)
+	}
+	defer live.stream.Hub().Unsubscribe(quiet.Subscriber, "test_done")
+	waitFor(t, func() bool { return live.stream.Hub().Stats().Subscribers == readers+1 })
+	before := live.stream.Hub().Stats().Published
+	started := time.Now()
+	close(begin)
+	var got [2]string
+	select {
+	case got = <-result:
+	case <-time.After(2 * writeTimeout):
+		t.Fatalf("the run did not finish while %d readers stalled: it waited for them", readers)
+	}
+	elapsed := time.Since(started)
+	t.Logf("%d stalled readers, %d logs: run %s", readers, logs, elapsed)
+	if elapsed >= writeTimeout {
+		t.Fatalf("the run took %s, as long as a stalled reader's write timeout %s: it waited for one", elapsed, writeTimeout)
+	}
+	if got[0] != "200 OK" {
+		t.Fatalf("run=%v", got)
+	}
+	run, err := store.Run(context.Background(), admission.RunID)
+	if err != nil || run.State != "completed" {
+		t.Fatalf("journal run=%+v err=%v", run, err)
+	}
+	operation, err := store.Operation(context.Background(), journal.OperationIdentity{RunID: admission.RunID, ArtifactDigest: "sha256:" + name, InvocationPath: "flood", IterationPath: "root"}.Key())
+	if err != nil || operation.State != "committed" {
+		t.Fatalf("journal operation=%+v err=%v", operation, err)
+	}
+	// The quiet reader consumed nothing, yet the run published past its
+	// whole queue: those publications did not wait for it. It was cut off
+	// as slow, not left buffering.
+	select {
+	case <-quiet.Subscriber.Done():
+	default:
+		t.Fatal("the quiet reader, which consumed nothing, was neither waited for nor cut off")
+	}
+	if reason := quiet.Subscriber.Reason(); reason != "slow_subscriber" {
+		t.Fatalf("quiet reader reason=%q", reason)
+	}
+	if published := live.stream.Hub().Stats().Published - before; published <= queueDepth {
+		t.Fatalf("the run published %d frames after the quiet reader attached, not past its queue of %d", published, queueDepth)
+	}
+	// Every stalled reader was cut off; none was waited for. Its handler,
+	// blocked writing to a socket nobody drains, is interrupted at once
+	// rather than at its write timeout, although the connections
+	// are still open.
+	cut := time.Now()
+	waitFor(t, func() bool { return live.stream.Hub().Stats().Subscribers == 0 && live.active.Load() == 0 })
+	if stats := live.stream.Hub().Stats(); stats.SlowSubscribers != readers+1 {
+		t.Fatalf("stats=%+v", stats)
+	}
+	t.Logf("stalled handlers exited %s after the run", time.Since(cut))
 }
 
 // TestCrashRecoveryReconstructsRunFromJournal kills a real process in the
