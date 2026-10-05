@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/well-prado/new-blok/internal/generate"
@@ -108,13 +109,13 @@ func normalize(options Options) (Options, error) {
 	}
 	options.Directory = filepath.Clean(options.Directory)
 	if options.Name == "" {
-		options.Name = executableName(filepath.Base(options.Directory))
+		options.Name = DefaultName(options.Directory)
 	}
 	if !validIdentifier(options.Name) {
 		return Options{}, fmt.Errorf("new: application name %q must be lower-case letters, digits and underscores, starting with a letter", options.Name)
 	}
 	if options.Module == "" {
-		options.Module = "example.com/" + options.Name
+		options.Module = DefaultModule(options.Name)
 	}
 	if strings.ContainsAny(options.Module, " \t\r\n\"\\`") || strings.HasPrefix(options.Module, ".") || strings.HasPrefix(options.Module, "/") || options.Module == FrameworkModule || strings.HasPrefix(options.Module, FrameworkModule+"/") {
 		return Options{}, fmt.Errorf("new: invalid Go module path %q", options.Module)
@@ -215,6 +216,14 @@ func validIdentifier(value string) bool {
 	return true
 }
 
+// DefaultName is the executable name a target directory implies.
+func DefaultName(directory string) string {
+	return executableName(filepath.Base(filepath.Clean(directory)))
+}
+
+// DefaultModule is the module path an executable name implies.
+func DefaultModule(name string) string { return "example.com/" + name }
+
 func executableName(value string) string {
 	var builder strings.Builder
 	for _, char := range strings.ToLower(value) {
@@ -238,21 +247,13 @@ func goModSource(options Options) []byte {
 	var source strings.Builder
 	fmt.Fprintf(&source, "module %s\n\ngo 1.27.0\n\n", options.Module)
 	if options.Framework.Dir != "" {
-		fmt.Fprintf(&source, "require %s v0.0.0-00010101000000-000000000000\n\nreplace %s => %s\n", FrameworkModule, FrameworkModule, quoteModPath(options.Framework.Dir))
+		// Always quoted: go.mod splits unquoted paths on spaces, quotes,
+		// brackets and commas, and the quoted form is valid on every OS.
+		fmt.Fprintf(&source, "require %s v0.0.0-00010101000000-000000000000\n\nreplace %s => %s\n", FrameworkModule, FrameworkModule, strconv.Quote(options.Framework.Dir))
 	} else {
 		fmt.Fprintf(&source, "require %s %s\n", FrameworkModule, options.Framework.Version)
 	}
 	return []byte(source.String())
-}
-
-// quoteModPath writes a filesystem path as a go.mod path, quoting it when it
-// holds characters go.mod treats specially (spaces, on Windows backslashes
-// are fine as is).
-func quoteModPath(path string) string {
-	if strings.ContainsAny(path, " \t\"'`") || strings.ContainsRune(path, '\\') && strings.ContainsAny(path, " ") {
-		return fmt.Sprintf("%q", path)
-	}
-	return path
 }
 
 const typesSource = `package quote

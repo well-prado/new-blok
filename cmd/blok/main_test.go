@@ -78,12 +78,20 @@ func TestFreshApplicationBuildsServesAndRegenerates(t *testing.T) {
 			}
 			goTool(t, directory, "vet", "./...")
 			goTool(t, directory, "test", "./...")
-			// Selecting only HTTP links only HTTP: no other trigger, store,
-			// broker or foreign-runtime package reaches the application.
-			deps := goTool(t, directory, "list", "-deps", "./...")
-			for _, unselected := range []string{"/trigger/worker", "/trigger/cron", "/trigger/grpc", "/trigger/pubsub", "/trigger/webhook", "/trigger/sse", "/trigger/websocket", "/trigger/mcp", "/store/sqlite", "/runtime/worker", "nats-io", "modernc.org/sqlite"} {
-				if strings.Contains(deps, unselected) {
-					t.Fatalf("the HTTP-only starter depends on %s:\n%s", unselected, deps)
+			// Selecting only HTTP links only HTTP: besides the standard
+			// library, the application reaches only its own packages and
+			// framework packages that are not another trigger, a store, a
+			// worker runtime or an SDK. No third-party module is linked.
+			deps := goTool(t, directory, "list", "-deps", "-f", "{{if not .Standard}}{{.ImportPath}}{{end}}", "./...")
+			for _, dep := range strings.Fields(deps) {
+				framework, own := strings.CutPrefix(dep, "github.com/well-prado/new-blok/")
+				switch {
+				case strings.HasPrefix(dep, "example.com/shop"):
+				case !own:
+					t.Fatalf("the starter links a third-party package %s", dep)
+				case strings.HasPrefix(framework, "trigger/") && framework != "trigger/http",
+					strings.HasPrefix(framework, "store/"), strings.HasPrefix(framework, "runtime/"), strings.HasPrefix(framework, "sdk/"):
+					t.Fatalf("the HTTP-only starter links unselected %s", dep)
 				}
 			}
 			binary := filepath.Join(t.TempDir(), "shop")
@@ -350,5 +358,54 @@ func TestGenerateRejectsTypeErrorsAndNeverReplacesHandWrittenFiles(t *testing.T)
 	}
 	if content, _ := os.ReadFile(output); string(content) != "package example\n// hand written\n" {
 		t.Fatalf("the hand-written file changed: %q", content)
+	}
+}
+
+// TestUnusualFrameworkPathsBuild: the replace directive reaches a framework
+// checkout whose path holds spaces, accents, brackets and a comma, which an
+// unquoted go.mod path cannot (#64 review).
+func TestUnusualFrameworkPathsBuild(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds a fresh application")
+	}
+	parent := filepath.Join(t.TempDir(), "Área de Trabalho (Blök), [1]")
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	framework := filepath.Join(parent, "new blok")
+	if err := os.Symlink(repoRoot(t), framework); err != nil {
+		t.Skipf("cannot link the framework: %v", err)
+	}
+	directory := filepath.Join(t.TempDir(), "odd")
+	var out bytes.Buffer
+	if err := run([]string{"new", directory, "--non-interactive", "--framework", framework}, &out); err != nil {
+		t.Fatalf("new: %v\n%s", err, out.String())
+	}
+	goTool(t, directory, "build", "./...")
+}
+
+// TestInteractiveDefaultsAndUnterminatedLastAnswer: Enter accepts each
+// offered default, and a last answer that ends the input without a newline
+// is still used (#64 review).
+func TestInteractiveDefaultsAndUnterminatedLastAnswer(t *testing.T) {
+	root := repoRoot(t)
+	defaults := filepath.Join(t.TempDir(), "defaults")
+	var out bytes.Buffer
+	if err := runWithIO([]string{"new", "--interactive", "--skip-tidy", "--framework", root}, &out, strings.NewReader(defaults+"\n\n\n\n\n\n")); err != nil {
+		t.Fatalf("defaults: %v\n%s", err, out.String())
+	}
+	flags := filepath.Join(t.TempDir(), "defaults")
+	if err := run([]string{"new", flags, "--non-interactive", "--skip-tidy", "--framework", root}, &out); err != nil {
+		t.Fatal(err)
+	}
+	want, got := readTree(t, flags), readTree(t, defaults)
+	for path, content := range want {
+		if !bytes.Equal(got[path], content) {
+			t.Fatalf("%s differs between accepted defaults and flag defaults", path)
+		}
+	}
+	unterminated := filepath.Join(t.TempDir(), "eof")
+	if err := runWithIO([]string{"new", "--interactive", "--skip-tidy", "--framework", root}, &out, strings.NewReader(unterminated+"\n\n\n\n\nhttp")); err != nil {
+		t.Fatalf("unterminated last answer: %v", err)
 	}
 }

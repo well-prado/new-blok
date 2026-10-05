@@ -78,7 +78,7 @@ func TestGoModReachesTheFramework(t *testing.T) {
 		t.Fatal(err)
 	}
 	mod, _ = os.ReadFile(filepath.Join(local, "go.mod"))
-	if !strings.Contains(string(mod), "replace github.com/well-prado/new-blok => ") || !strings.Contains(string(mod), frameworkDir(t)) {
+	if !strings.Contains(string(mod), "replace github.com/well-prado/new-blok => \""+frameworkDir(t)+"\"") {
 		t.Fatalf("go.mod does not replace the framework with the checkout:\n%s", mod)
 	}
 }

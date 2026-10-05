@@ -89,6 +89,13 @@ func runNew(args []string, out io.Writer, in io.Reader) error {
 		if directory, err = prompt(reader, out, "Target directory", directory); err != nil {
 			return err
 		}
+		// Offer the defaults new would apply, so Enter accepts them.
+		if name == "" {
+			name = scaffold.DefaultName(directory)
+		}
+		if module == "" {
+			module = scaffold.DefaultModule(name)
+		}
 		if module, err = prompt(reader, out, "Module path", module); err != nil {
 			return err
 		}
@@ -131,7 +138,11 @@ func runNew(args []string, out io.Writer, in io.Reader) error {
 	tidy := exec.Command("go", "mod", "tidy")
 	tidy.Dir = directory
 	if output, err := tidy.CombinedOutput(); err != nil {
-		return fmt.Errorf("new: go mod tidy failed in %s (the files were created; fix the cause and rerun it): %v\n%s", directory, err, bytes.TrimSpace(output))
+		hint := ""
+		if framework == "" {
+			hint = fmt.Sprintf("; the starter requires %s %s, the version this blok was built from — if that commit is not published, rerun with --framework <version or framework checkout>", scaffold.FrameworkModule, selected.Version)
+		}
+		return fmt.Errorf("new: go mod tidy failed in %s (the files were created; fix the cause and rerun it)%s: %v\n%s", directory, hint, err, bytes.TrimSpace(output))
 	}
 	return nil
 }
@@ -170,7 +181,8 @@ func prompt(in *bufio.Reader, out io.Writer, label, current string) (string, err
 	if errors.Is(err, io.EOF) && strings.TrimSpace(line) == "" {
 		return "", scaffold.ErrCancelled
 	}
-	if err != nil {
+	// An answer that ends the input without a newline is still an answer.
+	if err != nil && !errors.Is(err, io.EOF) {
 		return "", fmt.Errorf("%w: %v", scaffold.ErrCancelled, err)
 	}
 	line = strings.TrimSpace(line)
