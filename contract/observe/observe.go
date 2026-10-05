@@ -18,6 +18,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"regexp"
+	"strings"
 )
 
 const (
@@ -283,18 +284,32 @@ func ValidLabel(value string) bool {
 // pattern shared by inspection projections, worker logs and telemetry
 // exporters; observe/redact adds the structured and encoded layers on top of
 // it (ADR 0021). A sensitive key may carry a prefix or suffix
-// ("client_secret", "access_token") and may be quoted, as in JSON text.
-var sensitiveLogText = regexp.MustCompile(`(?i)([a-z0-9_.-]*(password|passwd|secret|token|authorization|credential|api[_-]?key|private[_-]?key)[a-z0-9_.-]*["']?\s*[:=]\s*\S+|\bbearer\s+\S+|\bAKIA[0-9A-Z]{16}\b|\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b|\b[a-z][a-z0-9+.-]*://[^/\s:@]+:[^/\s@]+@|-----BEGIN [A-Z ]*PRIVATE KEY-----)`)
+// ("client_secret", "access_token") and may be quoted, as in JSON text: the
+// unanchored match starts at the marker, so no prefix class is needed.
+var sensitiveLogText = regexp.MustCompile(`(?i)((password|passwd|secret|token|authorization|credential|api[_-]?key|private[_-]?key)[a-z0-9_.-]*["']?\s*[:=]\s*\S+|\bbearer\s+\S+|\bAKIA[0-9A-Z]{16}\b|\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b|\b[a-z][a-z0-9+.-]*://[^/\s:@]+:[^/\s@]+@|-----BEGIN [A-Z ]*PRIVATE KEY-----)`)
+
+// sensitiveMarkers is a necessary condition for sensitiveLogText: text that
+// contains none of them (case-insensitively) cannot match, so the regular
+// expression runs only on the rare text that might.
+var sensitiveMarkers = []string{"password", "passwd", "secret", "token", "authorization", "credential", "api", "private", "bearer", "akia", "eyj", "://", "-----begin"}
 
 // SensitiveText reports whether text contains a credential-shaped fragment.
 // It inspects the text as written; observe/redact also inspects encoded forms.
-func SensitiveText(text string) bool { return sensitiveLogText.MatchString(text) }
+func SensitiveText(text string) bool {
+	lower := strings.ToLower(text)
+	for _, marker := range sensitiveMarkers {
+		if strings.Contains(lower, marker) {
+			return sensitiveLogText.MatchString(text)
+		}
+	}
+	return false
+}
 
 // RedactLogMessage replaces a log message that contains credential-shaped
 // text with a fixed marker. Pattern matching cannot find every secret in
 // prose; applications keep sensitive values in structured attributes.
 func RedactLogMessage(message string) string {
-	if sensitiveLogText.MatchString(message) {
+	if SensitiveText(message) {
 		return "[redacted: sensitive-looking log message]"
 	}
 	return message

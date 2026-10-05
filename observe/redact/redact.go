@@ -167,13 +167,19 @@ func decodeBase64(token string) (string, bool) {
 			return "", false
 		}
 	}
-	for _, encoding := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
-		decoded, err := encoding.DecodeString(token)
-		if err == nil && printable(decoded) {
-			return string(decoded), true
-		}
+	// The alphabet and padding select the one encoding that can apply.
+	encoding := base64.RawStdEncoding
+	if strings.ContainsAny(token, "-_") {
+		encoding = base64.RawURLEncoding
 	}
-	return "", false
+	if strings.HasSuffix(token, "=") {
+		encoding = encoding.WithPadding(base64.StdPadding)
+	}
+	decoded, err := encoding.DecodeString(token)
+	if err != nil || !printable(decoded) {
+		return "", false
+	}
+	return string(decoded), true
 }
 
 // printable accepts decoded bytes that are text: valid UTF-8 and almost
