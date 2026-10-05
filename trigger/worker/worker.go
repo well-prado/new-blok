@@ -17,6 +17,7 @@ import (
 	"unicode"
 
 	"github.com/well-prado/new-blok/contract/schema"
+	"github.com/well-prado/new-blok/internal/migration"
 	"github.com/well-prado/new-blok/store"
 	"github.com/well-prado/new-blok/trigger"
 )
@@ -340,7 +341,7 @@ func New(ctx context.Context, database store.Database, clock func() time.Time) (
 	}
 	writeDomain, _ := store.WriteDomainOf(database)
 	queue := &Queue{database: database, writeDomain: writeDomain, clock: clock, schemas: map[string]schema.Schema{}}
-	if err := migrate(ctx, func() error {
+	if err := migration.Retry(ctx, func() error {
 		return queue.withTx(ctx, func(tx *sql.Tx) error {
 			if err := createJobs(ctx, tx); err != nil {
 				return err
@@ -364,38 +365,6 @@ func New(ctx context.Context, database store.Database, clock func() time.Time) (
 		return nil, fmt.Errorf("worker: schema: %w", err)
 	}
 	return queue, nil
-}
-
-// migrationBudget bounds how long New keeps starting new attempts at a
-// schema migration that lost a race with another opener. An attempt that
-// starts within it may still wait up to the store's busy timeout for the
-// write lock, so New can take the budget plus one busy timeout.
-const migrationBudget = 10 * time.Second
-
-// migrate runs the schema transaction, retrying it while it fails busy (#233).
-// Adding a column must read the schema before it writes, and SQLite cannot
-// make such a transaction wait for another writer: when several processes
-// open a queue that needs a column, all but one fail busy at once instead of
-// waiting their turn. The migration is idempotent and a failed attempt
-// commits nothing, so it is simply run again, with a short growing pause,
-// until it succeeds, fails otherwise, ctx ends or the budget is spent.
-func migrate(ctx context.Context, run func() error) error {
-	deadline := time.Now().Add(migrationBudget)
-	pause := 5 * time.Millisecond
-	for {
-		err := run()
-		if err == nil || !errors.Is(err, store.ErrBusy) || time.Now().Add(pause).After(deadline) {
-			return err
-		}
-		timer := time.NewTimer(pause)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return errors.Join(err, ctx.Err())
-		case <-timer.C:
-		}
-		pause = min(2*pause, 200*time.Millisecond)
-	}
 }
 
 func createJobs(ctx context.Context, tx *sql.Tx) error {
