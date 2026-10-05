@@ -89,13 +89,16 @@ type rigOptions struct {
 	minRetention time.Duration
 	hold         func(audit.Record) bool
 	runHold      func(journal.RetainedRun) bool
-	readers      tenantReaders
+	// runMinRetention is the journal's legal minimum for run data (#281).
+	runMinRetention time.Duration
+	readers         tenantReaders
+	busyTimeout     time.Duration
 }
 
 func openRig(t *testing.T, path string, options rigOptions) *rig {
 	t.Helper()
 	ctx := context.Background()
-	db, err := (sqlite.Backend{}).Open(ctx, path)
+	db, err := (sqlite.Backend{BusyTimeout: options.busyTimeout}).Open(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +124,7 @@ func openRig(t *testing.T, path string, options rigOptions) *rig {
 			t.Fatal(err)
 		}
 	}
-	r.journal, err = journal.New(ctx, db, journal.Config{Clock: clock, Audit: r.audit, Hold: options.runHold})
+	r.journal, err = journal.New(ctx, db, journal.Config{Clock: clock, Audit: r.audit, Hold: options.runHold, MinRetention: options.runMinRetention})
 	if err != nil {
 		t.Fatal(err)
 	}
