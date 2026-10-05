@@ -3,7 +3,8 @@
 - Status: accepted
 - Date: 2026-10-02
 - Amended: #188 (worker nested-store diagnostics and saturation), #207
-  (undetected self-submits fail after one busy wait)
+  (undetected self-submits fail after one busy wait), #245 (a started
+  attempt is committed before its handler runs)
 - Roadmap: E09-T02 ([#55](https://github.com/well-prado/new-blok/issues/55))
 - Amends: [ADR 0005](0005-trigger-adapter-contract.md) (webhook declaration)
 - Consumers: webhook now; cron (#56) and pubsub (#57) are expected to submit
@@ -116,10 +117,57 @@ redelivery (#180). `Tx` therefore fails closed:
   statements through the same check.
 
 A claim lost to consumer cancellation is deferred as before. A claim lost
-any other way is a failed attempt, charged in a fresh transaction: the job
-is retried after a backoff, or dead-lettered once `MaxAttempts` is spent,
-with error `claim transaction ended`. Like any failed attempt, `ProcessOnce`
-reports it as processed without an error; the job's error records why.
+any other way is a failed attempt: the job is retried after a backoff, or
+dead-lettered once `MaxAttempts` is spent, with error `claim transaction
+ended`. Like any failed attempt, `ProcessOnce` reports it as processed
+without an error; the job's error records why.
+
+**Started attempts survive a crash (#245).** Before #245 the claim counted
+its attempt inside the handler's transaction. A worker process that died
+mid-handler (SIGKILL, OOM, a runtime crash) rolled that count back with the
+handler's writes, and the job was claimed again at once as if the attempt
+had never happened. A handler that kills its process every time was
+redelivered forever: a subprocess test restarted such a worker 10 times
+against a job with `MaxAttempts` 3, and the job stayed `pending` at attempt
+0 through 10 handler runs.
+
+`ProcessOnce` now uses two write transactions, both write-first (#176) and
+marked `store.Writer` (#214):
+
+1. **Start.** The claim leases the job for `worker.LeaseDuration` (30 s),
+   counts the attempt, and commits. Nothing else is written.
+2. **Handle.** A second transaction takes the lease over (its first
+   statement rewrites the lease to a value only this transaction holds,
+   and fails if another worker has claimed the job since), runs the
+   handler, and commits the handler's writes with the job's outcome. The
+   business writes and the acknowledgment are still atomic: a crash rolls
+   both back. The fail-closed `Tx` checks for this transaction's own lease
+   value, so a rollback SQLite performs under it is still detected (#180).
+
+A worker that dies after the start leaves the lease and the counted attempt
+behind. Once the lease expires, the claim takes the job again as its next
+attempt. A claim that finds the job's attempts already spent (every one
+started and none finished) does not run the handler: it dead-letters the
+job with error `claim_abandoned` (`worker.ClaimAbandoned`) at attempt
+`MaxAttempts`. The same subprocess test now sees attempts 1, 2, 3 and then
+`dead`, after exactly `MaxAttempts` handler runs, with no handler write
+committed; a worker restarted before the lease expires claims nothing.
+
+How each ending treats the started attempt:
+
+| Ending | Attempt | Job |
+| --- | --- | --- |
+| Handler succeeds, fails, or is saturated | as before (saturation and nested submission unchanged, #188/#207/#225) | committed with the handler's outcome |
+| Consumer lost while the handler runs (graceful cancel) | given back | deferred, one deferral charged, as before |
+| Handle transaction fails before the handler runs (for example busy) | given back | released at once, like a busy claim before #245 |
+| Lease taken by another worker before the handler starts | stays counted | left to that worker; `ProcessOnce` returns `worker.ErrClaimLost` |
+| Claim lost under the handler (#180), or the handle transaction fails to commit | stays counted | retried after a backoff, or dead (`claim transaction ended`) |
+| Process dies | stays counted | redelivered when the lease expires, or dead (`claim_abandoned`) once attempts are spent |
+
+The accounting after a rolled-back handle transaction (give back, defer,
+charge) is its own transaction, matched on the start's lease. If the process
+dies before it commits, the job keeps the counted attempt and is redelivered
+when the lease expires; it is never acknowledged.
 
 `worker.Queue` implements the port. It persists the principal established by the
 trusted producer (`EnqueueRequest.Principal`, `Job.Principal`) and makes it part
@@ -226,6 +274,7 @@ is never parsed before verification.
 | Worker handler returns saturation naming its own claim's domain, alone or joined with other failures in any order | behavioral | The job fails as `worker.ErrNestedSubmission` after one busy wait instead of being deferred to `deferral_budget_exhausted` |
 | SQLite `:memory:` uses the memdb VFS instead of shared cache | behavioral | Same shared database per process; writer conflicts are `store.ErrBusy` within the busy timeout instead of an unbounded wait |
 | `principal_json` column | schema | added by `worker.New` |
+| A started attempt is committed before its handler runs (#245): `worker.LeaseDuration`, `worker.ClaimAbandoned` | behavioral, additive | No schema change or migration: the start reuses `state`, `attempt` and `lease_until`. A job whose worker died mid-handler is redelivered when its 30 s lease expires instead of at once, counts that attempt, and dead-letters as `claim_abandoned` once its attempts are spent. A handle transaction that rolls back after the handler ran now counts its attempt. Workers from before #245 on the same store still claim only pending jobs and expired leases, so they skip a live lease, but their own crashed attempts stay uncounted |
 | Jobs tied on `created_at` are claimed in enqueue order; `enqueue_seq` column and index | behavioral, schema | added by `worker.New`; existing jobs keep 0 and stay in `job_id` order among themselves |
 | New package `trigger/webhook` | additive | none |
 
@@ -253,3 +302,21 @@ is never parsed before verification.
   provider integration yet (E10).
 - The deduplication record lives as long as the job row; retention is the
   queue's (E07).
+- Each job now commits two write transactions instead of one. Draining 200
+  instant jobs with 4 workers (`TestMeasureClaimContention`, 5 samples, two
+  interleaved runs per arm, macOS arm64 on a host shared with other load)
+  took 22–28 ms on `origin/main` and 29–32 ms with #245, with 0 busy errors
+  on both. macOS `fsync` does not flush the drive cache; on a host where it
+  does, the second commit costs one more durable flush per job.
+- Recovery after a crash waits for the lease: up to 30 s, where it was
+  immediate. The lease is not configurable and is not renewed; a handler
+  holds the write lock, so no other worker can claim its job while it
+  runs, however long the handler takes.
+- An attempt counts from its start, so a crash charges every job whose
+  attempt the dying process had started and not finished: not only the job
+  whose handler crashed it, but also jobs of other workers in that process
+  that had started and were waiting for the write lock behind it. Enough
+  such crashes can dead-letter a job whose own handler never failed.
+  One attempt is also lost when the lease expires before the handle
+  transaction gets the write lock, which needs a writer-queue wait longer
+  than 30 s; the default busy timeout is 5 s.

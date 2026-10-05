@@ -66,6 +66,15 @@ type Job struct {
 }
 
 const (
+	// LeaseDuration is how long a started attempt keeps its job from other
+	// workers. A worker that dies mid-attempt leaves its lease behind, and
+	// the job is claimed again once it expires (#245).
+	LeaseDuration = 30 * time.Second
+	// ClaimAbandoned is the dead-letter code for a job whose attempts were
+	// all started and never finished: every worker that claimed it died or
+	// lost its lease before acknowledging, for example because the handler
+	// kills its own process (#245).
+	ClaimAbandoned = "claim_abandoned"
 	// MaxDeferrals bounds saturation and consumer-loss redeliveries per job.
 	MaxDeferrals = 16
 	// DeferralExhausted is the dead-letter code once MaxDeferrals is spent.
@@ -123,6 +132,9 @@ type Handler func(ctx context.Context, tx Tx, job Job) error
 // statements is interrupted, fails for want of space, memory or I/O, or
 // hits an ON CONFLICT ROLLBACK constraint or a trigger's RAISE(ROLLBACK).
 // Nothing the handler wrote was committed, and no further statement runs.
+// ProcessOnce also returns it, without running the handler, when another
+// worker claimed the job after the attempt's lease expired and before the
+// handler could start (#245).
 var ErrClaimLost = errors.New("worker: the claim's transaction ended")
 
 // Tx is the claim's transaction as a handler sees it. It fails closed: when
@@ -547,28 +559,40 @@ type claimedWriteDomain struct {
 	active atomic.Bool
 }
 
-// ProcessOnce claims and processes one job. The handler and acknowledgment are
-// in the same transaction, so a crash rolls back both the business write and
-// the delivery acknowledgment. A handler must not perform unknown external
-// effects without an idempotency key or reconciliation path.
+// ProcessOnce claims and processes one job, in two write transactions.
+//
+// The first starts the attempt: it leases the job for LeaseDuration and
+// counts the attempt, and commits. A worker process that dies after this
+// point (SIGKILL, OOM, a crash) leaves the lease and the counted attempt
+// behind, so a handler that kills its process every time still spends the
+// job's attempts and dead-letters it as ClaimAbandoned instead of being
+// redelivered forever (#245). The job is claimed again once the lease
+// expires.
+//
+// The second takes that lease over and runs the handler. The handler's
+// writes and the job's acknowledgment are in this one transaction, so a crash
+// rolls back both the business write and the delivery acknowledgment (ADR
+// 0006); only the started attempt survives it. A handler must not perform
+// unknown external effects without an idempotency key or reconciliation path.
 //
 // Only the claim statement and the handler observe ctx. The claim holds
 // nothing while it waits for its turn in the store's writer queue (#214) or
 // for the write lock, so a consumer canceled meanwhile is reported as
-// ErrConsumerLost. Neither wait is interrupted by ctx (the claim's
-// transaction deliberately is not canceled with it), so that report can
-// take up to the busy timeout, or twice that when a writer on another
-// handle then holds the lock.
+// ErrConsumerLost. Neither wait is interrupted by ctx (the transactions
+// deliberately are not canceled with it), so that report can take up to the
+// busy timeout, or twice that when a writer on another handle then holds the
+// lock. A consumer lost after the attempt started gives the attempt back and
+// charges a deferral instead.
 // Everything after the claim runs on a context ctx cannot cancel, so losing
-// the consumer rolls the claim back synchronously before ProcessOnce returns
-// instead of leaving database/sql to abort it in the background while the
-// write lock is still held.
+// the consumer rolls the handler's transaction back synchronously before
+// ProcessOnce returns instead of leaving database/sql to abort it in the
+// background while the write lock is still held.
 //
-// The handler runs inside the claim's write transaction, which holds the
-// store's single write lock until it commits: handlers of concurrent workers
-// run one at a time, and every other writer waits for them under the busy
-// timeout. Keep handlers short; a writer that waits longer than the busy
-// timeout still fails with SQLITE_BUSY (ADR 0003).
+// The handler runs inside a write transaction, which holds the store's single
+// write lock until it commits: handlers of concurrent workers run one at a
+// time, and every other writer waits for them under the busy timeout. Keep
+// handlers short; a writer that waits longer than the busy timeout still
+// fails with SQLITE_BUSY (ADR 0003).
 func (q *Queue) ProcessOnce(ctx context.Context, handler Handler) (bool, error) {
 	if handler == nil {
 		return false, errors.New("worker: handler is required")
@@ -577,21 +601,16 @@ func (q *Queue) ProcessOnce(ctx context.Context, handler Handler) (bool, error) 
 		return false, fmt.Errorf("%w: %w", ErrConsumerLost, err)
 	}
 	txCtx := context.WithoutCancel(ctx)
-	processed := false
-	var lost, died Job
-	var activeDomain *claimedWriteDomain
-	defer func() {
-		if activeDomain != nil {
-			activeDomain.active.Store(false)
-		}
-	}()
+	var job Job
+	var lease int64
+	abandoned := false
 	// The claim writes first (#176), so it takes its turn in the store's
-	// writer queue (#214); the handler then runs inside that turn, as it
-	// runs inside the write lock.
+	// writer queue (#214).
 	err := q.withTx(store.Writer(txCtx), func(tx *sql.Tx) error {
-		job, lease, err := q.claim(ctx, tx)
+		var err error
+		job, lease, err = q.claim(ctx, tx)
 		if errors.Is(err, ErrNotFound) {
-			return nil
+			return err
 		}
 		if err != nil && ctx.Err() != nil {
 			return fmt.Errorf("%w: %w", ErrConsumerLost, ctx.Err())
@@ -599,14 +618,67 @@ func (q *Queue) ProcessOnce(ctx context.Context, handler Handler) (bool, error) 
 		if err != nil {
 			return err
 		}
-		processed = true
+		if job.Attempt <= job.MaxAttempts {
+			return nil
+		}
+		// Every attempt this job had was started and none finished: each
+		// worker that held it died (or lost its lease) before acknowledging.
+		abandoned = true
+		_, err = tx.ExecContext(txCtx, `UPDATE worker_jobs SET state = ?, attempt = max_attempts, lease_until = NULL, error_text = ?, updated_at = ? WHERE job_id = ?`, StateDead, ClaimAbandoned, q.now(), job.ID)
+		return err
+	})
+	if errors.Is(err, ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		if !errors.Is(err, ErrConsumerLost) && ctx.Err() != nil {
+			// The consumer was lost while this worker waited for its write
+			// turn (#214): it claimed nothing, so the job is untouched.
+			err = fmt.Errorf("%w: %w", ErrConsumerLost, errors.Join(ctx.Err(), err))
+		}
+		return false, fmt.Errorf("worker: process: %w", err)
+	}
+	if abandoned {
+		return true, nil
+	}
+	return q.handle(ctx, txCtx, handler, job, lease)
+}
+
+// handle runs the handler for a started attempt, in a transaction that takes
+// over the attempt's lease and commits the handler's writes with the job's
+// outcome.
+func (q *Queue) handle(ctx, txCtx context.Context, handler Handler, job Job, lease int64) (bool, error) {
+	// held identifies this transaction's hold on the job. The fail-closed Tx
+	// checks for it: once SQLite has rolled the transaction back, the job
+	// shows the started attempt's lease again, not held (#180).
+	held := lease + 1
+	ran, lost, died := false, false, false
+	var activeDomain *claimedWriteDomain
+	defer func() {
+		if activeDomain != nil {
+			activeDomain.active.Store(false)
+		}
+	}()
+	// This transaction also writes first (#176), taking the lease over, so it
+	// too takes its turn in the store's writer queue (#214); the handler then
+	// runs inside that turn, as it runs inside the write lock.
+	err := q.withTx(store.Writer(txCtx), func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(txCtx, `UPDATE worker_jobs SET lease_until = ?, updated_at = ? WHERE job_id = ? AND state = ? AND lease_until = ?`, held, q.now(), job.ID, StateProcessing, lease)
+		if err != nil {
+			return err
+		}
+		if taken, err := result.RowsAffected(); err != nil {
+			return err
+		} else if taken == 0 {
+			return errLeaseExpired
+		}
 		// Every statement after the claim goes through the claim's
 		// fail-closed transaction: once SQLite has ended it, nothing more
 		// runs, so nothing can commit outside the claim.
-		claimed := &claimTx{tx: tx, jobID: job.ID, lease: lease}
+		claimed := &claimTx{tx: tx, jobID: job.ID, lease: held}
 		ended := func(err error) error {
 			if claimed.lost() {
-				died = job
+				died = true
 				return ErrClaimLost
 			}
 			return err
@@ -620,11 +692,12 @@ func (q *Queue) ProcessOnce(ctx context.Context, handler Handler) (bool, error) 
 			activeDomain.active.Store(true)
 			handlerCtx = context.WithValue(ctx, claimedWriteDomainKey{}, activeDomain)
 		}
+		ran = true
 		handlerErr := handler(handlerCtx, Tx{claim: claimed}, job)
 		if ctx.Err() != nil {
-			// Returning an error discards the claim with the handler's
-			// writes: the delivery was never acknowledged.
-			lost = job
+			// Returning an error discards the handler's writes with its
+			// outcome: the delivery was never acknowledged.
+			lost = true
 			return fmt.Errorf("%w: %w", ErrConsumerLost, ctx.Err())
 		}
 		if claimed.lost() {
@@ -687,59 +760,88 @@ func (q *Queue) ProcessOnce(ctx context.Context, handler Handler) (bool, error) 
 		// contexts no longer represent a held write lock.
 		activeDomain.active.Store(false)
 	}
-	if err != nil && !processed && !errors.Is(err, ErrConsumerLost) && ctx.Err() != nil {
-		// The consumer was lost while this worker waited for its write
-		// turn (#214): it claimed nothing, so the job is untouched.
-		err = fmt.Errorf("%w: %w", ErrConsumerLost, errors.Join(ctx.Err(), err))
-	}
-	if errors.Is(err, ErrConsumerLost) && lost.ID != "" {
-		if deferErr := q.deferLost(txCtx, lost); deferErr != nil {
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, errLeaseExpired):
+		// Another worker claimed the job after this attempt's lease ran out
+		// while this worker waited for its write turn; that worker owns it now.
+		return false, fmt.Errorf("worker: process: %w: the attempt's lease expired before its handler started", ErrClaimLost)
+	case !ran:
+		// The handler never ran (the transaction could not take the lease
+		// over): the attempt is given back and the job released at once.
+		if ctx.Err() != nil && !errors.Is(err, ErrConsumerLost) {
+			err = fmt.Errorf("%w: %w", ErrConsumerLost, errors.Join(ctx.Err(), err))
+		}
+		if releaseErr := q.release(txCtx, job, lease); releaseErr != nil {
+			err = errors.Join(err, releaseErr)
+		}
+		return false, fmt.Errorf("worker: process: %w", err)
+	case lost:
+		if deferErr := q.deferLost(txCtx, job, lease); deferErr != nil {
 			err = errors.Join(err, deferErr)
 		}
-	}
-	if errors.Is(err, ErrClaimLost) && died.ID != "" {
-		// The claim's transaction ended and took the claim with it, so the
-		// attempt would otherwise go uncounted and the job be redelivered at
-		// once, forever. It is a failed attempt, counted in a fresh
-		// transaction.
-		if chargeErr := q.chargeLostClaim(txCtx, died); chargeErr != nil {
+		return false, fmt.Errorf("worker: process: %w", err)
+	case died:
+		// The claim's transaction ended and took the handler's writes with
+		// it. The attempt was counted when it started; the job is retried
+		// after a backoff, or dead-lettered once its attempts are spent.
+		if chargeErr := q.chargeLostClaim(txCtx, job, lease); chargeErr != nil {
 			return true, fmt.Errorf("worker: process: %w", errors.Join(err, chargeErr))
 		}
 		return true, nil
-	}
-	if err != nil {
+	default:
+		// The handler ran but its transaction did not commit: the attempt
+		// failed and was counted when it started.
+		if chargeErr := q.chargeLostClaim(txCtx, job, lease); chargeErr != nil {
+			err = errors.Join(err, chargeErr)
+		}
 		return false, fmt.Errorf("worker: process: %w", err)
 	}
-	return processed, nil
 }
 
-// chargeLostClaim counts a claim whose transaction ended as a failed
-// attempt: the job is retried after a backoff, or dead once its attempts
-// are spent. A crash before it commits leaves one uncounted redelivery.
-func (q *Queue) chargeLostClaim(ctx context.Context, job Job) error {
+// errLeaseExpired reports that a started attempt's lease was taken by
+// another worker before this worker's handler transaction could take it over.
+var errLeaseExpired = errors.New("worker: lease expired")
+
+// chargeLostClaim ends a started attempt whose handler transaction did not
+// commit as a failed attempt: the job is retried after a backoff, or dead
+// once its attempts are spent. The attempt was counted when it started, so a
+// crash before this commits still counts it; the job is then redelivered
+// once the attempt's lease expires.
+func (q *Queue) chargeLostClaim(ctx context.Context, job Job, lease int64) error {
 	return q.withTx(store.Writer(ctx), func(tx *sql.Tx) error {
 		state, available := StateDead, q.now()
 		if job.Attempt < job.MaxAttempts {
 			state = StatePending
 			available += int64(time.Duration(job.Attempt) * time.Second)
 		}
-		// The rollback restored the job as it was before this claim, at the
-		// previous attempt; another worker's claim would have moved it on.
-		_, err := tx.ExecContext(ctx, `UPDATE worker_jobs SET state = ?, attempt = ?, available_at = ?, lease_until = NULL, error_text = ?, updated_at = ? WHERE job_id = ? AND attempt = ? AND state IN (?, ?)`, state, job.Attempt, available, "claim transaction ended", q.now(), job.ID, job.Attempt-1, StatePending, StateProcessing)
+		_, err := tx.ExecContext(ctx, `UPDATE worker_jobs SET state = ?, available_at = ?, lease_until = NULL, error_text = ?, updated_at = ? WHERE job_id = ? AND state = ? AND lease_until = ?`, state, available, "claim transaction ended", q.now(), job.ID, StateProcessing, lease)
 		return err
 	})
 }
 
-// deferLost charges a lost consumer against the job's deferral budget after
-// the claim has been rolled back. A crash between the two leaves one
-// uncounted redelivery, never an acknowledged one.
-func (q *Queue) deferLost(ctx context.Context, job Job) error {
+// deferLost gives a lost consumer's attempt back and charges the job's
+// deferral budget instead, after the handler's transaction has been rolled
+// back. A crash between the two leaves the attempt counted, and the job is
+// redelivered once its lease expires; it is never acknowledged.
+func (q *Queue) deferLost(ctx context.Context, job Job, lease int64) error {
 	return q.withTx(store.Writer(ctx), func(tx *sql.Tx) error {
 		state, message := StatePending, ""
 		if job.Deferrals+1 > MaxDeferrals {
 			state, message = StateDead, DeferralExhausted
 		}
-		_, err := tx.ExecContext(ctx, `UPDATE worker_jobs SET state = ?, deferrals = deferrals + 1, available_at = ?, error_text = ?, updated_at = ? WHERE job_id = ? AND state = ?`, state, q.now()+int64(deferralDelay(job.Deferrals+1)), message, q.now(), job.ID, StatePending)
+		_, err := tx.ExecContext(ctx, `UPDATE worker_jobs SET state = ?, attempt = attempt - 1, deferrals = deferrals + 1, available_at = ?, lease_until = NULL, error_text = ?, updated_at = ? WHERE job_id = ? AND state = ? AND lease_until = ?`, state, q.now()+int64(deferralDelay(job.Deferrals+1)), message, q.now(), job.ID, StateProcessing, lease)
+		return err
+	})
+}
+
+// release gives back a started attempt whose handler never ran, and makes
+// the job available again at once. If it cannot commit, the attempt stays
+// counted and the job is redelivered once its lease expires.
+func (q *Queue) release(ctx context.Context, job Job, lease int64) error {
+	return q.withTx(store.Writer(ctx), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE worker_jobs SET state = ?, attempt = attempt - 1, lease_until = NULL, updated_at = ? WHERE job_id = ? AND state = ? AND lease_until = ?`, StatePending, q.now(), job.ID, StateProcessing, lease)
 		return err
 	})
 }
@@ -800,15 +902,17 @@ func (q *Queue) Get(ctx context.Context, requestKey string) (Job, error) {
 	return job, err
 }
 
-// claim leases the next available job: the oldest created_at first, and
-// among jobs that share one, the first enqueued (#217). Its first statement
+// claim leases the next available job and counts its attempt: the oldest
+// created_at first, and among jobs that share one, the first enqueued
+// (#217). A job whose lease expired is available again: its worker started
+// an attempt and never finished it. Its first statement
 // writes: a
 // transaction that reads before writing cannot wait for a concurrent
 // writer and fails with SQLITE_BUSY once that writer commits; one that
 // writes first waits under the busy timeout (as cron's cursor writes do).
 func (q *Queue) claim(ctx context.Context, tx *sql.Tx) (Job, int64, error) {
 	now := q.now()
-	leaseUntil := time.Unix(0, now).Add(30 * time.Second).UnixNano()
+	leaseUntil := time.Unix(0, now).Add(LeaseDuration).UnixNano()
 	job, err := scanJob(tx.QueryRowContext(ctx, `UPDATE worker_jobs SET state = ?, attempt = attempt + 1, lease_until = ?, updated_at = ?
 		WHERE job_id = (SELECT job_id FROM worker_jobs
 			WHERE (state = ? OR (state = ? AND lease_until <= ?)) AND available_at <= ? ORDER BY created_at, enqueue_seq, job_id LIMIT 1)
