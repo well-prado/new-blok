@@ -1,0 +1,15 @@
+{
+  "fixtureVersion": 1,
+  "synthetic": true,
+  "name": "tenant-slot-taken-between-capacity-read-and-commit",
+  "limits": {"partitions": 8, "partitionAdmissions": 4, "tenantAdmissions": 1},
+  "expected": {
+    "interleavedAdmission": "admission_full",
+    "rejectionScope": "tenant",
+    "activeRunsAfterInterleaving": 1,
+    "tenantSlotHolder": "competitor",
+    "competitorFinished": "completed",
+    "activeRunsAfterFinish": 0,
+    "externalEffects": 1
+  }
+}

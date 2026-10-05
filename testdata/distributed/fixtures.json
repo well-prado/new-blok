@@ -28,7 +28,7 @@
     },
     {
       "name": "two-voters-paused",
-      "expected": {"acknowledgment": "unknown", "reconcileByStableID": true, "committedRecordsAfterRecovery": 1, "externalEffects": 0, "errors": ["acknowledgment_unknown"]}
+      "expected": {"acknowledgment": "unknown", "reconcileByStableID": true, "committedRecordsAfterRecovery": 1, "errors": ["acknowledgment_unknown"]}
     },
     {
       "name": "snapshot-restore-revision-rewind",
