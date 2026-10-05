@@ -61,7 +61,7 @@ func setup(t *testing.T, path string) *rig {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r.a, err = approval.NewJournalStore(ctx, db, approval.Config{Authorizer: reviewFunc(func(context.Context, approval.Proposal, []string) (string, error) {
+	r.a, err = approval.NewJournalStore(ctx, db, approval.Config{Audit: testAudit(t, db), Authorizer: reviewFunc(func(context.Context, approval.Proposal, []string) (string, error) {
 		if !r.reviewerAllowed {
 			return "", approval.ErrDenied
 		}

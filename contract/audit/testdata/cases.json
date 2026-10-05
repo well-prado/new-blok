@@ -1,0 +1,263 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Synthetic ADR 0021 audit fixtures. Each case runs one real decision (approval, reconciliation or deployment) against a fresh SQLite store under one audit condition and predeclares the error, the durable rows and the effect counts. Secret-shaped strings are synthetic.",
+  "conditions": {
+    "available": "audit composed and writable",
+    "unavailable": "a SQLite trigger aborts every audit insert (the audit store is down)",
+    "capacity": "the audit store is already full (MaxRecords=1, one record present)",
+    "sensitive-actor": "the authenticated actor is credential-shaped (plain for approval, base64-encoded for reconciliation)",
+    "not-composed": "the operation is composed without an audit journal"
+  },
+  "counts": {
+    "decisions": "approval_decisions_v1 rows",
+    "auditRecords": "audit_records_v1 rows",
+    "authorized": "approval.Authorize succeeded for the decision (a dispatch it would permit)",
+    "reconciliations": "journal_reconciliations rows",
+    "committedOperations": "committed journal operations",
+    "uncertainOperations": "uncertain journal operations",
+    "plans": "upgrade plans returned",
+    "mirrored": "records the optional mirror accepted"
+  },
+  "cases": [
+    {
+      "name": "approval-recorded",
+      "operation": "approve",
+      "condition": "available",
+      "expected": {
+        "error": "",
+        "decisions": 1,
+        "auditRecords": 1,
+        "authorized": 1,
+        "reconciliations": 0,
+        "committedOperations": 0,
+        "uncertainOperations": 0,
+        "plans": 0,
+        "mirrored": 1
+      }
+    },
+    {
+      "name": "rejection-recorded",
+      "operation": "reject",
+      "condition": "available",
+      "expected": {
+        "error": "",
+        "decisions": 1,
+        "auditRecords": 1,
+        "authorized": 0,
+        "reconciliations": 0,
+        "committedOperations": 0,
+        "uncertainOperations": 0,
+        "plans": 0,
+        "mirrored": 1
+      }
+    },
+    {
+      "name": "approval-refused-audit-unavailable",
+      "operation": "approve",
+      "condition": "unavailable",
+      "expected": {
+        "error": "audit_unavailable",
+        "decisions": 0,
+        "auditRecords": 0,
+        "authorized": 0,
+        "reconciliations": 0,
+        "committedOperations": 0,
+        "uncertainOperations": 0,
+        "plans": 0,
+        "mirrored": 0
+      }
+    },
+    {
+      "name": "approval-refused-audit-full",
+      "operation": "approve",
+      "condition": "capacity",
+      "expected": {
+        "error": "audit_capacity",
+        "decisions": 0,
+        "auditRecords": 1,
+        "authorized": 0,
+        "reconciliations": 0,
+        "committedOperations": 0,
+        "uncertainOperations": 0,
+        "plans": 0,
+        "mirrored": 0
+      }
+    },
+    {
+      "name": "approval-refused-secret-shaped-reviewer",
+      "operation": "approve",
+      "condition": "sensitive-actor",
+      "expected": {
+        "error": "audit_sensitive",
+        "decisions": 0,
+        "auditRecords": 0,
+        "authorized": 0,
+        "reconciliations": 0,
+        "committedOperations": 0,
+        "uncertainOperations": 0,
+        "plans": 0,
+        "mirrored": 0
+      }
+    },
+    {
+      "name": "approval-refused-without-audit",
+      "operation": "approve",
+      "condition": "not-composed",
+      "expected": {
+        "error": "audit_required",
+        "decisions": 0,
+        "auditRecords": 0,
+        "authorized": 0,
+        "reconciliations": 0,
+        "committedOperations": 0,
+        "uncertainOperations": 0,
+        "plans": 0,
+        "mirrored": 0
+      }
+    },
+    {
+      "name": "reconcile-recorded",
+      "operation": "reconcile",
+      "condition": "available",
+      "expected": {
+        "error": "",
+        "decisions": 0,
+        "auditRecords": 1,
+        "authorized": 0,
+        "reconciliations": 1,
+        "committedOperations": 1,
+        "uncertainOperations": 0,
+        "plans": 0,
+        "mirrored": 1
+      }
+    },
+    {
+      "name": "reconcile-refused-audit-unavailable",
+      "operation": "reconcile",
+      "condition": "unavailable",
+      "expected": {
+        "error": "audit_unavailable",
+        "decisions": 0,
+        "auditRecords": 0,
+        "authorized": 0,
+        "reconciliations": 0,
+        "committedOperations": 0,
+        "uncertainOperations": 1,
+        "plans": 0,
+        "mirrored": 0
+      }
+    },
+    {
+      "name": "reconcile-refused-audit-full",
+      "operation": "reconcile",
+      "condition": "capacity",
+      "expected": {
+        "error": "audit_capacity",
+        "decisions": 0,
+        "auditRecords": 1,
+        "authorized": 0,
+        "reconciliations": 0,
+        "committedOperations": 0,
+        "uncertainOperations": 1,
+        "plans": 0,
+        "mirrored": 0
+      }
+    },
+    {
+      "name": "reconcile-refused-encoded-secret-actor",
+      "operation": "reconcile",
+      "condition": "sensitive-actor",
+      "expected": {
+        "error": "audit_sensitive",
+        "decisions": 0,
+        "auditRecords": 0,
+        "authorized": 0,
+        "reconciliations": 0,
+        "committedOperations": 0,
+        "uncertainOperations": 1,
+        "plans": 0,
+        "mirrored": 0
+      }
+    },
+    {
+      "name": "reconcile-refused-without-audit",
+      "operation": "reconcile",
+      "condition": "not-composed",
+      "expected": {
+        "error": "audit_required",
+        "decisions": 0,
+        "auditRecords": 0,
+        "authorized": 0,
+        "reconciliations": 0,
+        "committedOperations": 0,
+        "uncertainOperations": 1,
+        "plans": 0,
+        "mirrored": 0
+      }
+    },
+    {
+      "name": "upgrade-accepted-recorded",
+      "operation": "upgrade-retain",
+      "condition": "available",
+      "expected": {
+        "error": "",
+        "decisions": 0,
+        "auditRecords": 1,
+        "authorized": 0,
+        "reconciliations": 0,
+        "committedOperations": 0,
+        "uncertainOperations": 0,
+        "plans": 1,
+        "mirrored": 1
+      }
+    },
+    {
+      "name": "upgrade-refusal-recorded",
+      "operation": "upgrade-discard",
+      "condition": "available",
+      "expected": {
+        "error": "upgrade_would_discard",
+        "decisions": 0,
+        "auditRecords": 1,
+        "authorized": 0,
+        "reconciliations": 0,
+        "committedOperations": 0,
+        "uncertainOperations": 0,
+        "plans": 0,
+        "mirrored": 1
+      }
+    },
+    {
+      "name": "upgrade-refused-audit-unavailable",
+      "operation": "upgrade-retain",
+      "condition": "unavailable",
+      "expected": {
+        "error": "audit_unavailable",
+        "decisions": 0,
+        "auditRecords": 0,
+        "authorized": 0,
+        "reconciliations": 0,
+        "committedOperations": 0,
+        "uncertainOperations": 0,
+        "plans": 0,
+        "mirrored": 0
+      }
+    },
+    {
+      "name": "upgrade-refused-without-audit",
+      "operation": "upgrade-retain",
+      "condition": "not-composed",
+      "expected": {
+        "error": "audit_required",
+        "decisions": 0,
+        "auditRecords": 0,
+        "authorized": 0,
+        "reconciliations": 0,
+        "committedOperations": 0,
+        "uncertainOperations": 0,
+        "plans": 0,
+        "mirrored": 0
+      }
+    }
+  ]
+}

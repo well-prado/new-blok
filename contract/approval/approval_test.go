@@ -34,7 +34,7 @@ func TestImmutableReviewAuditRestartAndCapacity(t *testing.T) {
 	}
 	now := time.Date(2026, 10, 2, 0, 0, 0, 0, time.UTC)
 	cfg := Config{Authorizer: reviewer{true}, Clock: func() time.Time { return now }, MaxDecisions: 2}
-	s, err := NewJournalStore(ctx, db, cfg)
+	s, err := NewJournalStore(ctx, db, withAudit(t, db, cfg))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +78,7 @@ func TestImmutableReviewAuditRestartAndCapacity(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	s, err = NewJournalStore(ctx, db, cfg)
+	s, err = NewJournalStore(ctx, db, withAudit(t, db, cfg))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,14 +112,14 @@ func TestReviewerAndScopeAuthorization(t *testing.T) {
 	defer db.Close()
 	now := time.Now()
 	p := proposal()
-	s, err := NewJournalStore(ctx, db, Config{Authorizer: reviewer{false}, MaxDecisions: 10})
+	s, err := NewJournalStore(ctx, db, withAudit(t, db, Config{Authorizer: reviewer{false}, MaxDecisions: 10}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.Record(ctx, "unauthorized", p, p.Scope, now.Add(time.Hour), true); !errors.Is(err, ErrDenied) {
 		t.Fatalf("reviewer=%v", err)
 	}
-	s, err = NewJournalStore(ctx, db, Config{Authorizer: reviewer{true}, MaxDecisions: 10})
+	s, err = NewJournalStore(ctx, db, withAudit(t, db, Config{Authorizer: reviewer{true}, MaxDecisions: 10}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +147,7 @@ func TestConcurrentReviewNeverOverwrites(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	s, err := NewJournalStore(ctx, db, Config{Authorizer: reviewer{true}, MaxDecisions: 1})
+	s, err := NewJournalStore(ctx, db, withAudit(t, db, Config{Authorizer: reviewer{true}, MaxDecisions: 1}))
 	if err != nil {
 		t.Fatal(err)
 	}

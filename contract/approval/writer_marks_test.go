@@ -32,7 +32,7 @@ func TestRecordIsAMarkedWriterAndGetIsNot(t *testing.T) {
 	defer db.Close()
 	marks := &markRecorder{Database: db}
 	now := time.Date(2026, 10, 2, 0, 0, 0, 0, time.UTC)
-	s, err := NewJournalStore(ctx, marks, Config{Authorizer: reviewer{true}, Clock: func() time.Time { return now }, MaxDecisions: 2})
+	s, err := NewJournalStore(ctx, marks, withAudit(t, marks, Config{Authorizer: reviewer{true}, Clock: func() time.Time { return now }, MaxDecisions: 2}))
 	if err != nil {
 		t.Fatal(err)
 	}

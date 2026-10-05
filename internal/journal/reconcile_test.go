@@ -16,7 +16,7 @@ func TestReconciliationIsAuthorizedIdempotentAndRepairsUncertainEffect(t *testin
 		t.Fatal(err)
 	}
 	defer database.Close()
-	j, err := New(context.Background(), database, Config{})
+	j, err := New(context.Background(), database, Config{Audit: newTestAudit(t, database)})
 	if err != nil {
 		t.Fatal(err)
 	}

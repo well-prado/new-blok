@@ -8,21 +8,29 @@ import (
 	"errors"
 	"time"
 
+	"github.com/well-prado/new-blok/contract/audit"
 	"github.com/well-prado/new-blok/store"
 )
 
 // JournalStore shares the journal's transactional database port and volume.
 // Its owned tables never modify journal_runs/operations/attempts. Decisions
 // and their audit payload commit atomically under SQLite WAL/FULL barriers.
+// Every decision also writes its mandatory audit record (ADR 0021) in the
+// same transaction: if the record cannot be written, the decision is not
+// recorded and cannot authorize anything.
 type JournalStore struct {
 	database     store.Database
 	authorizer   ReviewAuthorizer
+	audit        *audit.Journal
 	clock        func() time.Time
 	maxDecisions int
 }
 
 type Config struct {
-	Authorizer   ReviewAuthorizer
+	Authorizer ReviewAuthorizer
+	// Audit is the durable audit journal. Required, and it must write to
+	// the same database, so a decision and its record commit together.
+	Audit        *audit.Journal
 	Clock        func() time.Time
 	MaxDecisions int
 }
@@ -31,13 +39,16 @@ func NewJournalStore(ctx context.Context, database store.Database, cfg Config) (
 	if database == nil || cfg.Authorizer == nil || cfg.MaxDecisions <= 0 || cfg.MaxDecisions > 1000000 {
 		return nil, ErrDenied
 	}
+	if !cfg.Audit.Shares(database) {
+		return nil, audit.ErrRequired
+	}
 	if err := database.Integrity(ctx); err != nil {
 		return nil, err
 	}
 	if cfg.Clock == nil {
 		cfg.Clock = time.Now
 	}
-	s := &JournalStore{database: database, authorizer: cfg.Authorizer, clock: cfg.Clock, maxDecisions: cfg.MaxDecisions}
+	s := &JournalStore{database: database, authorizer: cfg.Authorizer, audit: cfg.Audit, clock: cfg.Clock, maxDecisions: cfg.MaxDecisions}
 	err := database.WithTx(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS approval_decisions_v1 (
 			id TEXT PRIMARY KEY, decision BLOB NOT NULL CHECK(length(decision) <= 16384),
@@ -88,6 +99,8 @@ func (s *JournalStore) Record(ctx context.Context, id string, p Proposal, grant 
 	if len(encoded) > MaxRecordBytes || len(proposalJSON) > MaxRecordBytes {
 		return Decision{}, ErrCapacity
 	}
+	var record audit.Record
+	inserted := false
 	err = s.database.WithTx(store.Writer(ctx), func(tx *sql.Tx) error {
 		// Reserve the write lock before reading limits or detecting duplicates;
 		// concurrent writers cannot both consume the last capacity slot.
@@ -107,7 +120,10 @@ func (s *JournalStore) Record(ctx context.Context, id string, p Proposal, grant 
 				return ErrConflict
 			}
 			d = existing
-			return nil
+			// A retried decision writes the same record: a no-op when it
+			// exists, and the missing record when an earlier store lacked it.
+			record, inserted, err = s.audit.Append(ctx, tx, decisionRecord(ctx, d, p))
+			return err
 		}
 		if !errors.Is(err, sql.ErrNoRows) {
 			return err
@@ -119,13 +135,60 @@ func (s *JournalStore) Record(ctx context.Context, id string, p Proposal, grant 
 		if count >= s.maxDecisions {
 			return ErrCapacity
 		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO approval_decisions_v1 (id,decision,proposal,binding,recorded_at) VALUES (?,?,?,?,?)`, id, encoded, proposalJSON, digest, now.Format(time.RFC3339Nano))
+		if _, err = tx.ExecContext(ctx, `INSERT INTO approval_decisions_v1 (id,decision,proposal,binding,recorded_at) VALUES (?,?,?,?,?)`, id, encoded, proposalJSON, digest, now.Format(time.RFC3339Nano)); err != nil {
+			return err
+		}
+		record, inserted, err = s.audit.Append(ctx, tx, decisionRecord(ctx, d, p))
 		return err
 	})
 	if err != nil {
 		return Decision{}, err
 	}
+	if inserted {
+		s.audit.Notify(record)
+	}
 	return d, nil
+}
+
+// AuditKind and AuditedIDs make the store an audit.Owner: every recorded
+// decision requires its approval record, which audit.Journal.Verify checks.
+func (s *JournalStore) AuditKind() audit.Kind { return audit.KindApproval }
+
+func (s *JournalStore) AuditedIDs(ctx context.Context, tx *sql.Tx, fn func(string) error) error {
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM approval_decisions_v1 ORDER BY id`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		if err := fn("approval:" + id); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
+// decisionRecord is the audit form of a decision: the authenticated reviewer,
+// the outcome, the granted scope names and the digests that bind what was
+// reviewed. It carries no input, output or secret value.
+func decisionRecord(ctx context.Context, d Decision, p Proposal) audit.Record {
+	outcome := audit.OutcomeRejected
+	if d.Approved {
+		outcome = audit.OutcomeApproved
+	}
+	digests := map[string]string{"proposal": d.ProposalDigest, "input": p.InputDigest, "artifact": p.ArtifactDigest}
+	if p.ToolDigest != "" {
+		digests["tool"] = p.ToolDigest
+	}
+	return audit.Record{
+		ID: "approval:" + d.ID, Kind: audit.KindApproval, Tenant: audit.TenantFrom(ctx),
+		Actor: d.Reviewer, Subject: d.ID, RunID: p.RunID, Action: p.Action, Outcome: outcome,
+		Digests: digests, Refs: append([]string(nil), d.Scope...), At: d.RecordedAt,
+	}
 }
 
 func (s *JournalStore) Get(ctx context.Context, id string) (Decision, bool, error) {

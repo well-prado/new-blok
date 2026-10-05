@@ -3,6 +3,11 @@
 Status: implemented pre-alpha slice; dependency completion and independent
 security/durability review remain required before issue closure.
 
+Amended by [ADR 0021](0021-sensitive-data-and-reliable-audit.md) (#80): every
+decision also commits a mandatory `contract/audit` record in the same
+transaction, and `NewJournalStore` requires `Config.Audit` on the same
+database. An audit failure refuses the decision.
+
 ## Binding and trusted composition
 
 `contract/approval.Proposal` binds action (including version), normalized input
