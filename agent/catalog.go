@@ -20,6 +20,7 @@ import (
 	"github.com/well-prado/new-blok/contract/tool"
 	"github.com/well-prado/new-blok/flow"
 	"github.com/well-prado/new-blok/internal/engine"
+	"github.com/well-prado/new-blok/internal/lowering"
 	"github.com/well-prado/new-blok/node"
 )
 
@@ -50,6 +51,7 @@ type binding struct {
 	native                  func(context.Context, []byte) ([]byte, error)
 	program                 *contract.InternalProgram
 	children                map[string]binding
+	steps                   map[string]binding
 	literals                map[string][]byte
 	maxDepth, calls, tokens int
 }
@@ -147,10 +149,23 @@ func RegisterWorkflow[I, O any](c *Catalog, wf flow.Definition[I, O], inputSchem
 	if len(p.Instructions) == 0 || len(p.Instructions) > 10000 {
 		return ErrBudget
 	}
-	program := contract.InternalProgram{WorkflowID: p.Spec.Name, Version: p.Spec.Version}
+	// One lowering for developer- and agent-authored workflows (#249): the
+	// same rules as flow.Lower, plus the catalog's two extensions — a
+	// literal call input, which dispatch substitutes, and a child workflow
+	// call.
+	instructions := make([]lowering.Instruction, len(p.Instructions))
+	for index, instruction := range p.Instructions {
+		instructions[index] = lowering.Instruction{Kind: instruction.Kind, ID: instruction.ID, Node: instruction.Node.Name, Input: instruction.Input, Literal: instruction.Literal}
+		if instruction.Kind == "child" {
+			instructions[index].Node, _ = instruction.Data["workflow"].(string)
+		}
+	}
+	lowered, err := lowering.Lower(p.Spec.Name, p.Spec.Version, instructions, p.Output, lowering.Options{Literals: true, Children: true})
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrNotAgentSafe, err)
+	}
 	children := map[string]binding{}
-	literals := map[string][]byte{}
-	seen := map[string]bool{}
+	steps := map[string]binding{}
 	m := cloneManifest(parent)
 	c.mu.RLock()
 	registered := make(map[string]binding, len(c.tools))
@@ -160,9 +175,6 @@ func RegisterWorkflow[I, O any](c *Catalog, wf flow.Definition[I, O], inputSchem
 	c.mu.RUnlock()
 	maxDepth, calls, tokens := 1, 0, 0
 	for _, instruction := range p.Instructions {
-		if (instruction.Kind != "call" && instruction.Kind != "child") || instruction.ID == flow.OutputID || seen[instruction.ID] {
-			return ErrNotAgentSafe
-		}
 		key := instruction.Node.Name + "@" + instruction.Node.Version
 		if instruction.Kind == "child" {
 			key, _ = instruction.Data["workflow"].(string)
@@ -175,7 +187,13 @@ func RegisterWorkflow[I, O any](c *Catalog, wf flow.Definition[I, O], inputSchem
 		if instruction.Kind == "call" && (!bytes.Equal(instruction.Node.InputSchema, child.listing.InputSchema) || !bytes.Equal(instruction.Node.OutputSchema, child.listing.OutputSchema)) {
 			return ErrNotAgentSafe
 		}
+		if literal, ok := lowered.Literals[instruction.ID]; ok {
+			if err := checkLiteral(instruction.Kind, instruction.ID, key, child, literal); err != nil {
+				return err
+			}
+		}
 		children[key] = child
+		steps[instruction.ID] = child
 		calls += child.calls
 		tokens += child.tokens
 		if calls > 10000 || tokens > 1<<30 {
@@ -191,32 +209,14 @@ func RegisterWorkflow[I, O any](c *Catalog, wf flow.Definition[I, O], inputSchem
 		m.Capabilities = append(m.Capabilities, child.manifest.Capabilities...)
 		m.SecretRefs = append(m.SecretRefs, child.manifest.SecretRefs...)
 		m.Deterministic = m.Deterministic && child.manifest.Deterministic
-		i := contract.InternalInstruction{Index: len(program.Instructions), ID: instruction.ID, Kind: "call", Node: key}
-		switch {
-		case instruction.Input == "$input":
-		case instruction.Input == "$literal" && len(instruction.Literal) > 0:
-			literals[instruction.ID] = append([]byte(nil), instruction.Literal...)
-		default:
-			ref, err := reference(instruction.Input, seen)
-			if err != nil {
-				return err
-			}
-			i.References = []contract.Reference{ref}
-		}
-		program.Instructions = append(program.Instructions, i)
-		seen[instruction.ID] = true
 	}
-	ref, err := reference(p.Output, seen)
-	if err != nil {
-		return err
-	}
-	program.Instructions = append(program.Instructions, contract.InternalInstruction{ID: flow.OutputID, Kind: "output", References: []contract.Reference{ref}})
+	program := lowered.Program
 	m.Effects, m.Capabilities, m.SecretRefs = unique(m.Effects), unique(m.Capabilities), unique(m.SecretRefs)
 	b, err := prepare(p.Spec.Name, p.Spec.Version, "composed workflow tool", inputSchema, outputSchema, m, metadata)
 	if err != nil {
 		return err
 	}
-	b.program, b.children, b.literals = &program, children, literals
+	b.program, b.children, b.steps, b.literals = &program, children, steps, lowered.Literals
 	b.maxDepth, b.calls, b.tokens = maxDepth, calls, tokens
 	b.resources = tool.Resources{TokenLimit: tokens}
 	b.listing.Resources = b.resources
@@ -229,16 +229,25 @@ func RegisterWorkflow[I, O any](c *Catalog, wf flow.Definition[I, O], inputSchem
 	return c.register(b)
 }
 
-func reference(source string, seen map[string]bool) (contract.Reference, error) {
-	source = strings.Replace(source, "$child.", "$step.", 1)
-	if !strings.HasPrefix(source, "$step.") {
-		return contract.Reference{}, ErrNotAgentSafe
+// checkLiteral runs, at registration, the admission dispatch will run on a
+// literal call input (#261): the input-size bound, then the tool's own
+// Normalize. A literal no budget can admit — over the 1 MiB payload limit
+// tool.Budget caps MaxInputBytes at, before or after normalization — is
+// ErrBudget; a literal the tool's schema refuses is ErrNotAgentSafe. Both
+// name the step. The check only validates: the catalog keeps the literal as
+// flow recorded it, and dispatch normalizes it exactly as it did before.
+func checkLiteral(kind, id, key string, child binding, literal []byte) error {
+	if len(literal) > schema.MaxPayloadBytes {
+		return fmt.Errorf("%w: %s %q: literal input is %d bytes, over the %d-byte input limit", ErrBudget, kind, id, len(literal), schema.MaxPayloadBytes)
 	}
-	parts := strings.Split(strings.TrimPrefix(source, "$step."), ".")
-	if !seen[parts[0]] {
-		return contract.Reference{}, ErrNotAgentSafe
+	normal, err := child.in.Normalize(literal)
+	if err != nil {
+		return fmt.Errorf("%w: %s %q: literal input does not satisfy the input schema of %s: %w", ErrNotAgentSafe, kind, id, key, err)
 	}
-	return contract.Reference{Step: parts[0], Path: parts[1:]}, nil
+	if len(normal) > schema.MaxPayloadBytes {
+		return fmt.Errorf("%w: %s %q: literal input normalizes to %d bytes, over the %d-byte input limit", ErrBudget, kind, id, len(normal), schema.MaxPayloadBytes)
+	}
+	return nil
 }
 
 func prepare(name, version, description string, input, output []byte, m Manifest, metadata tool.Metadata) (binding, error) {
@@ -391,7 +400,7 @@ func (c *Catalog) execute(ctx context.Context, b binding, input []byte, s *execu
 			if instruction.Kind != "call" {
 				continue
 			}
-			child := b.children[instruction.Node]
+			child := b.steps[instruction.ID]
 			literal := b.literals[instruction.ID]
 			key := instruction.ID
 			program.Instructions[index].Node = key

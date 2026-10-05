@@ -255,7 +255,7 @@ so a document call named `output` is valid, and a document that repeats any id
 keeps failing `duplicate_id`. Documents therefore do not reserve the id. The
 agent catalog's workflow lowering already refused a call named `output` and
 now names the same `flow.OutputID` constant; its other divergences from
-`flow.Lower` remain #249.
+`flow.Lower` were #249 (below).
 
 This is a behavioral validation tightening plus one additive exported constant
 (`flow.OutputID`), linked to
@@ -294,7 +294,8 @@ characters, an empty id on a construct) had no document form, so the same
 structure written as a document fails `invalid_id`. One grammar now holds in
 flow, the canonical compiler and documents. The agent catalog's workflow
 lowering reads only programs built by `flow.Define`, so its step ids now obey
-the grammar as well; its other divergences from `flow.Lower` remain #249.
+the grammar as well; its other divergences from `flow.Lower` were #249
+(below).
 
 `flow.Define` now returns every builder violation as its error instead of
 letting it escape as a panic: the id rules above, and the construct rules
@@ -341,8 +342,150 @@ panic stack reaches the builder call. `contract/document_test.go` pins
 `ValidID` to document validation's `invalid_id`. Limits: flow still does not
 grammar-check `Choose` case keys, the `Child` workflow name or `Spec.Name`
 (document workflow ids are a separate field that a flow `Spec.Name` such as
-`shop/quote` does not map to), and `migration/blokv2.go` keeps its own copy of
-the grammar.
+`shop/quote` does not map to). `migration/blokv2.go` kept its own copy of the
+grammar until #256 (below).
+
+#### Migration uses the shared id grammar (#256)
+
+`migration/blokv2.go` carried a private `validID` regular expression, so a
+change to `contract.IDPattern` (or to the copy) would have let migration
+accept ids that documents reject, or the reverse, with no test failing. The
+copy is deleted; `Convert` checks source step ids (`unsupported_step_id`) and
+inventory node ids (`invalid_target_node_id`) with `contract.ValidID`.
+
+Compatibility: none. The deleted expression was byte-for-byte
+`^[a-z][a-z0-9_-]{0,63}$`, the same text as `contract.IDPattern`, and has not
+changed since it was added (`ef67bcb`); the anchors, length bound and
+character set are identical, so migration accepts and rejects exactly the
+ids it did before, with the same diagnostics. Go's `$` (no `(?m)` flag)
+matches only at the end of the text, so neither expression accepts `"a\n"`.
+This is an internal refactor, not a wire-shape, diagnostic or document-version
+change. `migration/blokv2_test.go` proves it with a shared table of edge ids
+(1, 64 and 65 characters, dotted, uppercase, leading digit, leading `_` and
+`-`, empty, non-ASCII, trailing newline) driven through `Convert`: migration
+must agree with `contract.ValidID` on every row, for step ids and inventory
+ids, and an accepted id must also pass `Document.Validate`. Mutating the old
+copy to `{0,64}` or `{0,62}` turns the test red. An empty inventory id is not
+an error: migration derives one from the `use` key's slug.
+
+#### Agent catalog workflows lower through flow's lowering (#249)
+
+`agent.RegisterWorkflow` used to lower a composed workflow with its own copy
+of `flow.Lower`'s rules, and the copy had drifted. It accepted an empty field
+segment (`$step.reserve.body..sku`), so the workflow registered and then
+failed at invocation after its earlier calls had already run their effects;
+it gave a whole-value reference an empty non-nil path where `flow.Lower`
+gives `nil`; it left the output instruction at index 0; and every rejection
+was a bare `ErrNotAgentSafe` with no reason.
+
+There is now one lowering, `internal/lowering.Lower`. `flow.Definition.Lower`
+calls it with zero `Options`; `RegisterWorkflow` calls it with the catalog's
+two extensions, each an explicit option:
+
+- `Children` lowers a `flow.Child` instruction as a call of the registered
+  child workflow tool, under the same reference rules: `$child.<id>` names an
+  earlier child and `$step.<id>` an earlier call.
+- `Literals` lets a call take a `flow.Lit` input. The call lowers with no
+  references, and the literal is returned beside the program, keyed by call
+  id, for the catalog's dispatch to substitute, exactly as before.
+
+The ids (grammar, the reserved `flow.OutputID`, duplicates) are checked
+again by the lowering, so a program it returns never holds an id the
+canonical compiler would reject; builders reject them first. The catalog
+stores exactly the program `flow.Lower` produces for the same workflow, and
+finds each step's tool by step id instead of by the program's node name.
+
+**Decision: no program literal form, and `flow.Lower` keeps rejecting
+literals.** A literal in `contract.InternalInstruction` would change the
+versioned program format `internal/program` defines (it digests every
+instruction and decodes with unknown fields disallowed), has no document form
+for the canonical compiler to match, and would need the engine's input
+resolution and inspection to carry it. None of that is needed to keep the
+catalog's literal support, which only needs the value at dispatch. `flow.Lower` sets neither
+option, so a developer-authored flow does not start lowering literals or
+child calls; the #244 message for a literal is unchanged. A program literal
+form, if a consumer needs one, is a separate wire decision.
+
+Compatibility: a behavioral validation tightening and a diagnostic change in
+`agent.RegisterWorkflow`, linked to
+[#249](https://github.com/well-prado/new-blok/issues/249). No public API,
+wire shape, document version or artifact digest changes (the catalog digest
+still hashes `flow.Program`), and `flow.Lower`'s results and errors are
+unchanged. Affected registrations:
+
+- a call input or output with an empty field segment now fails registration
+  instead of failing at invocation after earlier effects. Migration: fix the
+  `flow.Select` path.
+- a reference whose prefix names the other kind (`$step.<child id>`,
+  `$child.<call id>`) now fails. Builders never record one; only a reference
+  leaked from another definition can.
+- a rejection still matches `errors.Is(err, agent.ErrNotAgentSafe)`, and its
+  message now carries the reason, for example
+  `agent: tool is not agent-safe: flow: call "commit": input "$step.reserve.body..sku" has an empty field`.
+
+`agent/lower_conformance_test.go` runs the same workflow through the flow
+builder and `flow.Lower` and through `RegisterWorkflow`, and requires
+identical programs and identical node inputs and outputs, the same rejection
+with the same reason for every input and control construct (`If`, `Choose`,
+`Each`, `Parallel`, `TryFinally`, `Compare`, `Default`, `Template`) that
+`flow.Lower` rejects, and the literal and child extensions to differ from
+`flow.Lower` only by that extension. `internal/lowering/lowering_test.go`
+covers the option-gated rules directly. Limits: `flow` and `agent` each copy
+`flow.Program` into the lowering's instruction form (a few lines each; the
+lowering cannot import `flow`, which imports it), guarded by the conformance
+tests; the catalog still composes only calls and children, so a control
+construct remains unsupported for agent tools; and a literal remains
+invisible in the stored program, so the engine sees that call as taking the
+workflow input until dispatch substitutes it.
+
+#### Catalog literals are checked against the tool's input schema (#261)
+
+After #249 a literal call input was still only checked when dispatch reached
+its call: `RegisterWorkflow` stored it without looking at it, so a literal
+the tool's input schema refuses registered, and every invocation ran the
+earlier calls' effects before failing on it. `RegisterWorkflow` now runs on
+each literal, at registration, the same admission dispatch runs on it: the
+1 MiB input bound, then the receiving tool's own `schema.Schema.Normalize`
+(the binding's `in`, the one dispatch uses), then the bound again on the
+normalized value. The two cannot diverge because they call the same
+function on the same schema value.
+
+**Decision: validate, do not rewrite.** `Normalize` rewrites values — it
+applies defaults, puts `int64-string` integers in wire form, and re-encodes
+keys in order. The catalog keeps the literal exactly as `flow` recorded it and
+discards the normalized copy; dispatch normalizes it as before. The node and
+the approval gate therefore receive byte-for-byte what they received before
+#261, and the artifact digest (which hashes `flow.Program`) is unchanged.
+
+Compatibility: a behavioral validation tightening and a diagnostic addition
+in `agent.RegisterWorkflow`, linked to
+[#261](https://github.com/well-prado/new-blok/issues/261). No public API,
+wire shape, document version, artifact digest or dispatch input changes.
+Affected registrations — each one could only ever fail at invocation, after
+its earlier calls' effects:
+
+- a literal the tool's input schema refuses (missing required field, wrong
+  type, unknown field, null, range, format, union) now fails registration
+  with `errors.Is(err, agent.ErrNotAgentSafe)`, naming the step and tool, for
+  example `agent: tool is not agent-safe: call "commit": literal input does
+  not satisfy the input schema of conf/commit@1.0.0: missing_required at
+  $.quantity: required field is absent`. Migration: fix the `flow.Lit` value.
+- a literal over 1 MiB, before or after normalization, now fails
+  registration with `errors.Is(err, agent.ErrBudget)`, naming the step. It
+  was already unadmittable: `tool.Budget` caps `MaxInputBytes` at 1 MiB, so
+  dispatch refused it with `ErrBudget` on every invocation. The error class
+  is kept; only the moment moves.
+- a literal within 1 MiB but over one invocation's `MaxInputBytes` still
+  registers and still trips `ErrBudget` at that invocation, as before: the
+  budget is per invocation, so registration cannot know it.
+
+A child workflow's literals are checked when that child registers, so a
+parent can only compose a child whose literals passed; `flow.Child` records
+no literal, so a child call cannot take one (the lowering refuses it). The
+check covers any literal the lowering returns, whatever the instruction kind.
+`agent/literal_validation_test.go` holds the cases; each rejection case is
+red on the pre-#261 catalog, which registers the workflow and then, on
+invocation, runs the reserve effect before failing.
 
 The initial portable contract is a bounded, JSON-compatible value subset with
 explicit semantics for missing, null, optional fields, objects, arrays, string,

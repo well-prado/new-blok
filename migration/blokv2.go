@@ -58,7 +58,6 @@ type structuralReference struct {
 	Path []string `json:"path"`
 }
 
-var validID = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,63}$`)
 var supportedTriggerKinds = map[string]bool{"http": true, "webhook": true, "worker": true, "cron": true, "pubsub": true, "grpc": true, "sse": true, "websocket": true, "mcp": true}
 
 const (
@@ -192,7 +191,7 @@ func Convert(source []byte, inventory map[string]contract.NodeDescriptor) (contr
 				return contract.Document{}, Diagnostic{Code: "unsupported_step_option", Path: fieldPath, Message: "step options such as retry, timeout, and idempotency do not map to the current native executor", Remediation: "preserve the behavior in application composition or keep this workflow on the source engine until a target contract exists"}
 			}
 		}
-		if !validID.MatchString(sourceStep.ID) {
+		if !contract.ValidID(sourceStep.ID) {
 			return contract.Document{}, Diagnostic{Code: "unsupported_step_id", Path: path + ".id", Message: fmt.Sprintf("step id %s is outside the target identifier grammar", shortDiagnosticValue(sourceStep.ID, 80)), Remediation: "rename it to lowercase letters, digits, underscores, or hyphens, starting with a letter"}
 		}
 		if stepIDs[sourceStep.ID] {
@@ -206,7 +205,7 @@ func Convert(source []byte, inventory map[string]contract.NodeDescriptor) (contr
 		if descriptor.ID == "" {
 			descriptor.ID = slug(sourceStep.Use)
 		}
-		if !validID.MatchString(descriptor.ID) {
+		if !contract.ValidID(descriptor.ID) {
 			return contract.Document{}, Diagnostic{Code: "invalid_target_node_id", Path: path + ".use", Message: fmt.Sprintf("inventory id %s is invalid", shortDiagnosticValue(descriptor.ID, 80)), Remediation: "assign a unique target-safe id in the inventory; keep the source `use` key as its inventory key"}
 		}
 		if existing, exists := nodeIDs[descriptor.ID]; exists && !sameNodeDescriptor(existing, descriptor) {
