@@ -17,12 +17,16 @@ func interruptGroup(process *os.Process) error { return process.Kill() }
 
 func killGroup(process *os.Process) error { return process.Kill() }
 
+// terminate has no graceful request here: the application is killed and
+// cannot drain its workers (unverified, Windows track #156/#157).
+func terminate(process *os.Process) error { return process.Kill() }
+
 // guardShell is unused on Windows, which has no guard.
 var guardShell = ""
 
 // processGuard is absent on Windows; see isolate.
 type processGuard struct{}
 
-func startGuard(*os.Process) (*processGuard, error) { return &processGuard{}, nil }
+func startGuard(*os.Process, string) (*processGuard, error) { return &processGuard{}, nil }
 
 func (*processGuard) release() {}

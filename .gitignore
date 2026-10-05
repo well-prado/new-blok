@@ -27,6 +27,8 @@ runtime/nodejs/dist/
 /examples/quote/cmd/quote/quote
 /examples/recipes/cmd/shop/shop
 /examples/recipes/external/shopapp/recipes.shopapp
+/testdata/tooling/dev/durable/durable
+/testdata/tooling/dev/node/node
 /trigger/testdata/selection/http/http
 /trigger/testdata/selection/none/none
 /trigger/testdata/selection/worker/worker

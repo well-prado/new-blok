@@ -145,3 +145,78 @@ func writeReferences(out io.Writer, kind string, references []Reference) {
 		fmt.Fprintln(out)
 	}
 }
+
+// WriteDevJSON writes one blok dev event as a single JSON line.
+func WriteDevJSON(w io.Writer, event DevEvent) error {
+	data, err := json.Marshal(event)
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(append(data, '\n'))
+	return err
+}
+
+// WriteDevHuman writes one blok dev event for a person: a "blok dev: …"
+// line, then the event's diagnostics in WriteHuman's line shapes.
+func WriteDevHuman(w io.Writer, event DevEvent) error {
+	out := bufio.NewWriter(w)
+	fmt.Fprint(out, "blok dev: ")
+	switch event.Event {
+	case EventWatching:
+		fmt.Fprintf(out, "watching %d files", event.Files)
+	case EventWatchFailed:
+		fmt.Fprint(out, "cannot watch the project")
+	case EventChanged:
+		fmt.Fprintf(out, "%d %s changed: %s", event.Files, plural(event.Files, "file", "files"), strings.Join(event.Changed, ", "))
+		if more := event.Files - len(event.Changed); more > 0 {
+			fmt.Fprintf(out, " and %d more", more)
+		}
+	case EventBuildStarted:
+		fmt.Fprintf(out, "build %d started", event.Build)
+	case EventBuildFailed:
+		fmt.Fprintf(out, "build %d failed, %d %s; ", event.Build, len(event.Diagnostics), plural(len(event.Diagnostics), "problem", "problems"))
+		if event.Running > 0 {
+			fmt.Fprintf(out, "build %d keeps running", event.Running)
+		} else {
+			fmt.Fprint(out, "nothing is running")
+		}
+	case EventBuildSucceeded:
+		fmt.Fprintf(out, "build %d succeeded", event.Build)
+	case EventAppStarted:
+		fmt.Fprintf(out, "started build %d (generation %d, pid %d)", event.Build, event.Generation, event.PID)
+	case EventAppStopped:
+		fmt.Fprintf(out, "stopped build %d (%s)", event.Build, event.Status)
+	case EventAppExited:
+		fmt.Fprintf(out, "build %d exited", event.Build)
+		if event.Status != "" {
+			fmt.Fprintf(out, " (%s)", event.Status)
+		}
+	case EventRestartScheduled:
+		fmt.Fprintf(out, "restarting build %d in %dms", event.Build, event.DelayMS)
+	case EventStopped:
+		fmt.Fprint(out, "stopped")
+		if event.ExitCode != nil {
+			fmt.Fprintf(out, ", exit code %d", *event.ExitCode)
+		}
+	default:
+		fmt.Fprint(out, event.Event)
+	}
+	if len(event.Regenerated) > 0 {
+		fmt.Fprintf(out, " (regenerated %s)", strings.Join(event.Regenerated, ", "))
+	}
+	fmt.Fprintln(out)
+	for _, line := range event.Output {
+		fmt.Fprintf(out, "  | %s\n", line)
+	}
+	for _, item := range event.Diagnostics {
+		writeDiagnostic(out, item)
+	}
+	return out.Flush()
+}
+
+func plural(count int, one, many string) string {
+	if count == 1 {
+		return one
+	}
+	return many
+}

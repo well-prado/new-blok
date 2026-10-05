@@ -107,7 +107,7 @@ func runGo(ctx context.Context, spec goCommand) (goRun, error) {
 	if err := command.Start(); err != nil {
 		return goRun{}, &startError{err: err}
 	}
-	guard, err := startGuard(command.Process)
+	guard, err := startGuard(command.Process, "")
 	if err != nil {
 		_ = killGroup(command.Process)
 		_ = command.Wait()

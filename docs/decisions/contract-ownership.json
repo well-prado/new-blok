@@ -43,6 +43,14 @@
       "evidence": ["cli-fixture-cases-both-layouts", "cli-golden-json-stable-twice", "cli-golden-human-streams", "cli-json-equals-api", "cli-check-test-agree", "cli-repair-one-diagnostic", "cli-interrupt-sigint-ctrl-c-sigterm", "cli-writer-failure", "cli-missing-toolchain", "cli-field-policy-redaction", "cli-discovery-confined"]
     },
     {
+      "id": "cli-dev-build-watch-reload",
+      "question": "How does blok dev rebuild, replace and stop the application, what does it watch, and what does it report?",
+      "owner": "E11-T03",
+      "status": "implemented",
+      "decision": "internal/tooling/devtool.Dev polls the project files layout discovery defines (blok.json, go.mod, go.sum, non-test Go source, node-root files; links recorded, never followed, a linked source refused), debounces changes (quiet 300 ms, at most 2 s), runs layout discovery, regenerates stale bindings like blok generate and builds with ADR 0024's hardened go command into a new executable per build; only a build that compiles replaces the application, which runs in its own process group under the pipe guard with BLOK_DEV_GENERATION for its workers, is stopped by SIGTERM to it alone then a group kill after 10 s, is swept with its group after exit, and is restarted after a failure exit with backoff doubling from 500 ms to 30 s; events are one versioned blok-dev/v1 stream carrying redacted #28 diagnostics; exit 130 on a signal, 1 unreadable project, 2 usage, 3 tool or guard unavailable or panic, 4 output not written (ADR 0026).",
+      "evidence": ["dev-fixture-cases-both-layouts", "dev-node-worker-drain-and-generation", "dev-durable-run-not-relabelled", "dev-signals-zero-leftover-processes", "dev-second-interrupt-forces", "dev-panic-kills-group", "dev-descendants-swept", "dev-backoff-bounded", "dev-watch-confined-and-bounded", "dev-code-registry"]
+    },
+    {
       "id": "go-authoring-api",
       "question": "Which typed Go authoring forms and ownership rules are supported?",
       "owner": "E03-T01",

@@ -75,6 +75,16 @@ versioned `blok-cli/v1` report and exits 0 when clean, 1 on problems and 130
 when interrupted ([ADR 0024](docs/decisions/0024-check-test-inspect-cli-contract.md)).
 Their Windows behaviour is unverified.
 
+`blok dev` builds the application's `cmd/<name>` package, runs it and
+watches the project. A save rebuilds it (regenerating stale bindings) and
+replaces the running process; a build that fails is reported and the last
+good build keeps serving; an application that crashes is restarted with
+backoff. The application runs in its own process group with
+`BLOK_DEV_GENERATION` set for its workers' generation, and Ctrl+C (or blok
+dev dying) stops it and everything it started. `--json` streams
+`blok-dev/v1` events ([ADR 0026](docs/decisions/0026-dev-build-watch-reload.md)).
+Its Windows behaviour is unverified.
+
 The initial toolchain is Go 1.27.1. The first application milestone delivers a quote service that can be authored, tested and served entirely in Go. Follow the [roadmap](ROADMAP.md) for implementation order, issue dependencies, and exit evidence.
 
 ### Run the native quote application

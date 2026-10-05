@@ -134,38 +134,68 @@ func checkBindings(ctx context.Context, workspace Workspace, found *diagnostics)
 	if ctx.Err() != nil {
 		return CheckResult{Name: CheckBindings, State: CheckInterrupted}
 	}
-	if workspace.Manifest == nil {
-		return CheckResult{Name: CheckBindings, State: CheckSkipped, Reason: "blok.json is missing or invalid"}
-	}
-	if workspace.Manifest.Types == "" {
-		return CheckResult{Name: CheckBindings, State: CheckSkipped, Reason: "blok.json names no types file"}
-	}
-	types := path.Clean(workspace.Manifest.Types)
-	bindings := path.Join(path.Dir(types), "bindings_gen.go")
-	source, err := readBounded(filepath.Join(workspace.Root, filepath.FromSlash(types)), MaxSourceFileBytes)
-	if err != nil {
-		found.add(diagnostic.Diagnostic{Code: "bindings_types_missing", Source: types, Field: "types", Expected: "the Go types file blok.json names", Actual: errorText(err), Remediation: "restore the types file, or point blok.json's types at the file that declares the node's input and output", Message: "the types file blok.json names cannot be read"})
-		return CheckResult{Name: CheckBindings, State: CheckFailed}
-	}
-	generated, err := generate.Source(source, generate.Options{})
-	if err != nil {
-		found.add(diagnostic.Diagnostic{Code: "bindings_generate_failed", Source: types, Expected: "types blok generate supports", Actual: relativeText(err.Error(), workspace.Root), Remediation: "fix the types file so blok generate accepts it, then run blok generate", Message: "the typed bindings cannot be generated from the types file"})
-		return CheckResult{Name: CheckBindings, State: CheckFailed}
-	}
-	existing, err := readBounded(filepath.Join(workspace.Root, filepath.FromSlash(bindings)), MaxSourceFileBytes)
+	plan, problem, skipped := planBindings(workspace)
 	switch {
-	case errors.Is(err, os.ErrNotExist):
-		found.add(diagnostic.Diagnostic{Code: "bindings_missing", Source: bindings, Expected: "generated bindings beside the types file", Actual: "missing", Remediation: "run blok generate", Message: "the typed bindings have not been generated"})
-	case err != nil:
-		found.add(diagnostic.Diagnostic{Code: "bindings_missing", Source: bindings, Expected: "generated bindings beside the types file", Actual: errorText(err), Remediation: "make the bindings file readable, then run blok generate", Message: "the typed bindings cannot be read"})
-	case !bytes.HasPrefix(existing, []byte(generatedHeader)):
-		found.add(diagnostic.Diagnostic{Code: "bindings_not_generated", Source: bindings, Expected: generatedHeader, Actual: "a hand-written file", Remediation: "move the hand-written code to another file, delete this one, then run blok generate", Message: "the bindings file was not written by blok generate"})
-	case !bytes.Equal(existing, generated):
-		found.add(diagnostic.Diagnostic{Code: "bindings_stale", Source: bindings, Expected: "bindings generated from " + types, Actual: "out of date", Remediation: "run blok generate", Message: "the typed bindings are stale"})
+	case skipped != "":
+		return CheckResult{Name: CheckBindings, State: CheckSkipped, Reason: skipped}
+	case problem != nil:
+		found.add(*problem)
+		return CheckResult{Name: CheckBindings, State: CheckFailed}
+	case plan.readErr != nil && errors.Is(plan.readErr, os.ErrNotExist):
+		found.add(diagnostic.Diagnostic{Code: "bindings_missing", Source: plan.path, Expected: "generated bindings beside the types file", Actual: "missing", Remediation: "run blok generate", Message: "the typed bindings have not been generated"})
+	case plan.readErr != nil:
+		found.add(diagnostic.Diagnostic{Code: "bindings_missing", Source: plan.path, Expected: "generated bindings beside the types file", Actual: errorText(plan.readErr), Remediation: "make the bindings file readable, then run blok generate", Message: "the typed bindings cannot be read"})
+	case plan.handWritten():
+		found.add(handWrittenBindings(plan.path))
+	case plan.stale():
+		found.add(diagnostic.Diagnostic{Code: "bindings_stale", Source: plan.path, Expected: "bindings generated from " + plan.types, Actual: "out of date", Remediation: "run blok generate", Message: "the typed bindings are stale"})
 	default:
 		return CheckResult{Name: CheckBindings, State: stateOf(ctx, false)}
 	}
 	return CheckResult{Name: CheckBindings, State: CheckFailed}
+}
+
+// bindingsPlan is the manifest's typed bindings as blok generate would
+// write them, beside what the project holds now.
+type bindingsPlan struct {
+	// types and path are project-relative and slash-separated.
+	types, path string
+	generated   []byte
+	existing    []byte
+	readErr     error
+}
+
+func (p bindingsPlan) handWritten() bool {
+	return p.readErr == nil && !bytes.HasPrefix(p.existing, []byte(generatedHeader))
+}
+
+func (p bindingsPlan) stale() bool { return !bytes.Equal(p.existing, p.generated) }
+
+func handWrittenBindings(path string) diagnostic.Diagnostic {
+	return diagnostic.Diagnostic{Code: "bindings_not_generated", Source: path, Expected: generatedHeader, Actual: "a hand-written file", Remediation: "move the hand-written code to another file, delete this one, then run blok generate", Message: "the bindings file was not written by blok generate"}
+}
+
+// planBindings generates the manifest's bindings in memory with the same
+// generate.Source blok generate uses. It returns a reason when there is
+// nothing to generate, or the diagnostic that stops generation.
+func planBindings(workspace Workspace) (bindingsPlan, *diagnostic.Diagnostic, string) {
+	if workspace.Manifest == nil {
+		return bindingsPlan{}, nil, "blok.json is missing or invalid"
+	}
+	if workspace.Manifest.Types == "" {
+		return bindingsPlan{}, nil, "blok.json names no types file"
+	}
+	plan := bindingsPlan{types: path.Clean(workspace.Manifest.Types)}
+	plan.path = path.Join(path.Dir(plan.types), "bindings_gen.go")
+	source, err := readBounded(filepath.Join(workspace.Root, filepath.FromSlash(plan.types)), MaxSourceFileBytes)
+	if err != nil {
+		return plan, &diagnostic.Diagnostic{Code: "bindings_types_missing", Source: plan.types, Field: "types", Expected: "the Go types file blok.json names", Actual: errorText(err), Remediation: "restore the types file, or point blok.json's types at the file that declares the node's input and output", Message: "the types file blok.json names cannot be read"}, ""
+	}
+	if plan.generated, err = generate.Source(source, generate.Options{}); err != nil {
+		return plan, &diagnostic.Diagnostic{Code: "bindings_generate_failed", Source: plan.types, Expected: "types blok generate supports", Actual: relativeText(err.Error(), workspace.Root), Remediation: "fix the types file so blok generate accepts it, then run blok generate", Message: "the typed bindings cannot be generated from the types file"}, ""
+	}
+	plan.existing, plan.readErr = readBounded(filepath.Join(workspace.Root, filepath.FromSlash(plan.path)), MaxSourceFileBytes)
+	return plan, nil, ""
 }
 
 // checkWorkflowSteps applies the step-id rules flow.Define enforces to every

@@ -1,0 +1,27 @@
+{
+  "name": "app/slow-quote",
+  "version": "1.0.0",
+  "description": "blok dev fixture: a quote that takes delayMs and records each start and finish",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "requestId": {"type": "string"},
+      "sku": {"type": "string"},
+      "quantity": {"type": "integer", "minimum": 1, "maximum": 100},
+      "delayMs": {"type": "integer", "minimum": 0, "maximum": 5000}
+    },
+    "required": ["requestId", "sku", "quantity", "delayMs"],
+    "additionalProperties": false
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "totalCents": {"type": "integer", "wire": "int64-string"},
+      "marker": {"type": "string"},
+      "workerPid": {"type": "string"}
+    },
+    "required": ["totalCents", "marker", "workerPid"],
+    "additionalProperties": false
+  },
+  "deterministic": false
+}

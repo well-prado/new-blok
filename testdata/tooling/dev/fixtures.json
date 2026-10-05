@@ -1,0 +1,555 @@
+{
+  "schemaVersion": 1,
+  "roadmap": "E11-T03",
+  "description": "blok dev runs against real scaffolded applications (module example.com/shop) and these edits, applied while it runs. Placeholders: {module}, {node} (the quote node's directory in the layout), {nodes} (the directory of the layout's Go nodes). Steps run in order: await waits for the next event of that name and build; post sends {sku: coffee, quantity} to POST /quotes; edits change the project (and a shadow copy); repeat/everyMs repeat edits, substituting {n}; outside writes the sibling file ../outside.go; link makes a symbolic link to it; observeMs waits. Expected counts cover the whole session, which the harness ends with a cancellation (exit 130): builds and failedBuilds count build-started and build-failed, starts app-started, stops app-stopped (the final stop included), exits app-exited, regenerated the files blok dev rewrote, stopTimeouts dev_app_stop_timeout diagnostics, effectRecords the project files whose content differs from the shadow copy (blok dev's own writes), diagnostics every build-failed diagnostic. Every case also requires zero processes left in any application's process group.",
+  "cases": [
+    {
+      "id": "dev-edit-rebuilds-and-restarts",
+      "layouts": [
+        "classic",
+        "unified"
+      ],
+      "description": "An edit to the composition root rebuilds, stops the old process, starts the new one; a request afterwards sees the new price.",
+      "steps": [
+        {
+          "await": "app-started",
+          "build": 1
+        },
+        {
+          "post": 2,
+          "status": 200,
+          "totalCents": 3000
+        },
+        {
+          "edits": [
+            {
+              "file": "internal/app/app.go",
+              "replace": [
+                "\"coffee\": 1500",
+                "\"coffee\": 1700"
+              ]
+            }
+          ]
+        },
+        {
+          "await": "app-started",
+          "build": 2
+        },
+        {
+          "post": 2,
+          "status": 200,
+          "totalCents": 3400
+        }
+      ],
+      "expected": {
+        "builds": 2,
+        "failedBuilds": 0,
+        "starts": 2,
+        "stops": 2,
+        "exits": 0,
+        "regenerated": 0,
+        "stopTimeouts": 0,
+        "effectRecords": 0,
+        "diagnostics": []
+      }
+    },
+    {
+      "id": "dev-broken-build-keeps-last-good",
+      "layouts": [
+        "classic",
+        "unified"
+      ],
+      "description": "A compile error is one positioned diagnostic; build 1 keeps serving until the repair builds.",
+      "steps": [
+        {
+          "await": "app-started",
+          "build": 1
+        },
+        {
+          "edits": [
+            {
+              "file": "workflows/quotes/quotes.go",
+              "replace": [
+                "TotalCents()",
+                "TotalCentz()"
+              ]
+            }
+          ]
+        },
+        {
+          "await": "build-failed",
+          "build": 2,
+          "running": 1
+        },
+        {
+          "post": 2,
+          "status": 200,
+          "totalCents": 3000
+        },
+        {
+          "edits": [
+            {
+              "file": "workflows/quotes/quotes.go",
+              "replace": [
+                "TotalCentz()",
+                "TotalCents()"
+              ]
+            }
+          ]
+        },
+        {
+          "await": "app-started",
+          "build": 3
+        },
+        {
+          "post": 2,
+          "status": 200,
+          "totalCents": 3000
+        }
+      ],
+      "expected": {
+        "builds": 3,
+        "failedBuilds": 1,
+        "starts": 2,
+        "stops": 2,
+        "exits": 0,
+        "regenerated": 0,
+        "stopTimeouts": 0,
+        "effectRecords": 0,
+        "diagnostics": [
+          {
+            "code": "go_compile_error",
+            "source": "workflows/quotes/quotes.go:18:37"
+          }
+        ]
+      }
+    },
+    {
+      "id": "dev-rapid-edits-coalesce",
+      "layouts": [
+        "classic",
+        "unified"
+      ],
+      "description": "Twenty saves 25ms apart become one rebuild and one restart.",
+      "steps": [
+        {
+          "await": "app-started",
+          "build": 1
+        },
+        {
+          "edits": [
+            {
+              "file": "internal/app/app.go",
+              "replace": [
+                "\"coffee\": 1500",
+                "\"coffee\": 1900"
+              ]
+            }
+          ]
+        },
+        {
+          "edits": [
+            {
+              "file": "internal/app/app.go",
+              "append": "\n// save {n}\n"
+            }
+          ],
+          "repeat": 19,
+          "everyMs": 25
+        },
+        {
+          "await": "app-started",
+          "build": 2
+        },
+        {
+          "observeMs": 1500
+        },
+        {
+          "post": 2,
+          "status": 200,
+          "totalCents": 3800
+        }
+      ],
+      "expected": {
+        "builds": 2,
+        "failedBuilds": 0,
+        "starts": 2,
+        "stops": 2,
+        "exits": 0,
+        "regenerated": 0,
+        "stopTimeouts": 0,
+        "effectRecords": 0,
+        "diagnostics": []
+      }
+    },
+    {
+      "id": "dev-stale-bindings-regenerated",
+      "layouts": [
+        "classic",
+        "unified"
+      ],
+      "description": "A types change regenerates the bindings once, exactly as blok generate, without a second build for blok dev's own write.",
+      "steps": [
+        {
+          "await": "app-started",
+          "build": 1
+        },
+        {
+          "edits": [
+            {
+              "file": "{node}/types.go",
+              "append": "\n// Extra is a type the committed bindings do not know yet.\ntype Extra struct {\n\tNote string `json:\"note\"`\n}\n"
+            }
+          ]
+        },
+        {
+          "await": "app-started",
+          "build": 2
+        },
+        {
+          "observeMs": 1500
+        }
+      ],
+      "expected": {
+        "builds": 2,
+        "failedBuilds": 0,
+        "starts": 2,
+        "stops": 2,
+        "exits": 0,
+        "regenerated": 1,
+        "stopTimeouts": 0,
+        "effectRecords": 1,
+        "diagnostics": []
+      }
+    },
+    {
+      "id": "dev-deleted-files",
+      "layouts": [
+        "classic",
+        "unified"
+      ],
+      "description": "A deleted generated file is regenerated; a deleted test file changes nothing; a deleted workflow fails the build while build 2 keeps serving.",
+      "steps": [
+        {
+          "await": "app-started",
+          "build": 1
+        },
+        {
+          "edits": [
+            {
+              "file": "{node}/bindings_gen.go",
+              "delete": true
+            }
+          ]
+        },
+        {
+          "await": "app-started",
+          "build": 2
+        },
+        {
+          "edits": [
+            {
+              "file": "internal/app/app_test.go",
+              "delete": true
+            }
+          ]
+        },
+        {
+          "observeMs": 1500
+        },
+        {
+          "edits": [
+            {
+              "file": "workflows/quotes/quotes.go",
+              "delete": true
+            }
+          ]
+        },
+        {
+          "await": "build-failed",
+          "build": 3,
+          "running": 2
+        },
+        {
+          "post": 2,
+          "status": 200,
+          "totalCents": 3000
+        }
+      ],
+      "expected": {
+        "builds": 3,
+        "failedBuilds": 1,
+        "starts": 2,
+        "stops": 2,
+        "exits": 0,
+        "regenerated": 1,
+        "stopTimeouts": 0,
+        "effectRecords": 1,
+        "diagnostics": [
+          {
+            "code": "go_module_missing",
+            "source": "internal/app/app.go:17:2"
+          }
+        ]
+      }
+    },
+    {
+      "id": "dev-node-import-keeps-last-good",
+      "layouts": [
+        "classic",
+        "unified"
+      ],
+      "description": "Layout discovery's node-independence rule blocks the build; removing the offending node rebuilds.",
+      "steps": [
+        {
+          "await": "app-started",
+          "build": 1
+        },
+        {
+          "edits": [
+            {
+              "file": "{nodes}/tax/tax.go",
+              "write": "package tax\n\nimport (\n\t\"context\"\n\n\t\"github.com/well-prado/new-blok/node\"\n\n\t\"{module}/{node}\"\n)\n\n// New defines a node that wrongly imports another node.\nfunc New() (node.Definition[quote.Input, quote.Output], error) {\n\treturn node.Define(\"app/tax\", \"1.0.0\", func(ctx context.Context, input quote.Input) (quote.Output, error) {\n\t\treturn quote.Output{SKU: input.SKU}, nil\n\t})\n}\n"
+            }
+          ]
+        },
+        {
+          "await": "build-failed",
+          "build": 2,
+          "running": 1
+        },
+        {
+          "post": 2,
+          "status": 200,
+          "totalCents": 3000
+        },
+        {
+          "edits": [
+            {
+              "file": "{nodes}/tax/tax.go",
+              "delete": true
+            },
+            {
+              "file": "{nodes}/tax",
+              "delete": true
+            }
+          ]
+        },
+        {
+          "await": "app-started",
+          "build": 3
+        }
+      ],
+      "expected": {
+        "builds": 3,
+        "failedBuilds": 1,
+        "starts": 2,
+        "stops": 2,
+        "exits": 0,
+        "regenerated": 0,
+        "stopTimeouts": 0,
+        "effectRecords": 0,
+        "diagnostics": [
+          {
+            "code": "layout_node_imports_node",
+            "sourcePrefix": "{nodes}/tax/tax.go"
+          }
+        ]
+      }
+    },
+    {
+      "id": "dev-symlink-and-outside-root",
+      "layouts": [
+        "unified"
+      ],
+      "description": "A source file linked to a file outside the root is refused, never followed; editing the outside file triggers nothing; removing the link rebuilds.",
+      "steps": [
+        {
+          "await": "app-started",
+          "build": 1
+        },
+        {
+          "outside": "package app\n\nconst outside = 1\n"
+        },
+        {
+          "link": "internal/app/outside.go"
+        },
+        {
+          "await": "build-failed",
+          "build": 2,
+          "running": 1
+        },
+        {
+          "outside": "package app\n\nconst outside = 2\n"
+        },
+        {
+          "observeMs": 1500
+        },
+        {
+          "unlink": "internal/app/outside.go"
+        },
+        {
+          "await": "app-started",
+          "build": 3
+        }
+      ],
+      "expected": {
+        "builds": 3,
+        "failedBuilds": 1,
+        "starts": 2,
+        "stops": 2,
+        "exits": 0,
+        "regenerated": 0,
+        "stopTimeouts": 0,
+        "effectRecords": 0,
+        "diagnostics": [
+          {
+            "code": "dev_symlink_unwatched",
+            "source": "internal/app/outside.go"
+          }
+        ]
+      }
+    },
+    {
+      "id": "dev-crash-loop-backs-off",
+      "layouts": [
+        "classic"
+      ],
+      "description": "An application that dies at start is restarted 100, 200, 400, 400\u2026 ms later, never faster; the repair rebuilds and serves.",
+      "options": {
+        "backoffMs": 100,
+        "maxBackoffMs": 400,
+        "stableAfterMs": 60000
+      },
+      "steps": [
+        {
+          "await": "app-started",
+          "build": 1
+        },
+        {
+          "edits": [
+            {
+              "file": "cmd/shop/main.go",
+              "replace": [
+                "func main() {\n",
+                "func main() {\n\tlog.Fatal(\"fixture: refusing to start\")\n"
+              ]
+            }
+          ]
+        },
+        {
+          "await": "build-succeeded",
+          "build": 2
+        },
+        {
+          "observeMs": 2500
+        },
+        {
+          "edits": [
+            {
+              "file": "cmd/shop/main.go",
+              "replace": [
+                "\tlog.Fatal(\"fixture: refusing to start\")\n",
+                ""
+              ]
+            }
+          ]
+        },
+        {
+          "await": "app-started",
+          "build": 3
+        },
+        {
+          "post": 2,
+          "status": 200,
+          "totalCents": 3000
+        }
+      ],
+      "expected": {
+        "builds": 3,
+        "failedBuilds": 0,
+        "minExits": 5,
+        "maxStarts": 12,
+        "stops": 2,
+        "regenerated": 0,
+        "stopTimeouts": 0,
+        "effectRecords": 0,
+        "restartDelaysMs": [
+          100,
+          200,
+          400,
+          400,
+          400
+        ],
+        "exitOutputContains": "fixture: refusing to start",
+        "diagnostics": []
+      }
+    },
+    {
+      "id": "dev-slow-shutdown-is-bounded",
+      "layouts": [
+        "unified"
+      ],
+      "description": "An application that ignores SIGTERM is killed with its group at the grace period, reported, and replaced.",
+      "options": {
+        "stopGraceMs": 1500
+      },
+      "steps": [
+        {
+          "await": "app-started",
+          "build": 1
+        },
+        {
+          "edits": [
+            {
+              "file": "cmd/shop/main.go",
+              "replace": [
+                "signal.Notify(signals, os.Interrupt, syscall.SIGTERM)",
+                "signal.Notify(signals, os.Interrupt)\n\tsignal.Ignore(syscall.SIGTERM)"
+              ]
+            }
+          ]
+        },
+        {
+          "await": "app-started",
+          "build": 2
+        },
+        {
+          "edits": [
+            {
+              "file": "internal/app/app.go",
+              "replace": [
+                "\"coffee\": 1500",
+                "\"coffee\": 1600"
+              ]
+            }
+          ]
+        },
+        {
+          "await": "app-started",
+          "build": 3
+        },
+        {
+          "post": 1,
+          "status": 200,
+          "totalCents": 1600
+        }
+      ],
+      "expected": {
+        "builds": 3,
+        "failedBuilds": 0,
+        "starts": 3,
+        "stops": 3,
+        "exits": 0,
+        "regenerated": 0,
+        "stopTimeouts": 2,
+        "effectRecords": 0,
+        "stopTimeoutMs": [
+          1500,
+          6000
+        ],
+        "diagnostics": []
+      }
+    }
+  ]
+}
