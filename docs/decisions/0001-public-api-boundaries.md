@@ -342,8 +342,31 @@ panic stack reaches the builder call. `contract/document_test.go` pins
 `ValidID` to document validation's `invalid_id`. Limits: flow still does not
 grammar-check `Choose` case keys, the `Child` workflow name or `Spec.Name`
 (document workflow ids are a separate field that a flow `Spec.Name` such as
-`shop/quote` does not map to), and `migration/blokv2.go` keeps its own copy of
-the grammar.
+`shop/quote` does not map to). `migration/blokv2.go` kept its own copy of the
+grammar until #256 (below).
+
+#### Migration uses the shared id grammar (#256)
+
+`migration/blokv2.go` carried a private `validID` regular expression, so a
+change to `contract.IDPattern` (or to the copy) would have let migration
+accept ids that documents reject, or the reverse, with no test failing. The
+copy is deleted; `Convert` checks source step ids (`unsupported_step_id`) and
+inventory node ids (`invalid_target_node_id`) with `contract.ValidID`.
+
+Compatibility: none. The deleted expression was byte-for-byte
+`^[a-z][a-z0-9_-]{0,63}$`, the same text as `contract.IDPattern`, and has not
+changed since it was added (`ef67bcb`); the anchors, length bound and
+character set are identical, so migration accepts and rejects exactly the
+ids it did before, with the same diagnostics. Go's `$` (no `(?m)` flag)
+matches only at the end of the text, so neither expression accepts `"a\n"`.
+This is an internal refactor, not a wire-shape, diagnostic or document-version
+change. `migration/blokv2_test.go` proves it with a shared table of edge ids
+(1, 64 and 65 characters, dotted, uppercase, leading digit, leading `_` and
+`-`, empty, non-ASCII, trailing newline) driven through `Convert`: migration
+must agree with `contract.ValidID` on every row, for step ids and inventory
+ids, and an accepted id must also pass `Document.Validate`. Mutating the old
+copy to `{0,64}` or `{0,62}` turns the test red. An empty inventory id is not
+an error: migration derives one from the `use` key's slug.
 
 #### Agent catalog workflows lower through flow's lowering (#249)
 

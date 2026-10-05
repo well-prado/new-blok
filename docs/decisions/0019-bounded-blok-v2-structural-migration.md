@@ -23,7 +23,8 @@ runtime.
 The accepted subset is deliberately structural:
 
 - One workflow, at most one trigger kind, and at least one step.
-- Step IDs are unique and satisfy the target identifier grammar.
+- Step IDs are unique and satisfy the target identifier grammar, checked with
+  `contract.ValidID` rather than a private copy (ADR 0001, #256).
 - The target workflow ID is the normalized name plus a stable SHA-256 prefix,
   so distinct names that normalize to the same slug do not silently collide.
 - Each `use` resolves to an exact inventory descriptor carrying its version,
