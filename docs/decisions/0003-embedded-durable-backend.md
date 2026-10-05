@@ -152,6 +152,117 @@ file after a truncating checkpoint.
 | `secure_delete=ON` on every connection (#281) | behavioral | None. Deletes and updates write zeros over freed space; content deleted before the upgrade stays until `PurgeFree` |
 | `store.Purger`, `store.PurgerOf`; `sqlite` implements it | additive | Optional; other `store.Database` implementations need not purge, and the journal then reports `LogPurged = false` |
 
+## Schema versions (#291)
+
+Several components migrate their tables in place when they open, and some
+of those migrations are one-way: #281 rebuilt the journal's
+reconciliations and dropped its legacy tombstone table, #286 gave
+reconciliations a tenant, #290 gave the worker queue tombstones. Before
+#291 nothing recorded which shape a database had, so an older binary
+opened a migrated database as if it were its own: a pre-#281 journal
+recreated an empty legacy tombstone table and failed its reconcile on a
+`NOT NULL` constraint, a pre-#286 journal inserted reconciliations without
+a tenant, and a pre-#290 worker accepted and ran again a duplicate of a
+job compacted to a tombstone (shown with real binaries in the #291 PR).
+
+**The stamp.** Every component that owns tables in the shared database
+stamps its schema version in `blok_schema_versions`, one row per
+component: `(component, version, upgraded_from)`. One row per component,
+not `PRAGMA user_version`, because one file holds several components that
+each binary opens independently, in whatever combination it composes, and
+that migrate on their own schedules; a single number would make the
+journal's version and the queue's indistinguishable, and an application
+may use `user_version` itself. The components and the versions this
+release supports:
+
+| Component | Owner | Version | History |
+| --- | --- | --- | --- |
+| `journal` | `internal/journal` | 3 | 1 before #281; 2 with #281's erasure tables; 3 with #286's reconciliation tenant |
+| `audit` | `contract/audit` | 1 | the #80 tables, unchanged since |
+| `worker` | `trigger/worker` | 2 | 1 before #290; 2 with #290's `worker_compacted` and `worker_meta` |
+| `approval` | `contract/approval` | 1 | `approval_decisions_v1` as #75 introduced it |
+| `cron` | `trigger/cron` | 1 | `cron_cursors` as introduced |
+| `provider` | `provider` (`Records`) | 1 | `provider_records`, `provider_outbox` as introduced |
+
+`internal/migration.Apply` is the one implementation, run inside each
+component's existing schema transaction:
+
+1. **Read.** The component's row is read. A database with no row (written
+   before #291, or a component opened for the first time) is classified by
+   its tables' shape instead: 0 when they do not exist, otherwise the
+   version they show (the journal by its reconciliations' `tenant` and
+   `erased_at` columns, the queue by `worker_compacted`, the others by
+   their tables' presence).
+2. **Refuse.** A version newer than the highest this binary supports is
+   refused before anything else runs, with `store.NewerSchemaError`
+   (matching `store.ErrNewerSchema`) naming the component, the stamped
+   version and the supported one, for example `store: the journal schema
+   in this database is version 4, newer than version 3, the highest this
+   binary supports; refusing to open it: run a binary that supports
+   version 4, or restore a backup taken before the upgrade`. Nothing is
+   written; the open fails and the constructor returns no component. It is
+   never transient, and `migration.Retry` does not retry it. `provider`
+   returns it unredacted: it holds a component name and two numbers, no
+   cause text.
+3. **Migrate.** The component's migration runs with the version found.
+   The steps that predate the stamp (journal 1–3, queue 1–2) keep their
+   shape guards and run on every open, as before: a binary from before
+   #291 cannot see the stamp, so it can still bring an older shape back
+   into a stamped database (a pre-#281 journal recreates `journal_audit`,
+   a pre-#286 one inserts an untenanted reconciliation), and the next open
+   must keep repairing it. A step added from now on runs when the version
+   found is older than its own.
+4. **Stamp.** The row is raised to the supported version, with the version
+   found as `upgraded_from`, in the same transaction as the migration. A
+   crash leaves neither (shown with a process killed inside the journal's
+   schema transaction), and the next open does both. A database already at
+   the supported version is not written, so reopening changes nothing.
+
+The same or an older version is migrated forward; an equal one opens
+unchanged. Concurrent first opens of an existing database read the stamp
+before writing it, so they race for the write lock; every component's
+schema transaction now runs under `migration.Retry` (#235), which the
+journal and the queue already did, and audit, approval, cron and provider
+now do too.
+
+**Raising a version** is part of any change an older binary would misread:
+the change bumps the component's `schemaVersion`, adds its migration step
+gated on the version found, extends the shape classification only if the
+change can meet unstamped databases (it cannot, from #291 on), and
+records the version in the table above.
+
+**Application tables** are the application's. The shop recipe keeps its
+own ordered `shop_schema_migrations` and now refuses a database whose
+latest migration is newer than the ones it knows, with the same error
+(component `shop`); its `Teardown` also removes the queue's stamp with the
+queue's tables. The deployment example's `deployment_format` row already
+refuses an incompatible format.
+
+| Change | Class | Migration |
+| --- | --- | --- |
+| `blok_schema_versions` table; each component stamps its version on open (#291) | schema, additive | Created on the first open by this release, inside each component's schema transaction. An unstamped database is classified by shape and stamped; no existing table changes |
+| Opening a database stamped newer than the binary supports fails with `store.NewerSchemaError` / `store.ErrNewerSchema` (#291) | behavioral (breaking for downgrades) | None for upgrades. A downgrade below a release that raised a component's version is refused at open; restore a backup taken before the upgrade, as ADR 0021 §7 already required for #281 |
+| Audit, approval, cron and provider schema transactions retried while busy (#291) | behavioral | None; a concurrent first open that failed `store.ErrBusy` now waits its turn, bounded as in #235 |
+| `store.ErrNewerSchema`, `store.NewerSchemaError` | additive | None |
+
+**Limits.**
+- Only binaries from this release on refuse. Binaries built before it have
+  no check and still open a stamped database as before, with the effects
+  above; they are not made safe retroactively. The shape-guarded repairs
+  keep cleaning up after them on the next open by a current binary, and
+  ADR 0006's "one version per store" still applies to them.
+- A component checks only its own stamp. The journal's tenant repair reads
+  audit records and `audit.Verify` reads journal reconciliations; each
+  relies on the binary composing both components, whose own opens check
+  their stamps. An application that opens one of them without the other on
+  a database a newer binary migrated is not protected for the other's
+  tables.
+- `store/distributed` stores (ADR 0019) have no tables of these components
+  and are not stamped.
+- A newer binary's migration is not reversible by an older one: the
+  refusal tells the operator to restore a pre-upgrade backup, and a backup
+  carries the stamp with it (`VACUUM INTO` copies the table).
+
 ## Alternatives considered
 
 The executable spike compares SQLite with `go.etcd.io/bbolt` v1.5.0. bbolt is
