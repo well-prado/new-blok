@@ -546,7 +546,7 @@ func runPausedOwnerHelper() error {
 }
 
 func TestSnapshotRestoreRotatesIncarnationAndPreservesPartitionData(t *testing.T) {
-	store, client := integrationStore(t, "BLOK_DISTRIBUTED_ENDPOINTS")
+	store, _ := integrationStore(t, "BLOK_DISTRIBUTED_ENDPOINTS")
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	partition := fmt.Sprintf("restore-%d", time.Now().UnixNano())
@@ -560,7 +560,19 @@ func TestSnapshotRestoreRotatesIncarnationAndPreservesPartitionData(t *testing.T
 
 	directory := t.TempDir()
 	snapshotPath := filepath.Join(directory, "snapshot.db")
-	snapshot, err := client.Snapshot(ctx)
+	// The maintenance snapshot is served by one member and is not
+	// linearizable: a follower can still be applying the event above. A
+	// linearizable read through that same member first waits until it has
+	// applied the event, so the snapshot is guaranteed to contain it.
+	snapshotMember, err := clientv3.New(clientv3.Config{Endpoints: strings.Split(os.Getenv("BLOK_DISTRIBUTED_ENDPOINTS"), ",")[:1], DialTimeout: 2 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshotMember.Close()
+	if applied, err := snapshotMember.Get(ctx, eventKey(partition, "snapshot-event")); err != nil || len(applied.Kvs) != 1 {
+		t.Fatalf("snapshot member has not applied the pre-snapshot event: response=%v err=%v", applied, err)
+	}
+	snapshot, err := snapshotMember.Snapshot(ctx)
 	if err != nil {
 		t.Fatalf("create etcd snapshot: %v", err)
 	}

@@ -47,6 +47,32 @@ accepted-run event would not make workflow execution recoverable.
   uncertain until an effect provider's idempotency or reconciliation resolves
   it. No automatic retry crosses an uncertain effect boundary.
 
+## Declared storage-outage and ownership-change behavior
+
+Every transition below was exercised against a real three-voter etcd cluster
+(two voters paused, an owner process killed, stopped, or network-partitioned).
+
+| Transition | Outage before the transaction is sent | Transaction in flight when quorum is lost |
+|---|---|---|
+| Admission | Reject, never acknowledged (`ErrUnavailable`, HTTP 503 + `Retry-After`); nothing durable | Not acknowledged; a retry with the same request key reconciles to exactly one accepted run |
+| Signal delivery | Reject (`ErrUnavailable`, 503); wait stays open | Not acknowledged; a retry with the same signal ID is accepted or reported as a duplicate, never twice |
+| Due timer | Error; the timer index entry is kept for the next poll | Error; the next poll fires it or finds it already fired, never twice |
+| Pure step result | The run stays accepted with its slots; the step is re-dispatched | Same |
+| Effectful step result | The run is reported uncertain unless recovery finds the committed result; the effect is never invoked again automatically | Same |
+| Finish | The run keeps its slots and non-terminal state | Terminal state and slot release commit together or not at all; a later owner finishes without re-invoking committed steps |
+
+Capacity exhaustion is a definite rejection (`ErrAdmissionFull`, HTTP 429 +
+`Retry-After`). A request key already committed with a different input is a
+definite conflict (`ErrRequestConflict`, HTTP 409), including when two ingress
+nodes race. A standby worker retries partition acquisition at a bounded
+interval.
+
+Fencing rejects a stale owner's durable writes, not its external calls. A
+paused or partitioned owner that resumes after a takeover may still perform
+the effect of a step it had already dispatched; its result is rejected and the
+successor has already marked that run uncertain. Effect providers that need
+stronger guarantees must check the step's operation key or the owner fence.
+
 ## Compatibility and limits
 
 Ordinary in-memory `Engine.Run` remains unchanged and uses no journal. Durable
