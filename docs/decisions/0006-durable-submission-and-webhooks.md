@@ -365,9 +365,12 @@ verdict has not come back is simply not erased yet, and a panic still keeps
 it. The write transaction deletes a row only if it is still the finished
 job that was read (same id, state and finish time), so a job erased in the
 meantime by another `Compact` is skipped. A hold placed in the service
-after its verdict was given and before the erasure commits is not seen; the
-window is one batch, and the same race exists for any hold decided before
-the delete.
+after its verdict was given and before the erasure commits is not seen.
+Every verdict in a batch is collected before any of that batch is erased,
+so in time the window is up to Batch × the hold's latency plus one write
+chunk: with the default batch of 256 and a 300 ms hold, about 77 s. The
+same race exists for any hold decided before the delete. Applications that
+need a tighter window use a smaller `Retention.Batch` or a faster hold.
 
 **Bounded batches.** `Compact` works in write transactions of at most
 `Retention.Batch` rows (`worker.DefaultCompactBatch` = 256 when zero,
