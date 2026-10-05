@@ -71,6 +71,13 @@ func (c *lineCollector) wait(t *testing.T, match func(string) bool) string {
 // foreground job, so a test can deliver Ctrl+C to that group alone.
 func startDevProcess(t *testing.T, dir string, args ...string) *devRun {
 	t.Helper()
+	return startDevCommand(t, dir, nil, append([]string{blokBinary(t), "dev"}, args...)...)
+}
+
+// startDevCommand runs argv (blok dev, possibly behind a wrapper that
+// execs it) like startDevProcess, with extra environment.
+func startDevCommand(t *testing.T, dir string, env []string, argv ...string) *devRun {
+	t.Helper()
 	run := &devRun{stdout: &lineCollector{}, done: make(chan struct{})}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -78,9 +85,9 @@ func startDevProcess(t *testing.T, dir string, args ...string) *devRun {
 	}
 	run.address = listener.Addr().String()
 	listener.Close()
-	run.command = exec.Command(blokBinary(t), append([]string{"dev"}, args...)...)
+	run.command = exec.Command(argv[0], argv[1:]...)
 	run.command.Dir = dir
-	run.command.Env = append(os.Environ(), "ADDR="+run.address)
+	run.command.Env = append(append(os.Environ(), "ADDR="+run.address), env...)
 	run.command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	run.command.Stderr = &run.stderr
 	stdout, err := run.command.StdoutPipe()

@@ -185,6 +185,13 @@ func (s *devSession) stop() []timedEvent {
 	return append([]timedEvent(nil), s.events...)
 }
 
+// snapshot returns every event so far, without stopping the session.
+func (s *devSession) snapshot() []timedEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]timedEvent(nil), s.events...)
+}
+
 func (s *devSession) dump() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()

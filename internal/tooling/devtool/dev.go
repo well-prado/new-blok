@@ -112,6 +112,7 @@ type DevEvent struct {
 	// Output is the redacted tail of the application's standard error.
 	Output      []string                `json:"output,omitempty"`
 	Diagnostics []diagnostic.Diagnostic `json:"diagnostics,omitempty"`
+	Resume      string                  `json:"resume,omitempty"` // STUB(a66-red)
 	// ExitCode is blok dev's own exit code, on the final stopped event.
 	ExitCode *int `json:"exitCode,omitempty"`
 }

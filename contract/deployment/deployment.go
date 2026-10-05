@@ -20,6 +20,9 @@ var (
 	ErrDraining   = errors.New("deployment: draining")
 )
 
+// STUB(a66-red): exit code only, no behaviour yet.
+const ExitRetainedIncompatible = 65
+
 type Config struct {
 	ListenerAddress string
 	External        bool
