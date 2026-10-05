@@ -18,6 +18,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"regexp"
+	"strings"
 )
 
 const (
@@ -367,14 +368,161 @@ func ValidLabel(value string) bool {
 }
 
 // sensitiveLogText matches credential-shaped free text. It is the single
-// pattern shared by inspection projections and telemetry exporters.
-var sensitiveLogText = regexp.MustCompile(`(?i)(\b(password|passwd|secret|token|authorization|credential|api[_-]?key|private[_-]?key)\b\s*[:=]\s*\S+|\bbearer\s+\S+|\bAKIA[0-9A-Z]{16}\b|\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b)`)
+// pattern shared by inspection projections, worker logs and telemetry
+// exporters; observe/redact adds the structured and encoded layers on top of
+// it (ADR 0021). Groups: 1-2 a sensitive key and its value (the key may carry
+// a prefix or suffix, "client_secret", "access_token", and may be quoted or
+// JSON-escaped, `\"password\":`); 3-4 an XML element; 5-6 a bearer token;
+// 7 a credential with an unconditional shape (cloud and provider token
+// prefixes, JWTs, URL userinfo, PEM private keys).
+var sensitiveLogText = regexp.MustCompile(`(?i)` +
+	`((?:password|passwd|pwd|passphrase|secret|token|authorization|credential|cookie|session[_-]?id|api[_-]?key|private[_-]?key)[a-z0-9_.-]*)\\?["']?\s*[:=]\s*\\?["']?((?:bearer\s+|basic\s+)?[^\s"'\\,;&<>]+)` +
+	`|<(password|passwd|pwd|passphrase|secret|token|api[_-]?key|private[_-]?key)>\s*([^<\s]+)` +
+	`|\b(bearer)\s+([A-Za-z0-9._~+/=-]+)` +
+	`|(\bAKIA[0-9A-Z]{16}\b|\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|\b[a-z][a-z0-9+.-]*://[^/\s:@]+:[^/\s@]+@|-----BEGIN [A-Z ]*PRIVATE KEY-----|\bgh[pousr]_[A-Za-z0-9]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}|\bsk-[A-Za-z0-9_-]{16,}|\bxox[abprs]-[A-Za-z0-9-]{10,})`)
+
+// sensitiveMarkers is a necessary condition for sensitiveLogText: text that
+// contains none of them (case-insensitively) cannot match, so the regular
+// expression runs only on the rare text that might.
+var sensitiveMarkers = []string{"password", "passwd", "pwd", "passphrase", "secret", "token", "authorization", "credential", "cookie", "session", "api", "private", "bearer", "akia", "eyj", "://", "-----begin", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "sk-", "xox"}
+
+// scanCredentials calls accept for each candidate match: the full key (the
+// marker with its prefix and suffix, lowercased; "bearer" for a bearer
+// token; "" for an unconditional shape), its value, and whether the match
+// has an unconditional credential shape. It reports whether accept returned
+// true for any.
+func scanCredentials(text string, accept func(key, value string, shaped bool) bool) bool {
+	lower := strings.ToLower(text)
+	found := false
+	for _, marker := range sensitiveMarkers {
+		if strings.Contains(lower, marker) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return false
+	}
+	group := func(m []int, i int) string {
+		if m[2*i] < 0 {
+			return ""
+		}
+		return text[m[2*i]:m[2*i+1]]
+	}
+	for _, m := range sensitiveLogText.FindAllStringSubmatchIndex(text, -1) {
+		var ok bool
+		switch {
+		case m[2] >= 0:
+			// The unanchored match starts at the marker; the key's prefix
+			// ("access_", "max_") precedes it.
+			start := m[2]
+			for start > 0 && keyByte(lower[start-1]) {
+				start--
+			}
+			ok = accept(lower[start:m[3]], group(m, 2), false)
+		case m[6] >= 0:
+			ok = accept(strings.ToLower(group(m, 3)), group(m, 4), false)
+		case m[10] >= 0:
+			ok = accept("bearer", group(m, 6), false)
+		default:
+			ok = accept("", group(m, 7), true)
+		}
+		if ok {
+			return true
+		}
+	}
+	return false
+}
+
+func keyByte(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_' || c == '.' || c == '-'
+}
+
+// tokenCountNames are the exact (normalized) names of model-token counts and
+// limits. Only these are exempt from the "token" marker: a plural key such
+// as refreshTokens, accessTokens or csrfTokens holds tokens and stays
+// sensitive.
+var tokenCountNames = map[string]bool{
+	"maxtokens": true, "totaltokens": true, "prompttokens": true, "completiontokens": true,
+	"inputtokens": true, "outputtokens": true, "maxoutputtokens": true, "maxinputtokens": true,
+	"maxcompletiontokens": true, "cachedtokens": true, "reasoningtokens": true, "numtokens": true,
+	"tokensused": true, "usedtokens": true, "tokencount": true, "tokenlimit": true,
+	"tokenbudget": true, "tokenusage": true, "maxtokenlimit": true,
+}
+
+// TokenCountKey reports whether key is the exact name of a model-token
+// count or limit, such as "max_tokens", "tokenLimit" or the last segment of
+// a dotted path ("usage.total_tokens"). Case and '_' '-' are ignored.
+func TokenCountKey(key string) bool {
+	if dot := strings.LastIndexAny(key, "./"); dot >= 0 {
+		key = key[dot+1:]
+	}
+	key = strings.ToLower(strings.NewReplacer("_", "", "-", "").Replace(key))
+	return tokenCountNames[key]
+}
+
+// SensitiveText reports whether text contains a credential-shaped fragment.
+// It is deliberately broad, for redacting projected copies: any value after
+// a sensitive key counts, except a plain number after an exact token-count
+// name ("max_tokens: 256"). A number after any other token key
+// ("access_token=48291736") is still redacted. It inspects the text as written;
+// observe/redact also inspects encoded forms.
+func SensitiveText(text string) bool {
+	return scanCredentials(text, func(key, value string, shaped bool) bool {
+		return shaped || !(TokenCountKey(key) && digits(value))
+	})
+}
+
+// CredentialText reports whether text contains an actual credential value,
+// not merely a sensitive word in prose: an unconditional credential shape,
+// or a value after a sensitive key or bearer scheme that looks generated (at
+// least 8 characters, with both letters and digits). Use it to refuse
+// content; use SensitiveText to redact it.
+func CredentialText(text string) bool {
+	return scanCredentials(text, func(_, value string, shaped bool) bool {
+		return shaped || LooksSecret(value)
+	})
+}
+
+// LooksSecret reports whether a value looks generated rather than written:
+// at least 8 characters (after an optional "Bearer "/"Basic " scheme) with
+// both a letter and a digit. "the new password" and "256" do not.
+func LooksSecret(value string) bool {
+	lower := strings.ToLower(value)
+	for _, scheme := range []string{"bearer ", "basic "} {
+		if strings.HasPrefix(lower, scheme) {
+			value = strings.TrimSpace(value[len(scheme):])
+		}
+	}
+	if len(value) < 8 {
+		return false
+	}
+	letter, digit := false, false
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		letter = letter || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+		digit = digit || c >= '0' && c <= '9'
+	}
+	return letter && digit
+}
+
+func digits(value string) bool {
+	if value == "" {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		if value[i] < '0' || value[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
 
 // RedactLogMessage replaces a log message that contains credential-shaped
 // text with a fixed marker. Pattern matching cannot find every secret in
 // prose; applications keep sensitive values in structured attributes.
 func RedactLogMessage(message string) string {
-	if sensitiveLogText.MatchString(message) {
+	if SensitiveText(message) {
 		return "[redacted: sensitive-looking log message]"
 	}
 	return message

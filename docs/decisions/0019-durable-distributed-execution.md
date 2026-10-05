@@ -41,7 +41,16 @@ accepted-run event would not make workflow execution recoverable.
   several engine calls (suspension at a wait, replay of committed steps after
   takeover), and per-attempt step events would report a suspension as a failed
   step and a restored output as a fresh completion; durable runs are inspected
-  through their committed journal.
+  through their committed journal. That journal is readable (#263): the
+  runtime's `InspectionSource` is an `inspection.Source` over the run, step and
+  wait records, owned by the run record's tenant, and the live event stream
+  reconstructs a cluster run from it and follows it by bounded polling until
+  its terminal state (ADR 0016). Live events would also be the wrong
+  mechanism here: the run executes on its partition owner's replica while the
+  event hub is process-local, so only readers on that replica would see them.
+  The source only reads: it replays committed outputs through the engine with
+  a journal that refuses dispatch, so inspection never invokes a node, never
+  writes, and never holds or alters durable execution.
 - Expose typed checkpoint decoding on `node.Any`; persisted raw JSON is schema
   validated before typed decoding, and interface-valued numbers retain
   `json.Number` precision. Decoding does not invoke a node or establish trust.

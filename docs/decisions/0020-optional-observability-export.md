@@ -7,6 +7,9 @@
   at the trigger boundary: #276.
 - Owners: observation port (`contract/observe`), engine instrumentation
   (`internal/engine`), OpenTelemetry exporter module (`observe/otel`)
+- Amended by: [ADR 0021](0021-sensitive-data-and-reliable-audit.md) (#80):
+  allowlisted log attributes with a sensitive key or a credential-shaped
+  value are exported as `[redacted]`; the shared credential pattern is wider
 
 ## Context
 

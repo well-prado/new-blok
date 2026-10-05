@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/well-prado/new-blok/contract/audit"
 	"github.com/well-prado/new-blok/internal/migration"
 	"github.com/well-prado/new-blok/store"
 )
@@ -56,12 +57,31 @@ type Hooks struct {
 type Config struct {
 	Clock func() time.Time
 	Hooks Hooks
+	// Audit is the durable audit journal (ADR 0021). Reconcile and
+	// DecideUpgrade require it and refuse without it. It must write to the
+	// same database, so each decision and its record commit together.
+	Audit *audit.Journal
+	// Hold is the application's legal-hold policy for run data: Compact
+	// keeps a completed run for which it returns true.
+	Hold func(RetainedRun) bool
+	// MinRetention is the application's legal minimum for run data: Compact
+	// never removes a run completed less than this long ago, whatever cutoff
+	// it is given. Negative is refused.
+	MinRetention time.Duration
+}
+
+// RetainedRun identifies a completed run Compact is about to delete.
+type RetainedRun struct {
+	RunID, Workflow, Principal string
 }
 
 type Journal struct {
 	database store.Database
 	clock    func() time.Time
 	hooks    Hooks
+	audit    *audit.Journal
+	hold     func(RetainedRun) bool
+	minimum  time.Duration
 }
 
 type AdmissionRequest struct {
@@ -146,7 +166,13 @@ func New(ctx context.Context, database store.Database, config Config) (*Journal,
 	if err := database.Integrity(ctx); err != nil {
 		return nil, fmt.Errorf("journal: integrity check: %w", err)
 	}
-	j := &Journal{database: database, clock: config.Clock, hooks: config.Hooks}
+	if config.Audit != nil && !config.Audit.Shares(database) {
+		return nil, errors.New("journal: audit must write to the journal's database")
+	}
+	if config.MinRetention < 0 {
+		return nil, errors.New("journal: minimum retention must not be negative")
+	}
+	j := &Journal{database: database, clock: config.Clock, hooks: config.Hooks, audit: config.Audit, hold: config.Hold, minimum: config.MinRetention}
 	if j.clock == nil {
 		j.clock = time.Now
 	}
@@ -196,7 +222,7 @@ func New(ctx context.Context, database store.Database, config Config) (*Journal,
 					return err
 				}
 			}
-			return nil
+			return j.migrateErasure(ctx, tx)
 		})
 	}); err != nil {
 		return nil, err
@@ -205,26 +231,9 @@ func New(ctx context.Context, database store.Database, config Config) (*Journal,
 }
 
 func ensureColumn(ctx context.Context, tx *sql.Tx, table, column, declaration string) error {
-	rows, err := tx.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s)", table))
-	if err != nil {
+	found, err := hasColumn(ctx, tx, table, column)
+	if err != nil || found {
 		return err
-	}
-	found := false
-	for rows.Next() {
-		var cid, notnull, pk int
-		var name, typ string
-		var def any
-		if err := rows.Scan(&cid, &name, &typ, &notnull, &def, &pk); err != nil {
-			rows.Close()
-			return err
-		}
-		found = found || name == column
-	}
-	if err := rows.Close(); err != nil {
-		return err
-	}
-	if found {
-		return nil
 	}
 	_, err = tx.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, declaration))
 	return err
@@ -349,24 +358,42 @@ var schemaStatements = []string{
 		manifest_json BLOB NOT NULL,
 		created_at INTEGER NOT NULL
 	)`,
-	`CREATE TABLE IF NOT EXISTS journal_reconciliations (
+	// A reconciliation's evidence, provider result and actor are kept with
+	// its run and erased with it, leaving the decision's identity and
+	// digests (#281). The table has no foreign key to journal_operations:
+	// the decision outlives its compacted operation.
+	reconciliationsTable("journal_reconciliations"),
+	// journal_meta holds the journal's own counters: erasure_generation
+	// counts compactions that erased content, purged_generation the latest
+	// one whose log purge succeeded (#281).
+	`CREATE TABLE IF NOT EXISTS journal_meta (name TEXT PRIMARY KEY, value INTEGER NOT NULL)`,
+	// The compaction tombstone proves a run existed and ended; it holds
+	// digests and timestamps only (#281).
+	`CREATE TABLE IF NOT EXISTS journal_compacted (
+		run_id TEXT PRIMARY KEY,
+		request_digest TEXT NOT NULL,
+		artifact_digest TEXT NOT NULL,
+		input_digest TEXT NOT NULL,
+		output_digest TEXT NOT NULL,
+		state TEXT NOT NULL,
+		completed_at INTEGER NOT NULL,
+		compacted_at INTEGER NOT NULL
+	)`,
+}
+
+func reconciliationsTable(name string) string {
+	return `CREATE TABLE IF NOT EXISTS ` + name + ` (
 		operation_key TEXT PRIMARY KEY,
+		run_id TEXT NOT NULL,
 		actor TEXT NOT NULL,
-		evidence TEXT NOT NULL,
-		result_json BLOB NOT NULL,
+		evidence TEXT,
+		result_json BLOB,
+		evidence_digest TEXT NOT NULL,
+		result_digest TEXT NOT NULL,
 		state TEXT NOT NULL,
 		created_at INTEGER NOT NULL,
-		FOREIGN KEY (operation_key) REFERENCES journal_operations(operation_key)
-	)`,
-	`CREATE TABLE IF NOT EXISTS journal_audit (
-		audit_id TEXT PRIMARY KEY,
-		run_id TEXT NOT NULL,
-		request_key TEXT NOT NULL,
-		artifact_digest TEXT NOT NULL,
-		state TEXT NOT NULL,
-		output_json BLOB,
-		created_at INTEGER NOT NULL
-	)`,
+		erased_at INTEGER
+	)`
 }
 
 func (j *Journal) Admit(ctx context.Context, request AdmissionRequest) (Admission, error) {

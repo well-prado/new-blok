@@ -69,7 +69,7 @@ func TestProcessKillApprovalDispatchPublication(t *testing.T) {
 		phase := os.Getenv("BLOK_APPROVAL_CRASH_PHASE")
 		r := setup(t, path)
 		barrier := &barrierDB{Database: r.db, phase: phase, marker: path + ".marker"}
-		a, err := approval.NewJournalStore(context.Background(), barrier, approval.Config{Authorizer: r.aAuthorizer(), Clock: func() time.Time { return r.clock }, MaxDecisions: 100})
+		a, err := approval.NewJournalStore(context.Background(), barrier, approval.Config{Audit: testAudit(t, barrier), Authorizer: r.aAuthorizer(), Clock: func() time.Time { return r.clock }, MaxDecisions: 100})
 		if err != nil {
 			t.Fatal(err)
 		}

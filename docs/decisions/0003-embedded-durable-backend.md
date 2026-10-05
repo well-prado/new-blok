@@ -14,7 +14,8 @@ The SQLite configuration used by the port is:
 - `synchronous=FULL`;
 - a 5-second busy timeout on every pooled connection, configurable through
   `sqlite.Backend.BusyTimeout`, that also bounds the writer queue (#214);
-- foreign-key enforcement enabled.
+- foreign-key enforcement enabled;
+- `secure_delete=ON` on every pooled connection (#281, below).
 
 `Database.WithTx` returns only after the transaction commit succeeds. Durable
 callers may acknowledge accepted work only after that return. This is a local
@@ -116,6 +117,40 @@ driver, so a rollback could not undo it there.
 | Change | Class | Migration |
 | --- | --- | --- |
 | `WithTx` rolls back when its callback, or the commit hook, panics or calls `runtime.Goexit`, then lets the panic continue (#267) | behavioral (bug fix) | None. Callbacks that return are unaffected. A caller that recovered a panic from `WithTx` and relied on the transaction staying open, which no API exposed, now finds it rolled back. Other `store.Database` implementations must do the same |
+
+## Secure deletion and purge (#281)
+
+Journal compaction is the framework's erasure (ADR 0021 §7), and a deleted
+SQLite row is not erased: its bytes stay in the page's free space, on freed
+pages, and in older write-ahead-log frames until something overwrites them.
+Measured on this backend (`store/sqlite/erasure_test.go`): rows inserted,
+updated and deleted with the previous settings were still readable in the
+file after a truncating checkpoint.
+
+- **`secure_delete=ON`** is set through the DSN (`_pragma`), so every pooled
+  connection has it, not only the one that ran `configure`. SQLite then
+  zeroes deleted content in the page and on freed and overflow pages. It is
+  on for the whole database, since every component shares it. Measured in
+  review over 500 operations, three interleaved samples, without and with
+  it: worker queue 295–342 vs 301–397 ms, journal 89–112 vs 87–121 ms,
+  journal compaction 27–29 vs 31–33 ms (about +12%).
+- **`store.Purger`** is a new optional `Database` capability. `PurgeLog`
+  runs `PRAGMA wal_checkpoint(TRUNCATE)` in the handle's writer turn, on a
+  connection whose busy timeout is at most 100 ms: the checkpoint holds
+  writers while it waits for readers, so it must not wait the store's full
+  timeout. It returns `store.ErrBusy` when a reader still needs the log,
+  having truncated nothing; the journal persists the pending purge and
+  retries it (ADR 0021 §7). `PurgeFree` runs `VACUUM` and then `PurgeLog`, removing
+  free space written before secure deletion was on; it rewrites the whole
+  database and needs free space of its size. `:memory:` has no log, so
+  `PurgeLog` is a no-op there.
+- `Backup` (`VACUUM INTO`) already writes a fresh file without free space or
+  log, so a backup taken after an erasure holds none of the erased content.
+
+| Change | Class | Migration |
+| --- | --- | --- |
+| `secure_delete=ON` on every connection (#281) | behavioral | None. Deletes and updates write zeros over freed space; content deleted before the upgrade stays until `PurgeFree` |
+| `store.Purger`, `store.PurgerOf`; `sqlite` implements it | additive | Optional; other `store.Database` implementations need not purge, and the journal then reports `LogPurged = false` |
 
 ## Alternatives considered
 

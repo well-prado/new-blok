@@ -1,0 +1,526 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Synthetic redaction fixtures for ADR 0021. Every secret-shaped string is synthetic. Boundary cases record content the redactor is documented NOT to find.",
+  "cases": [
+    {
+      "name": "sensitive-keys",
+      "kind": "value",
+      "input": {
+        "password": "SYNTHETIC-pw-0001",
+        "Api-Key": "SYNTHETIC-0002",
+        "client.secret": "SYNTHETIC-0003",
+        "sessionId": "SYNTHETIC-0004",
+        "sku": "coffee"
+      },
+      "expected": {
+        "password": "[redacted]",
+        "Api-Key": "[redacted]",
+        "client.secret": "[redacted]",
+        "sessionId": "[redacted]",
+        "sku": "coffee"
+      },
+      "redacted": 4
+    },
+    {
+      "name": "bearer-value",
+      "kind": "value",
+      "input": {
+        "note": "Bearer SYNTHETIC-0005"
+      },
+      "expected": {
+        "note": "[redacted]"
+      },
+      "redacted": 1
+    },
+    {
+      "name": "prefixed-assignment",
+      "kind": "value",
+      "input": {
+        "note": "retry with access_token=SYNTHETIC-0006"
+      },
+      "expected": {
+        "note": "[redacted]"
+      },
+      "redacted": 1
+    },
+    {
+      "name": "jwt-shape",
+      "kind": "value",
+      "input": {
+        "t": "eyJhbGciOiJub25lIn0.eyJzdWIiOiJzeW50aGV0aWMifQ.c3ludGhldGlj"
+      },
+      "expected": {
+        "t": "[redacted]"
+      },
+      "redacted": 1
+    },
+    {
+      "name": "json-in-string",
+      "kind": "value",
+      "input": {
+        "payload": "{\"password\": \"SYNTHETIC-0007\"}"
+      },
+      "expected": {
+        "payload": "[redacted]"
+      },
+      "redacted": 1
+    },
+    {
+      "name": "json-in-string-nested",
+      "kind": "value",
+      "input": {
+        "payload": "[{\"user\": \"a\", \"apiKey\": \"SYNTHETIC-0008\"}]"
+      },
+      "expected": {
+        "payload": "[redacted]"
+      },
+      "redacted": 1
+    },
+    {
+      "name": "json-in-string-escaped-key",
+      "kind": "value",
+      "input": {
+        "payload": "{\"pass\\u0077ord\":\"SYNTHETIC-0023\"}"
+      },
+      "expected": {
+        "payload": "[redacted]"
+      },
+      "redacted": 1
+    },
+    {
+      "name": "json-in-string-key-only-known-structurally",
+      "kind": "value",
+      "input": {
+        "payload": "{\"session_cookie\": \"SYNTHETIC-0024\"}"
+      },
+      "expected": {
+        "payload": "[redacted]"
+      },
+      "redacted": 1
+    },
+    {
+      "name": "url-encoded",
+      "kind": "value",
+      "input": {
+        "q": "password%3DSYNTHETIC-0009"
+      },
+      "expected": {
+        "q": "[redacted]"
+      },
+      "redacted": 1
+    },
+    {
+      "name": "url-userinfo",
+      "kind": "value",
+      "input": {
+        "dsn": "postgres://app:SYNTHETIC-0010@db.example.test/app"
+      },
+      "expected": {
+        "dsn": "[redacted]"
+      },
+      "redacted": 1
+    },
+    {
+      "name": "base64-assignment",
+      "kind": "value",
+      "input": {
+        "blob": "cGFzc3dvcmQ9U1lOVEhFVElDLTAwMTE="
+      },
+      "expected": {
+        "blob": "[redacted]"
+      },
+      "redacted": 1
+    },
+    {
+      "name": "base64url-json",
+      "kind": "value",
+      "input": {
+        "blob": "eyJhcGlfa2V5IjogIlNZTlRIRVRJQy0wMDEyIn0"
+      },
+      "expected": {
+        "blob": "[redacted]"
+      },
+      "redacted": 1
+    },
+    {
+      "name": "double-base64",
+      "kind": "value",
+      "input": {
+        "blob": "ZEc5clpXNDZJRk5aVGxSSVJWUkpReTB3TURFeg=="
+      },
+      "expected": {
+        "blob": "[redacted]"
+      },
+      "redacted": 1
+    },
+    {
+      "name": "base64-query-value",
+      "kind": "value",
+      "input": {
+        "link": "https://example.test/cb?state=c2VjcmV0PVNZTlRIRVRJQy0wMDE0&x=1"
+      },
+      "expected": {
+        "link": "[redacted]"
+      },
+      "redacted": 1
+    },
+    {
+      "name": "basic-auth",
+      "kind": "value",
+      "input": {
+        "h": "Basic c3ZjOlNZTlRIRVRJQy0wMDE1"
+      },
+      "expected": {
+        "h": "[redacted]"
+      },
+      "redacted": 1
+    },
+    {
+      "name": "pem-private-key",
+      "kind": "value",
+      "input": {
+        "k": "-----BEGIN RSA PRIVATE KEY-----\nSYNTHETIC0016\n-----END RSA PRIVATE KEY-----"
+      },
+      "expected": {
+        "k": "[redacted]"
+      },
+      "redacted": 1
+    },
+    {
+      "name": "nested-array",
+      "kind": "value",
+      "input": {
+        "items": [
+          {
+            "sku": "tea"
+          },
+          {
+            "auth": {
+              "authorization": "SYNTHETIC-0017"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "items": [
+          {
+            "sku": "tea"
+          },
+          {
+            "auth": {
+              "authorization": "[redacted]"
+            }
+          }
+        ]
+      },
+      "redacted": 1
+    },
+    {
+      "name": "ordinary-content-unchanged",
+      "kind": "value",
+      "input": {
+        "sku": "coffee",
+        "note": "quote calculated",
+        "digest": "sha256:abababababababababababababababababababababababababababababababab",
+        "image": "iVBORw0KGgoAAAANSUhEUv/+AQKciA==",
+        "count": 3,
+        "basic": "basic configuration applied",
+        "ratio": 0.25
+      },
+      "expected": {
+        "sku": "coffee",
+        "note": "quote calculated",
+        "digest": "sha256:abababababababababababababababababababababababababababababababab",
+        "image": "iVBORw0KGgoAAAANSUhEUv/+AQKciA==",
+        "count": 3,
+        "basic": "basic configuration applied",
+        "ratio": 0.25
+      },
+      "redacted": 0
+    },
+    {
+      "name": "boundary-hex-encoded-not-detected",
+      "kind": "value",
+      "boundary": true,
+      "input": {
+        "blob": "70617373776f72643d53594e5448455449432d30303138"
+      },
+      "expected": {
+        "blob": "70617373776f72643d53594e5448455449432d30303138"
+      },
+      "redacted": 0
+    },
+    {
+      "name": "boundary-unmarked-prose-not-detected",
+      "kind": "value",
+      "boundary": true,
+      "input": {
+        "note": "the vault value is SYNTHETIC-0019"
+      },
+      "expected": {
+        "note": "the vault value is SYNTHETIC-0019"
+      },
+      "redacted": 0
+    },
+    {
+      "name": "boundary-four-encodings-not-detected",
+      "kind": "value",
+      "boundary": true,
+      "input": {
+        "blob": "V2tWak5XTnNjRmhPUkd4V1RWZDRVRlpyVm05U2JGcEdZa1ZTVFZaRlJqTlVWM0JDVUZFOVBRPT0="
+      },
+      "expected": {
+        "blob": "V2tWak5XTnNjRmhPUkd4V1RWZDRVRlpyVm05U2JGcEdZa1ZTVFZaRlJqTlVWM0JDVUZFOVBRPT0="
+      },
+      "redacted": 0
+    },
+    {
+      "name": "message-assignment",
+      "kind": "message",
+      "input": "login failed for client_secret=SYNTHETIC-0021",
+      "expected": "[redacted: sensitive-looking log message]",
+      "redacted": 1
+    },
+    {
+      "name": "message-base64",
+      "kind": "message",
+      "input": "forwarding header QXV0aG9yaXphdGlvbjogQmVhcmVyIFNZTlRIRVRJQy0wMDIy",
+      "expected": "[redacted: sensitive-looking log message]",
+      "redacted": 1
+    },
+    {
+      "name": "message-ordinary",
+      "kind": "message",
+      "input": "quote calculated for 2 items",
+      "expected": "quote calculated for 2 items",
+      "redacted": 0
+    },
+    {
+      "name": "padded-base64-in-key-value",
+      "kind": "value",
+      "input": {
+        "d": "data=cGFzc3dvcmQ9U1lOVEhFVElDLXBhZC0wMQ=="
+      },
+      "expected": {
+        "d": "[redacted]"
+      },
+      "redacted": 1
+    },
+    {
+      "name": "padded-base64-percent-encoded-query-value",
+      "kind": "value",
+      "input": {
+        "link": "https://example.test/cb?state=c2VjcmV0PVNZTlRIRVRJQy1xMg%3D%3D&x=1"
+      },
+      "expected": {
+        "link": "[redacted]"
+      },
+      "redacted": 1
+    },
+    {
+      "name": "base64url-alphabet",
+      "kind": "value",
+      "input": {
+        "blob": "dG9rZW49U1lOVEhFVElDLXVybC0xfn4_"
+      },
+      "expected": {
+        "blob": "[redacted]"
+      },
+      "redacted": 1
+    },
+    {
+      "name": "triple-base64",
+      "kind": "value",
+      "input": {
+        "blob": "WkVjNWNscFhORGxWTVd4UFZrVm9SbFpGYkVSTVdGSjVZVmhDYzFwVE1IZE5VVDA5"
+      },
+      "expected": {
+        "blob": "[redacted]"
+      },
+      "redacted": 1
+    },
+    {
+      "name": "plus-decoded-as-space",
+      "kind": "value",
+      "input": {
+        "q": "password+%3D+SYNTHETIC-plus-01"
+      },
+      "expected": {
+        "q": "[redacted]"
+      },
+      "redacted": 1
+    },
+    {
+      "name": "cookie-header-text",
+      "kind": "value",
+      "input": {
+        "h": "Cookie: sid=SYNTHETIC-cookie-01",
+        "s": "Set-Cookie: session=SYNTHETIC-cookie-02; Path=/",
+        "t": "sessionid=SYNTHETIC-sess-03"
+      },
+      "expected": {
+        "h": "[redacted]",
+        "s": "[redacted]",
+        "t": "[redacted]"
+      },
+      "redacted": 3
+    },
+    {
+      "name": "pwd-and-passphrase-keys",
+      "kind": "value",
+      "input": {
+        "pwd": "SYNTHETIC-pwd-01",
+        "key_passphrase": "SYNTHETIC-pp-02",
+        "note": "ops pwd=SYNTHETIC-pwd-03"
+      },
+      "expected": {
+        "pwd": "[redacted]",
+        "key_passphrase": "[redacted]",
+        "note": "[redacted]"
+      },
+      "redacted": 3
+    },
+    {
+      "name": "provider-token-prefixes",
+      "kind": "value",
+      "input": {
+        "gh": "ghp_SYNTHETICabcdefghijklmnop0123",
+        "oa": "sk-SYNTHETICabcdefghij0123",
+        "sl": "xoxb-SYNTHETIC-0123456789"
+      },
+      "expected": {
+        "gh": "[redacted]",
+        "oa": "[redacted]",
+        "sl": "[redacted]"
+      },
+      "redacted": 3
+    },
+    {
+      "name": "escaped-json-in-prose",
+      "kind": "value",
+      "input": {
+        "note": "body={\\\"password\\\":\\\"SYNTHETIC-esc-01\\\"}"
+      },
+      "expected": {
+        "note": "[redacted]"
+      },
+      "redacted": 1
+    },
+    {
+      "name": "xml-element",
+      "kind": "value",
+      "input": {
+        "note": "<user>a</user><password>SYNTHETIC-xml-01</password>"
+      },
+      "expected": {
+        "note": "[redacted]"
+      },
+      "redacted": 1
+    },
+    {
+      "name": "token-counts-are-not-tokens",
+      "kind": "value",
+      "input": {
+        "usage": {
+          "total_tokens": 1234,
+          "prompt_tokens": 1000
+        },
+        "max_tokens": 256,
+        "tokenLimit": 4096,
+        "note": "max_tokens: 256 by default"
+      },
+      "expected": {
+        "usage": {
+          "total_tokens": 1234,
+          "prompt_tokens": 1000
+        },
+        "max_tokens": 256,
+        "tokenLimit": 4096,
+        "note": "max_tokens: 256 by default"
+      },
+      "redacted": 0
+    },
+    {
+      "name": "plural-token-keys-hold-tokens",
+      "kind": "value",
+      "input": {
+        "refreshTokens": [
+          "SYNTHETIC8f3kQ2pLz9xVb7Rm1nTw"
+        ],
+        "accessTokens": [
+          "SYNTHETIC-at-01"
+        ],
+        "apiTokens": "SYNTHETIC-api-02",
+        "auth_tokens": "SYNTHETIC-auth-03",
+        "pushTokens": [
+          "SYNTHETIC-push-04"
+        ],
+        "csrfTokens": "SYNTHETIC-csrf-05"
+      },
+      "expected": {
+        "refreshTokens": "[redacted]",
+        "accessTokens": "[redacted]",
+        "apiTokens": "[redacted]",
+        "auth_tokens": "[redacted]",
+        "pushTokens": "[redacted]",
+        "csrfTokens": "[redacted]"
+      },
+      "redacted": 6
+    },
+    {
+      "name": "digits-after-token-keys-in-text",
+      "kind": "value",
+      "input": {
+        "a": "retry with access_token=48291736",
+        "b": "session_token: 82734561",
+        "c": "usage.total_tokens: 1234",
+        "d": "maxTokens=4096"
+      },
+      "expected": {
+        "a": "[redacted]",
+        "b": "[redacted]",
+        "c": "usage.total_tokens: 1234",
+        "d": "maxTokens=4096"
+      },
+      "redacted": 2
+    },
+    {
+      "name": "message-digits-after-access-token",
+      "kind": "message",
+      "input": "refresh failed for access_token=48291736",
+      "expected": "[redacted: sensitive-looking log message]",
+      "redacted": 1
+    },
+    {
+      "name": "boundary-unicode-escaped-json-after-prefix-not-detected",
+      "kind": "value",
+      "boundary": true,
+      "input": {
+        "note": "body={\"pass\\u0077ord\":\"SYNTHETIC-uesc-01\"}"
+      },
+      "expected": {
+        "note": "body={\"pass\\u0077ord\":\"SYNTHETIC-uesc-01\"}"
+      },
+      "redacted": 0
+    },
+    {
+      "name": "boundary-gzip-base64-not-detected",
+      "kind": "value",
+      "boundary": true,
+      "input": {
+        "blob": "H4sIAAAAAAAC/ytILC4uzy9KsQ2O9AvxcA3xdNZNr8os0DUwBADbuEkZGgAAAA=="
+      },
+      "expected": {
+        "blob": "H4sIAAAAAAAC/ytILC4uzy9KsQ2O9AvxcA3xdNZNr8os0DUwBADbuEkZGgAAAA=="
+      },
+      "redacted": 0
+    },
+    {
+      "name": "message-token-count-kept",
+      "kind": "message",
+      "input": "request used max_tokens: 256",
+      "expected": "request used max_tokens: 256",
+      "redacted": 0
+    }
+  ]
+}
