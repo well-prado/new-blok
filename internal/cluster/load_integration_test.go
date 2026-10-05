@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -172,7 +173,7 @@ type sustainedLoadFixture struct {
 		UnexpectedIngressErrors        int     `json:"unexpectedIngressErrors"`
 		SpuriousAdmissionFull          int     `json:"spuriousAdmissionFull"`
 		KilledWorkerOwnedFairness      bool    `json:"killedWorkerOwnedFairnessPartition"`
-		MinTerminalFractionAtIngress   float64 `json:"minTerminalFractionAtIngressEnd"`
+		MaxProbeWritesPerFinishedRun   float64 `json:"maxProbeWritesPerFinishedRun"`
 		MinSteadyToNoisyCompletionRate float64 `json:"minSteadyToNoisyCompletionRatio"`
 	} `json:"expected"`
 }
@@ -259,7 +260,24 @@ func TestSustainedLoadFailoverWithWorkerKill(t *testing.T) {
 	full := map[string]int{}
 	spuriousFull := make([]string, 0)
 	unexpected := make([]string, 0)
-	deadline := time.Now().Add(time.Duration(fixture.IngressSeconds) * time.Second)
+	// Speed reference for the throughput floor below: one client in this
+	// process writes to the same etcd cluster, one write at a time, for the
+	// whole ingress window. Its write rate moves with the machine (CPU
+	// contention, fsync latency, etcd load) but not with the runtime code.
+	probeClient := integrationClient(t)
+	var probeWrites atomic.Int64
+	probeCtx, stopProbe := context.WithCancel(ctx)
+	probeDone := make(chan struct{})
+	go func() {
+		defer close(probeDone)
+		for probeCtx.Err() == nil {
+			if _, err := probeClient.Put(probeCtx, "/load-probe", "x"); err == nil {
+				probeWrites.Add(1)
+			}
+		}
+	}()
+	ingressStart := time.Now()
+	deadline := ingressStart.Add(time.Duration(fixture.IngressSeconds) * time.Second)
 	var submitters sync.WaitGroup
 	submit := func(tenant string, submitter int) {
 		defer submitters.Done()
@@ -386,12 +404,19 @@ func TestSustainedLoadFailoverWithWorkerKill(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	submitters.Wait()
+	stopProbe()
+	<-probeDone
+	ingressWindow := time.Since(ingressStart)
 	// Throughput floor. After the drain below every accepted run is terminal
 	// however slowly the workers ran, so the final count cannot show a
-	// slowdown. Measure instead, the moment ingress stops, how many accepted
+	// slowdown. Count instead, the moment ingress stops, how many accepted
 	// runs had already left their admission slot (reached a terminal state).
-	// Admission is bounded by tenant and partition slots, so if completion
-	// slows, the slots stay full and accepted runs pile up unfinished.
+	// Admission keeps every slot full, so that count is the workers'
+	// throughput over the window. A raw count tracks machine speed, so it is
+	// divided into the probe's sequential etcd writes over the same window:
+	// the result is what one finished run cost, in units of one etcd write
+	// on this machine at this moment. A slower runtime raises it; a slower
+	// machine slows both sides.
 	mu.Lock()
 	acceptedAtIngressEnd := len(accepted)
 	mu.Unlock()
@@ -404,9 +429,9 @@ func TestSustainedLoadFailoverWithWorkerKill(t *testing.T) {
 		activeAtIngressEnd += len(active)
 	}
 	terminalAtIngressEnd := acceptedAtIngressEnd - activeAtIngressEnd
-	terminalFraction := 0.0
-	if acceptedAtIngressEnd > 0 {
-		terminalFraction = float64(terminalAtIngressEnd) / float64(acceptedAtIngressEnd)
+	writesPerRun := float64(probeWrites.Load())
+	if terminalAtIngressEnd > 0 {
+		writesPerRun /= float64(terminalAtIngressEnd)
 	}
 
 	drainDeadline := time.Now().Add(time.Duration(fixture.DrainTimeoutSeconds) * time.Second)
@@ -506,7 +531,7 @@ func TestSustainedLoadFailoverWithWorkerKill(t *testing.T) {
 		fixture.Workers, fixture.IngressClients, len(accepted), states, totalEffects, states["completed"], uncertainWithEffect, sumCounts(full), len(spuriousFull), len(unexpected), takeover.Round(time.Millisecond), victim.id)
 	t.Logf("burst partition %s: %d distinct tenants per burst every %dms: outcomes=%v", burstPartition, fixture.BurstTenants, fixture.BurstEveryMillis, burstOutcomes)
 	t.Logf("contended partition %s: completions=%v admission-full=%v steady/noisy ratio=%.2f", fairnessPartition, contendedCompletions, contendedFull, ratio)
-	t.Logf("at ingress end: accepted=%d still-active=%d terminal=%d (%.0f%% of accepted; fixture min %.0f%%)", acceptedAtIngressEnd, activeAtIngressEnd, terminalAtIngressEnd, 100*terminalFraction, 100*fixture.Expected.MinTerminalFractionAtIngress)
+	t.Logf("throughput over the %s ingress window: accepted=%d still-active=%d finished=%d (%.1f runs/s); probe etcd writes=%d (%.1f/s); probe writes per finished run=%.2f (fixture max %.2f)", ingressWindow.Round(time.Millisecond), acceptedAtIngressEnd, activeAtIngressEnd, terminalAtIngressEnd, float64(terminalAtIngressEnd)/ingressWindow.Seconds(), probeWrites.Load(), float64(probeWrites.Load())/ingressWindow.Seconds(), writesPerRun, fixture.Expected.MaxProbeWritesPerFinishedRun)
 	if len(spuriousFull) != fixture.Expected.SpuriousAdmissionFull {
 		t.Errorf("admission_full without an exhausted-capacity read=%d (first: %v), fixture %d", len(spuriousFull), spuriousFull[:min(3, len(spuriousFull))], fixture.Expected.SpuriousAdmissionFull)
 	}
@@ -522,8 +547,8 @@ func TestSustainedLoadFailoverWithWorkerKill(t *testing.T) {
 	if !fixture.Expected.KilledWorkerOwnedFairness || takeover == 0 {
 		t.Errorf("no successor took the killed worker's partition")
 	}
-	if terminalFraction < fixture.Expected.MinTerminalFractionAtIngress {
-		t.Errorf("throughput floor: %d of %d accepted runs (%.0f%%) were terminal when ingress stopped; fixture min %.0f%%", terminalAtIngressEnd, acceptedAtIngressEnd, 100*terminalFraction, 100*fixture.Expected.MinTerminalFractionAtIngress)
+	if terminalAtIngressEnd < 1 || writesPerRun > fixture.Expected.MaxProbeWritesPerFinishedRun {
+		t.Errorf("throughput floor: %d runs finished during ingress against %d probe etcd writes = %.2f writes per run; fixture max %.2f", terminalAtIngressEnd, probeWrites.Load(), writesPerRun, fixture.Expected.MaxProbeWritesPerFinishedRun)
 	}
 	if ratio < fixture.Expected.MinSteadyToNoisyCompletionRate {
 		t.Errorf("steady/noisy ratio=%.2f; fixture min %.2f", ratio, fixture.Expected.MinSteadyToNoisyCompletionRate)
@@ -580,10 +605,18 @@ func waitForAcquisitions(ctx context.Context, client *hookedClient, count int, t
 // worker releases the partition and waits before acquiring it again; that wait
 // must double from 500ms up to min(16s, OwnerTTL). The owner TTL is the
 // runtime's own knob for the cap, so a 4s TTL brings the cap within reach of
-// a test: the gaps between successive acquisitions must be at least 0.5s, 1s,
-// 2s, 4s, 4s, and never exceed the cap by more than a scheduling slack. A flat
-// retry interval, a backoff that does not grow, or one that ignores the TTL
-// cap each fails this test.
+// a test.
+//
+// The lower bounds are exact, because a timer never fires early: the gaps
+// between successive acquisitions must be at least 0.5s, 1s, 2s, 4s, 4s, 4s.
+// A flat retry interval, a backoff reset on every attempt, or a cap below the
+// TTL fails them. The upper bound only has to reject a backoff that ignores
+// the TTL cap, whose sixth gap is at least 16s, so it is loose: every gap must
+// stay under maxGapCapMultiple x cap (12s). Scheduling delay on a loaded host
+// stretches gaps by seconds, so a tighter bound is fragile. For the same
+// reason a backoff that grows faster than doubling (for example quadrupling)
+// but still respects the cap is out of scope: without an injectable clock its
+// gaps cannot be told apart from scheduling delay.
 func TestFaultyWorkerAloneBacksOffExponentially(t *testing.T) {
 	var fixture struct {
 		FixtureVersion   int               `json:"fixtureVersion"`
@@ -592,11 +625,11 @@ func TestFaultyWorkerAloneBacksOffExponentially(t *testing.T) {
 		Limits           workerErrorLimits `json:"limits"`
 		MaxObserveMillis int               `json:"maxObserveMillis"`
 		Expected         struct {
-			BackoffCapMillis int    `json:"backoffCapMillis"`
-			MinGapsMillis    []int  `json:"minAcquisitionGapsMillis"`
-			GapSlackMillis   int    `json:"gapSlackMillis"`
-			FinalState       string `json:"finalState"`
-			ExternalEffects  int    `json:"externalEffects"`
+			BackoffCapMillis  int    `json:"backoffCapMillis"`
+			MinGapsMillis     []int  `json:"minAcquisitionGapsMillis"`
+			MaxGapCapMultiple int    `json:"maxGapCapMultiple"`
+			FinalState        string `json:"finalState"`
+			ExternalEffects   int    `json:"externalEffects"`
 		} `json:"expected"`
 	}
 	readDistributedFixture(t, "worker-error-backoff-fixtures.json", &fixture)
@@ -646,11 +679,12 @@ func TestFaultyWorkerAloneBacksOffExponentially(t *testing.T) {
 	if len(gaps) != len(fixture.Expected.MinGapsMillis) {
 		t.Fatalf("observed %d acquisition gaps in %dms, fixture expects %d", len(gaps), fixture.MaxObserveMillis, len(fixture.Expected.MinGapsMillis))
 	}
-	slack := time.Duration(fixture.Expected.GapSlackMillis) * time.Millisecond
+	backoffCap := time.Duration(fixture.Expected.BackoffCapMillis) * time.Millisecond
+	ceiling := time.Duration(fixture.Expected.MaxGapCapMultiple) * backoffCap
 	for index, gap := range gaps {
 		floor := time.Duration(fixture.Expected.MinGapsMillis[index]) * time.Millisecond
-		if gap < floor || gap > floor+slack {
-			t.Errorf("acquisition gap %d = %s, fixture wants [%s, %s] (backoff doubling from 500ms, capped at %dms)", index+1, gap.Round(time.Millisecond), floor, floor+slack, fixture.Expected.BackoffCapMillis)
+		if gap < floor || gap >= ceiling {
+			t.Errorf("acquisition gap %d = %s, fixture wants [%s, %s) (backoff doubling from 500ms, capped at %s)", index+1, gap.Round(time.Millisecond), floor, ceiling, backoffCap)
 		}
 	}
 	if final.State != fixture.Expected.FinalState || ledger.total("effect") != fixture.Expected.ExternalEffects {

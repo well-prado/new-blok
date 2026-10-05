@@ -29,7 +29,7 @@
     "unexpectedIngressErrors": 0,
     "spuriousAdmissionFull": 0,
     "killedWorkerOwnedFairnessPartition": true,
-    "minTerminalFractionAtIngressEnd": 0.5,
+    "maxProbeWritesPerFinishedRun": 11,
     "minSteadyToNoisyCompletionRatio": 0.5
   }
 }

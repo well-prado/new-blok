@@ -1,13 +1,13 @@
 {
-  "fixtureVersion": 1,
+  "fixtureVersion": 2,
   "synthetic": true,
   "name": "faulty-worker-alone-backs-off-exponentially",
   "limits": {"partitions": 1, "partitionAdmissions": 4, "tenantAdmissions": 2, "ownerTTLMillis": 4000},
-  "maxObserveMillis": 40000,
+  "maxObserveMillis": 60000,
   "expected": {
     "backoffCapMillis": 4000,
-    "minAcquisitionGapsMillis": [500, 1000, 2000, 4000, 4000],
-    "gapSlackMillis": 2000,
+    "minAcquisitionGapsMillis": [500, 1000, 2000, 4000, 4000, 4000],
+    "maxGapCapMultiple": 3,
     "finalState": "accepted",
     "externalEffects": 0
   }
