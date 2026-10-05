@@ -1,0 +1,36 @@
+Descriptor failures: missing, computed (not static), two identities in one node, invalid grammar, and an unparsable file.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"classic","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+
+go 1.27.0
+-- runtimes/go/nodes/empty/empty.go --
+package empty
+-- runtimes/go/nodes/computed/computed.go --
+package computed
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine(nameFromEnv(), "1.0.0", nil)
+-- runtimes/go/nodes/twice/twice.go --
+package twice
+
+import "github.com/well-prado/new-blok/node"
+
+var A = node.MustDefine("shop/a", "1.0.0", nil)
+var B = node.MustDefine("shop/b", "1.0.0", nil)
+-- runtimes/go/nodes/badname/badname.go --
+package badname
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("Shop/../Quote", "v1", nil)
+-- runtimes/go/nodes/broken/broken.go --
+package broken
+
+func {
+-- runtimes/nodejs/nodes/nodesc/index.mjs --
+export default () => ({})
+-- @expect --
+{"diagnostics":[["layout_descriptor_invalid","runtimes/go/nodes/badname/badname.go:5"],["layout_descriptor_missing","runtimes/go/nodes/empty"],["layout_descriptor_missing","runtimes/nodejs/nodes/nodesc"],["layout_descriptor_multiple","runtimes/go/nodes/twice/twice.go:6"],["layout_descriptor_not_static","runtimes/go/nodes/computed/computed.go:5"],["layout_parse_failed","runtimes/go/nodes/broken/broken.go"]]}

@@ -1,0 +1,21 @@
+Two unconstrained files of one directory declare different packages; the go tool would refuse the directory, so its Defines are not trusted.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+
+go 1.27.0
+-- nodes/go/split/a.go --
+package a
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/a", "1.0.0", nil)
+-- nodes/go/split/b.go --
+package main
+
+import "github.com/well-prado/new-blok/node"
+
+var Main = node.MustDefine("shop/b", "1.0.0", nil)
+-- @expect --
+{"diagnostics":[["layout_package_mismatch","nodes/go/split/a.go"],["layout_package_mismatch","nodes/go/split/b.go"]]}

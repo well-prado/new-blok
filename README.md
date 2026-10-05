@@ -61,7 +61,10 @@ under `nodes/go/` instead of `runtimes/go/nodes/`. `blok new` runs
 The framework generator analyzes Go source without executing package
 initializers and writes only marked generated files. In the application,
 `blok generate` regenerates the accessors from the types file `blok.json`
-names; repeat it with `--check` to verify byte-stable output.
+names; repeat it with `--check` to verify byte-stable output. `blok.json` is validated when read: an unknown field or a
+path outside the project is refused. It may list explicit `workflows` paths
+(default `workflows`); layout discovery reads nodes and workflows from their
+descriptors without running code ([ADR 0023](docs/decisions/0023-layout-discovery.md)).
 
 The initial toolchain is Go 1.27.1. The first application milestone delivers a quote service that can be authored, tested and served entirely in Go. Follow the [roadmap](ROADMAP.md) for implementation order, issue dependencies, and exit evidence.
 

@@ -1,0 +1,38 @@
+Scope: only a package-level var initializer may use package constants. A constructor whose parameter or local constant shadows the package constant, and a Define inside a closure, are refused: discovery would otherwise report shop/good while the built node registers something else.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+
+go 1.27.0
+-- nodes/go/param/param.go --
+package param
+
+import "github.com/well-prado/new-blok/node"
+
+const name = "shop/good"
+
+func New(name string) (node.Definition[int, int], error) {
+	return node.Define(name, "1.0.0", nil)
+}
+-- nodes/go/local/local.go --
+package local
+
+import "github.com/well-prado/new-blok/node"
+
+const name = "shop/good"
+
+func New() (node.Definition[int, int], error) {
+	const name = "shop/evil"
+	return node.Define(name, "1.0.0", nil)
+}
+-- nodes/go/closure/closure.go --
+package closure
+
+import "github.com/well-prado/new-blok/node"
+
+var Make = func() node.Definition[int, int] {
+	return node.MustDefine("shop/closure", "1.0.0", nil)
+}
+-- @expect --
+{"diagnostics":[["layout_descriptor_not_static","nodes/go/closure/closure.go:6"],["layout_descriptor_not_static","nodes/go/local/local.go:9"],["layout_descriptor_not_static","nodes/go/param/param.go:8"]]}

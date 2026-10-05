@@ -1,0 +1,21 @@
+In-root aliases: a second node directory linked to an existing one would discover shop/quote twice; a linked file would give one source two owners.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+
+go 1.27.0
+-- nodes/go/quote/quote.go --
+package quote
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/quote", "1.0.0", nil)
+-- internal/shared/shared.go --
+package shared
+-- @links --
+nodes/go/copy -> quote
+nodes/go/quote/shared.go -> ../../../internal/shared/shared.go
+nodes/go/quote/absolute.go -> $ROOT/internal/shared/shared.go
+-- @expect --
+{"diagnostics":[["layout_symlink_alias","nodes/go/copy"],["layout_symlink_alias","nodes/go/quote/absolute.go"],["layout_symlink_alias","nodes/go/quote/shared.go"]]}

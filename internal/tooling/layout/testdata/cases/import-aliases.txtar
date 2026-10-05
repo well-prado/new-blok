@@ -1,0 +1,36 @@
+Import aliases, a dot import, generic MustDefine and package constants are all read statically; aliases never hide identity.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+
+go 1.27.0
+-- nodes/go/aliased/aliased.go --
+package aliased
+
+import blok "github.com/well-prado/new-blok/node"
+
+const (
+	namespace = "shop/"
+	version   = "3.2.1"
+)
+
+var Node = blok.MustDefine[In, Out](namespace+"aliased", version, nil)
+-- nodes/go/dotted/dotted.go --
+package dotted
+
+import . "github.com/well-prado/new-blok/node"
+
+var Node, _ = Define[In, Out]("shop/dotted", "1.0.0", nil)
+-- nodes/go/blank/blank.go --
+package blank
+
+import (
+	_ "github.com/well-prado/new-blok/node"
+
+	real "github.com/well-prado/new-blok/node"
+)
+
+var Node = real.MustDefine("shop/blank", "1.0.0", nil)
+-- @expect --
+{"catalog":{"version":1,"nodes":[{"name":"shop/aliased","version":"3.2.1","runtime":"go","files":["aliased.go"]},{"name":"shop/blank","version":"1.0.0","runtime":"go","files":["blank.go"]},{"name":"shop/dotted","version":"1.0.0","runtime":"go","files":["dotted.go"]}],"workflows":[]},"digest":"sha256:231b1bf99795d950d7003ad2622856e21f34bd3052c7cf7a3094471be1af9b30"}

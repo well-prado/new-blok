@@ -1,0 +1,7 @@
+blok.json fails closed: unknown field, unsupported layout, a types path escaping the root, an absolute workflow path, overlapping workflow paths.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"flat","triggers":["http"],"types":"../outside/types.go","workflows":["/abs","flows","flows/inner"]}
+-- go.mod --
+module example.com/shop
+-- @expect --
+{"diagnostics":[["layout_manifest_invalid","blok.json"],["layout_manifest_invalid","blok.json"],["layout_path_outside_root","blok.json"],["layout_path_outside_root","blok.json"]]}

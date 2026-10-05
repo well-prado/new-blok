@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -14,7 +15,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/well-prado/new-blok/contract"
+	blokruntime "github.com/well-prado/new-blok/contract/runtime"
 	"github.com/well-prado/new-blok/internal/scaffold"
+	"github.com/well-prado/new-blok/internal/tooling/layout"
+	"github.com/well-prado/new-blok/node"
 )
 
 func TestCommands(t *testing.T) {
@@ -69,6 +74,7 @@ func TestFreshApplicationBuildsServesAndRegenerates(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds a fresh application")
 	}
+	probes := map[string]layoutProbe{}
 	for layout, node := range map[string]string{"classic": "runtimes/go/nodes/quote", "unified": "nodes/go/quote"} {
 		t.Run(layout, func(t *testing.T) {
 			directory := filepath.Join(t.TempDir(), "shop")
@@ -78,6 +84,7 @@ func TestFreshApplicationBuildsServesAndRegenerates(t *testing.T) {
 			}
 			goTool(t, directory, "vet", "./...")
 			goTool(t, directory, "test", "./...")
+			probes[layout] = probeLayout(t, directory, node)
 			// Selecting only HTTP links only HTTP: besides the standard
 			// library, the application reaches only its own packages and
 			// framework packages that are not another trigger, a store, a
@@ -149,6 +156,151 @@ func TestFreshApplicationBuildsServesAndRegenerates(t *testing.T) {
 			}
 			if after, _ := os.ReadFile(bindings); !bytes.Equal(before, after) {
 				t.Fatal("regenerating changed the bindings")
+			}
+		})
+	}
+	assertLayoutsAgree(t, probes)
+}
+
+// layoutProbe is what one built starter actually produces, next to what
+// static discovery read from its source without building it.
+type layoutProbe struct {
+	Program    json.RawMessage `json:"program"`
+	Descriptor node.Descriptor `json:"descriptor"`
+	discovered *layout.Project
+}
+
+// probeLayout runs the starter's own code in its own module (go test, not
+// discovery) to lower the workflow and read the node descriptor, then runs
+// discovery over the same tree. The probe file is added after the starter's
+// own gates ran, so it never changes what blok new wrote.
+func probeLayout(t *testing.T, directory, nodeDir string) layoutProbe {
+	t.Helper()
+	probe := `package app
+
+import (
+	"encoding/json"
+	"os"
+	"testing"
+
+	"example.com/shop/` + nodeDir + `"
+	"example.com/shop/workflows/quotes"
+)
+
+func TestLayoutProbe(t *testing.T) {
+	calculate, err := quote.New(quote.Prices{"coffee": 1500})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow, err := quotes.New(calculate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	program, err := workflow.Lower()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(map[string]any{"program": program, "descriptor": calculate.Descriptor()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(os.Getenv("BLOK_LAYOUT_PROBE"), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+`
+	probeFile := filepath.Join(directory, "internal", "app", "layout_probe_test.go")
+	if err := os.WriteFile(probeFile, []byte(probe), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(probeFile) })
+	output := filepath.Join(t.TempDir(), "probe.json")
+	command := exec.Command("go", "test", "-count=1", "-run", "^TestLayoutProbe$", "./internal/app")
+	command.Dir = directory
+	command.Env = append(os.Environ(), "BLOK_LAYOUT_PROBE="+output)
+	if combined, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("probe: %v\n%s", err, combined)
+	}
+	raw, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result layoutProbe
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(probeFile); err != nil {
+		t.Fatal(err)
+	}
+	if result.discovered, err = layout.Discover(directory); err != nil {
+		t.Fatalf("discovery of the fresh %s starter: %v", nodeDir, err)
+	}
+	return result
+}
+
+// assertLayoutsAgree: both layouts lower byte-identical programs and the
+// same runtime catalog digest, and static discovery's identities are the
+// ones the built code reports.
+func assertLayoutsAgree(t *testing.T, probes map[string]layoutProbe) {
+	t.Helper()
+	classic, unified := probes["classic"], probes["unified"]
+	if classic.discovered == nil || unified.discovered == nil {
+		t.Fatal("a layout was not probed")
+	}
+	if !bytes.Equal(classic.Program, unified.Program) {
+		t.Fatalf("lowered programs differ:\nclassic %s\nunified %s", classic.Program, unified.Program)
+	}
+	var digests [2]string
+	for i, probe := range []layoutProbe{classic, unified} {
+		digest, err := blokruntime.CatalogDigest([]node.Descriptor{probe.Descriptor})
+		if err != nil {
+			t.Fatal(err)
+		}
+		digests[i] = digest
+		var program contract.InternalProgram
+		if err := json.Unmarshal(probe.Program, &program); err != nil {
+			t.Fatal(err)
+		}
+		found := probe.discovered
+		if len(found.Nodes) != 1 || found.Nodes[0].Name != probe.Descriptor.Name || found.Nodes[0].Version != probe.Descriptor.Version {
+			t.Fatalf("discovered nodes %+v; built code reports %s@%s", found.Nodes, probe.Descriptor.Name, probe.Descriptor.Version)
+		}
+		if len(found.Workflows) != 1 || found.Workflows[0].Name != program.WorkflowID || found.Workflows[0].Version != program.Version {
+			t.Fatalf("discovered workflows %+v; built code lowers %s@%s", found.Workflows, program.WorkflowID, program.Version)
+		}
+	}
+	if digests[0] != digests[1] {
+		t.Fatalf("runtime catalog digests differ: %s vs %s", digests[0], digests[1])
+	}
+	classicCatalog, _ := classic.discovered.Catalog().Digest()
+	unifiedCatalog, _ := unified.discovered.Catalog().Digest()
+	if classicCatalog != unifiedCatalog {
+		t.Fatalf("discovery catalog digests differ: %s vs %s", classicCatalog, unifiedCatalog)
+	}
+	t.Logf("both layouts: program %d bytes, runtime catalog %s, discovery catalog %s", len(classic.Program), digests[0], classicCatalog)
+}
+
+// TestGenerateReadsTheManifestThroughDiscovery: a bare blok generate reads
+// blok.json with layout's validation, so a types path outside the project
+// or an unknown field is refused rather than followed or ignored (#67).
+func TestGenerateReadsTheManifestThroughDiscovery(t *testing.T) {
+	for name, test := range map[string]struct{ manifest, code string }{
+		"types outside the root": {`{"name":"a","module":"example.com/a","runtime":"go","layout":"classic","triggers":["http"],"types":"../elsewhere/types.go"}`, layout.CodePathOutsideRoot},
+		"unknown field":          {`{"name":"a","layout":"classic","typesDir":"x"}`, layout.CodeManifestInvalid},
+	} {
+		t.Run(name, func(t *testing.T) {
+			directory := t.TempDir()
+			if err := os.WriteFile(filepath.Join(directory, "blok.json"), []byte(test.manifest), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			t.Chdir(directory)
+			var out bytes.Buffer
+			err := run([]string{"generate"}, &out)
+			if err == nil || !strings.Contains(err.Error(), test.code) {
+				t.Fatalf("err=%v; want %s", err, test.code)
+			}
+			if out.Len() != 0 {
+				t.Fatalf("a refused manifest produced output %q", out.String())
 			}
 		})
 	}

@@ -1,0 +1,39 @@
+Explicit workflow paths: only declared paths are read. workflows/ is not declared, so its definition is not discovered.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":"","workflows":["flows/orders","flows/single.go"]}
+-- go.mod --
+module example.com/shop
+
+go 1.27.0
+-- nodes/go/quote/quote.go --
+package n
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/quote", "1.0.0", handle)
+-- flows/orders/orders.go --
+package orders
+
+import "github.com/well-prado/new-blok/flow"
+
+var W = flow.MustDefine[int, int](flow.Spec{Name: "shop/orders", Version: "1.0.0"}, nil)
+-- flows/orders/orders_test.go --
+package orders
+
+import "github.com/well-prado/new-blok/flow"
+
+var T = flow.MustDefine[int, int](flow.Spec{Name: "shop/orders", Version: "9.9.9"}, nil)
+-- flows/single.go --
+package flows
+
+import "github.com/well-prado/new-blok/flow"
+
+var W = flow.MustDefine[int, int](flow.Spec{Name: "shop/single", Version: "1.0.0"}, nil)
+-- workflows/ignored/ignored.go --
+package ignored
+
+import "github.com/well-prado/new-blok/flow"
+
+var W = flow.MustDefine[int, int](flow.Spec{Name: "shop/ignored", Version: "1.0.0"}, nil)
+-- @expect --
+{"catalog":{"version":1,"nodes":[{"name":"shop/quote","version":"1.0.0","runtime":"go","files":["quote.go"]}],"workflows":[{"name":"shop/orders","version":"1.0.0"},{"name":"shop/single","version":"1.0.0"}]},"digest":"sha256:ede8ffba05cc108391ff999e790e186a0ba6fa13596500cc1f967e486c43e6f5"}

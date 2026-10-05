@@ -1,0 +1,35 @@
+vendor, testdata and node_modules inside a node are owned by other tools: their Defines and links are not discovered, and their files are not in the catalog.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+
+go 1.27.0
+-- nodes/go/quote/quote.go --
+package quote
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/quote", "1.0.0", nil)
+-- nodes/go/quote/vendor/dep/dep.go --
+package dep
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/vendored", "1.0.0", nil)
+-- nodes/go/quote/testdata/fixture.go --
+package fixture
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/fixture", "1.0.0", nil)
+-- nodes/nodejs/fmt/node.json --
+{"name":"shop/fmt","version":"1.0.0"}
+-- nodes/nodejs/fmt/index.mjs --
+export default () => ({})
+-- nodes/nodejs/fmt/node_modules/dep/index.js --
+module.exports = {}
+-- @links --
+nodes/nodejs/fmt/node_modules/.bin/escape -> $OUTSIDE
+-- @expect --
+{"catalog":{"version":1,"nodes":[{"name":"shop/fmt","version":"1.0.0","runtime":"nodejs","files":["index.mjs","node.json"]},{"name":"shop/quote","version":"1.0.0","runtime":"go","files":["quote.go"]}],"workflows":[]},"digest":"sha256:8e53cc968eb5ae0b4d2e4ab5ade87a15da63c7102c6cfb4799419680b813341c"}

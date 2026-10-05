@@ -1,0 +1,37 @@
+A constructor must be exactly one return statement. A Define after an unconditional return never runs, and a conditional or second return makes which identity is registered depend on control flow; both are refused. The unshadowed single-statement form beside them is accepted.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+
+go 1.27.0
+-- nodes/go/dead/dead.go --
+package dead
+
+import "github.com/well-prado/new-blok/node"
+
+func New() (node.Definition[int, int], error) {
+	return node.Define("shop/real", "1.0.0", nil)
+	return node.Define("shop/dead", "1.0.0", nil)
+}
+-- nodes/go/branch/branch.go --
+package branch
+
+import "github.com/well-prado/new-blok/node"
+
+func New(fast bool) (node.Definition[int, int], error) {
+	if fast {
+		return node.Define("shop/fast", "1.0.0", nil)
+	}
+	return node.Define("shop/slow", "1.0.0", nil)
+}
+-- nodes/go/good/good.go --
+package good
+
+import "github.com/well-prado/new-blok/node"
+
+func New(define bool) (node.Definition[int, int], error) {
+	return node.Define("shop/good", "1.0.0", nil)
+}
+-- @expect --
+{"diagnostics":[["layout_descriptor_not_static","nodes/go/branch/branch.go:7"],["layout_descriptor_not_static","nodes/go/branch/branch.go:9"],["layout_descriptor_not_static","nodes/go/dead/dead.go:6"],["layout_descriptor_not_static","nodes/go/dead/dead.go:7"]]}

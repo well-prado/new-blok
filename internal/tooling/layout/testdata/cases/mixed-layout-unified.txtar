@@ -1,0 +1,23 @@
+A unified project also has a classic runtimes/<rt>/nodes tree; runtimes/nodejs alone (a worker package) is fine.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+
+go 1.27.0
+-- nodes/go/a/a.go --
+package n
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/a", "1.0.0", handle)
+-- runtimes/go/nodes/b/b.go --
+package n
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/b", "1.0.0", handle)
+-- runtimes/nodejs/package.json --
+{}
+-- @expect --
+{"diagnostics":[["layout_mixed","runtimes/go/nodes"]]}
