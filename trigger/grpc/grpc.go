@@ -601,9 +601,14 @@ func hasUnknown(message protoreflect.Message) bool {
 
 // statusFor maps a workflow error to a status that carries only a stable
 // code: never the error's text. A call whose context ended at or after its
-// deadline reports DeadlineExceeded even when the client's own cancellation
-// arrived first, as it does when the client's deadline is the earlier one;
-// one canceled before it reports Canceled.
+// deadline reports DeadlineExceeded, even when the client's cancellation is
+// what ended it; one that ended before its deadline reports Canceled.
+//
+// A client whose own, earlier deadline passes resets the stream with the same
+// code as a deliberate cancel. The server's deadline starts when the request
+// arrives, so it falls slightly after the client's: when that reset reaches
+// the server first, the call reports Canceled, and nothing on the wire tells
+// the two apart (#230). The workflow is canceled either way.
 func statusFor(ctx context.Context, err error, ended time.Time) error {
 	deadline, bounded := ctx.Deadline()
 	switch {
