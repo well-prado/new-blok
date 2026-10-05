@@ -263,7 +263,14 @@ unverified, never treated as an inert asset.
 On the 1,381 script files of the Blok TypeScript repository
 (`~/Projects/Deskree/blok`, `.ts .mts .cts .js .mjs .cjs` including
 declaration files, excluding `node_modules`, `dist`, `.git` and `.blok`),
-CORPUS_SUMMARY The repository's own Node.js SDK (`sdk/nodejs`) is
+517 (37.4%) are unverified (the 13 declaration files are exempt; none
+failed to lex). The files containing each form: a computed member access
+311 (the only cause in 170), the string `"module"` 115 (the only cause in
+51), `this` outside `this.<name>` 46, `.prototype` 39, `process` beyond its
+data members 33, `import(expression)` 28, the string `"process"` 28,
+`Function` (mostly the TypeScript type; no file would be rescued by a
+type-position exemption) 26, `arguments` 21, `module` beyond `exports` 21,
+`window` 20, `globalThis` 19. The repository's own Node.js SDK (`sdk/nodejs`) is
 unverified for the same reasons (`text[at]`, `object[key]`,
 `Object.prototype`), so a Node.js node that imports it is unverified, never
 a violation; a node written in the safe forms verifies. A reviewer who
