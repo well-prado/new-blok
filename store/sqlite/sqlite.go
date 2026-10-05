@@ -92,7 +92,7 @@ func (b Backend) Open(ctx context.Context, path string) (store.Database, error) 
 	}
 	database.SetMaxOpenConns(8)
 	database.SetMaxIdleConns(8)
-	if err := configure(ctx, database, timeout); err != nil {
+	if err := configure(ctx, database, path, timeout); err != nil {
 		_ = database.Close()
 		return nil, err
 	}
@@ -108,9 +108,13 @@ func (b Backend) Open(ctx context.Context, path string) (store.Database, error) 
 	return &connection{database: database, writeDomain: writeDomain, writers: writers, busyTimeout: timeout}, nil
 }
 
-func configure(ctx context.Context, database *sql.DB, timeout time.Duration) error {
+func configure(ctx context.Context, database *sql.DB, path string, timeout time.Duration) error {
+	if path != ":memory:" {
+		if err := enableWAL(ctx, database, timeout); err != nil {
+			return err
+		}
+	}
 	settings := []string{
-		"PRAGMA journal_mode=" + journalMode,
 		"PRAGMA synchronous=" + synchronous,
 		fmt.Sprintf("PRAGMA busy_timeout=%d", timeout.Milliseconds()),
 		"PRAGMA foreign_keys=ON",
@@ -123,8 +127,69 @@ func configure(ctx context.Context, database *sql.DB, timeout time.Duration) err
 	return nil
 }
 
+// maxWALSwitchPause caps the pause between two attempts to switch a file
+// to WAL.
+const maxWALSwitchPause = 50 * time.Millisecond
+
+// enableWAL switches the file to WAL, and fails unless it is in WAL
+// afterwards. WAL is a property of the file, so every later connection to it
+// opens in WAL.
+//
+// SQLite switches a file to WAL in a transaction that reads page 1 and then
+// writes it, and it never waits for the write lock when a read transaction
+// asks for it: the busy handler is skipped. So when several openers switch
+// the same brand-new file at once, the losers fail SQLITE_BUSY at once,
+// without their busy timeout (#320). The switch is therefore retried while
+// it fails busy, until the busy timeout is spent, and each attempt's own
+// busy wait is cut to what remains of it. Any other failure, such as an
+// unwritable path, returns at once. The switch runs on a connection of its
+// own that is discarded afterwards, so no pooled connection keeps the
+// shortened wait.
+func enableWAL(ctx context.Context, database *sql.DB, timeout time.Duration) error {
+	statement := "PRAGMA journal_mode=" + journalMode
+	deadline := time.Now().Add(timeout)
+	// Connecting applies the DSN's pragmas, which wait out the busy timeout
+	// on a file another connection holds.
+	conn, err := database.Conn(ctx)
+	if err != nil {
+		return busy(fmt.Errorf("sqlite: open: %w", err), nil)
+	}
+	defer conn.Close()
+	defer discard(conn)
+	pause := time.Millisecond
+	for {
+		var mode string
+		_, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout=%d", max(time.Until(deadline), 0).Milliseconds()))
+		if err == nil {
+			err = conn.QueryRowContext(ctx, statement).Scan(&mode)
+		}
+		if err == nil {
+			if !strings.EqualFold(mode, journalMode) {
+				return fmt.Errorf("sqlite: configure %q: the database stayed in journal mode %q", statement, mode)
+			}
+			return nil
+		}
+		err = busy(fmt.Errorf("sqlite: configure %q: %w", statement, err), nil)
+		remaining := time.Until(deadline)
+		if !errors.Is(err, store.ErrBusy) || remaining <= 0 {
+			return err
+		}
+		timer := time.NewTimer(min(pause, remaining))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return errors.Join(err, ctx.Err())
+		case <-timer.C:
+		}
+		pause = min(2*pause, maxWALSwitchPause)
+	}
+}
+
 // dsn opens every :memory: path as one named database on SQLite's memdb VFS,
 // so each handle shares the database and participates in one writer domain.
+// A file's DSN does not ask for WAL: the driver would switch on connect,
+// where a concurrent opener's busy failure cannot be retried; enableWAL
+// switches it instead (#320).
 func dsn(path string, timeout time.Duration) string {
 	if path == ":memory:" {
 		return fmt.Sprintf("file:/new-blok-memory?vfs=memdb&_busy_timeout=%d&_journal_mode=MEMORY&_synchronous=FULL&_foreign_keys=ON&_pragma=%s", timeout.Milliseconds(), secureDelete)
@@ -132,7 +197,7 @@ func dsn(path string, timeout time.Duration) string {
 	return (&url.URL{
 		Scheme:   "file",
 		Path:     uriPath(path),
-		RawQuery: fmt.Sprintf("_busy_timeout=%d&_journal_mode=WAL&_synchronous=FULL&_foreign_keys=ON&_pragma=%s", timeout.Milliseconds(), secureDelete),
+		RawQuery: fmt.Sprintf("_busy_timeout=%d&_synchronous=FULL&_foreign_keys=ON&_pragma=%s", timeout.Milliseconds(), secureDelete),
 	}).String()
 }
 
