@@ -1,0 +1,72 @@
+The constructor form is refused when the function can rebind the name its call uses: a parameter, a named result, a type parameter or an earlier local called node, and a dot-import's Define rebound by a parameter. Accepting any of them would put shop/decoy in the catalog although the framework never registers it.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+
+go 1.27.0
+-- nodes/go/param/param.go --
+package param
+
+import "github.com/well-prado/new-blok/node"
+
+type fake struct{}
+
+func (fake) Define(string, string, any) any { return nil }
+
+var _ node.Option
+
+func Decoy(node fake) any {
+	return node.Define("shop/decoy", "1.0.0", nil)
+}
+-- nodes/go/result/result.go --
+package result
+
+import "github.com/well-prado/new-blok/node"
+
+type fake struct{}
+
+func (fake) Define(string, string, any) fake { return fake{} }
+
+var _ node.Option
+
+func Decoy() (node fake) {
+	return node.Define("shop/decoy", "1.0.0", nil)
+}
+-- nodes/go/local/local.go --
+package local
+
+import "github.com/well-prado/new-blok/node"
+
+type fake struct{}
+
+func (fake) Define(string, string, any) any { return nil }
+
+var _ node.Option
+
+func Decoy() any {
+	node := fake{}
+	return node.Define("shop/decoy", "1.0.0", nil)
+}
+-- nodes/go/dotted/dotted.go --
+package dotted
+
+import . "github.com/well-prado/new-blok/node"
+
+var _ Option
+
+func Decoy(Define func(string, string, any) any) any {
+	return Define("shop/decoy", "1.0.0", nil)
+}
+-- nodes/go/typeparam/typeparam.go --
+package typeparam
+
+import "github.com/well-prado/new-blok/node"
+
+var _ node.Option
+
+func Decoy[node interface{ Define(string, string, any) any }]() any {
+	return node.Define("shop/decoy", "1.0.0", nil)
+}
+-- @expect --
+{"diagnostics":[["layout_descriptor_not_static","nodes/go/dotted/dotted.go:8"],["layout_descriptor_not_static","nodes/go/local/local.go:13"],["layout_descriptor_not_static","nodes/go/param/param.go:12"],["layout_descriptor_not_static","nodes/go/result/result.go:12"],["layout_descriptor_not_static","nodes/go/typeparam/typeparam.go:8"]]}

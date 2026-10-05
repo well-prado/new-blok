@@ -100,6 +100,10 @@ type Event struct {
 	// TracePolicy.
 	Tenant string       `json:"-"`
 	Trace  observe.Span `json:"-"`
+	// External marks step events of a node that declares effects: the
+	// attempt is an external call (ADR 0022). Like Tenant and Trace it is
+	// in-process only.
+	External bool `json:"-"`
 }
 
 type Observer interface{ Observe(Event) }

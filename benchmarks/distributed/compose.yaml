@@ -20,7 +20,11 @@ services:
     networks: [distributed]
   s3:
     image: chrislusf/seaweedfs:4.47
-    command: ["server", "-dir=/data", "-s3"]
+    # Headroom for small disks (#292): by default SeaweedFS sizes its volume
+    # budget from free disk space at 1 GB per volume, which can leave only a
+    # handful of slots, and every S3 bucket claims some. Small volumes and a
+    # fixed slot count keep a long-lived dev cluster writable.
+    command: ["server", "-dir=/data", "-s3", "-master.volumeSizeLimitMB=64", "-volume.max=64"]
     environment:
       AWS_ACCESS_KEY_ID: spike-access
       AWS_SECRET_ACCESS_KEY: spike-secret-only-local

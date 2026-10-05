@@ -1,0 +1,19 @@
+One identity declared twice in one node, as a package var and a constructor, is one node, not two.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+
+go 1.27.0
+-- nodes/go/same/same.go --
+package same
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/same", "1.0.0", nil)
+
+func New() (node.Definition[int, int], error) {
+	return node.Define("shop/same", "1.0.0", nil)
+}
+-- @expect --
+{"catalog":{"version":1,"nodes":[{"name":"shop/same","version":"1.0.0","runtime":"go","files":["same.go"]}],"workflows":[]},"digest":"sha256:4c361f3a4233f5526db445ff180c9646d3e9ad0622190ea8595e923d41a60e13"}

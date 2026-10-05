@@ -1,0 +1,86 @@
+{
+  "classic": {
+    "README.md": {
+      "sha256": "3f18c641396c5c484e2ebcb4337cf2d376c9678fb304656bf5b84ea703e4be6a",
+      "bytes": 509
+    },
+    "blok.json": {
+      "sha256": "ce4a89c5a8f00684bb62bb4e84da09ff111e4bb07aa33d06fdcd57b4d30a00e6",
+      "bytes": 174
+    },
+    "cmd/shop/main.go": {
+      "sha256": "16e440a9d1abe2435ca1876b6141b21220fc2a674d061596f00fdf8f482edb97",
+      "bytes": 978
+    },
+    "go.mod": {
+      "sha256": "f7a749f4e7c403d6d7c475cf8800d988bb8bd26840ef4bb53d2addc335ecd8ed",
+      "bytes": 82
+    },
+    "internal/app/app.go": {
+      "sha256": "5f49e74ce7a5f5d00b014a0fb566447809204842d42a237fe745c180070367a2",
+      "bytes": 2039
+    },
+    "internal/app/app_test.go": {
+      "sha256": "20816c15a9b30e4e75bc718fd975f094189c7c37826ea876c9f0e1e83a521fa2",
+      "bytes": 1381
+    },
+    "runtimes/go/nodes/quote/bindings_gen.go": {
+      "sha256": "56fe007062875b213d89811b360376850c246b3fb0aa734273e9fbeb9b1f2998",
+      "bytes": 1215
+    },
+    "runtimes/go/nodes/quote/quote.go": {
+      "sha256": "fe8db86b23d482761cce129900b6d3738c9e326fddd202940e8b4e08d24dcdb5",
+      "bytes": 1527
+    },
+    "runtimes/go/nodes/quote/types.go": {
+      "sha256": "826619364b36ee1ad4d21c1406c26d454c293dcb1b19dd7cd8a6b70971aedacb",
+      "bytes": 489
+    },
+    "workflows/quotes/quotes.go": {
+      "sha256": "43e426250784ead141137ce32d1ed20290bda114b15337ba322fc8968990b68e",
+      "bytes": 782
+    }
+  },
+  "unified": {
+    "README.md": {
+      "sha256": "68e87b0f8bf5dfcb95673b3bb06314ddb338d2a0ea8c4962c4e115eccd4ba063",
+      "bytes": 491
+    },
+    "blok.json": {
+      "sha256": "e10973cfb6b9e976d83c25f119601013237ef181f6733b2fc02c875f0335f06f",
+      "bytes": 165
+    },
+    "cmd/shop/main.go": {
+      "sha256": "16e440a9d1abe2435ca1876b6141b21220fc2a674d061596f00fdf8f482edb97",
+      "bytes": 978
+    },
+    "go.mod": {
+      "sha256": "f7a749f4e7c403d6d7c475cf8800d988bb8bd26840ef4bb53d2addc335ecd8ed",
+      "bytes": 82
+    },
+    "internal/app/app.go": {
+      "sha256": "49eee5258dabbbeb6fa9b933efbd93f4a6ab6047ed8827a2272eba0f0f959122",
+      "bytes": 2030
+    },
+    "internal/app/app_test.go": {
+      "sha256": "20816c15a9b30e4e75bc718fd975f094189c7c37826ea876c9f0e1e83a521fa2",
+      "bytes": 1381
+    },
+    "nodes/go/quote/bindings_gen.go": {
+      "sha256": "56fe007062875b213d89811b360376850c246b3fb0aa734273e9fbeb9b1f2998",
+      "bytes": 1215
+    },
+    "nodes/go/quote/quote.go": {
+      "sha256": "fe8db86b23d482761cce129900b6d3738c9e326fddd202940e8b4e08d24dcdb5",
+      "bytes": 1527
+    },
+    "nodes/go/quote/types.go": {
+      "sha256": "826619364b36ee1ad4d21c1406c26d454c293dcb1b19dd7cd8a6b70971aedacb",
+      "bytes": 489
+    },
+    "workflows/quotes/quotes.go": {
+      "sha256": "15add4e6fce7c218eea5a56c771b629ff0556be0cf68f18f56e183ad98e48fd5",
+      "bytes": 773
+    }
+  }
+}

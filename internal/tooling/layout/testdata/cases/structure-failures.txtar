@@ -1,0 +1,23 @@
+A module mismatch, an invalid runtime directory name, and a stray file where node directories live.
+-- blok.json --
+{"name":"shop","module":"example.com/other","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+-- nodes/go/a/a.go --
+package n
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/a", "1.0.0", handle)
+-- nodes/Go2/b/b.go --
+package n
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/b", "1.0.0", handle)
+-- nodes/go/stray.go --
+package stray
+-- nodes/go/.hidden/skip.go --
+package skip
+-- @expect --
+{"diagnostics":[["layout_file_unowned","nodes/go/stray.go"],["layout_invalid_runtime","nodes/Go2"],["layout_manifest_invalid","blok.json"]]}

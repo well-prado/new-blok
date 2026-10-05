@@ -1,0 +1,7 @@
+No blok.json: discovery does not guess a layout.
+-- go.mod --
+module example.com/shop
+-- runtimes/go/nodes/a/a.go --
+package a
+-- @expect --
+{"diagnostics":[["layout_manifest_missing","blok.json"]]}

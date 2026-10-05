@@ -1,0 +1,75 @@
+# blok-fixture v1
+# scenario: overload
+# source: app/deploy /metrics (standard library exposition)
+# phase: before
+blok_active 0
+blok_admission_rejected_total 0
+# HELP blok_ready 1 when the deployment is ready for admission
+# TYPE blok_ready gauge
+blok_ready 1
+# HELP blok_draining 1 while the deployment drains; not-ready while draining is expected
+# TYPE blok_draining gauge
+blok_draining 0
+# HELP blok_dependency_ready 1 when the readiness dependency is ready
+# TYPE blok_dependency_ready gauge
+blok_dependency_ready{blok_dependency="artifact"} 1
+# HELP blok_admission_active requests holding an admission slot
+# TYPE blok_admission_active gauge
+blok_admission_active 0
+# HELP blok_admission_capacity admission slots configured
+# TYPE blok_admission_capacity gauge
+blok_admission_capacity 2
+# HELP blok_admission_requests_total requests offered at the edge, by admission result
+# TYPE blok_admission_requests_total counter
+blok_admission_requests_total{blok_result="accepted",blok_reason="none"} 0
+blok_admission_requests_total{blok_result="rejected",blok_reason="capacity"} 0
+blok_admission_requests_total{blok_result="rejected",blok_reason="draining"} 0
+blok_admission_requests_total{blok_result="rejected",blok_reason="not_ready"} 0
+blok_admission_requests_total{blok_result="rejected",blok_reason="unavailable"} 0
+blok_admission_requests_total{blok_result="rejected",blok_reason="invalid"} 0
+blok_admission_requests_total{blok_result="rejected",blok_reason="conflict"} 0
+# HELP blok_source_up 1 when the source answered this sample; every source is always reported
+# TYPE blok_source_up gauge
+blok_source_up{blok_source="deployment",blok_pages="true"} 1
+# HELP blok_source_age_seconds seconds since the source last answered; 0 while it answers
+# TYPE blok_source_age_seconds gauge
+blok_source_age_seconds{blok_source="deployment",blok_pages="true"} 0
+# HELP blok_operational_sample_failures_total operational source samples that failed, timed out or were invalid
+# TYPE blok_operational_sample_failures_total counter
+blok_operational_sample_failures_total 0
+# phase: after
+blok_active 2
+blok_admission_rejected_total 4
+# HELP blok_ready 1 when the deployment is ready for admission
+# TYPE blok_ready gauge
+blok_ready 1
+# HELP blok_draining 1 while the deployment drains; not-ready while draining is expected
+# TYPE blok_draining gauge
+blok_draining 0
+# HELP blok_dependency_ready 1 when the readiness dependency is ready
+# TYPE blok_dependency_ready gauge
+blok_dependency_ready{blok_dependency="artifact"} 1
+# HELP blok_admission_active requests holding an admission slot
+# TYPE blok_admission_active gauge
+blok_admission_active 2
+# HELP blok_admission_capacity admission slots configured
+# TYPE blok_admission_capacity gauge
+blok_admission_capacity 2
+# HELP blok_admission_requests_total requests offered at the edge, by admission result
+# TYPE blok_admission_requests_total counter
+blok_admission_requests_total{blok_result="accepted",blok_reason="none"} 2
+blok_admission_requests_total{blok_result="rejected",blok_reason="capacity"} 4
+blok_admission_requests_total{blok_result="rejected",blok_reason="draining"} 0
+blok_admission_requests_total{blok_result="rejected",blok_reason="not_ready"} 0
+blok_admission_requests_total{blok_result="rejected",blok_reason="unavailable"} 0
+blok_admission_requests_total{blok_result="rejected",blok_reason="invalid"} 0
+blok_admission_requests_total{blok_result="rejected",blok_reason="conflict"} 0
+# HELP blok_source_up 1 when the source answered this sample; every source is always reported
+# TYPE blok_source_up gauge
+blok_source_up{blok_source="deployment",blok_pages="true"} 1
+# HELP blok_source_age_seconds seconds since the source last answered; 0 while it answers
+# TYPE blok_source_age_seconds gauge
+blok_source_age_seconds{blok_source="deployment",blok_pages="true"} 0
+# HELP blok_operational_sample_failures_total operational source samples that failed, timed out or were invalid
+# TYPE blok_operational_sample_failures_total counter
+blok_operational_sample_failures_total 0

@@ -1,0 +1,37 @@
+Build constraints: constants that differ per GOOS by file name, and a //go:build ignore package main file supplying a Define, would make the identity depend on the build. Both are refused.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"classic","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+
+go 1.27.0
+-- runtimes/go/nodes/tagged/n.go --
+package tagged
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine(name, "1.0.0", nil)
+-- runtimes/go/nodes/tagged/n_linux.go --
+package tagged
+
+const name = "shop/linux"
+-- runtimes/go/nodes/tagged/n_darwin.go --
+package tagged
+
+const name = "shop/darwin"
+-- runtimes/go/nodes/gobuild/real.go --
+package gobuild
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/real", "1.0.0", nil)
+-- runtimes/go/nodes/gobuild/ignore.go --
+//go:build ignore
+
+package main
+
+import "github.com/well-prado/new-blok/node"
+
+var Main = node.MustDefine("shop/main", "1.0.0", nil)
+-- @expect --
+{"diagnostics":[["layout_descriptor_constrained","runtimes/go/nodes/gobuild/ignore.go:7"],["layout_descriptor_not_static","runtimes/go/nodes/tagged/n.go:5"]]}

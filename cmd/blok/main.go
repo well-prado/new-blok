@@ -5,11 +5,11 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -20,6 +20,7 @@ import (
 	"github.com/well-prado/new-blok/internal/generate"
 	"github.com/well-prado/new-blok/internal/scaffold"
 	"github.com/well-prado/new-blok/internal/tooling/devtool"
+	"github.com/well-prado/new-blok/internal/tooling/layout"
 )
 
 const version = "0.0.0-dev"
@@ -233,7 +234,10 @@ func runGenerate(args []string, out io.Writer) error {
 		return fmt.Errorf("generate: expected input and optional output")
 	}
 	if input == "" {
-		input = defaultTypes()
+		var err error
+		if input, err = defaultTypes(); err != nil {
+			return fmt.Errorf("generate: %w", err)
+		}
 	}
 	source, err := os.ReadFile(input)
 	if err != nil {
@@ -268,17 +272,23 @@ func runGenerate(args []string, out io.Writer) error {
 }
 
 // defaultTypes is the types file the application's blok.json names, so a
-// bare blok generate run in the application regenerates its bindings.
-func defaultTypes() string {
-	raw, err := os.ReadFile("blok.json")
+// bare blok generate run in the application regenerates its bindings. The
+// manifest is read through layout discovery's validation: an unknown field,
+// a linked manifest or a types path outside the project fails instead of
+// being guessed around.
+func defaultTypes() (string, error) {
+	const fallback = "internal/app/types.go"
+	if _, err := os.Lstat(layout.ManifestFile); errors.Is(err, fs.ErrNotExist) {
+		return fallback, nil
+	}
+	manifest, err := layout.LoadManifest(".")
 	if err != nil {
-		return "internal/app/types.go"
+		return "", err
 	}
-	var manifest scaffold.Manifest
-	if json.Unmarshal(raw, &manifest) != nil || manifest.Types == "" {
-		return "internal/app/types.go"
+	if manifest.Types == "" {
+		return fallback, nil
 	}
-	return filepath.FromSlash(manifest.Types)
+	return filepath.FromSlash(manifest.Types), nil
 }
 
 func writeAtomic(path string, data []byte) error {

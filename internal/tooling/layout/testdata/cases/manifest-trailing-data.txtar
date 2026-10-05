@@ -1,0 +1,8 @@
+blok.json with a second JSON value after the manifest object is refused, not truncated to the first.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"classic","triggers":["http"],"types":""}
+{"layout":"unified"}
+-- go.mod --
+module example.com/shop
+-- @expect --
+{"diagnostics":[["layout_manifest_invalid","blok.json"]]}

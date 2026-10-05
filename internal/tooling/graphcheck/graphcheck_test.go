@@ -111,3 +111,45 @@ func TestFixtureProvenance(t *testing.T) {
 		t.Fatalf("invalid fixture provenance: %+v", fixture)
 	}
 }
+
+// TestNestedNodeFilesShareOneOwner: files nested under one node directory,
+// in either layout, belong to that node, so importing them is a same-node
+// import, while importing another node still fails (#67). Only a
+// root-anchored nodes/ or runtimes/<rt>/nodes/ path is a node: a "nodes"
+// element elsewhere, including in the checkout's own absolute path, is an
+// ordinary package name.
+func TestNestedNodeFilesShareOneOwner(t *testing.T) {
+	for _, layout := range [][2]string{{"runtimes/go/nodes/alpha", "runtimes/go/nodes/beta"}, {"nodes/go/alpha", "nodes/go/beta"}} {
+		alpha, beta := layout[0], layout[1]
+		for _, parent := range []string{"plain", "nodes"} {
+			t.Run(alpha+" under "+parent, func(t *testing.T) {
+				root := filepath.Join(t.TempDir(), parent, "checkout")
+				files := map[string]string{
+					"go.mod":                   "module fixture.test\n",
+					alpha + "/alpha.go":        "package alpha\n\nimport (\n\t_ \"fixture.test/" + alpha + "/rates\"\n\t_ \"fixture.test/" + beta + "\"\n)\n",
+					alpha + "/rates/rates.go":  "package rates\n\nimport _ \"fixture.test/" + alpha + "/rates/deep\"\n",
+					alpha + "/rates/deep/d.go": "package deep\n",
+					beta + "/beta.go":          "package beta\n",
+					"internal/nodes/x/x.go":    "package x\n\nimport _ \"fixture.test/internal/nodes/y\"\n",
+					"internal/nodes/y/y.go":    "package y\n",
+				}
+				for rel, content := range files {
+					path := filepath.Join(root, filepath.FromSlash(rel))
+					if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+						t.Fatal(err)
+					}
+				}
+				diagnostics, err := Check(root)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(diagnostics) != 1 || diagnostics[0].Code != "node_import_forbidden" || diagnostics[0].Package != "fixture.test/"+alpha || diagnostics[0].Import != "fixture.test/"+beta {
+					t.Fatalf("diagnostics=%+v; want only %s importing %s", diagnostics, alpha, beta)
+				}
+			})
+		}
+	}
+}

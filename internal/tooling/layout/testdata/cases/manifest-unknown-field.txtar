@@ -1,0 +1,7 @@
+An unknown blok.json field fails closed instead of being ignored.
+-- blok.json --
+{"name":"shop","layout":"classic","nodeDirs":["anywhere"]}
+-- go.mod --
+module example.com/shop
+-- @expect --
+{"diagnostics":[["layout_manifest_invalid","blok.json"]]}

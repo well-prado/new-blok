@@ -1,0 +1,23 @@
+A constant declared in two files (or twice in one) is refused rather than one value picked.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+
+go 1.27.0
+-- nodes/go/dup/a.go --
+package dup
+
+const name = "shop/a"
+-- nodes/go/dup/b.go --
+package dup
+
+const name = "shop/b"
+-- nodes/go/dup/n.go --
+package dup
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine(name, "1.0.0", nil)
+-- @expect --
+{"diagnostics":[["layout_descriptor_not_static","nodes/go/dup/n.go:5"]]}
