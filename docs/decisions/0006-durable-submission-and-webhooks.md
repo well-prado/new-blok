@@ -126,6 +126,30 @@ trusted producer (`EnqueueRequest.Principal`, `Job.Principal`) and makes it part
 of request identity. `worker.New` migrates existing queues in place by adding a
 `principal_json` column, with empty for existing jobs.
 
+**Claim order (#217).** A worker claims the available job with the oldest
+`created_at` first. Jobs that share a `created_at` are claimed in the order
+they were enqueued. Before #217 they went in `job_id` (hash) order, which was
+effectively random. Ties are common on Windows: Go's clock there advances in
+steps of about 2 ms (0.3–12.7 ms measured on the #156 host), against about
+1 µs on macOS.
+
+The order is kept in an `enqueue_seq` column. Each enqueue sets it to one
+past the highest so far, inside its write transaction, so it follows commit
+order. It is stored rather than taken from SQLite's `rowid`, which a backup's
+`VACUUM INTO` may renumber.
+
+This is not a strict FIFO:
+- `created_at` is the enqueuing process's wall clock, so producers with
+  skewed clocks, or a clock stepped back, are ordered by timestamp, not
+  commit.
+- A retried or deferred job keeps its `created_at` and competes again once
+  `available_at` passes.
+- Concurrent workers run their handlers one at a time, but a later job can
+  finish first if an earlier one fails and is retried.
+
+Jobs enqueued before the column existed keep 0 and fall back to `job_id`
+among themselves.
+
 ### Webhook admission
 
 `trigger/webhook` declares durable / redeliver / caller: an event is
@@ -200,6 +224,7 @@ is never parsed before verification.
 | Worker handler returns saturation naming its own claim's domain, alone or joined with other failures in any order | behavioral | The job fails as `worker.ErrNestedSubmission` after one busy wait instead of being deferred to `deferral_budget_exhausted` |
 | SQLite `:memory:` uses the memdb VFS instead of shared cache | behavioral | Same shared database per process; writer conflicts are `store.ErrBusy` within the busy timeout instead of an unbounded wait |
 | `principal_json` column | schema | added by `worker.New` |
+| Jobs tied on `created_at` are claimed in enqueue order; `enqueue_seq` column and index | behavioral, schema | added by `worker.New`; existing jobs keep 0 and stay in `job_id` order among themselves |
 | New package `trigger/webhook` | additive | none |
 
 ## Limits
