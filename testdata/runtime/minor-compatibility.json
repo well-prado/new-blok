@@ -1,0 +1,23 @@
+[
+  {
+    "id": "protocol-1.0-client-with-1.1-worker",
+    "clientMinor": 0,
+    "workerMinor": 1,
+    "compatible": true,
+    "negotiatedMinor": 0
+  },
+  {
+    "id": "protocol-1.1-client-with-1.0-worker-requires-worker-upgrade",
+    "clientMinor": 1,
+    "workerMinor": 0,
+    "compatible": false,
+    "negotiatedMinor": 0
+  },
+  {
+    "id": "protocol-1.1-client-with-1.1-worker",
+    "clientMinor": 1,
+    "workerMinor": 1,
+    "compatible": true,
+    "negotiatedMinor": 1
+  }
+]

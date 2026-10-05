@@ -3,7 +3,6 @@ package trigger_test
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -225,7 +224,7 @@ func TestOneWorkflowServesMultipleCompatibleBindings(t *testing.T) {
 				t.Fatal(err)
 			}
 			var workerOutput any
-			if _, err := queue.ProcessOnce(context.Background(), func(ctx context.Context, _ *sql.Tx, job worker.Job) error {
+			if _, err := queue.ProcessOnce(context.Background(), func(ctx context.Context, _ worker.Tx, job worker.Job) error {
 				workerOutput, err = run(ctx, job.Kind, job.Payload)
 				return err
 			}); err != nil {

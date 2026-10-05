@@ -36,11 +36,16 @@ type memorySubmitter struct {
 	count    int
 	hold     chan struct{}
 	holdFor  string
+	// entered, when set, is signaled as a held submission starts waiting.
+	entered  chan struct{}
 	canceled atomic.Bool
 }
 
 func (m *memorySubmitter) Submit(ctx context.Context, s trigger.Submission) (bool, error) {
 	if m.hold != nil && (m.holdFor == "" || strings.Contains(string(s.Payload), m.holdFor)) {
+		if m.entered != nil {
+			m.entered <- struct{}{}
+		}
 		<-m.hold
 		// Give the caller's disconnect time to reach the context, if it
 		// is going to.
@@ -122,6 +127,7 @@ func (c *closed) wait(t *testing.T, reason string) {
 }
 
 type fixture struct {
+	app    *app.Application
 	hub    *sse.Hub
 	server *sse.Server
 	http   *httptest.Server
@@ -131,19 +137,29 @@ type fixture struct {
 }
 
 func newFixture(t *testing.T, config sse.HubConfig, configure func(*sse.Endpoint)) *fixture {
+	return newFixtureWithListener(t, config, configure, nil)
+}
+
+func newFixtureWithListener(t *testing.T, config sse.HubConfig, configure func(*sse.Endpoint), listener net.Listener) *fixture {
+	t.Helper()
+	return newFixtureWith(t, app.Config{}, config, configure, listener)
+}
+
+// newFixtureWith is newFixtureWithListener with its application configured.
+func newFixtureWith(t *testing.T, appConfig app.Config, config sse.HubConfig, configure func(*sse.Endpoint), listener net.Listener) *fixture {
 	t.Helper()
 	hub, err := sse.NewHub(config)
 	if err != nil {
 		t.Fatal(err)
 	}
-	application, err := app.New(app.Config{})
+	application, err := app.New(appConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := application.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	f := &fixture{hub: hub, submit: &memorySubmitter{payloads: map[string]string{}, settled: map[string]bool{}}, closed: &closed{}}
+	f := &fixture{app: application, hub: hub, submit: &memorySubmitter{payloads: map[string]string{}, settled: map[string]bool{}}, closed: &closed{}}
 	endpoint := sse.Endpoint{Name: "orders", Path: "/orders", Kind: "order.build", Submit: f.submit, Tracker: f.submit, Authenticate: authenticate, InputSchema: []byte(orderSchema), OnClose: f.closed.record}
 	if configure != nil {
 		configure(&endpoint)
@@ -152,7 +168,32 @@ func newFixture(t *testing.T, config sse.HubConfig, configure func(*sse.Endpoint
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.http = httptest.NewServer(f.server)
+	f.http = httptest.NewUnstartedServer(f.server)
+	if listener != nil {
+		unusedListener := f.http.Listener
+		tcpListener, ok := unusedListener.(*net.TCPListener)
+		if !ok {
+			t.Fatalf("httptest default listener has type %T, want *net.TCPListener", unusedListener)
+		}
+		if err := tcpListener.SetDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+			t.Fatalf("set deadline on unused httptest listener: %v", err)
+		}
+		if err := unusedListener.Close(); err != nil {
+			t.Fatalf("close unused httptest listener: %v", err)
+		}
+		conn, err := unusedListener.Accept()
+		if conn != nil {
+			_ = conn.Close()
+			closeErr := unusedListener.Close()
+			t.Fatalf("closed httptest listener accepted a connection (accept error %v); cleanup close: %v", err, closeErr)
+		}
+		if !errors.Is(err, net.ErrClosed) {
+			closeErr := unusedListener.Close()
+			t.Fatalf("accept on closed httptest listener returned %v, want %v; cleanup close: %v", err, net.ErrClosed, closeErr)
+		}
+		f.http.Listener = listener
+	}
+	f.http.Start()
 	f.client = &http.Client{Transport: &http.Transport{}}
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -534,27 +575,21 @@ func TestSlowSubscriberIsDisconnectedNotBuffered(t *testing.T) {
 // TestBlockedWriteTimesOut: a subscriber whose socket stops draining is
 // disconnected by the write deadline even while its queue has room.
 func TestBlockedWriteTimesOut(t *testing.T) {
-	f := newFixture(t, sse.HubConfig{RetainBytes: 1 << 20, MaxEventBytes: 64 << 10}, func(e *sse.Endpoint) {
+	transport, err := newWriteGateListener()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newFixtureWithListener(t, sse.HubConfig{RetainBytes: 1 << 20, MaxEventBytes: 64 << 10}, func(e *sse.Endpoint) {
 		e.QueueDepth = 256
 		e.WriteTimeout = 100 * time.Millisecond
-	})
+	}, transport)
 	stream := f.started(t, "alice", "k1")
-	conn := stalled(t, f, stream)
+	conn := blockedSubscription(t, f, stream, transport)
 	defer conn.Close()
-	// Small events the socket absorbs, for longer than one write timeout:
-	// each write gets its own deadline, so none of them times out.
-	for i := 0; i < 10; i++ {
-		publish(t, f.hub, stream, 1, "progress")
-		time.Sleep(30 * time.Millisecond)
+	if _, err := f.hub.Publish(stream, sse.Event{Type: "progress", Data: json.RawMessage(`{"step":1}`)}); err != nil {
+		t.Fatal(err)
 	}
-	f.closed.mu.Lock()
-	early := append([]string(nil), f.closed.reasons...)
-	f.closed.mu.Unlock()
-	if len(early) != 0 {
-		t.Fatalf("a draining subscription was closed: %v", early)
-	}
-	// More than the socket absorbs, fewer than it absorbs plus the queue.
-	flood(t, f.hub, stream, 280)
+	transport.waitBlocked(t)
 	f.closed.wait(t, sse.ReasonWriteTimeout)
 	if stats := f.hub.Stats(); stats.SlowSubscribers != 0 {
 		t.Fatalf("closed by the queue, not the write deadline: %+v", stats)
@@ -840,15 +875,21 @@ func TestLongStreamsDoNotLeak(t *testing.T) {
 // socket that stopped draining is ended by Shutdown at once, not after its
 // write deadline.
 func TestShutdownInterruptsABlockedWrite(t *testing.T) {
-	f := newFixture(t, sse.HubConfig{RetainBytes: 1 << 20, MaxEventBytes: 64 << 10}, func(e *sse.Endpoint) {
+	transport, err := newWriteGateListener()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newFixtureWithListener(t, sse.HubConfig{RetainBytes: 1 << 20, MaxEventBytes: 64 << 10}, func(e *sse.Endpoint) {
 		e.QueueDepth = 256
 		e.WriteTimeout = time.Minute
-	})
+	}, transport)
 	stream := f.started(t, "alice", "k1")
-	conn := stalled(t, f, stream)
+	conn := blockedSubscription(t, f, stream, transport)
 	defer conn.Close()
-	flood(t, f.hub, stream, 280)
-	time.Sleep(50 * time.Millisecond)
+	if _, err := f.hub.Publish(stream, sse.Event{Type: "progress", Data: json.RawMessage(`{"step":1}`)}); err != nil {
+		t.Fatal(err)
+	}
+	transport.waitBlocked(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	began := time.Now()
@@ -857,6 +898,33 @@ func TestShutdownInterruptsABlockedWrite(t *testing.T) {
 	}
 	f.closed.wait(t, sse.ReasonShutdown)
 	t.Logf("shutdown ended a blocked subscriber in %v", time.Since(began))
+}
+
+// TestClosingTransportUnblocksABlockedWrite verifies that force-closing the
+// server-side connection also releases the transport gate, as test cleanup
+// and client disconnect handling may do independently of a write deadline.
+func TestClosingTransportUnblocksABlockedWrite(t *testing.T) {
+	transport, err := newWriteGateListener()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newFixtureWithListener(t, sse.HubConfig{RetainBytes: 1 << 20, MaxEventBytes: 64 << 10}, func(e *sse.Endpoint) {
+		e.QueueDepth = 256
+		e.WriteTimeout = time.Minute
+	}, transport)
+	stream := f.started(t, "alice", "k1")
+	conn := blockedSubscription(t, f, stream, transport)
+	defer conn.Close()
+	if _, err := f.hub.Publish(stream, sse.Event{Type: "progress", Data: json.RawMessage(`{"step":1}`)}); err != nil {
+		t.Fatal(err)
+	}
+	transport.waitBlocked(t)
+
+	f.http.CloseClientConnections()
+	if err := transport.waitWriteExit(t); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("closing the server connection ended the blocked write with %v, want %v", err, net.ErrClosed)
+	}
+	f.closed.wait(t, sse.ReasonClientClosed)
 }
 
 // TestEndpointBoundsAreRefused: New refuses endpoints past their bounds,
@@ -1236,5 +1304,93 @@ func TestLeftSubscriberDoesNotPinStream(t *testing.T) {
 	clock.add(2 * time.Minute)
 	if status, body := f.start(t, "alice", "k2", `{"item":"book"}`); status != http.StatusAccepted {
 		t.Fatalf("a stream its subscriber left kept the hub full: %d %v", status, body)
+	}
+}
+
+// TestStartHoldsTheApplicationUntilSubmitted: the application cannot stop
+// while a start's durable submission is in flight; a start that arrives
+// while it drains is refused without submitting, and an open subscription
+// does not hold the application open.
+func TestStartHoldsTheApplicationUntilSubmitted(t *testing.T) {
+	f := newFixture(t, sse.HubConfig{}, nil)
+	stream := f.started(t, "alice", "first")
+	follow, err := http.NewRequest(http.MethodGet, f.url(stream), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	follow.Header.Set("Authorization", "Bearer alice")
+	subscription, err := f.client.Do(follow)
+	if err != nil || subscription.StatusCode != http.StatusOK {
+		t.Fatalf("subscription: %v %v", subscription, err)
+	}
+	defer subscription.Body.Close()
+	f.submit.hold, f.submit.entered = make(chan struct{}), make(chan struct{}, 1)
+	f.submit.holdFor = "pen"
+	var release sync.Once
+	// Cleanups run last-in first-out: this one frees a held submission
+	// before the fixture shuts down, so a failure cannot hang the test.
+	t.Cleanup(func() { release.Do(func() { close(f.submit.hold) }) })
+	type reply struct {
+		status int
+		body   map[string]any
+	}
+	replies := make(chan reply, 1)
+	go func() {
+		status, body := f.start(t, "alice", "held", `{"item":"pen"}`)
+		replies <- reply{status, body}
+	}()
+	select {
+	case <-f.submit.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the held start never reached its submission")
+	}
+	drained := make(chan error, 1)
+	go func() { drained <- f.app.Shutdown(context.Background()) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for f.app.State() == app.ReadyState {
+		if time.Now().After(deadline) {
+			t.Fatal("the application never began draining")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	before := f.submit.submissions()
+	late, err := http.NewRequest(http.MethodPost, f.http.URL+"/orders", strings.NewReader(`{"item":"book"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	late.Header.Set("Authorization", "Bearer alice")
+	late.Header.Set("Idempotency-Key", "late")
+	refused, err := f.client.Do(late)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var refusal map[string]any
+	_ = json.NewDecoder(refused.Body).Decode(&refusal)
+	refused.Body.Close()
+	if refused.StatusCode != http.StatusServiceUnavailable || refused.Header.Get("Retry-After") != "1" || refusal["error"] != "unavailable" {
+		t.Fatalf("a start while draining: %d Retry-After=%q %v", refused.StatusCode, refused.Header.Get("Retry-After"), refusal)
+	}
+	if got := f.submit.submissions(); got != before {
+		t.Fatalf("a refused start submitted (%d submissions, was %d)", got, before)
+	}
+	if state := f.app.State(); state != app.DrainingState {
+		t.Fatalf("the application is %s with a submission in flight; want draining", state)
+	}
+	release.Do(func() { close(f.submit.hold) })
+	select {
+	case r := <-replies:
+		if r.status != http.StatusAccepted {
+			t.Fatalf("the held start answered %d %v", r.status, r.body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the held start never answered")
+	}
+	select {
+	case err := <-drained:
+		if err != nil {
+			t.Fatalf("drain: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("an open subscription kept the application from stopping")
 	}
 }

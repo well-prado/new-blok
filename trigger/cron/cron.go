@@ -318,7 +318,7 @@ func (s *Scheduler) AddAll(ctx context.Context, schedules []Schedule) ([]bool, e
 	s.mu.Unlock()
 	var fresh []*entry
 	now := s.clock.Now().UTC()
-	err := s.database.WithTx(ctx, func(tx *sql.Tx) error {
+	err := s.database.WithTx(store.Writer(ctx), func(tx *sql.Tx) error {
 		fresh = fresh[:0]
 		for i, e := range entries {
 			if e == nil {
@@ -487,7 +487,7 @@ func (s *Scheduler) flush(ctx context.Context, updates map[*entry]cursorUpdate) 
 		return nil
 	}
 	now := s.clock.Now().UnixNano()
-	return s.database.WithTx(ctx, func(tx *sql.Tx) error {
+	return s.database.WithTx(store.Writer(ctx), func(tx *sql.Tx) error {
 		for e, u := range updates {
 			var held any
 			if u.pending != nil {

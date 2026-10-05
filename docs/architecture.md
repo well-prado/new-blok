@@ -111,6 +111,19 @@ One admission path authenticates/authorizes, maps and validates input, deduplica
 
 HTTP and one durable job path ship first. Other adapters pass shared conformance plus actual protocol integration tests. They implement no second interpreter, mapper or retry engine. The shared `trigger` contract, the per-kind completion/disconnect table and the `contract/conformance.RunTrigger` harness are recorded in [ADR 0005](decisions/0005-trigger-adapter-contract.md). Multiple bindings can share a listener where protocols permit; independent TLS/listeners remain selectable. Queue acknowledgment follows an explicit transfer model and stable delivery deduplication.
 
+Worker handlers write durable business state through the handler's `worker.Tx`
+so effects and acknowledgment commit together. The handler context carries the
+claim's write domain when the store exposes it; a nested queue submission to
+that same domain returns an actionable error before waiting on its own writer
+lock. A nested submission that bypasses that check (a replaced context, or a
+wrapper that hides the domain) waits out one busy timeout; its saturation
+names the write domain it waited on, and when that is the claim's own the job
+fails as a nested submission instead of being deferred. Saturation from
+another store remains backpressure and defers the job without spending an
+attempt. Stores and wrappers opt into detection by exposing and forwarding
+`store.WriteDomainProvider` and by naming the domain on their busy errors
+(`store.WithWriteDomain`).
+
 ## 7. Durability, effects and artifacts
 
 Memory mode permits in-flight loss. Journal mode resumes accepted work after process restart with its volume intact; it does not imply disk-loss survival or multi-host failover. Choose one embedded backend through a measured spike (SQLite candidate, Pebble alternative), implement the winner and keep the port replaceable.
@@ -122,6 +135,8 @@ An external success followed by a crash before result commit creates an uncertai
 Deployment manifests bind workflow document, native binary, worker artifacts, schemas, module locks, runtime versions, compiler and checkpoint formats. Immutable versions cannot be overwritten. Initial upgrades drain/retain compatible executables or refuse startup with actionable diagnostics. A later multi-version manager retains old workers for old runs. Replay creates a new run with lineage; partial reruns require separate tested effect semantics.
 
 Retention, compaction, backup, corruption checks and restore must preserve verified checkpoints and audit obligations. The current SQLite backup contract uses `VACUUM INTO` to create a new, transaction-consistent snapshot; it never overwrites an existing destination. Restore first runs `PRAGMA integrity_check`, copies into a temporary file, syncs it, and renames it into a new destination before checking the restored database again. These guarantees cover one local filesystem only: they do not provide disk-loss survival, replication, or multi-host failover. Business tables remain application-owned; the journal is not an ORM or a substitute for domain persistence.
+
+Distributed ownership remains an evaluation spike, not an available backend. [ADR 0017](decisions/0017-distributed-persistence-ownership.md) records an isolated etcd v3.6.5 fencing prototype, the incarnation-plus-revision fence needed across snapshot restore, the S3 blob acknowledgment boundary, and the limits of its one-host failure experiments. No app or engine code imports the prototype, and the spike does not select a production backend.
 
 ## 8. Workers and runtime coverage
 
@@ -145,11 +160,11 @@ Dev inspection streams bounded per-step input, started/processing events, output
 
 ## 10. Registry, deployment and scale
 
-Node/workflow packages have namespaced immutable identities, schemas, capability manifests, artifacts, dependency bounds and integrity digests. CLI add/remove/update/verify works offline from locked/cache data, rejects traversal/signature/digest/cycle/version conflicts, stages atomic changes and never executes install hooks without explicit policy. Go packages remain normal modules; foreign dependencies retain native lockfiles. Hosted publishing, ownership/moderation/search infrastructure and billing belong to the separate registry product.
+Node/workflow packages have namespaced immutable identities, schemas, capability manifests, artifacts, dependency bounds and integrity digests. E13-T02 implements deterministic dependency resolution, exact execution-relevant locks, and a bounded verified offline cache; see [ADR 0018](decisions/0018-deterministic-package-resolution.md). E13-T03 owns the later CLI add/remove/update/verify operations and atomic project-file changes. Go and npm remain authoritative for their own dependency graphs; Blok captures their exact native locks and execution context without acting as a universal installer. Hosted publishing, ownership/moderation/search infrastructure and billing belong to the separate registry product.
 
 App-owned binaries support health/readiness/metrics, bounded admission, signal-driven drain, graceful worker shutdown and durable-volume configuration. Cloud consumes reproducible deployment manifests, artifacts, readiness and operational APIs; framework self-hosting remains first-class. No proprietary service is required for core operation.
 
-Millions of requests per second is a fleet-scale design target, not a bootstrap claim. Partition ownership, fencing, replicated persistence, timers, blobs, load balancing, fairness and resharding require independent failure and capacity tests. Distinguish accepted requests, completed workflows, steps and external calls. Model retention and audit/telemetry cost per event.
+Millions of requests per second is a fleet-scale design target, not a bootstrap claim. Partition ownership, fencing, replicated persistence, timers, blobs, load balancing, fairness and resharding require independent failure and capacity tests. Distinguish accepted requests, completed workflows, steps and external calls. Model retention and audit/telemetry cost per event. ADR 0017 covers only one-host Docker failure and load experiments; those measurements are not fleet RPS or multi-region capacity. A replicated journal must fence each state commit in the same authoritative storage transaction; an ownership log alone is not failover.
 
 Benchmarks include useful native quote HTTP, journaled orders, bounded parallel work, worker equivalents, suspended runs, mixed tenants, slow clients, invalid/large payloads and overload. Publish hardware/topology/configuration, tool versions, warmup, repeated distributions, throughput, p50/p95/p99, CPU, RSS, allocations, queue depth, errors and crash recovery. Use controlled runners/noise policy for regressions. Optimization requires profiles.
 

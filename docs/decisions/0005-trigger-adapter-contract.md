@@ -41,8 +41,17 @@ dependency. It defines:
   publisher as a `caller`. Every other kind must authenticate its caller, so
   a caller-facing adapter cannot opt out of the authentication cases.
 - `Principal`: produced only by an adapter's authenticator.
-- `ErrSaturated`: returned by an admission handler without capacity. Adapters
-  translate it into protocol backpressure and never retry it themselves.
+- `ErrSaturated` (the same value as `capacity.ErrSaturated`): returned by an
+  admission handler without capacity, or by anything a handler calls that
+  ran out of capacity: a busy store's `store.ErrBusy` matches it (#190). It
+  means the operation that failed committed nothing; it does not mean the
+  handler did nothing, so the engine hides it once an earlier step's
+  declared effect has committed (ADR 0003). Adapters translate it into
+  protocol backpressure and never retry it themselves. An error that
+  matches both `ErrSaturated` and a context deadline may be answered as
+  either (HTTP and WebSocket check saturation first, gRPC and MCP the
+  deadline); both answers are retryable. Once the engine hides
+  saturation, the error matches the deadline alone, if it carries one.
 - `Classified` / `Classify`: a stable public `ErrorCode()`/`ErrorClass()` pair.
   `internal/engine.Error` and `node.DomainError` implement it, so adapters map
   domain errors without importing the engine. Codes are source-visible, so
@@ -73,7 +82,99 @@ assigns. Conformance distinguishes the two by counting dispatches per delivery.
 Redelivery is bounded. In the worker, a handler failure consumes an attempt;
 saturation and a lost consumer consume a separate deferral budget instead
 (`MaxDeferrals` = 16, backoff 1s doubling to a 1-minute cap), after which the
-job is dead-lettered with `deferral_budget_exhausted`.
+job is dead-lettered with `deferral_budget_exhausted`. Saturation that names
+the write domain the job's own claim holds is not backpressure but a nested
+submission, and fails the job (ADR 0006, #207).
+
+### Drain timeout
+
+A caller-facing adapter (HTTP, webhook, SSE, gRPC, WebSocket, MCP) holds an
+application lease (`app.Application.Begin`) for the work it admits, and
+`app.Shutdown` waits for every lease up to `DrainTimeout` before it closes
+the application's dependencies. The queued sources (worker, pubsub, cron)
+take no leases: they are loops driven by their context
+(`worker.Queue.ProcessOnce`, `pubsub.Consumer.Run`, `cron.Scheduler.Run`),
+and they stop with the application only if the host runs each as an
+`app.Dependency` whose `Close` cancels that context and waits for the
+loop. Work can outlive that wait.
+Shutdown then cancels it rather than closing the store under it (#177):
+
+- Every such adapter derives the admitted work's context from its lease
+  (`Lease.Bind`) right after admission, so authentication is covered too.
+  When the drain times out, that context is canceled with cause
+  `app.ErrDrainTimeout`; work bound after that starts canceled.
+- `Shutdown` then waits up to `AbortGrace` (1 s by default) for the canceled
+  work to release its leases, and only then closes the dependencies; both
+  waits end early if `Shutdown`'s own ctx does, so a caller's deadline also
+  bounds the grace. Work that ignores its context beyond that still meets
+  closed dependencies: it fails with their error, and nothing it was
+  writing commits.
+- `app/deploy.Deployment.Run` has two bounded phases. Its configured
+  `deployment.Config.DrainTimeout` bounds HTTP server drain. If that expires,
+  it cancels request contexts with `app.ErrDrainTimeout`, closes the listener
+  and connections, then gives the application at most its configured
+  `AbortGrace` for canceled handlers to release their leases. The overall
+  handler-drain bound is therefore the deployment drain timeout plus the
+  application abort grace. A handler that ignores cancellation beyond that
+  grace may still be running when dependencies close; native application code
+  is trusted code, so the host cannot guarantee it stops. Dependencies must
+  honor their close context. `Deployment.Run` treats its `ctx` cancellation
+  or signal as the shutdown trigger; the configured two phases bound shutdown
+  after that trigger. Direct `app.Shutdown(ctx)` instead keeps the caller's
+  context as the bound for both of its waits.
+  Only admitted work holds the HTTP drain open. Once admission is closed,
+  `Run` closes every connection that has not yet delivered a request (a
+  client's spare or speculative dial): it carries no admitted work, and
+  `http.Server.Shutdown` alone would keep it for five seconds, timing out a
+  drain whose real work had finished (#194). Such a connection gets no
+  answer; its request was never admitted, so retrying it is safe.
+- Aborted work may already have committed something, so it is answered as
+  a retry invitation only where a retry is harmless. The durable starts
+  (webhook, SSE) are keyed, so they answer 503 `unavailable` with
+  `Retry-After`; a final answer the submission already had (conflict,
+  invalid input) still wins. The in-band adapters have no key, and answer
+  as the cancellation it is, which clients do not retry by default (the
+  rule #190 set for a failure after an effect): HTTP 504, gRPC `Canceled`,
+  MCP and WebSocket `canceled` (HTTP 504 when the handler returns the
+  context's error; any other unclassified error stays 500). A handler that
+  returned success is still answered with it. An aborted WebSocket
+  `OnConnect` closes with 1013 (try again later); the disconnect workflow
+  that follows starts canceled.
+
+The alternative considered was to require `DrainTimeout` to cover every
+endpoint's read and submit bounds. It was rejected: it ties the
+application's configuration to every adapter's knobs, and it still fails
+for a dependency that hangs.
+
+### Host shutdown order
+
+A host that runs several adapters over one application stops them in this
+order, which `trigger/nine_test.go` drives with work in flight (#173):
+
+1. **The adapters.** `sse.Server.Shutdown` ends subscriptions,
+   `websocket.Server.Shutdown` closes connections as going away (1001),
+   `mcp.Server.Shutdown` refuses new sessions and calls and waits for the
+   calls in flight and their answers (#197), the gRPC server's `GracefulStop` finishes its calls, and
+   the HTTP server's `Shutdown` finishes its requests (HTTP, webhook, SSE
+   starts). The order matters: SSE subscriptions keep their connections
+   active, so the HTTP server's `Shutdown` would
+   wait on them until its deadline if they were not ended first. The
+   application stays ready meanwhile, so work they hold completes and is
+   answered, and until the HTTP server's `Shutdown` runs, HTTP, webhook and
+   SSE starts are still admitted (an SSE start admitted then is followed
+   from another instance, or after the restart). A WebSocket message in
+   flight is not answered: closing the connection cancels it, and the
+   client resends; the websocket package's own shutdown tests cover that.
+2. **The application.** `app.Shutdown` drains what is left. The queued
+   sources (cron, pubsub, the worker pool) are registered as its
+   dependencies, after the store if the store is one, so they stop before
+   it: a worker job in flight is canceled with its consumer, rolled back and
+   left pending without spending an attempt.
+3. **The store and broker connections**, closed last, by the application as
+   its first dependencies or by the host after `app.Shutdown` returns.
+
+The queued sources stop with the application only because the host
+registers them as dependencies; nothing else stops them.
 
 ### Conformance harness
 
@@ -145,6 +246,15 @@ not applicable with a reason, never as passed. Failures are
 | Worker defers `ErrSaturated` and lost consumers against a bounded deferral budget instead of attempts | behavioral (fix) | saturation was dead-lettered. Adds `Job.Deferrals` and a `deferrals` column; `worker.New` migrates existing queues in place |
 | Worker consumer loss returns `ErrConsumerLost` after a synchronous rollback | behavioral (fix) | the claim was aborted by `database/sql` in the background; an immediate redelivery hit `SQLITE_BUSY` in 7 of 400 contended conformance runs (0 of 400 after the fix) |
 | Worker dead-letter text may be a classified error code | behavioral | only codes `Classify` accepts as stable identifiers; never arbitrary error text |
+| `trigger.ErrSaturated` is `capacity.ErrSaturated`; `store.ErrBusy` matches it (#190) | behavioral | a busy store's error, reaching an in-band trigger, is answered as saturation instead of an internal error. Code that read `errors.Is(err, ErrSaturated)` as "refused before admission, nothing happened" now also sees "a store transaction committed nothing" |
+| The engine hides saturation after an earlier step's declared effect (#190) | behavioral | such a failure keeps its code and matches everything else it carried, but no longer `ErrSaturated`; its text gains `(after step "<id>" committed its effects)`. It is answered as a failure, never as a retryable refusal. A worker hosting such a workflow fails or dead-letters the job instead of deferring it |
+| Agent catalog workflow tools' dispatch steps declare their child's effects (#190) | behavioral | lets the engine hide saturation after a child's effect; dispatch steps are internal, so nothing else observes it |
+| `store.ErrBusy` text is `store: busy` | behavioral | log text only; match it with `errors.Is` |
+| `app.Lease.Context`/`Bind`, `app.Aborted`, `Config.AbortGrace` | additive | none |
+| `app.Application.AbortGrace()` | additive | none; reports the effective configured grace for host shutdown orchestration |
+| A drain timeout cancels admitted work, waits up to `AbortGrace`, then closes the dependencies (#177) | behavioral (fix) | work that outlived `DrainTimeout` used to run on into closed dependencies. Handlers should observe their context |
+| HTTP's draining 503 carries `Retry-After` | additive | none |
+| `Deployment.Run` closes request-less connections when drain begins (#194) | behavioral (fix) | a connection opened but not yet carrying a request is closed instead of answered. Its request was never admitted. A drain that used to report `application_drain_timeout` because of such a connection now ends when the admitted work does |
 
 ## Limits
 

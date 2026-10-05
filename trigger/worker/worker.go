@@ -10,8 +10,11 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/well-prado/new-blok/contract/schema"
 	"github.com/well-prado/new-blok/store"
@@ -33,6 +36,9 @@ var (
 	ErrNotFound        = errors.New("worker: job not found")
 	// ErrInvalidPayload rejects a job before durable acceptance.
 	ErrInvalidPayload = fmt.Errorf("worker: payload is invalid for its kind: %w", trigger.ErrInvalidInput)
+	// ErrNestedSubmission reports a handler submission to the write domain
+	// held by its claim. Use the handler's Tx for atomic writes instead.
+	ErrNestedSubmission = errors.New("worker: nested submission targets the store whose claim this handler holds; use the handler Tx for atomic writes")
 )
 
 const (
@@ -100,13 +106,229 @@ type HandlerError struct {
 
 func (e *HandlerError) Error() string { return e.Message }
 
-type Handler func(context.Context, *sql.Tx, Job) error
+// Handler processes one job. Its writes go through tx, in the same
+// transaction as the job's acknowledgment, so they commit only if the job
+// does. ctx is the consumer's: it is canceled when the consumer is lost. The
+// context also carries the claimed write domain when the store exposes one,
+// allowing Queue.Enqueue/Submit to reject a nested write to that same domain
+// before it waits. Preserve ctx when submitting: a nested submission made
+// with context.Background (or through a wrapper that hides the write domain)
+// still fails the job as ErrNestedSubmission, but only after waiting out the
+// store's busy timeout once.
+type Handler func(ctx context.Context, tx Tx, job Job) error
+
+// ErrClaimLost reports that the claim's transaction ended while a handler
+// was running: SQLite rolls a whole transaction back when one of its
+// statements is interrupted, fails for want of space, memory or I/O, or
+// hits an ON CONFLICT ROLLBACK constraint or a trigger's RAISE(ROLLBACK).
+// Nothing the handler wrote was committed, and no further statement runs.
+var ErrClaimLost = errors.New("worker: the claim's transaction ended")
+
+// Tx is the claim's transaction as a handler sees it. It fails closed: when
+// a statement fails, Tx checks that the transaction still holds this claim,
+// and once it does not, every further statement returns ErrClaimLost. A
+// transaction SQLite rolled back is otherwise invisible to database/sql, and
+// a handler that went on writing would commit outside the claim, and again
+// on redelivery (#180). ProcessOnce counts a lost claim as a failed attempt.
+// Tx is safe for concurrent use. It refuses statements that would begin,
+// end or nest the transaction (ErrTransactionControl); a handler must not
+// hide one inside a multi-statement string.
+type Tx struct{ claim *claimTx }
+
+// claimTx is the claim's transaction and what identifies the claim in it.
+type claimTx struct {
+	tx    *sql.Tx
+	jobID string
+	lease int64
+	// mu is held across each statement and the check after it, so no
+	// statement, from any goroutine, starts on a transaction SQLite has
+	// ended before the claim is known to be lost.
+	mu   sync.Mutex
+	dead bool
+}
+
+func (c *claimTx) lost() bool { c.mu.Lock(); defer c.mu.Unlock(); return c.dead }
+
+// do runs one statement in the claim's transaction. It refuses to run once
+// the claim is lost. When the statement fails, the failure may have ended
+// the whole transaction: the claim is still held only if the transaction
+// still sees its own uncommitted lease on the job (read on the claim's own
+// connection; once SQLite has rolled back, that read sees the job as it was
+// before the claim).
+func (c *claimTx) do(statement func() error) error {
+	if c == nil {
+		return ErrClaimLost
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.dead {
+		return ErrClaimLost
+	}
+	err := statement()
+	if err == nil || errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	var state string
+	var lease sql.NullInt64
+	probe := c.tx.QueryRowContext(context.Background(), `SELECT state, lease_until FROM worker_jobs WHERE job_id = ?`, c.jobID).Scan(&state, &lease)
+	if probe != nil || state != StateProcessing || !lease.Valid || lease.Int64 != c.lease {
+		c.dead = true
+	}
+	return err
+}
+
+func (c *claimTx) exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	var result sql.Result
+	err := c.do(func() error {
+		var err error
+		result, err = c.tx.ExecContext(ctx, query, args...)
+		return err
+	})
+	return result, err
+}
+
+// ErrTransactionControl reports a handler statement that would begin, end
+// or nest the claim's transaction: the claim owns it.
+var ErrTransactionControl = errors.New("worker: a handler cannot control the claim's transaction")
+
+// controls reports whether a statement begins with a transaction-control
+// keyword, after any leading whitespace, comments and empty statements (a
+// lone ";", which SQLite skips).
+func controls(query string) bool {
+	for {
+		query = strings.TrimLeftFunc(query, func(r rune) bool { return unicode.IsSpace(r) || r == ';' })
+		switch {
+		case strings.HasPrefix(query, "--"):
+			_, rest, found := strings.Cut(query, "\n")
+			if !found {
+				return false
+			}
+			query = rest
+		case strings.HasPrefix(query, "/*"):
+			_, rest, found := strings.Cut(query[2:], "*/")
+			if !found {
+				return false
+			}
+			query = rest
+		default:
+			end := strings.IndexFunc(query, func(r rune) bool { return !unicode.IsLetter(r) })
+			if end < 0 {
+				end = len(query)
+			}
+			switch strings.ToUpper(query[:end]) {
+			case "BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE":
+				return true
+			}
+			return false
+		}
+	}
+}
+
+// ExecContext runs a statement in the claim's transaction.
+func (t Tx) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	if controls(query) {
+		return nil, ErrTransactionControl
+	}
+	return t.claim.exec(ctx, query, args...)
+}
+
+// QueryContext runs a query in the claim's transaction.
+func (t Tx) QueryContext(ctx context.Context, query string, args ...any) (*Rows, error) {
+	if controls(query) {
+		return nil, ErrTransactionControl
+	}
+	var rows *sql.Rows
+	err := t.claim.do(func() error {
+		var err error
+		rows, err = t.claim.tx.QueryContext(ctx, query, args...)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &Rows{rows: rows, claim: t.claim}, nil
+}
+
+// QueryRowContext runs a single-row query in the claim's transaction. The
+// query runs, and its failure is checked, before it returns.
+func (t Tx) QueryRowContext(ctx context.Context, query string, args ...any) *Row {
+	if controls(query) {
+		return &Row{err: ErrTransactionControl}
+	}
+	var row *sql.Row
+	err := t.claim.do(func() error {
+		row = t.claim.tx.QueryRowContext(ctx, query, args...)
+		return row.Err()
+	})
+	if err != nil {
+		return &Row{err: err}
+	}
+	return &Row{row: row, claim: t.claim}
+}
+
+// Row is the result of Tx.QueryRowContext.
+type Row struct {
+	row   *sql.Row
+	claim *claimTx
+	err   error
+}
+
+// Scan copies the row's columns into dest, like sql.Row.Scan.
+func (r *Row) Scan(dest ...any) error {
+	if r.err != nil {
+		return r.err
+	}
+	return r.claim.do(func() error { return r.row.Scan(dest...) })
+}
+
+// Err reports the row's error without scanning, like sql.Row.Err.
+func (r *Row) Err() error { return r.err }
+
+// Rows is the result of Tx.QueryContext.
+type Rows struct {
+	rows  *sql.Rows
+	claim *claimTx
+	err   error
+}
+
+// Next prepares the next row, like sql.Rows.Next. When it returns false,
+// Err reports why.
+func (r *Rows) Next() bool {
+	next := false
+	if err := r.claim.do(func() error {
+		next = r.rows.Next()
+		if next {
+			return nil
+		}
+		return r.rows.Err()
+	}); err != nil {
+		r.err = err
+	}
+	return next
+}
+
+// Scan copies the current row's columns into dest, like sql.Rows.Scan.
+func (r *Rows) Scan(dest ...any) error {
+	return r.claim.do(func() error { return r.rows.Scan(dest...) })
+}
+
+// Err reports the error, if any, that ended the iteration.
+func (r *Rows) Err() error {
+	if r.err != nil {
+		return r.err
+	}
+	return r.rows.Err()
+}
+
+// Close closes the rows.
+func (r *Rows) Close() error { return r.rows.Close() }
 
 type Queue struct {
-	database store.Database
-	clock    func() time.Time
-	mu       sync.RWMutex
-	schemas  map[string]schema.Schema
+	database    store.Database
+	writeDomain *store.WriteDomain
+	clock       func() time.Time
+	mu          sync.RWMutex
+	schemas     map[string]schema.Schema
 }
 
 func New(ctx context.Context, database store.Database, clock func() time.Time) (*Queue, error) {
@@ -116,19 +338,64 @@ func New(ctx context.Context, database store.Database, clock func() time.Time) (
 	if clock == nil {
 		clock = time.Now
 	}
-	queue := &Queue{database: database, clock: clock, schemas: map[string]schema.Schema{}}
-	if err := queue.withTx(ctx, func(tx *sql.Tx) error {
-		if err := createJobs(ctx, tx); err != nil {
+	writeDomain, _ := store.WriteDomainOf(database)
+	queue := &Queue{database: database, writeDomain: writeDomain, clock: clock, schemas: map[string]schema.Schema{}}
+	if err := migrate(ctx, func() error {
+		return queue.withTx(ctx, func(tx *sql.Tx) error {
+			if err := createJobs(ctx, tx); err != nil {
+				return err
+			}
+			if err := ensureColumn(ctx, tx, "deferrals", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+				return err
+			}
+			if err := ensureColumn(ctx, tx, "principal_json", "TEXT NOT NULL DEFAULT ''"); err != nil {
+				return err
+			}
+			// enqueue_seq orders jobs that share a created_at by when they were
+			// enqueued (#217). Jobs from before the column existed keep 0 and
+			// fall back to job_id among themselves.
+			if err := ensureColumn(ctx, tx, "enqueue_seq", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+				return err
+			}
+			_, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS worker_jobs_enqueue_seq ON worker_jobs (enqueue_seq)`)
 			return err
-		}
-		if err := ensureColumn(ctx, tx, "deferrals", "INTEGER NOT NULL DEFAULT 0"); err != nil {
-			return err
-		}
-		return ensureColumn(ctx, tx, "principal_json", "TEXT NOT NULL DEFAULT ''")
+		})
 	}); err != nil {
 		return nil, fmt.Errorf("worker: schema: %w", err)
 	}
 	return queue, nil
+}
+
+// migrationBudget bounds how long New keeps starting new attempts at a
+// schema migration that lost a race with another opener. An attempt that
+// starts within it may still wait up to the store's busy timeout for the
+// write lock, so New can take the budget plus one busy timeout.
+const migrationBudget = 10 * time.Second
+
+// migrate runs the schema transaction, retrying it while it fails busy (#233).
+// Adding a column must read the schema before it writes, and SQLite cannot
+// make such a transaction wait for another writer: when several processes
+// open a queue that needs a column, all but one fail busy at once instead of
+// waiting their turn. The migration is idempotent and a failed attempt
+// commits nothing, so it is simply run again, with a short growing pause,
+// until it succeeds, fails otherwise, ctx ends or the budget is spent.
+func migrate(ctx context.Context, run func() error) error {
+	deadline := time.Now().Add(migrationBudget)
+	pause := 5 * time.Millisecond
+	for {
+		err := run()
+		if err == nil || !errors.Is(err, store.ErrBusy) || time.Now().Add(pause).After(deadline) {
+			return err
+		}
+		timer := time.NewTimer(pause)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return errors.Join(err, ctx.Err())
+		case <-timer.C:
+		}
+		pause = min(2*pause, 200*time.Millisecond)
+	}
 }
 
 func createJobs(ctx context.Context, tx *sql.Tx) error {
@@ -147,7 +414,8 @@ func createJobs(ctx context.Context, tx *sql.Tx) error {
 		lease_until INTEGER,
 		error_text TEXT NOT NULL DEFAULT '',
 		created_at INTEGER NOT NULL,
-		updated_at INTEGER NOT NULL
+		updated_at INTEGER NOT NULL,
+		enqueue_seq INTEGER NOT NULL DEFAULT 0
 	)`)
 	return err
 }
@@ -204,6 +472,12 @@ func (q *Queue) RegisterKind(kind string, inputSchema []byte) error {
 }
 
 func (q *Queue) Enqueue(ctx context.Context, request EnqueueRequest) (EnqueueResult, error) {
+	if q.writeDomain != nil {
+		claimed, ok := ctx.Value(claimedWriteDomainKey{}).(*claimedWriteDomain)
+		if ok && claimed.active.Load() && store.SameWriteDomain(claimed.domain, q.writeDomain) {
+			return EnqueueResult{}, ErrNestedSubmission
+		}
+	}
 	if request.RequestKey == "" || request.Kind == "" {
 		return EnqueueResult{}, errors.New("worker: request key and kind are required")
 	}
@@ -230,10 +504,14 @@ func (q *Queue) Enqueue(ctx context.Context, request EnqueueRequest) (EnqueueRes
 	// ID from the clock let equal payloads collide under a coarse clock.
 	jobID := "job:" + digest([]byte(request.RequestKey))[:32]
 	var result EnqueueResult
-	err = q.withTx(ctx, func(tx *sql.Tx) error {
+	err = q.withTx(store.Writer(ctx), func(tx *sql.Tx) error {
+		// enqueue_seq is one past the highest so far, read under this
+		// transaction's write lock, so it follows commit order. It is stored
+		// rather than taken from SQLite's rowid, which SQLite documents VACUUM
+		// may renumber for tables without an INTEGER PRIMARY KEY.
 		res, err := tx.ExecContext(ctx, `INSERT INTO worker_jobs
-			(job_id, request_key, kind, payload_json, payload_digest, max_attempts, principal_json, state, available_at, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(request_key) DO NOTHING`,
+			(job_id, request_key, kind, payload_json, payload_digest, max_attempts, principal_json, state, available_at, created_at, updated_at, enqueue_seq)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(enqueue_seq), 0) + 1 FROM worker_jobs)) ON CONFLICT(request_key) DO NOTHING`,
 			jobID, request.RequestKey, request.Kind, []byte(request.Payload), payloadDigest, request.MaxAttempts, principal, StatePending, q.now(), q.now(), q.now())
 		if err != nil {
 			return err
@@ -261,6 +539,26 @@ func (q *Queue) Enqueue(ctx context.Context, request EnqueueRequest) (EnqueueRes
 		return nil
 	})
 	if err != nil {
+		// A WithTx error means nothing was committed (the driver rolls back
+		// any failed COMMIT). The deadline is also read from ctx: if it ran
+		// out just before COMMIT, database/sql may report ErrTxDone instead.
+		if errors.Is(err, store.ErrBusy) || errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			// A store too busy to take the submission before the lock wait
+			// or the caller's deadline runs out is saturation: nothing was
+			// committed (database/sql checks the deadline before COMMIT),
+			// so the submission may be retried. A caller that canceled is
+			// not saturation.
+			saturated := fmt.Errorf("worker: enqueue: %w: %w", trigger.ErrSaturated, err)
+			// Name the write domain the submission waited on. A store that
+			// annotates its busy errors already did, even through a wrapper
+			// that hides WriteDomain; otherwise it is this queue's own. A
+			// handler that returns this error from inside a claim on the
+			// same domain is diagnosed by ProcessOnce (#207).
+			if _, named := store.ErrorWriteDomain(saturated); !named {
+				saturated = store.WithWriteDomain(saturated, q.writeDomain)
+			}
+			return EnqueueResult{}, saturated
+		}
 		return EnqueueResult{}, fmt.Errorf("worker: enqueue: %w", err)
 	}
 	return result, nil
@@ -271,15 +569,37 @@ func (q *Queue) Enqueue(ctx context.Context, request EnqueueRequest) (EnqueueRes
 // so the job is delivered again without consuming an attempt.
 var ErrConsumerLost = errors.New("worker: consumer lost before acknowledgment")
 
+// claimedWriteDomainKey marks the write domain held by ProcessOnce's claim.
+// The value is attached only to the handler's trusted native context.
+type claimedWriteDomainKey struct{}
+
+type claimedWriteDomain struct {
+	domain *store.WriteDomain
+	active atomic.Bool
+}
+
 // ProcessOnce claims and processes one job. The handler and acknowledgment are
 // in the same transaction, so a crash rolls back both the business write and
 // the delivery acknowledgment. A handler must not perform unknown external
 // effects without an idempotency key or reconciliation path.
 //
-// Only the handler observes ctx. The transaction runs on a context ctx cannot
-// cancel, so losing the consumer rolls the claim back synchronously before
-// ProcessOnce returns instead of leaving database/sql to abort it in the
-// background while the write lock is still held.
+// Only the claim statement and the handler observe ctx. The claim holds
+// nothing while it waits for its turn in the store's writer queue (#214) or
+// for the write lock, so a consumer canceled meanwhile is reported as
+// ErrConsumerLost. Neither wait is interrupted by ctx (the claim's
+// transaction deliberately is not canceled with it), so that report can
+// take up to the busy timeout, or twice that when a writer on another
+// handle then holds the lock.
+// Everything after the claim runs on a context ctx cannot cancel, so losing
+// the consumer rolls the claim back synchronously before ProcessOnce returns
+// instead of leaving database/sql to abort it in the background while the
+// write lock is still held.
+//
+// The handler runs inside the claim's write transaction, which holds the
+// store's single write lock until it commits: handlers of concurrent workers
+// run one at a time, and every other writer waits for them under the busy
+// timeout. Keep handlers short; a writer that waits longer than the busy
+// timeout still fails with SQLITE_BUSY (ADR 0003).
 func (q *Queue) ProcessOnce(ctx context.Context, handler Handler) (bool, error) {
 	if handler == nil {
 		return false, errors.New("worker: handler is required")
@@ -289,48 +609,99 @@ func (q *Queue) ProcessOnce(ctx context.Context, handler Handler) (bool, error) 
 	}
 	txCtx := context.WithoutCancel(ctx)
 	processed := false
-	var lost Job
-	err := q.withTx(txCtx, func(tx *sql.Tx) error {
-		job, err := q.claim(txCtx, tx)
+	var lost, died Job
+	var activeDomain *claimedWriteDomain
+	defer func() {
+		if activeDomain != nil {
+			activeDomain.active.Store(false)
+		}
+	}()
+	// The claim writes first (#176), so it takes its turn in the store's
+	// writer queue (#214); the handler then runs inside that turn, as it
+	// runs inside the write lock.
+	err := q.withTx(store.Writer(txCtx), func(tx *sql.Tx) error {
+		job, lease, err := q.claim(ctx, tx)
 		if errors.Is(err, ErrNotFound) {
 			return nil
+		}
+		if err != nil && ctx.Err() != nil {
+			return fmt.Errorf("%w: %w", ErrConsumerLost, ctx.Err())
 		}
 		if err != nil {
 			return err
 		}
 		processed = true
-		if _, err := tx.ExecContext(txCtx, `SAVEPOINT worker_handler`); err != nil {
+		// Every statement after the claim goes through the claim's
+		// fail-closed transaction: once SQLite has ended it, nothing more
+		// runs, so nothing can commit outside the claim.
+		claimed := &claimTx{tx: tx, jobID: job.ID, lease: lease}
+		ended := func(err error) error {
+			if claimed.lost() {
+				died = job
+				return ErrClaimLost
+			}
 			return err
 		}
-		handlerErr := handler(ctx, tx, job)
+		if _, err := claimed.exec(txCtx, `SAVEPOINT worker_handler`); err != nil {
+			return ended(err)
+		}
+		handlerCtx := ctx
+		if q.writeDomain != nil {
+			activeDomain = &claimedWriteDomain{domain: q.writeDomain}
+			activeDomain.active.Store(true)
+			handlerCtx = context.WithValue(ctx, claimedWriteDomainKey{}, activeDomain)
+		}
+		handlerErr := handler(handlerCtx, Tx{claim: claimed}, job)
 		if ctx.Err() != nil {
 			// Returning an error discards the claim with the handler's
 			// writes: the delivery was never acknowledged.
 			lost = job
 			return fmt.Errorf("%w: %w", ErrConsumerLost, ctx.Err())
 		}
+		if claimed.lost() {
+			return ended(ErrClaimLost)
+		}
 		if handlerErr == nil {
-			if _, err := tx.ExecContext(txCtx, `RELEASE SAVEPOINT worker_handler`); err != nil {
-				return err
+			if _, err := claimed.exec(txCtx, `RELEASE SAVEPOINT worker_handler`); err != nil {
+				return ended(err)
 			}
-			_, err = tx.ExecContext(txCtx, `UPDATE worker_jobs SET state = ?, lease_until = NULL, updated_at = ? WHERE job_id = ? AND state = ?`, StateCompleted, q.now(), job.ID, StateProcessing)
-			return err
+			_, err = claimed.exec(txCtx, `UPDATE worker_jobs SET state = ?, lease_until = NULL, updated_at = ? WHERE job_id = ? AND state = ?`, StateCompleted, q.now(), job.ID, StateProcessing)
+			return ended(err)
 		}
-		if _, err := tx.ExecContext(txCtx, `ROLLBACK TO SAVEPOINT worker_handler`); err != nil {
-			return err
+		if _, err := claimed.exec(txCtx, `ROLLBACK TO SAVEPOINT worker_handler`); err != nil {
+			return ended(err)
 		}
-		if _, err := tx.ExecContext(txCtx, `RELEASE SAVEPOINT worker_handler`); err != nil {
-			return err
+		if _, err := claimed.exec(txCtx, `RELEASE SAVEPOINT worker_handler`); err != nil {
+			return ended(err)
 		}
-		if errors.Is(handlerErr, trigger.ErrSaturated) {
+		// Store saturation is backpressure. Enqueue diagnoses a submission
+		// to this claim's own write domain as ErrNestedSubmission before it
+		// waits when the handler's context reaches it. When it did not (a
+		// detached context, or a wrapper that hides WriteDomain) the
+		// submission waits out the busy timeout and names the domain it
+		// waited on: if that is this claim's, the claim itself held the
+		// lock, and deferring would only repeat the wait (#207). A handler
+		// may join that failure with saturation from another store, so the
+		// job fails if any branch of the error names this claim's domain,
+		// not only the first. Busy errors and deadlines from other domains
+		// alone defer normally.
+		if errors.Is(handlerErr, trigger.ErrSaturated) && !errors.Is(handlerErr, ErrNestedSubmission) {
+			for _, domain := range store.ErrorWriteDomains(handlerErr) {
+				if store.SameWriteDomain(domain, q.writeDomain) {
+					handlerErr = fmt.Errorf("%w: %w", ErrNestedSubmission, handlerErr)
+					break
+				}
+			}
+		}
+		if errors.Is(handlerErr, trigger.ErrSaturated) && !errors.Is(handlerErr, ErrNestedSubmission) {
 			// Saturation is backpressure, not a handler failure: the job is
 			// deferred without consuming an attempt, within its deferral budget.
 			state, message := StatePending, ""
 			if job.Deferrals+1 > MaxDeferrals {
 				state, message = StateDead, DeferralExhausted
 			}
-			_, err = tx.ExecContext(txCtx, `UPDATE worker_jobs SET state = ?, attempt = attempt - 1, deferrals = deferrals + 1, available_at = ?, lease_until = NULL, error_text = ?, updated_at = ? WHERE job_id = ? AND state = ?`, state, q.now()+int64(deferralDelay(job.Deferrals+1)), message, q.now(), job.ID, StateProcessing)
-			return err
+			_, err = claimed.exec(txCtx, `UPDATE worker_jobs SET state = ?, attempt = attempt - 1, deferrals = deferrals + 1, available_at = ?, lease_until = NULL, error_text = ?, updated_at = ? WHERE job_id = ? AND state = ?`, state, q.now()+int64(deferralDelay(job.Deferrals+1)), message, q.now(), job.ID, StateProcessing)
+			return ended(err)
 		}
 		message := safeMessage(handlerErr)
 		state := StateDead
@@ -339,13 +710,33 @@ func (q *Queue) ProcessOnce(ctx context.Context, handler Handler) (bool, error) 
 			state = StatePending
 			available += int64(time.Duration(job.Attempt) * time.Second)
 		}
-		_, err = tx.ExecContext(txCtx, `UPDATE worker_jobs SET state = ?, available_at = ?, lease_until = NULL, error_text = ?, updated_at = ? WHERE job_id = ? AND state = ?`, state, available, message, q.now(), job.ID, StateProcessing)
-		return err
+		_, err = claimed.exec(txCtx, `UPDATE worker_jobs SET state = ?, available_at = ?, lease_until = NULL, error_text = ?, updated_at = ? WHERE job_id = ? AND state = ?`, state, available, message, q.now(), job.ID, StateProcessing)
+		return ended(err)
 	})
+	if activeDomain != nil {
+		// The transaction has committed or rolled back; retained handler
+		// contexts no longer represent a held write lock.
+		activeDomain.active.Store(false)
+	}
+	if err != nil && !processed && !errors.Is(err, ErrConsumerLost) && ctx.Err() != nil {
+		// The consumer was lost while this worker waited for its write
+		// turn (#214): it claimed nothing, so the job is untouched.
+		err = fmt.Errorf("%w: %w", ErrConsumerLost, errors.Join(ctx.Err(), err))
+	}
 	if errors.Is(err, ErrConsumerLost) && lost.ID != "" {
 		if deferErr := q.deferLost(txCtx, lost); deferErr != nil {
 			err = errors.Join(err, deferErr)
 		}
+	}
+	if errors.Is(err, ErrClaimLost) && died.ID != "" {
+		// The claim's transaction ended and took the claim with it, so the
+		// attempt would otherwise go uncounted and the job be redelivered at
+		// once, forever. It is a failed attempt, counted in a fresh
+		// transaction.
+		if chargeErr := q.chargeLostClaim(txCtx, died); chargeErr != nil {
+			return true, fmt.Errorf("worker: process: %w", errors.Join(err, chargeErr))
+		}
+		return true, nil
 	}
 	if err != nil {
 		return false, fmt.Errorf("worker: process: %w", err)
@@ -353,11 +744,28 @@ func (q *Queue) ProcessOnce(ctx context.Context, handler Handler) (bool, error) 
 	return processed, nil
 }
 
+// chargeLostClaim counts a claim whose transaction ended as a failed
+// attempt: the job is retried after a backoff, or dead once its attempts
+// are spent. A crash before it commits leaves one uncounted redelivery.
+func (q *Queue) chargeLostClaim(ctx context.Context, job Job) error {
+	return q.withTx(store.Writer(ctx), func(tx *sql.Tx) error {
+		state, available := StateDead, q.now()
+		if job.Attempt < job.MaxAttempts {
+			state = StatePending
+			available += int64(time.Duration(job.Attempt) * time.Second)
+		}
+		// The rollback restored the job as it was before this claim, at the
+		// previous attempt; another worker's claim would have moved it on.
+		_, err := tx.ExecContext(ctx, `UPDATE worker_jobs SET state = ?, attempt = ?, available_at = ?, lease_until = NULL, error_text = ?, updated_at = ? WHERE job_id = ? AND attempt = ? AND state IN (?, ?)`, state, job.Attempt, available, "claim transaction ended", q.now(), job.ID, job.Attempt-1, StatePending, StateProcessing)
+		return err
+	})
+}
+
 // deferLost charges a lost consumer against the job's deferral budget after
 // the claim has been rolled back. A crash between the two leaves one
 // uncounted redelivery, never an acknowledged one.
 func (q *Queue) deferLost(ctx context.Context, job Job) error {
-	return q.withTx(ctx, func(tx *sql.Tx) error {
+	return q.withTx(store.Writer(ctx), func(tx *sql.Tx) error {
 		state, message := StatePending, ""
 		if job.Deferrals+1 > MaxDeferrals {
 			state, message = StateDead, DeferralExhausted
@@ -423,29 +831,27 @@ func (q *Queue) Get(ctx context.Context, requestKey string) (Job, error) {
 	return job, err
 }
 
-func (q *Queue) claim(ctx context.Context, tx *sql.Tx) (Job, error) {
-	var job Job
-	row := tx.QueryRowContext(ctx, `SELECT job_id, request_key, kind, payload_json, attempt, max_attempts, deferrals, principal_json, state, error_text FROM worker_jobs
-		WHERE (state = ? OR (state = ? AND lease_until <= ?)) AND available_at <= ? ORDER BY created_at, job_id LIMIT 1`, StatePending, StateProcessing, q.now(), q.now())
-	if scanned, err := scanJob(row); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return Job{}, ErrNotFound
-		}
-		return Job{}, err
-	} else {
-		job = scanned
+// claim leases the next available job: the oldest created_at first, and
+// among jobs that share one, the first enqueued (#217). Its first statement
+// writes: a
+// transaction that reads before writing cannot wait for a concurrent
+// writer and fails with SQLITE_BUSY once that writer commits; one that
+// writes first waits under the busy timeout (as cron's cursor writes do).
+func (q *Queue) claim(ctx context.Context, tx *sql.Tx) (Job, int64, error) {
+	now := q.now()
+	leaseUntil := time.Unix(0, now).Add(30 * time.Second).UnixNano()
+	job, err := scanJob(tx.QueryRowContext(ctx, `UPDATE worker_jobs SET state = ?, attempt = attempt + 1, lease_until = ?, updated_at = ?
+		WHERE job_id = (SELECT job_id FROM worker_jobs
+			WHERE (state = ? OR (state = ? AND lease_until <= ?)) AND available_at <= ? ORDER BY created_at, enqueue_seq, job_id LIMIT 1)
+		RETURNING job_id, request_key, kind, payload_json, attempt, max_attempts, deferrals, principal_json, state, error_text`,
+		StateProcessing, leaseUntil, now, StatePending, StateProcessing, now, now))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Job{}, 0, ErrNotFound
 	}
-	leaseUntil := time.Unix(0, q.now()).Add(30 * time.Second).UnixNano()
-	result, err := tx.ExecContext(ctx, `UPDATE worker_jobs SET state = ?, attempt = attempt + 1, lease_until = ?, updated_at = ? WHERE job_id = ? AND (state = ? OR (state = ? AND lease_until <= ?))`, StateProcessing, leaseUntil, q.now(), job.ID, StatePending, StateProcessing, q.now())
 	if err != nil {
-		return Job{}, err
+		return Job{}, 0, err
 	}
-	if changed, _ := result.RowsAffected(); changed != 1 {
-		return Job{}, ErrNotFound
-	}
-	job.Attempt++
-	job.State = StateProcessing
-	return job, nil
+	return job, leaseUntil, nil
 }
 
 func scanJob(row interface{ Scan(...any) error }) (Job, error) {
@@ -469,7 +875,14 @@ func (q *Queue) withTx(ctx context.Context, fn func(*sql.Tx) error) error {
 }
 func (q *Queue) now() int64     { return q.clock().UTC().UnixNano() }
 func digest(data []byte) string { sum := sha256.Sum256(data); return fmt.Sprintf("%x", sum[:]) }
+
+// retryable reports whether a failed job gets another attempt. A nested
+// submission never does, even when joined with a retryable HandlerError:
+// every attempt would submit to its own claimed store again (#225).
 func retryable(err error) bool {
+	if errors.Is(err, ErrNestedSubmission) {
+		return false
+	}
 	var target *HandlerError
 	return errors.As(err, &target) && target.Retryable
 }
@@ -478,6 +891,9 @@ func retryable(err error) bool {
 // HandlerError message, a classified error's stable code, or a generic
 // diagnostic. Arbitrary error text never reaches the dead-letter record.
 func safeMessage(err error) string {
+	if errors.Is(err, ErrNestedSubmission) {
+		return "nested submission to claimed store; use worker.Tx for atomic writes"
+	}
 	var target *HandlerError
 	if errors.As(err, &target) && target.Message != "" {
 		return target.Message

@@ -4,7 +4,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"os"
 
@@ -35,7 +34,7 @@ func main() {
 		panic(err)
 	}
 	var output any
-	if _, err := queue.ProcessOnce(ctx, func(ctx context.Context, _ *sql.Tx, job worker.Job) error {
+	if _, err := queue.ProcessOnce(ctx, func(ctx context.Context, _ worker.Tx, job worker.Job) error {
 		var request quote.Input
 		if err := json.Unmarshal(job.Payload, &request); err != nil {
 			return err

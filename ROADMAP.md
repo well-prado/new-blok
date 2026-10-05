@@ -2959,24 +2959,24 @@ Resolve compatible node/workflow package graphs with exact artifact hashes and n
 
 ## Acceptance criteria
 
-- [ ] Lock captures all execution-relevant resolved artifacts.
-- [ ] Cycles/conflicts/unsupported runtime ranges fail clearly.
-- [ ] Offline install works from verified cache.
-- [ ] Cache entries verify digest on read.
-- [ ] Concurrent resolution does not corrupt lock/cache.
-- [ ] No universal runtime installer is introduced.
+- [x] Lock captures all execution-relevant resolved artifacts.
+- [x] Cycles/conflicts/unsupported runtime ranges fail clearly.
+- [x] Offline install works from verified cache.
+- [x] Cache entries verify digest on read.
+- [x] Concurrent resolution does not corrupt lock/cache.
+- [x] No universal runtime installer is introduced.
 
 ## Validation and required evidence
 
-- [ ] Conflicting/transitive/cyclic dependency fixtures.
-- [ ] Corrupted cache and offline missing entry.
-- [ ] Concurrent cache writes.
-- [ ] Repeated resolutions yield identical locks.
-- [ ] Go/npm native lock integration.
-- [ ] Add synthetic fixtures with predeclared expected output/error/effect counts. Include negative/failure cases, not just happy-path compilation.
-- [ ] Run focused package/language tests first, then `go vet ./...`, `go test -race ./...`, `go build ./...` and `git diff --check`. New SDK code also runs its native lint/type/build/test commands with exact versions recorded in the PR.
-- [ ] Run the applicable actual protocol/store/worker/crash/load suite described above. A fake, file-presence test or green unrelated suite does not satisfy integration evidence. If no Go source changes, document why each Go gate is unchanged and still run the current repository gate.
-- [ ] Record commands, versions, fixtures/seeds, results and material limitations. Update examples, machine-readable contract/diagnostic fixtures and documentation if behavior changes.
+- [x] Conflicting/transitive/cyclic dependency fixtures.
+- [x] Corrupted cache and offline missing entry.
+- [x] Concurrent cache writes.
+- [x] Repeated resolutions yield identical locks.
+- [x] Go/npm native lock integration.
+- [x] Add synthetic fixtures with predeclared expected output/error/effect counts. Include negative/failure cases, not just happy-path compilation.
+- [x] Run focused package/language tests first, then `go vet ./...`, `go test -race ./...`, `go build ./...` and `git diff --check`. New SDK code also runs its native lint/type/build/test commands with exact versions recorded in the PR.
+- [x] Run the applicable actual protocol/store/worker/crash/load suite described above. A fake, file-presence test or green unrelated suite does not satisfy integration evidence. If no Go source changes, document why each Go gate is unchanged and still run the current repository gate.
+- [x] Record commands, versions, fixtures/seeds, results and material limitations. Update examples, machine-readable contract/diagnostic fixtures and documentation if behavior changes.
 
 ## Dependencies
 

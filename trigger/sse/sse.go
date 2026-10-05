@@ -272,26 +272,34 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	respond(writer, http.StatusNotFound, "error", "not_found")
 }
 
-// admit takes and releases an application lease: new work is refused while
-// the application is not ready or is draining.
-func (s *Server) admit(writer http.ResponseWriter) bool {
+// admit takes an application lease for a start: new work is refused while
+// the application is not ready or is draining, and the application cannot
+// stop until the start, its durable submission included, has answered.
+func (s *Server) admit(writer http.ResponseWriter) (*app.Lease, bool) {
 	lease, err := s.application.Begin()
 	if err != nil {
 		writer.Header().Set("Retry-After", "1")
 		respond(writer, http.StatusServiceUnavailable, "error", "unavailable")
-		return false
+		return nil, false
 	}
-	lease.Release()
-	return true
+	return lease, true
 }
 
 // start runs a start request's steps in a fixed order: admission,
 // authentication, idempotency key, bounded body read, input validation, a
 // stream slot in the hub, and the durable submission.
 func (s *Server) start(writer http.ResponseWriter, request *http.Request, e *endpoint) {
-	if !s.admit(writer) {
+	lease, admitted := s.admit(writer)
+	if !admitted {
 		return
 	}
+	defer lease.Release()
+	// Authentication and the body read also stop if the application's
+	// drain times out.
+	original := request.Context()
+	bound, unbindRequest := lease.Bind(original)
+	defer unbindRequest()
+	request = request.WithContext(bound)
 	principal, err := e.Authenticate(request)
 	if err != nil || strings.TrimSpace(principal.ID) == "" {
 		respond(writer, http.StatusUnauthorized, "error", "unauthorized")
@@ -335,7 +343,9 @@ func (s *Server) start(writer http.ResponseWriter, request *http.Request, e *end
 	}
 	// The submission runs under a context the caller cannot cancel: once
 	// started, its outcome is decided by the store, not by the connection.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(request.Context()), e.SubmitTimeout)
+	submitting, unbind := lease.Bind(context.WithoutCancel(original))
+	defer unbind()
+	ctx, cancel := context.WithTimeout(submitting, e.SubmitTimeout)
 	defer cancel()
 	accepted, err := e.Submit.Submit(ctx, trigger.Submission{Key: submissionKey, Kind: e.Kind, Payload: payload, Principal: principal})
 	committed := err == nil || errors.Is(err, trigger.ErrConflict)
@@ -367,6 +377,11 @@ func (s *Server) start(writer http.ResponseWriter, request *http.Request, e *end
 		respond(writer, http.StatusConflict, "error", "conflict")
 	case errors.Is(err, trigger.ErrInvalidInput):
 		respond(writer, http.StatusBadRequest, "error", "invalid_input")
+	case app.Aborted(ctx):
+		// The drain timed out under the submission: a retry with the same
+		// key is deduplicated if it did commit.
+		writer.Header().Set("Retry-After", "1")
+		respond(writer, http.StatusServiceUnavailable, "error", "unavailable")
 	case errors.Is(err, trigger.ErrSaturated):
 		writer.Header().Set("Retry-After", "1")
 		respond(writer, http.StatusServiceUnavailable, "error", "saturated")
@@ -386,8 +401,18 @@ func (s *Server) subscribe(writer http.ResponseWriter, request *http.Request, e 
 		retryLater(writer, e, "unavailable")
 		return
 	}
-	lease.Release()
-	principal, err := e.Authenticate(request)
+	// The lease covers everything decided before the status, the tracker's
+	// store read included, and is released before following the stream: a
+	// subscription is long-lived and does not hold the application open.
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(lease.Release) }
+	defer release()
+	// Authentication also stops if the application's drain times out.
+	principal, err := func() (trigger.Principal, error) {
+		authenticating, unbind := lease.Bind(request.Context())
+		defer unbind()
+		return e.Authenticate(request.WithContext(authenticating))
+	}()
 	if err != nil || strings.TrimSpace(principal.ID) == "" {
 		respond(writer, http.StatusUnauthorized, "error", "unauthorized")
 		return
@@ -413,10 +438,15 @@ func (s *Server) subscribe(writer http.ResponseWriter, request *http.Request, e 
 	result, err := s.hub.subscribe(streamID, principal, cursor, e.Authorize, e.QueueDepth, e.StreamSubscribers, interrupt)
 	if errors.Is(err, errUnverified) {
 		// Nothing has shown that this stream will ever end: ask the
-		// tracker before following it.
-		ctx, cancel := context.WithTimeout(request.Context(), e.SubmitTimeout)
-		checkErr := s.check(ctx, e, streamID, false)
-		cancel()
+		// tracker before following it. The read stops, too, if the
+		// application's drain times out.
+		checkErr := func() error {
+			bound, unbind := lease.Bind(request.Context())
+			defer unbind()
+			ctx, cancel := context.WithTimeout(bound, e.SubmitTimeout)
+			defer cancel()
+			return s.check(ctx, e, streamID, false)
+		}()
 		if checkErr != nil {
 			retryLater(writer, e, "unavailable")
 			return
@@ -443,6 +473,7 @@ func (s *Server) subscribe(writer http.ResponseWriter, request *http.Request, e 
 	// follow owns the replay; nothing here keeps it reachable while the
 	// subscription lasts.
 	sub := result.sub
+	release()
 	reason := s.follow(writer, control, request, e, streamID, result)
 	if sub != nil {
 		s.hub.unsubscribe(streamID, sub, reason)

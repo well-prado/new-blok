@@ -73,6 +73,26 @@ diagnostics.
 
 ### Initial schema boundary
 
+#### Strictly earlier instruction references (#218)
+
+The public document boundary rejects self, forward, missing and empty
+instruction references with `invalid_reference` before parsing returns a
+document, compilation returns a program, or canonical publication returns
+bytes. This applies to every supported instruction kind. Valid references to
+earlier instructions retain their field paths, and duplicate instruction IDs
+retain the `duplicate_id` diagnostic.
+
+This is a behavioral validation tightening linked to
+[#218](https://github.com/well-prado/new-blok/issues/218), not a wire-shape or
+document-version change. Previously the validator registered the current ID
+before checking references and accidentally accepted self-references. Such
+documents have no valid earlier result to read. Remove cyclic/forward edges
+and use supported structural control flow; the framework never silently drops
+or rewrites an invalid edge. The synthetic self-reference fixture and public
+Validate/Parse/Compile/Canonical tests prove rejection without executing
+business effects. This correction does not certify arbitrary control-flow
+programs or change typed authoring APIs.
+
 The initial portable contract is a bounded, JSON-compatible value subset with
 explicit semantics for missing, null, optional fields, objects, arrays, string,
 boolean, signed integer, exact decimal/money, timestamp, bytes/blob reference

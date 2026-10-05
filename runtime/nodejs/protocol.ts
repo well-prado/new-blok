@@ -34,7 +34,7 @@ export function loadProtocol(protoPath = resolve(repositoryRoot(), "contract/run
 // At the worker direction boundary, reject both rather than selecting the last.
 export function validateFrameBytes(bytes: Buffer): void {
   const tag = bytes[0];
-  if (tag === undefined || tag < 10 || tag > 50 || tag % 8 !== 2) throw new Error("invalid_frame");
+  if (tag === undefined || tag < 10 || tag > 58 || tag % 8 !== 2) throw new Error("invalid_frame");
   let length = 0, factor = 1, at = 1;
   for (let i = 0; i < 5; i++) {
     const byte = bytes[at++];

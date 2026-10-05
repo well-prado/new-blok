@@ -55,7 +55,11 @@ descriptor does not have, which protobuf records as unknown.
 
 ### Order of a call
 
-1. application admission (Unavailable `unavailable`);
+1. application admission (Unavailable `unavailable`). The call holds its
+   lease until it answers; if the application's drain times out first, its
+   context is canceled and it answers `Canceled canceled`, not
+   `Unavailable`, which clients retry: it may have committed (ADR 0005,
+   #177);
 2. authentication from the call's context, its metadata or peer
    (Unauthenticated `unauthorized`);
 3. the binding's server-side `Authorize(principal, method)`, which is
@@ -104,7 +108,7 @@ same on every trigger.
 
 | Workflow error | Status | Reason |
 | --- | --- | --- |
-| the deadline passed | DeadlineExceeded | `deadline_exceeded` |
+| the deadline passed | DeadlineExceeded | `deadline_exceeded` (see below) |
 | the client canceled | Canceled | `canceled` |
 | `trigger.ErrSaturated` | ResourceExhausted | `saturated` |
 | classified `validation` | InvalidArgument | its code |
@@ -113,6 +117,13 @@ same on every trigger.
 | classified `configuration` | Internal | `internal` |
 | any other classified class | FailedPrecondition | its code |
 | unclassified | Internal | `internal` |
+
+When the client's deadline is the shorter, the server may record Canceled
+instead of DeadlineExceeded. The server's deadline starts when the request
+arrives, slightly after the client's, and the client resets the stream with
+the same code whether its deadline passed or it canceled. If that reset
+arrives first, nothing on the wire tells them apart (#230). The client still
+sees DeadlineExceeded, and the workflow is canceled either way.
 
 ### Bounds
 

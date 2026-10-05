@@ -1,0 +1,44 @@
+{
+  "formatVersion": 1,
+  "expectedPackageExecutions": 0,
+  "defaults": {
+    "maxPackages": 256,
+    "maxArtifactBytes": 134217728
+  },
+  "hardLimits": {
+    "maxPackages": 4096,
+    "maxArtifactBytes": 1073741824
+  },
+  "cases": [
+    {
+      "name": "identical-publish-at-full-capacity",
+      "maxPackages": 1,
+      "maxArtifactBytes": 26,
+      "seedPackage": true,
+      "operation": "publish-same",
+      "expectedError": "",
+      "expectedPackages": 1,
+      "expectedArtifactBytes": 26
+    },
+    {
+      "name": "reject-new-version-at-package-count-limit",
+      "maxPackages": 1,
+      "maxArtifactBytes": 52,
+      "seedPackage": true,
+      "operation": "publish-new-version",
+      "expectedError": "store_capacity_exceeded",
+      "expectedPackages": 1,
+      "expectedArtifactBytes": 26
+    },
+    {
+      "name": "reject-new-version-at-aggregate-byte-limit",
+      "maxPackages": 2,
+      "maxArtifactBytes": 26,
+      "seedPackage": true,
+      "operation": "publish-new-version",
+      "expectedError": "store_capacity_exceeded",
+      "expectedPackages": 1,
+      "expectedArtifactBytes": 26
+    }
+  ]
+}

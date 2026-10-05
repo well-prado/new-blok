@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -54,6 +53,9 @@ func dependencies(t *testing.T, name string) map[string]int {
 func build(t *testing.T, name string) string {
 	t.Helper()
 	binary := filepath.Join(t.TempDir(), name)
+	if runtime.GOOS == "windows" {
+		binary += ".exe"
+	}
 	if output, err := exec.Command(goTool(t), "build", "-o", binary, "./testdata/selection/"+name).CombinedOutput(); err != nil {
 		t.Fatalf("go build %s: %v\n%s", name, err, output)
 	}
@@ -86,7 +88,7 @@ func noEmbeddedAssets(t *testing.T, deps map[string]int) {
 
 func TestBinaryWithoutTriggerLinksNoAdapterListenerOrStore(t *testing.T) {
 	deps := dependencies(t, "none")
-	for _, forbidden := range []string{module + "/trigger", "net", "net/http", "database/sql", module + "/store", module + "/contract/conformance", "github.com/nats-io", "github.com/coder/websocket"} {
+	for _, forbidden := range []string{module + "/trigger", "net", "net/http", "database/sql", module + "/store", module + "/contract/conformance", "github.com/nats-io", "github.com/coder/websocket", "github.com/modelcontextprotocol"} {
 		if found := linked(deps, forbidden); len(found) != 0 {
 			t.Fatalf("binary with no trigger links %v", found)
 		}
@@ -115,7 +117,7 @@ func TestBinaryWithHTTPSelectedServesAndDrains(t *testing.T) {
 	if len(linked(deps, module+"/trigger/http")) == 0 || len(linked(deps, "net/http")) == 0 {
 		t.Fatal("selected HTTP trigger is not linked")
 	}
-	for _, forbidden := range []string{module + "/trigger/worker", module + "/trigger/pubsub", module + "/trigger/websocket", module + "/trigger/sse", module + "/trigger/grpc", "google.golang.org/grpc", module + "/store", "database/sql", module + "/contract/conformance", "github.com/nats-io", "github.com/coder/websocket"} {
+	for _, forbidden := range []string{module + "/trigger/worker", module + "/trigger/pubsub", module + "/trigger/websocket", module + "/trigger/sse", module + "/trigger/grpc", "google.golang.org/grpc", module + "/trigger/mcp", module + "/store", "database/sql", module + "/contract/conformance", "github.com/nats-io", "github.com/coder/websocket", "github.com/modelcontextprotocol"} {
 		if found := linked(deps, forbidden); len(found) != 0 {
 			t.Fatalf("HTTP-only binary links unselected %v", found)
 		}
@@ -126,6 +128,7 @@ func TestBinaryWithHTTPSelectedServesAndDrains(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	prepareShutdownChild(command)
 	if err := command.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +155,7 @@ func TestBinaryWithHTTPSelectedServesAndDrains(t *testing.T) {
 	if err != nil || response.StatusCode != http.StatusOK || quote.TotalCents != 3000 {
 		t.Fatalf("status=%d quote=%+v err=%v", response.StatusCode, quote, err)
 	}
-	if err := command.Process.Signal(syscall.SIGTERM); err != nil {
+	if err := requestShutdown(command); err != nil {
 		t.Fatal(err)
 	}
 	if !lines.Scan() || !strings.Contains(lines.Text(), `"stopped":true`) {
@@ -175,7 +178,7 @@ func TestBinaryWithWorkerSelectedProcessesDurableJob(t *testing.T) {
 	if len(linked(deps, module+"/trigger/worker")) == 0 || len(linked(deps, module+"/store/sqlite")) == 0 {
 		t.Fatal("selected worker trigger or its store is not linked")
 	}
-	for _, forbidden := range []string{module + "/trigger/http", module + "/trigger/pubsub", "net/http", module + "/contract/conformance", "github.com/nats-io", "github.com/coder/websocket"} {
+	for _, forbidden := range []string{module + "/trigger/http", module + "/trigger/pubsub", module + "/trigger/mcp", "net/http", module + "/contract/conformance", "github.com/nats-io", "github.com/coder/websocket", "github.com/modelcontextprotocol"} {
 		if found := linked(deps, forbidden); len(found) != 0 {
 			t.Fatalf("worker-only binary links unselected %v", found)
 		}

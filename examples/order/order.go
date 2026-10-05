@@ -88,7 +88,7 @@ func (s *Service) Enqueue(ctx context.Context, request Request) (worker.EnqueueR
 }
 
 func (s *Service) ProcessOnce(ctx context.Context) (bool, error) {
-	return s.queue.ProcessOnce(ctx, func(ctx context.Context, tx *sql.Tx, job worker.Job) error {
+	return s.queue.ProcessOnce(ctx, func(ctx context.Context, tx worker.Tx, job worker.Job) error {
 		var request Request
 		if err := json.Unmarshal(job.Payload, &request); err != nil {
 			return &worker.HandlerError{Message: "invalid order payload"}

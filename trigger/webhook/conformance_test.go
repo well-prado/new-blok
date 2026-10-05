@@ -116,7 +116,7 @@ func (d *webhookDriver) Start(ctx context.Context) error {
 
 func (d *webhookDriver) Endpoint() string { d.mu.Lock(); defer d.mu.Unlock(); return d.address }
 
-func (d *webhookDriver) handle(ctx context.Context, tx *sql.Tx, job worker.Job) error {
+func (d *webhookDriver) handle(ctx context.Context, tx worker.Tx, job worker.Job) error {
 	if _, err := d.env.Workflow(ctx, conformance.Call{Input: job.Payload, Principal: job.Principal}); err != nil {
 		return err
 	}
@@ -190,7 +190,7 @@ func (d *webhookDriver) Deliver(ctx context.Context, delivery conformance.Delive
 func (d *webhookDriver) Recover(ctx context.Context) (conformance.Outcome, error) {
 	d.clock.Set(d.clock.Now().Add(2 * time.Minute))
 	var key string
-	if _, err := d.queue.ProcessOnce(ctx, func(ctx context.Context, tx *sql.Tx, job worker.Job) error {
+	if _, err := d.queue.ProcessOnce(ctx, func(ctx context.Context, tx worker.Tx, job worker.Job) error {
 		key = job.RequestKey
 		return d.handle(ctx, tx, job)
 	}); err != nil {
