@@ -203,11 +203,9 @@ type TriggerOptions struct {
 	// CancelTimeout bounds how long a blocked workflow waits for
 	// cancellation before the case fails.
 	CancelTimeout time.Duration
-	// SettleTimeout bounds how long goroutines may take to exit, both those
-	// left by constructing the adapter and those left after Stop. The check
-	// is for a goroutine that stays; one already on its way out (database/sql
-	// ends each transaction's watcher goroutine just after the commit, #310)
-	// gets this long, not a fixed 50 ms, to be scheduled and exit.
+	// SettleTimeout bounds how long goroutines may take to exit after Stop,
+	// and how long a database/sql watcher left by construction may take to
+	// exit (see constructionSettle).
 	SettleTimeout time.Duration
 }
 
@@ -279,7 +277,15 @@ func RunTrigger(ctx context.Context, driver TriggerDriver, corpus TriggerCorpus,
 	if err := driver.Open(ctx, env); err != nil {
 		return report, fmt.Errorf("open: %w", err)
 	}
-	if extra := settle(baseline, options.SettleTimeout); extra != "" {
+	if extra := settle(baseline, constructionSettle, databaseWatcher); extra != "" {
+		return report, &TriggerFailure{Code: "construction_side_effect", Message: "constructing the adapter started a goroutine: " + extra}
+	}
+	// A database/sql watcher exits once the scheduler runs it after the
+	// commit, rollback or close that ended its transaction or rows; under
+	// load that can take longer than constructionSettle (#310). It gets the
+	// settle timeout instead, so a transaction or rows construction left
+	// open, whose watcher never exits, is still reported.
+	if extra := settle(baseline, options.SettleTimeout, nil); extra != "" {
 		return report, &TriggerFailure{Code: "construction_side_effect", Message: "constructing the adapter started a goroutine: " + extra}
 	}
 	if endpoint, ok := driver.(Endpoint); ok && endpoint.Endpoint() != "" {
@@ -328,7 +334,7 @@ func RunTrigger(ctx context.Context, driver TriggerDriver, corpus TriggerCorpus,
 	if dispatches, _ := h.counts(); dispatches != 0 {
 		return report, &TriggerFailure{Code: "dispatch_after_stop", Message: "a delivery after Stop reached the workflow"}
 	}
-	if extra := settle(baseline, options.SettleTimeout); extra != "" {
+	if extra := settle(baseline, options.SettleTimeout, nil); extra != "" {
 		return report, &TriggerFailure{Code: "goroutine_leak", Message: "a goroutine started during the run outlived Stop: " + extra}
 	}
 	return report, nil
@@ -698,14 +704,38 @@ func quiescentGoroutines(timeout time.Duration) map[string]string {
 	return last
 }
 
-// settle waits until no goroutine outside baseline is alive. It returns the
-// stack of one that remains, or "".
-func settle(baseline map[string]string, timeout time.Duration) string {
+// constructionSettle is how long a goroutine started while constructing the
+// adapter may stay alive after Open returns.
+const constructionSettle = 50 * time.Millisecond
+
+// databaseWatchers are the creation sites of database/sql's per-transaction
+// and per-rows watcher goroutines. A watcher lives exactly as long as its
+// transaction or rows, then exits once it is scheduled.
+var databaseWatchers = []string{
+	"\ncreated by database/sql.(*DB).beginDC in goroutine ",
+	"\ncreated by database/sql.(*Rows).initContextClose in goroutine ",
+}
+
+// databaseWatcher reports whether stack is a database/sql watcher goroutine,
+// told by where it was created, whichever frame it is in.
+func databaseWatcher(stack string) bool {
+	for _, site := range databaseWatchers {
+		if strings.Contains(stack, site) {
+			return true
+		}
+	}
+	return false
+}
+
+// settle waits until no goroutine outside baseline is alive, disregarding
+// those skip reports (skip may be nil). It returns the stack of one that
+// remains, or "".
+func settle(baseline map[string]string, timeout time.Duration, skip func(string) bool) string {
 	deadline := time.Now().Add(timeout)
 	for {
 		extra := ""
 		for id, stack := range goroutines() {
-			if _, ok := baseline[id]; !ok {
+			if _, ok := baseline[id]; !ok && (skip == nil || !skip(stack)) {
 				extra = stack
 				break
 			}

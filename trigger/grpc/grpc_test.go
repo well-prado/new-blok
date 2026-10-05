@@ -304,8 +304,11 @@ func TestGeneratedClientRoundTripsEveryKind(t *testing.T) {
 // its workflow is running, not after a fixed delay; and every wait is for an
 // event, under a safety bound far below the one-minute bound on the side of
 // each case that must not end it, so a workflow that only that bound would
-// stop still reads as running. The deadline a workflow saw is judged against
-// the midpoint of the two bounds. One precondition cannot be made
+// stop still reads as running. The deadline is judged by what the workflow
+// had left of it on entry, measured on the server against a deadline the
+// server set: load can only shorten it, so it must not exceed the shorter of
+// the client's deadline and the binding's timeout, plus 10 ms for the
+// clock reads around it. One precondition cannot be made
 // event-driven: a client deadline has to start before the request is sent.
 // When the request does not reach the workflow before that deadline, or a
 // cancel is issued too close to it, the attempt proves nothing either way;
@@ -337,7 +340,7 @@ func TestDeadlinesAndCancellation(t *testing.T) {
 		// came too close to it.
 		attempt := func(client time.Duration) bool {
 			observed := make(chan error, 1)
-			bounded := make(chan time.Time, 1)
+			left := make(chan time.Duration, 1)
 			running := make(chan struct{})
 			adapter, err := tgrpc.New(started(t), principals, []tgrpc.Binding{{
 				Method: orders.Methods().ByName("Place"), Workflow: "place", WorkflowInput: f.Order, InputSchema: f.Order, OutputSchema: f.Placed, Authorize: tgrpc.AllowAuthenticated,
@@ -348,7 +351,7 @@ func TestDeadlinesAndCancellation(t *testing.T) {
 						// A workflow with no deadline is never the shorter bound.
 						deadline = time.Now().Add(time.Hour)
 					}
-					bounded <- deadline
+					left <- time.Until(deadline)
 					close(running)
 					if tc.ignore {
 						time.Sleep(time.Until(deadline) + 200*time.Millisecond)
@@ -391,9 +394,9 @@ func TestDeadlinesAndCancellation(t *testing.T) {
 			}
 			_, err = orderpb.NewOrdersClient(conn).Place(ctx, order)
 			cancel()
-			var deadline time.Time
+			var remaining time.Duration
 			select {
-			case deadline = <-bounded:
+			case remaining = <-left:
 			case <-time.After(safety):
 				if client < tc.binding && status.Code(err) == codes.DeadlineExceeded {
 					return false
@@ -421,9 +424,9 @@ func TestDeadlinesAndCancellation(t *testing.T) {
 			}
 			// The workflow runs under the shorter of the client's deadline
 			// and the binding's timeout, whatever status the call then
-			// reports: its deadline falls before the midpoint of the two.
-			if limit := began.Add((client + tc.binding) / 2); deadline.After(limit) {
-				t.Fatalf("%s: the workflow's deadline %v is not the shorter of the client's %v and the binding's %v", tc.name, deadline.Sub(began), client, tc.binding)
+			// reports.
+			if limit := min(client, tc.binding) + 10*time.Millisecond; remaining > limit {
+				t.Fatalf("%s: the workflow started with %v left, more than the shorter of the client's %v and the binding's %v", tc.name, remaining, client, tc.binding)
 			}
 			var server codes.Code
 			select {

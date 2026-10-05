@@ -2,6 +2,8 @@ package conformance
 
 import (
 	"context"
+	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"sync"
@@ -26,6 +28,9 @@ type reference struct {
 	effects     int
 	pending     []Call
 	stop        chan struct{}
+	// db and tx serve the database defects: construction begins tx on db.
+	db *sql.DB
+	tx *sql.Tx
 }
 
 func memoryReference(defect string) *reference {
@@ -59,8 +64,25 @@ func (r *reference) Open(_ context.Context, env TriggerEnv) error {
 		return err
 	}
 	r.env, r.input, r.accepted, r.stop = env, parsed, map[string]string{}, make(chan struct{})
-	if r.defect == "construction-goroutine" {
+	switch r.defect {
+	case "construction-goroutine":
 		go func() { <-r.stop }()
+	case "transient-construction-goroutine":
+		// Exits by itself a second after construction: still a goroutine
+		// construction started.
+		go func() { time.Sleep(time.Second) }()
+	case "construction-transaction", "construction-transaction-open":
+		// database/sql starts a watcher goroutine per transaction. Here it
+		// outlives the construction bound: the transaction ends 300 ms
+		// later, or, for the defect, never.
+		tx, err := r.db.BeginTx(context.Background(), nil)
+		if err != nil {
+			return err
+		}
+		r.tx = tx
+		if r.defect == "construction-transaction" {
+			time.AfterFunc(300*time.Millisecond, func() { _ = tx.Rollback() })
+		}
 	}
 	return nil
 }
@@ -359,6 +381,65 @@ func TestBrokenAdaptersFailTriggerConformance(t *testing.T) {
 		})
 	}
 }
+
+// TestTransientConstructionGoroutineIsCaught: a goroutine construction
+// starts is reported even when it exits on its own a second later, under the
+// default settle timeout that would let it finish.
+func TestTransientConstructionGoroutineIsCaught(t *testing.T) {
+	_, err := RunTrigger(context.Background(), memoryReference("transient-construction-goroutine"), loadCorpus(t), TriggerOptions{CancelTimeout: 300 * time.Millisecond})
+	var failure *TriggerFailure
+	if !errors.As(err, &failure) || failure.Code != "construction_side_effect" {
+		t.Fatalf("err=%v, want failure construction_side_effect", err)
+	}
+	time.Sleep(time.Second) // let it exit before the next test's baseline
+}
+
+// TestConstructionDatabaseWatcher: database/sql's watcher of a transaction
+// construction began is not mistaken for an adapter goroutine while the
+// transaction ends, however late it is scheduled (#310); a transaction left
+// open keeps its watcher, and is reported.
+func TestConstructionDatabaseWatcher(t *testing.T) {
+	db := sql.OpenDB(fakeConnector{})
+	t.Cleanup(func() { _ = db.Close() })
+	corpus := loadCorpus(t)
+	ended := memoryReference("construction-transaction")
+	ended.db = db
+	if _, err := RunTrigger(context.Background(), ended, corpus, TriggerOptions{CancelTimeout: 300 * time.Millisecond}); err != nil {
+		t.Fatalf("a transaction that ended was reported: %v", err)
+	}
+	open := memoryReference("construction-transaction-open")
+	open.db = db
+	_, err := RunTrigger(context.Background(), open, corpus, fastOptions)
+	if open.tx != nil {
+		_ = open.tx.Rollback()
+	}
+	var failure *TriggerFailure
+	if !errors.As(err, &failure) || failure.Code != "construction_side_effect" || !databaseWatcher(failure.Message) {
+		t.Fatalf("err=%v, want construction_side_effect naming the open transaction's watcher", err)
+	}
+}
+
+// fakeConnector is a database/sql connector with transactions and nothing
+// else: enough for database/sql to start its real per-transaction watcher.
+type fakeConnector struct{}
+
+func (fakeConnector) Connect(context.Context) (driver.Conn, error) { return fakeConn{}, nil }
+func (fakeConnector) Driver() driver.Driver                        { return fakeDriver{} }
+
+type fakeDriver struct{}
+
+func (fakeDriver) Open(string) (driver.Conn, error) { return fakeConn{}, nil }
+
+type fakeConn struct{}
+
+func (fakeConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("fake: no statements") }
+func (fakeConn) Close() error                        { return nil }
+func (fakeConn) Begin() (driver.Tx, error)           { return fakeTx{}, nil }
+
+type fakeTx struct{}
+
+func (fakeTx) Commit() error   { return nil }
+func (fakeTx) Rollback() error { return nil }
 
 func TestRunTriggerRefusesWeakenedCorpus(t *testing.T) {
 	trimmed := loadCorpus(t)
