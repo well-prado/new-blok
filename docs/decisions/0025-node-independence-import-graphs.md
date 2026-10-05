@@ -1,8 +1,9 @@
 # ADR 0025: Node independence across language import graphs
 
-- Status: implementation in review for E12-T02 (#68); revised after the
-  first specialist review of PR #314, which found 15 routes by which a node
-  loaded another node while reported verified
+- Status: implementation in review for E12-T02 (#68); revised after two
+  specialist reviews of PR #314, which found 15 and then 6 routes by which
+  a node loaded another node while reported verified; the second revision
+  replaces the JavaScript denylist with an allowlist
 - Date: 2026-10-05
 - Roadmap: E12-T02 ([#68](https://github.com/well-prado/new-blok/issues/68));
   builds on E12-T01 (#67, ADR 0023: discovery, node ownership, link and
@@ -101,9 +102,15 @@ module path to its directory — `replace example.com/billing =>
 standard library are external. A path inside the module with no non-test
 Go files, or inside a nested module, is unresolved. Imports in
 build-constrained files count like any other (ADR 0023). A `//go:embed`
-pattern's directory or file (up to its first wildcard) is ownership-checked
-like an import, so embedding another node's file is a node import;
-embedded data is not traversed as code. `_test.go` files are not part of a
+pattern is matched as Go matches it — each element a `path.Match` glob
+relative to the package directory, a matched directory embedding its tree,
+names starting with `.` or `_` below it left out unless the pattern has
+the `all:` prefix — against every discovered file of every other node;
+each matched file is ownership-checked like an import, so `nodes/*/b/*.go`
+or `all:nodes` in a root-package file is a node import. A pattern that
+reaches into another node's directory but matches none of its discovered
+files (which leave out hidden and `_` names) is unverified. Embedded data
+is not traversed as code. `_test.go` files are not part of a
 node, as in ADR 0023.
 
 Everything else go build compiles or consults that the adapter does not
@@ -138,7 +145,7 @@ tokenizes the whole file following the ECMAScript lexical grammar: a byte
 order mark and a hashbang line, line and block comments, string literals
 with every escape decoded (`\x2e`, `\u{2e}`, legacy octal `\56`, line
 continuations), template literals with nested substitutions, identifier
-escapes (`require` is `require`) and numeric literals. An
+escapes (`\u0072equire` is `require`) and numeric literals. An
 unterminated literal, comment or expression, or an unbalanced bracket,
 fails the whole file (`ownership_parse_failed`).
 
@@ -166,58 +173,102 @@ violation elsewhere is still reported, but the file is never verified. In
 (`~/Projects/Deskree/blok`, excluding `node_modules`, `dist` and
 declaration files) no position was ambiguous.
 
-A recognizer then reads the token stream. Only a static string (or a
-template without substitutions) in one of these forms is an edge:
+**HTML-like comments.** Annex B lets a CommonJS script use `<!--`
+anywhere, and `-->` at the start of a line, as a line comment; a module
+refuses both. Read as a less-than and a template, `<!-- `` ` `` would
+swallow the next line's `require`. The lexer reads both as line comments,
+as CommonJS does, and every occurrence makes the file unverified, because
+the two goals disagree about the file.
 
-| Form | Treated as |
+**The allowlist.** JavaScript reaches its module loader, evaluation and
+the `Function` constructor through the object graph in more ways than any
+list of forbidden forms can name: the first review found 15 such routes
+and the second six more (`const m = module; m["require"](…)`,
+`(() => 0)["constructor"](…)`, `const { constructor: F } = () => 0`,
+`process["main" + "Module"]`, a sloppy function's `this` handed to
+`Reflect.get`, and an HTML-like comment). The recognizer is therefore an
+allowlist. **"Verified" means exactly this: every file in the node's
+reachable graph lexed with no ambiguous `/` and no HTML-like comment, and
+the only places it mentions a sensitive word, or computes a property key,
+are the enumerated safe forms below; every import those forms make
+resolved; and nothing crosses a node or workflow.** It does not mean the
+code was understood; it means it stayed inside forms whose loading
+behavior is known.
+
+The sensitive words are `require`, `module`, `process`, `this`,
+`globalThis`, `global`, `self`, `window`, `eval`, `Function`, `Reflect`,
+`Proxy`, `import`, `arguments`, `constructor`, `__proto__`, `prototype`,
+and the loader names `createRequire`, `getBuiltinModule`, `mainModule`,
+`_load`, `dlopen`, `importScripts`, `ShadowRealm`, `_linkedBinding`,
+`Worker` and `binding` (the last only as a property, `process.binding`, or
+called bare). The safe forms, the complete list, are:
+
+| Safe form | Effect |
 | --- | --- |
-| `import … from "s"`, `import "s"`, `import type …`, `import defer/source …`, with attributes | edge |
+| `import … from "s"`, `import "s"`, `import type …`, `import defer/source …` (with attributes) | edge; the declaration's own binding names are part of it |
 | `export * from "s"`, `export * as n from "s"`, `export { … } from "s"`, `export type … from "s"` | edge |
 | `import x = require("s")`, `export import x = require("s")` | edge |
-| `require("s")`, `require.resolve("s")` | edge |
-| `import("s")`, `typeof import("s")`, `import.meta.resolve("s")` | edge |
+| `require("s")` (one string argument), `require.resolve("s")` | edge |
+| `import("s")` (also `typeof import("s")`), `import.meta.resolve("s")` | edge |
+| `import.meta.url`, `import.meta.dirname`, `import.meta.filename` | data |
+| `module.exports` | the module's exports |
+| `process.env argv cwd platform arch version versions pid exit exitCode nextTick hrtime stdout stderr stdin uptime memoryUsage emitWarning on once` (one of these, after a dot) | process data and control that do not reach the loader |
+| `this.<name>`, `this?.<name>`, `this.#name` | a property read; a sensitive `<name>` is still flagged as a property |
+| `constructor(…) {` / `constructor(…);` | a method definition, not an access |
 | `/// <reference path="…">` / `<reference types="…">` | edge |
 
-Everything below is unverified (the node is never verified). This is the
-complete list:
+Everything else is `ownership_unsupported_form` (or
+`ownership_dynamic_import` for a call of `import`, `require`,
+`require.resolve` or `import.meta.resolve` whose argument is not one
+string literal):
 
-| Form | Code |
-| --- | --- |
-| `import(expr)`, `require(expr)`, `require.resolve(expr)`, `import.meta.resolve(expr)`, a template with a substitution; methods named `import`/`require` with a non-literal argument | `ownership_dynamic_import` |
-| any `.require` property access (`module.require`, `require.main.require`, `module?.require`, `x.prototype.require.call`) | `ownership_unsupported_form` |
-| `require` followed by `.`, `?.` or `[` other than a static `require.resolve("s")` (including `require.main`, `require.cache`, `require?.()`); `require` used as a value | `ownership_unsupported_form` |
-| `module.<name>` / `module?.<name>` other than `module.exports`, and `module[…]` | `ownership_unsupported_form` |
-| the names `eval`, `Function`, `Worker`, `createRequire`, `getBuiltinModule`, `mainModule`, `_load`, `_linkedBinding`, `dlopen`, `importScripts`, `ShadowRealm`, bare or as a property (`globalThis.eval`, `(0, eval)`, `Reflect.construct(Function, …)`, TypeScript's `Function` type too) | `ownership_unsupported_form` |
-| `.binding` (`process.binding`), and `binding(…)` called bare | `ownership_unsupported_form` |
-| `.constructor` other than `.constructor.name` (it reaches the `Function` and `AsyncFunction` constructors) | `ownership_unsupported_form` |
-| `arguments` (at CommonJS module scope, or in an arrow function there, it is the module wrapper's `exports, require, module, …`) | `ownership_unsupported_form` |
-| `globalThis`/`global` used as a value (not followed by `.`), and a computed property of `globalThis`, `global`, `window`, `self` or `this` (`globalThis["ev"+"al"]`) | `ownership_unsupported_form` |
-| AMD `define(…)` | `ownership_unsupported_form` |
-| the built-ins `vm`, `module`, `worker_threads`, `child_process`, `cluster` (with or without `node:`); `data:`, `http:` and `https:` specifiers | `ownership_unsupported_form` |
-| an unrecognized `import`/`export` clause | `ownership_unsupported_form` |
-| a "/" whose goal needs a parser (above) | `ownership_ambiguous_syntax` |
-| `.jsx`, `.tsx`, `.node`, `.wasm` | `ownership_source_unsupported` |
-| a reached file with no script extension (none, `.txt`, …) that does not lex as JavaScript | `ownership_source_unsupported` |
+- any other occurrence of a sensitive word: as an identifier (`const m =
+  module`, `typeof require`, `return this`, the TypeScript type
+  `Function`), as a property (`x.require`, `o.constructor`,
+  `x.prototype`), as an object or destructuring key (`{ constructor: F }`),
+  and as a string or template-without-substitutions literal whose value is
+  the word (`"process"`, `` `mainModule` ``, `o["constructor"]`) — import
+  specifiers excepted;
+- every computed member access (`x[…]` after an operand, including `?.[`)
+  whose key is not empty (a TypeScript array type), a number, a string
+  literal of a non-sensitive word, or an arithmetic expression built only
+  from names, numbers, property reads, grouping and `- * / % ** ++ --`
+  (never `+`, a call, a string, a comparison, a conditional or a comma),
+  whose value is a number and so cannot name a property such as
+  `constructor`: `text[at - 1]` is allowed, `text[at]` is not;
+- AMD `define(…)`;
+- the built-ins `vm`, `module`, `worker_threads`, `child_process`,
+  `cluster` (with or without `node:`), and `data:`, `http:`, `https:`
+  specifiers;
+- an unrecognized `import`/`export` clause (`import A = B.C` included);
+- a `/` whose goal needs a parser (`ownership_ambiguous_syntax`) and an
+  HTML-like comment;
+- `.jsx`, `.tsx`, `.node`, `.wasm`, and a reached file with no script
+  extension that does not lex as JavaScript (`ownership_source_unsupported`).
+
+Declaration files (`.d.ts`, `.d.mts`, `.d.cts`) hold no run-time code:
+their imports are still edges and their lexical checks (ambiguous `/`,
+HTML-like comments) still apply, but the allowlist does not.
 
 Type-only imports are edges: a node depending on another node's types is
 still coupled to it. This is stricter than the SDK's executable-graph
-checker, which excludes type-only edges because they do not run. Strings,
-comments, template text, regular expressions, property keys
-(`{ require: … }`) and calls of methods on other objects (`o.import()`)
-are not imports.
+checker, which excludes type-only edges because they do not run.
 
 Node's CommonJS loader runs a required file with any extension other than
 `.js`, `.json` and `.node` — or none — as JavaScript, so any reached file
 that is not JSON is analyzed as JavaScript; one that does not lex is
 unverified, never treated as an inert asset.
 
-The fail-closed rules cost some verifications of ordinary code: on the
-same 1,366-file corpus, 90 files (6.6%) carry an unverified form —
-`import(expression)` 28, the `Function` name (mostly the TypeScript type)
-26, `globalThis` as a value 16, `createRequire` 12, `arguments` 10,
-`.constructor` 6, AMD `define` 4, `this[…]` 3, `global` as a value 3, and
-one or two each for the rest. A node
-whose code needs one of these is reported unverified, not violating.
+**What it costs.** Failing closed makes most real JavaScript unverified.
+On the 1,381 script files of the Blok TypeScript repository
+(`~/Projects/Deskree/blok`, `.ts .mts .cts .js .mjs .cjs` including
+declaration files, excluding `node_modules`, `dist`, `.git` and `.blok`),
+CORPUS_SUMMARY The repository's own Node.js SDK (`sdk/nodejs`) is
+unverified for the same reasons (`text[at]`, `object[key]`,
+`Object.prototype`), so a Node.js node that imports it is unverified, never
+a violation; a node written in the safe forms verifies. A reviewer who
+wants a node verified can rewrite the offending lines in safe forms; the
+check will not guess on their behalf. Go nodes are unaffected.
 
 **Resolution.** Every candidate any of Node.js or TypeScript could select
 is an edge (the union), so a declaration file and a runtime file cannot
@@ -377,7 +428,7 @@ No wire, journal, artifact, worker or manifest contract changes.
 
 ## Verification record
 
-- `internal/tooling/ownership` tests: 28 synthetic `txtar` fixtures under
+- `internal/tooling/ownership` tests: 30 synthetic `txtar` fixtures under
   `testdata/imports` (Apache-2.0, synthetic), each with predeclared node
   statuses and exact sorted `[code, source]` diagnostics, unit counts for
   the positive cases, and output/error/effect counts in
@@ -393,17 +444,20 @@ No wire, journal, artifact, worker or manifest contract changes.
   transitive (ESM → re-export → CommonJS), dynamic/evaluating forms,
   unresolved and cycle, links (shared and `node_modules`), case, workflow,
   JSX and an unsupported runtime.
-- Every probe of the first review is a node in one of seven `probe-*`
-  fixtures (`probe-lexer`, `probe-loaders`, `probe-files-packages`,
+- Every probe of both reviews is a node in one of nine `probe-*` fixtures
+  (`probe-lexer`, `probe-loaders`, `probe-files-packages`,
   `probe-go-sources`, `probe-go-replace`, `probe-go-work`,
-  `probe-go-vendor`) with its predeclared verdict; none of the 15 routes
-  that were verified is verified any more, and the controls that held
-  still hold.
-- The real `blok new` starter in both layouts, and a Node.js example built
-  from it with the repository's actual Node.js SDK source and worker
-  fixture node file (its `../../../sdk/nodejs/index.js` import unchanged in
-  the unified layout; the workspace package `@blok/nodejs-sdk` for a second
-  node), verify with zero diagnostics and non-empty graphs.
+  `probe-go-vendor`, `probe-allowlist`, `probe-go-embed`) with its
+  predeclared verdict; none of the 21 routes that were verified is
+  verified any more, and the controls that held still hold.
+- The real `blok new` starter in both layouts verifies with zero
+  diagnostics and a non-empty graph. A Node.js example built from it with
+  the repository's actual Node.js SDK source and worker fixture node file
+  (its `../../../sdk/nodejs/index.js` import unchanged in the unified
+  layout; the workspace package `@blok/nodejs-sdk` for a second node) has
+  no violation: the two nodes that reach the SDK are unverified, with
+  every finding in the SDK's files, and a third node written in the safe
+  forms verifies.
 - `TestImportForms` pins the lexical cases, including the ambiguous `/`
   positions, a hashbang holding a quote and a byte order mark;
   `TestRepositoryNodeSourcesLex` lexes every Node.js source in the
@@ -425,24 +479,19 @@ No wire, journal, artifact, worker or manifest contract changes.
   `windows/arm64`; no test ran on Windows, the link fixtures skip there,
   and off Unix files are not opened non-blocking or link-counted (ADR
   0023).
-- **What "verified" can and cannot promise for Node.js.** JavaScript can
-  reach its loader through the object graph at run time. Verified means:
-  every file in the node's reachable graph lexed without an ambiguous
-  `/`, every import was one of the static forms above and resolved, none
-  of the unverified forms listed above appears, and nothing crosses a
-  node or workflow. A route outside that list that obtains a loader,
-  `eval` or the `Function` constructor by aliasing (for example
-  destructuring a property named `constructor` out of a function, or
-  receiving `module` as an argument and calling a method on it that is
-  not `require`) is not detected statically. The list is closed over the
-  routes found so far and fails closed on every one of them; it is not a
-  proof against arbitrary code. Native nodes are trusted application code
-  (AGENTS.md); this check catches mistakes and shortcuts, it is not a
-  sandbox.
+- **What "verified" can and cannot promise for Node.js.** Verified is an
+  allowlist result: every sensitive word and computed key in the reachable
+  graph sits in one of the enumerated safe forms. Within those forms the
+  loading behavior is known; nothing else is assumed. The guarantee rests
+  on the safe forms being safe — for example that `this.<name>` and the
+  listed `process` members cannot reach a loader without a sensitive name
+  or a computed key appearing — and on the lexer tokenizing as the
+  engine does; both are argued above, not proven. Native nodes are
+  trusted application code (AGENTS.md); this check catches shortcuts, it
+  is not a sandbox.
 - The lexer is not a parser. It never decides an ambiguous `/` silently
-  (above), but brace kinds used elsewhere (property keys) are inferred
-  from context; a mis-inferred key position can only hide a `require`
-  label or key, which loads nothing.
+  (above). The allowlist does not depend on brace kinds: a sensitive word
+  is flagged wherever it is not one of the safe forms.
 - Spawning another process is not an import; `child_process`,
   `worker_threads` and `cluster` are unverified instead.
 - Installed third-party packages that a `package.json` declares (registry,
