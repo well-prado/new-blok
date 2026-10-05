@@ -173,8 +173,11 @@ func NewDistributedSignalHandler(
 				http.Error(w, "wait not found", http.StatusNotFound)
 			case errors.Is(err, cluster.ErrRequestConflict):
 				http.Error(w, "signal identity conflicts with prior delivery", http.StatusConflict)
-			default:
+			case errors.Is(err, cluster.ErrInvalid):
 				http.Error(w, "invalid signal", http.StatusBadRequest)
+			default:
+				// Not a client error: the delivery outcome was not established.
+				http.Error(w, "signal delivery failed", http.StatusInternalServerError)
 			}
 			return
 		}

@@ -220,12 +220,18 @@ func (r *Runtime) commitLateSignal(ctx context.Context, owner distributed.Owner,
 	}{tenant, waitID, signalID, principal, payload})
 	id := waitTransition("late-signal", tenant+"\x00"+waitID+"\x00"+signalID)
 	err := r.store.Commit(ctx, owner, id, "wait.signal_late", data)
+	if err == nil {
+		return nil
+	}
 	if !errors.Is(err, distributed.ErrAlreadyWritten) {
-		return err
+		// A storage outage or an owner change between reading the owner
+		// and committing leaves the late record unwritten or unknown; the
+		// caller must not acknowledge and may retry the same signal ID.
+		return fmt.Errorf("%w: record late signal: %v", ErrUnavailable, err)
 	}
 	committed, readErr := r.store.Read(ctx, owner.Partition, id)
 	if readErr != nil {
-		return readErr
+		return fmt.Errorf("%w: reconcile late signal: %v", ErrUnavailable, readErr)
 	}
 	var event struct {
 		ID      string          `json:"id"`

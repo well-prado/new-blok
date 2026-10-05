@@ -278,3 +278,108 @@ func TestDistributedHTTPStatusMappingForCapacityConflictAndOutage(t *testing.T) 
 		t.Fatalf("retry of the unacknowledged key after recovery status=%d body=%s, fixture %s", recovered.Code, recovered.Body.String(), fixture.Expected.HTTPRecovered)
 	}
 }
+
+// TestDistributedLateSignalDuringOutageIsRetryable delivers a signal through
+// the HTTP handler to a wait that already timed out, while etcd has lost
+// quorum. The late-signal record cannot be written, so the response must be
+// a retryable 503, and the same signal after recovery is recorded as late.
+func TestDistributedLateSignalDuringOutageIsRetryable(t *testing.T) {
+	store := namespacedDistributedStore(t)
+	program := contract.InternalProgram{WorkflowID: "late-signal-fixture", Digest: "sha256:" + strings.Repeat("5", 64), Instructions: []contract.InternalInstruction{
+		{Index: 0, ID: "approval", Kind: "wait", Wait: &contract.WaitInstruction{Name: "approval", TimeoutMillis: 1}},
+		{Index: 1, ID: "output", Kind: "output", References: []contract.Reference{{Step: "approval"}}},
+	}}
+	workflow := cluster.Workflow{Program: program, DecodeInput: func(raw json.RawMessage) (any, error) {
+		var input distributedHTTPInput
+		if err := json.Unmarshal(raw, &input); err != nil {
+			return nil, err
+		}
+		return input, nil
+	}}
+	runtime, err := cluster.New(store, engine.New(map[string]node.Any{}), map[string]cluster.Workflow{"late-signal-fixture": workflow}, cluster.Limits{Partitions: 8, PartitionAdmissions: 8, TenantAdmissions: 2, OwnerTTL: 2 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	tenant := tenantForPartition(runtime, "p-0000")
+	worker := DistributedWorkerDependency(runtime, "late-signal-worker")
+	if err := worker.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	stopped := false
+	stopWorker := func() {
+		if stopped {
+			return
+		}
+		stopped = true
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer closeCancel()
+		if err := worker.Close(closeCtx); err != nil {
+			t.Errorf("stop distributed worker dependency: %v", err)
+		}
+	}
+	t.Cleanup(stopWorker)
+	admission, err := runtime.Admit(ctx, cluster.Submission{Tenant: tenant, RequestKey: "late", Workflow: "late-signal-fixture", Input: json.RawMessage(`{"value":1}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitID := cluster.WaitIDFor(admission.RunID, "approval")
+	for ctx.Err() == nil {
+		if wait, err := runtime.GetWait(ctx, tenant, waitID); err == nil && wait.State == "timed_out" {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	// The worker keeps running: a signal is routed through the current
+	// partition owner, which it re-acquires after the outage.
+	signals := NewDistributedSignalHandler(runtime,
+		func(*http.Request) (string, error) { return tenant, nil },
+		func(*http.Request) (string, error) { return "synthetic-principal", nil },
+		func(*http.Request, string, string) bool { return true })
+	send := func(requestCtx context.Context) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		body := fmt.Sprintf(`{"waitId":%q,"signalId":"late-1","payload":{"approved":true}}`, waitID)
+		signals.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/signals", strings.NewReader(body)).WithContext(requestCtx))
+		return recorder
+	}
+	voters := strings.Split(os.Getenv("BLOK_DISTRIBUTED_ETCD_VOTERS"), ",")
+	if len(voters) != 3 || voters[0] == "" {
+		t.Fatal("BLOK_DISTRIBUTED_ETCD_VOTERS must name the three voter containers")
+	}
+	paused := make([]string, 0, 2)
+	restore := func() {
+		for index := len(paused) - 1; index >= 0; index-- {
+			if output, err := exec.Command("docker", "unpause", paused[index]).CombinedOutput(); err != nil {
+				t.Errorf("restore voter %s: %v: %s", paused[index], err, output)
+			}
+		}
+		paused = paused[:0]
+	}
+	t.Cleanup(restore)
+	for _, voter := range voters[1:] {
+		if output, err := exec.Command("docker", "pause", voter).CombinedOutput(); err != nil {
+			t.Fatalf("pause voter %s: %v: %s", voter, err, output)
+		}
+		paused = append(paused, voter)
+	}
+	outageCtx, stopOutage := context.WithTimeout(ctx, 3*time.Second)
+	during := send(outageCtx)
+	stopOutage()
+	restore()
+	if during.Code != http.StatusServiceUnavailable || during.Header().Get("Retry-After") != "1" {
+		t.Fatalf("late signal during quorum loss status=%d Retry-After=%q body=%s, want 503 with Retry-After", during.Code, during.Header().Get("Retry-After"), during.Body.String())
+	}
+	var after *httptest.ResponseRecorder
+	for attempt := 0; attempt < 300; attempt++ {
+		after = send(ctx)
+		if after.Code != http.StatusServiceUnavailable {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	var result cluster.SignalResult
+	if after.Code != http.StatusAccepted || json.Unmarshal(after.Body.Bytes(), &result) != nil || !result.Late {
+		t.Fatalf("late signal after recovery status=%d body=%s, want 202 late", after.Code, after.Body.String())
+	}
+}

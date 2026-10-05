@@ -605,6 +605,12 @@ type quorumTransitionFixture struct {
 		ActiveRuns      int    `json:"activeRuns"`
 		ExternalEffects int    `json:"externalEffects"`
 	} `json:"finishInFlight"`
+	LateSignalBeforeCommit struct {
+		Result           string `json:"result"`
+		Retry            string `json:"retry"`
+		WaitAfterRestore string `json:"waitAfterRestore"`
+		LateEvents       int    `json:"lateEvents"`
+	} `json:"lateSignalBeforeCommit"`
 	EffectCommitInFlight struct {
 		Result           string   `json:"result"`
 		FinalStateOneOf  []string `json:"finalStateOneOf"`
@@ -860,6 +866,95 @@ func TestQuorumLossAtEachRuntimeTransition(t *testing.T) {
 	}
 	t.Run("timer-before-commit", func(t *testing.T) { timerCase(t, false) })
 	t.Run("timer-in-flight", func(t *testing.T) { timerCase(t, true) })
+
+	t.Run("late-signal-before-commit", func(t *testing.T) {
+		expected := fixture.LateSignalBeforeCommit
+		ledger := effectLedger(filepath.Join(t.TempDir(), "ledger"))
+		store := integrationDistributedStore(t)
+		owners := newCountedWaitRuntime(t, store, ledger, 1)
+		ingress := newCountedWaitRuntime(t, integrationDistributedStore(t), ledger, 1)
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		if err := owners.Check(ctx); err != nil {
+			t.Fatal(err)
+		}
+		tenant := tenantsInPartition(owners, partition, "quorum-late-signal", 1)[0]
+		admission, err := owners.Admit(ctx, Submission{Tenant: tenant, RequestKey: "quorum-late-signal", Workflow: "acceptance-wait", Input: json.RawMessage(`{"value":8}`)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		owner := acquireWhenFree(t, ctx, store, partition, "quorum-late-signal-owner", ownerTTL)
+		if _, err := owners.processOne(ctx, owner); !errors.Is(err, ErrNoWork) {
+			t.Fatalf("initial process=%v, want suspended wait", err)
+		}
+		if fired, err := owners.FireDueWaits(ctx, owner, time.Now().UTC().Add(time.Second), 8); err != nil || len(fired) != 1 {
+			t.Fatalf("timer fired=%d err=%v", len(fired), err)
+		}
+		waitID := WaitIDFor(admission.RunID, "approval")
+		payload := json.RawMessage(`{"approved":true}`)
+		restore := pauseQuorum(t, store)
+		// The wait is already closed; the outage surfaces at the first
+		// linearizable read of the late-signal path.
+		blocked, stop := context.WithTimeout(ctx, 3*time.Second)
+		got := signalOutcome(ingress.DeliverSignal(blocked, tenant, waitID, "late-signal", "synthetic-principal", payload, true))
+		stop()
+		restore()
+		retry := signalOutcome(ingress.DeliverSignal(ctx, tenant, waitID, "late-signal", "synthetic-principal", payload, true))
+		wait, err := owners.GetWait(ctx, tenant, waitID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		late := eventCount(t, ctx, store, partition, "wait.signal_late")
+		t.Logf("late signal outage: first=%s retry=%s wait=%s late events=%d", got, retry, wait.State, late)
+		if got != expected.Result || retry != expected.Retry || wait.State != expected.WaitAfterRestore || late != expected.LateEvents {
+			t.Fatalf("first=%s retry=%s wait=%s late=%d; fixture %+v", got, retry, wait.State, late, expected)
+		}
+	})
+
+	t.Run("late-signal-commit-unavailable", func(t *testing.T) {
+		// The outage begins exactly at the late-signal commit, after owner
+		// and wait reads succeeded: the store error must still be retryable.
+		expected := fixture.LateSignalBeforeCommit
+		ledger := effectLedger(filepath.Join(t.TempDir(), "ledger"))
+		store := integrationDistributedStore(t)
+		hooked := &hookedClient{Client: integrationClient(t)}
+		owners := newCountedWaitRuntime(t, store, ledger, 1)
+		ingress := newCountedWaitRuntime(t, integrationStoreFor(t, hooked), ledger, 1)
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		if err := owners.Check(ctx); err != nil {
+			t.Fatal(err)
+		}
+		tenant := tenantsInPartition(owners, partition, "quorum-late-commit", 1)[0]
+		admission, err := owners.Admit(ctx, Submission{Tenant: tenant, RequestKey: "quorum-late-commit", Workflow: "acceptance-wait", Input: json.RawMessage(`{"value":9}`)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		owner := acquireWhenFree(t, ctx, store, partition, "quorum-late-commit-owner", ownerTTL)
+		if _, err := owners.processOne(ctx, owner); !errors.Is(err, ErrNoWork) {
+			t.Fatalf("initial process=%v, want suspended wait", err)
+		}
+		if fired, err := owners.FireDueWaits(ctx, owner, time.Now().UTC().Add(time.Second), 8); err != nil || len(fired) != 1 {
+			t.Fatalf("timer fired=%d err=%v", len(fired), err)
+		}
+		waitID := WaitIDFor(admission.RunID, "approval")
+		payload := json.RawMessage(`{"approved":true}`)
+		var restore func()
+		hooked.arm("/events/late-signal-", 0, false, func() { restore = pauseQuorum(t, store) })
+		blocked, stop := context.WithTimeout(ctx, 3*time.Second)
+		got := signalOutcome(ingress.DeliverSignal(blocked, tenant, waitID, "late-signal", "synthetic-principal", payload, true))
+		stop()
+		if restore == nil {
+			t.Fatal("late-signal transaction was never attempted")
+		}
+		restore()
+		retry := signalOutcome(ingress.DeliverSignal(ctx, tenant, waitID, "late-signal", "synthetic-principal", payload, true))
+		late := eventCount(t, ctx, store, partition, "wait.signal_late")
+		t.Logf("late signal commit outage: first=%s retry=%s late events=%d", got, retry, late)
+		if got != expected.Result || retry != expected.Retry || late != expected.LateEvents {
+			t.Fatalf("first=%s retry=%s late=%d; fixture %+v", got, retry, late, expected)
+		}
+	})
 
 	t.Run("finish-in-flight", func(t *testing.T) {
 		expected := fixture.FinishInFlight
