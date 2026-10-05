@@ -31,11 +31,20 @@ var allowedImports = map[string]bool{
 }
 
 // The engine is used in exactly one way: one engine.New(...).WithMaxSteps(...).Run(...)
-// chain, in (*Program).Run. Any other engine method (WithObserver,
-// RunObserved, RunObservedPending, RunJournaled, EmitRunTerminal,
-// RunControl, or one added later) — called, taken as a method value, or
-// named in a string for reflection — turns this test red, whatever the
-// exported surface looks like.
+// chain, in (*Program).Run. This test reads syntax, not types. It is red on:
+//   - any other engine method (WithObserver, RunObserved,
+//     RunObservedPending, RunJournaled, EmitRunTerminal, RunControl, or one
+//     added later) as a selector, called or taken as a method value, or as
+//     a whole string literal;
+//   - any engine package selector but New, and any reference to engine.New
+//     except as the callee that roots the one chain;
+//   - any reflect selector but reflect.DeepEqual, so a method cannot be
+//     reached by a computed name;
+//   - any import outside allowedImports, and dot or blank imports.
+//
+// Out of scope: unsafe or reflect used from another package of the module
+// on Program's unexported fields (this package's own unsafe import is
+// refused), edits to this test, and code-generation tricks.
 func TestSourceRunsTheEngineOnlyUnobserved(t *testing.T) {
 	allowedMethods := map[string]bool{"WithMaxSteps": true, "Run": true}
 	forbidden := map[string]bool{}
@@ -63,7 +72,7 @@ func TestSourceRunsTheEngineOnlyUnobserved(t *testing.T) {
 			t.Fatal(err)
 		}
 		checked++
-		engineName := ""
+		engineName, reflectName := "", ""
 		for _, spec := range file.Imports {
 			path, _ := strconv.Unquote(spec.Path.Value)
 			if !allowedImports[path] {
@@ -75,28 +84,19 @@ func TestSourceRunsTheEngineOnlyUnobserved(t *testing.T) {
 					engineName = spec.Name.Name
 				}
 			}
+			if path == "reflect" {
+				reflectName = "reflect"
+				if spec.Name != nil {
+					reflectName = spec.Name.Name
+				}
+			}
 			if spec.Name != nil && (spec.Name.Name == "." || spec.Name.Name == "_") {
 				t.Errorf("%s imports %s as %q", name, path, spec.Name.Name)
 			}
 		}
-		ast.Inspect(file, func(n ast.Node) bool {
-			switch x := n.(type) {
-			case *ast.BasicLit:
-				if x.Kind == token.STRING {
-					if text, err := strconv.Unquote(x.Value); err == nil && forbidden[text] {
-						t.Errorf("%s: string %q names a forbidden engine method", fset.Position(x.Pos()), text)
-					}
-				}
-			case *ast.SelectorExpr:
-				if forbidden[x.Sel.Name] {
-					t.Errorf("%s: uses engine method %s; a catalog program runs only through plain Run", fset.Position(x.Pos()), x.Sel.Name)
-				}
-				if id, ok := x.X.(*ast.Ident); ok && engineName != "" && id.Name == engineName && x.Sel.Name != "New" {
-					t.Errorf("%s: uses engine.%s; only engine.New is allowed", fset.Position(x.Pos()), x.Sel.Name)
-				}
-			}
-			return true
-		})
+		// chainNew holds the engine.New selector of each counted run chain:
+		// the only place engine.New may appear.
+		chainNew := map[*ast.SelectorExpr]bool{}
 		for _, decl := range file.Decls {
 			fn, ok := decl.(*ast.FuncDecl)
 			if !ok {
@@ -116,6 +116,7 @@ func TestSourceRunsTheEngineOnlyUnobserved(t *testing.T) {
 				}
 				if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Run" && rootedAtEngineNew(sel.X, engineName) {
 					runs++
+					chainNew[chainRoot(sel.X)] = true
 					if !inRun {
 						t.Errorf("%s: engine run outside (*Program).Run", fset.Position(call.Pos()))
 					}
@@ -123,6 +124,36 @@ func TestSourceRunsTheEngineOnlyUnobserved(t *testing.T) {
 				return true
 			})
 		}
+		ast.Inspect(file, func(n ast.Node) bool {
+			switch x := n.(type) {
+			case *ast.BasicLit:
+				if x.Kind == token.STRING {
+					if text, err := strconv.Unquote(x.Value); err == nil && forbidden[text] {
+						t.Errorf("%s: string %q names a forbidden engine method", fset.Position(x.Pos()), text)
+					}
+				}
+			case *ast.SelectorExpr:
+				if forbidden[x.Sel.Name] {
+					t.Errorf("%s: uses engine method %s; a catalog program runs only through plain Run", fset.Position(x.Pos()), x.Sel.Name)
+				}
+				if id, ok := x.X.(*ast.Ident); ok && engineName != "" && id.Name == engineName {
+					switch {
+					case x.Sel.Name != "New":
+						t.Errorf("%s: uses engine.%s; only engine.New is allowed", fset.Position(x.Pos()), x.Sel.Name)
+					case !chainNew[x]:
+						// engine.New as a value (reflect.ValueOf(engine.New),
+						// a function variable) escapes the chain check.
+						t.Errorf("%s: references engine.New outside the one engine.New(...).WithMaxSteps(...).Run(...) chain", fset.Position(x.Pos()))
+					}
+				}
+				// reflect can call any engine method by a computed name, so
+				// only reflect.DeepEqual (Equal) is allowed.
+				if id, ok := x.X.(*ast.Ident); ok && reflectName != "" && id.Name == reflectName && x.Sel.Name != "DeepEqual" {
+					t.Errorf("%s: uses reflect.%s; only reflect.DeepEqual is allowed", fset.Position(x.Pos()), x.Sel.Name)
+				}
+			}
+			return true
+		})
 	}
 	if checked == 0 {
 		t.Fatal("no source files checked")
@@ -138,6 +169,17 @@ func receiverIs(expr ast.Expr, name string) bool {
 	}
 	id, ok := expr.(*ast.Ident)
 	return ok && id.Name == name
+}
+
+// chainRoot returns the engine.New selector a rootedAtEngineNew chain
+// starts from.
+func chainRoot(expr ast.Expr) *ast.SelectorExpr {
+	call := expr.(*ast.CallExpr)
+	sel := call.Fun.(*ast.SelectorExpr)
+	if sel.Sel.Name == "New" {
+		return sel
+	}
+	return chainRoot(sel.X)
 }
 
 func isEngineNew(call *ast.CallExpr, engineName string) bool {

@@ -90,9 +90,10 @@ type Dispatch func(ctx context.Context, id string, input []byte) (any, error)
 // longer safe to retry (#190). The engine runs with maxSteps and no observer
 // or journal: Run accepts neither, because an engine event or journal entry
 // for a literal call would carry the workflow input, not the literal.
-// source_guard_test.go keeps it that way: it allows only engine.New,
-// WithMaxSteps and Run, forbids importing anything that observes or
-// journals, and requires this to be the package's one engine run.
+// source_guard_test.go keeps it that way: it allows only engine.New (as the
+// callee that starts this chain), WithMaxSteps and Run, only
+// reflect.DeepEqual from reflect, no import that observes or journals, and
+// requires this to be the package's one engine run.
 func (p *Program) Run(ctx context.Context, input any, maxSteps int, effects func(id string) []string, dispatch Dispatch) (any, error) {
 	nodes := map[string]node.Any{}
 	// Unique engine keys per instruction preserve literals and versions.

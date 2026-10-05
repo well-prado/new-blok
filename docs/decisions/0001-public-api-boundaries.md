@@ -507,12 +507,24 @@ The type exposes `Literals` (copies of the values dispatch hands the calls),
 whole `catalogprogram.Program`, literals included), and one `Run`, which
 builds the dispatch nodes, substitutes every literal and runs the engine.
 `Run` takes no observer, journal or engine, so a caller cannot attach one.
-Inside the package, a source test holds the same line: it allows only
-`engine.New`, `WithMaxSteps` and `Run` from the engine, forbids every other
-engine method by name (including in strings, against reflection), allows
-only the imports `Run` needs (so `contract/inspection`, `internal/journal`
-and the event hub are refused), and requires exactly one
-`engine.New(...).WithMaxSteps(...).Run(...)` chain, in `(*Program).Run`.
+Inside the package, a source test
+(`agent/internal/catalogprogram/source_guard_test.go`) holds the same line.
+It reads the package's syntax, not its types, and it is red on:
+
+- any import outside the set `Run` needs, so `contract/inspection`,
+  `internal/journal`, the event hub and `unsafe` are refused, as are dot
+  and blank imports;
+- any selector naming an engine method other than `WithMaxSteps` and `Run`
+  (`WithObserver`, `RunObserved`, `RunObservedPending`, `RunJournaled`,
+  `EmitRunTerminal`, `RunControl`, or one added later), whether called or
+  taken as a method value, and any string literal equal to such a name;
+- any engine package selector except `New`, and any reference to
+  `engine.New` except as the callee that starts the one chain, so
+  `engine.New` cannot be passed to `reflect` or held in a variable;
+- any `reflect` selector except `reflect.DeepEqual`, so no engine method
+  can be reached by a computed name;
+- anything other than exactly one `engine.New(...).WithMaxSteps(...).Run(...)`
+  chain, in `(*Program).Run`.
 `catalogprogram.Lower` is the only caller of the lowering with
 `Options.Literals`. Package `agent` no longer imports `internal/engine` or
 `internal/lowering`, so it cannot build an engine or lower a literal itself.
@@ -558,11 +570,22 @@ for a workflow at the 10000-call ceiling, whose program has 10001
 instructions. Without the bound, that workflow registers and then always
 fails. Both directions are tested.
 
-Limits: the source test reads syntax, not types. In-module code can still
-reach the program through `reflect` on unexported fields or through
-`unsafe`, and an edit to `catalogprogram` can weaken the source test
-itself. Either one is a visible change to a guarded file, not a silent
-one; it is not impossible.
+The second review found a further escape, inside `(*Program).Run` and in
+front of the untouched chain. It passed `engine.New` to `reflect.ValueOf`
+and called `MethodByName("With"+"Observer")` and
+`MethodByName("Run"+"Observed")`, splitting the names so no forbidden
+string appears. The leak reproduced. The test is now red on it, through
+both the `engine.New` reference rule and the `reflect` rule.
+
+Out of scope, because a syntax check cannot hold them:
+
+- `reflect` or `unsafe` used from another package of the module on
+  `Program`'s unexported fields;
+- edits to the source test itself;
+- code-generation tricks.
+
+Each is a visible change to a file, not a silent one, but none is
+impossible.
 
 The initial portable contract is a bounded, JSON-compatible value subset with
 explicit semantics for missing, null, optional fields, objects, arrays, string,
