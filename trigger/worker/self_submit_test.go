@@ -479,8 +479,15 @@ func TestNestedSubmissionJoinedWithRetryableErrorIsNotRetried(t *testing.T) {
 			if err != nil || !processed {
 				t.Fatalf("processed=%v err=%v", processed, err)
 			}
-			if scenario.nested && nestedErr == nil {
-				t.Fatal("the nested submission succeeded; the test proves nothing")
+			switch scenario.name {
+			case "context-diagnosed":
+				if !errors.Is(nestedErr, ErrNestedSubmission) {
+					t.Fatalf("submission=%v; want ErrNestedSubmission from the context check", nestedErr)
+				}
+			case "busy-wait-diagnosed":
+				if !errors.Is(nestedErr, trigger.ErrSaturated) || errors.Is(nestedErr, ErrNestedSubmission) {
+					t.Fatalf("submission=%v; want saturation after a busy wait, diagnosed only by ProcessOnce", nestedErr)
+				}
 			}
 			job, err := queue.Get(ctx, "job")
 			if err != nil {
