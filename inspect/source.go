@@ -3,20 +3,67 @@ package inspect
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/well-prado/new-blok/contract/inspection"
 	runtimecontract "github.com/well-prado/new-blok/contract/runtime"
 )
 
+// UnavailableSource is an optional inspection.Source extension: the same read,
+// also naming what the reconstruction could not include (for example steps
+// whose workflow artifact no longer matches), so a reader can tell "not
+// there" from "not readable". The event stream adds the names to a
+// snapshot's "unavailable" list, at most maxUnavailableNotes of them, each at
+// most maxUnavailableNoteBytes.
+type UnavailableSource interface {
+	inspection.Source
+	ReadInspectionUnavailable(ctx context.Context, principal, runID, stepID string, offset, limit int, fields map[inspection.Field]bool, maxPayload int) (inspection.Run, []inspection.Step, int, []string, error)
+}
+
+// RefusingSource is an optional inspection.Source extension that classifies
+// its own errors. Refused reports an error meaning the reader may not, or
+// may no longer, see the run, as opposed to a read that failed (a timeout,
+// an outage). The event stream closes a recovered follower whose poll is
+// refused, instead of keeping it open until MaxDuration; a failed poll is
+// skipped.
+type RefusingSource interface {
+	inspection.Source
+	Refused(error) bool
+}
+
+const (
+	maxUnavailableNotes     = 8
+	maxUnavailableNoteBytes = 128
+)
+
+// sourceReadError is a failed source read. It is ErrNotFound to callers, and
+// keeps the source's own error for RefusingSource.
+type sourceReadError struct{ cause error }
+
+func (e *sourceReadError) Error() string        { return ErrNotFound.Error() }
+func (e *sourceReadError) Is(target error) bool { return target == ErrNotFound }
+func (e *sourceReadError) Unwrap() error        { return e.cause }
+
 // InspectSource obtains an authorized bounded page from a durable source and
 // applies the same redaction and response bounds as the process-local recorder.
 func InspectSource(ctx context.Context, source inspection.Source, principal string, policy inspection.Policy, query inspection.Query) (inspection.Page, error) {
+	page, _, err := inspectSource(ctx, source, principal, policy, query)
+	var failed *sourceReadError
+	if errors.As(err, &failed) {
+		return inspection.Page{}, ErrNotFound
+	}
+	return page, err
+}
+
+// inspectSource is InspectSource that also returns an UnavailableSource's
+// notes, and a failed source read as a *sourceReadError.
+func inspectSource(ctx context.Context, source inspection.Source, principal string, policy inspection.Policy, query inspection.Query) (inspection.Page, []string, error) {
 	if query.Version != inspection.Version {
-		return inspection.Page{}, inspection.ErrUnsupportedVersion
+		return inspection.Page{}, nil, inspection.ErrUnsupportedVersion
 	}
 	if source == nil || principal == "" || query.RunID == "" {
-		return inspection.Page{}, ErrNotFound
+		return inspection.Page{}, nil, ErrNotFound
 	}
 	limit := policy.MaxPageSize
 	if limit <= 0 || limit > 200 {
@@ -34,15 +81,23 @@ func InspectSource(ctx context.Context, source inspection.Source, principal stri
 	}
 	pagePolicy, err := boundedProjectionPolicy(policy, limit, projectedAttempts, projectedLogs)
 	if err != nil {
-		return inspection.Page{}, err
+		return inspection.Page{}, nil, err
 	}
 	offset, err := decodeCursor(query.Cursor, query.RunID, query.StepID)
 	if err != nil {
-		return inspection.Page{}, err
+		return inspection.Page{}, nil, err
 	}
-	run, steps, total, err := source.ReadInspection(ctx, principal, query.RunID, query.StepID, offset, limit, policy.Fields, pagePolicy.MaxPayloadBytes)
+	var run inspection.Run
+	var steps []inspection.Step
+	var total int
+	var notes []string
+	if noting, ok := source.(UnavailableSource); ok {
+		run, steps, total, notes, err = noting.ReadInspectionUnavailable(ctx, principal, query.RunID, query.StepID, offset, limit, policy.Fields, pagePolicy.MaxPayloadBytes)
+	} else {
+		run, steps, total, err = source.ReadInspection(ctx, principal, query.RunID, query.StepID, offset, limit, policy.Fields, pagePolicy.MaxPayloadBytes)
+	}
 	if err != nil {
-		return inspection.Page{}, ErrNotFound
+		return inspection.Page{}, nil, &sourceReadError{cause: err}
 	}
 	sourceTruncated := len(steps) > limit
 	if sourceTruncated {
@@ -59,9 +114,25 @@ func InspectSource(ctx context.Context, source inspection.Source, principal stri
 	}
 	encoded, err := json.Marshal(page)
 	if err != nil || len(encoded) > responseLimit {
-		return inspection.Page{}, fmt.Errorf("inspection: response limit exceeded")
+		return inspection.Page{}, nil, fmt.Errorf("inspection: response limit exceeded")
 	}
-	return page, nil
+	return page, boundedNotes(notes), nil
+}
+
+// boundedNotes keeps at most maxUnavailableNotes non-empty notes of at most
+// maxUnavailableNoteBytes each.
+func boundedNotes(notes []string) []string {
+	var out []string
+	for _, note := range notes {
+		if note == "" || len(note) > maxUnavailableNoteBytes {
+			continue
+		}
+		if len(out) == maxUnavailableNotes {
+			break
+		}
+		out = append(out, note)
+	}
+	return out
 }
 
 // AuthorizedBlobReader must be bound to one authenticated session and enforce
