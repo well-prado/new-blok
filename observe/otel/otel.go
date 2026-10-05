@@ -47,6 +47,7 @@ import (
 
 	"github.com/well-prado/new-blok/contract/inspection"
 	"github.com/well-prado/new-blok/contract/observe"
+	"github.com/well-prado/new-blok/observe/redact"
 )
 
 // Bounds. A zero Config field takes the default; a value above the hard
@@ -783,7 +784,7 @@ func (e *Exporter) stepLog(event inspection.Event) {
 	severity, text := logSeverity(event.LogLevel)
 	record.SetSeverity(severity)
 	record.SetSeverityText(text)
-	record.SetBody(attribute.StringValue(observe.RedactLogMessage(truncate(event.LogMessage, maxLogBodyBytes))))
+	record.SetBody(attribute.StringValue(redact.Message(truncate(event.LogMessage, maxLogBodyBytes))))
 	record.AddAttributes(attribute.String(AttrRunID, identity(event.RunID)), attribute.String(AttrWorkflow, label(event.Workflow)), attribute.String(AttrStep, label(event.StepID)))
 	if tenant := e.spanTenant(event.Tenant); tenant != "" {
 		record.AddAttributes(attribute.String(AttrTenant, tenant))
@@ -793,6 +794,9 @@ func (e *Exporter) stepLog(event inspection.Event) {
 }
 
 // allowedLogAttributes decodes only allowlisted top-level scalar attributes.
+// Allowlisting a key selects it for export; it never exports a secret: a
+// sensitive key's value and any credential-shaped string, encoded ones
+// included, are exported as the redaction marker (ADR 0021).
 func (e *Exporter) allowedLogAttributes(raw json.RawMessage) []attribute.KeyValue {
 	if e.logAttributes == nil || len(raw) == 0 {
 		return nil
@@ -809,9 +813,13 @@ func (e *Exporter) allowedLogAttributes(raw json.RawMessage) []attribute.KeyValu
 		if !ok {
 			continue
 		}
+		if redact.Key(key) {
+			out = append(out, attribute.String(key, redact.Marker))
+			continue
+		}
 		switch typed := value.(type) {
 		case string:
-			out = append(out, attribute.String(key, observe.RedactLogMessage(truncate(typed, maxLogValueBytes))))
+			out = append(out, attribute.String(key, redact.String(truncate(typed, maxLogValueBytes))))
 		case bool:
 			out = append(out, attribute.Bool(key, typed))
 		case json.Number:

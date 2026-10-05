@@ -3,6 +3,10 @@
 - Status: accepted for the application-composed Go and journal inspection slices and the live development event stream
 - Date: 2026-10-03
 - Roadmap: E15-T01 (#76); live event stream E15-T02 (#77)
+- Amended by: [ADR 0021](0021-sensitive-data-and-reliable-audit.md) (#80):
+  payload, log and error-label redaction now goes through `observe/redact`,
+  including encoded content; credential-shaped labels project as
+  `redacted_label`
 
 ## Context
 
