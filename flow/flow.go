@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/well-prado/new-blok/contract"
+	"github.com/well-prado/new-blok/internal/lowering"
 	"github.com/well-prado/new-blok/node"
 )
 
@@ -67,7 +68,7 @@ type Definition[I, O any] struct {
 // OutputID is the id of the instruction Lower appends to return the
 // workflow's output. Every builder rejects it as a step id, so a lowered
 // program never holds two instructions with this id (#247).
-const OutputID = "output"
+const OutputID = lowering.OutputID
 
 func (d Definition[I, O]) Program() Program { return cloneProgram(d.program) }
 
@@ -83,81 +84,29 @@ func (d Definition[I, O]) Program() Program { return cloneProgram(d.program) }
 // earlier in this program — has no program form, so Lower rejects it instead
 // of letting the engine fall back to the workflow input (#244). Control
 // constructs are rejected the same way.
+//
+// The rules live in internal/lowering, which the agent catalog lowers
+// composed workflows through as well, so the two cannot drift (#249). Lower
+// uses it without the catalog's extensions: a literal call input and a
+// child workflow call stay rejected here.
 func (d Definition[I, O]) Lower() (contract.InternalProgram, error) {
 	program := d.Program()
-	internal := contract.InternalProgram{
-		WorkflowID: program.Spec.Name,
-		Version:    program.Spec.Version,
+	result, err := lowering.Lower(program.Spec.Name, program.Spec.Version, loweringInstructions(program), program.Output, lowering.Options{})
+	if err != nil {
+		return contract.InternalProgram{}, err
 	}
-	for _, instruction := range program.Instructions {
-		if instruction.Kind != "call" {
-			return contract.InternalProgram{}, fmt.Errorf("flow: instruction %q of kind %q cannot be lowered", instruction.ID, instruction.Kind)
-		}
-	}
-	earlier := make(map[string]bool, len(program.Instructions))
+	return result.Program, nil
+}
+
+// loweringInstructions copies the recorded instructions into the shared
+// lowering's form. A call names its node by descriptor name, as the
+// canonical compiler does.
+func loweringInstructions(program Program) []lowering.Instruction {
+	instructions := make([]lowering.Instruction, len(program.Instructions))
 	for index, instruction := range program.Instructions {
-		references, err := lowerCallInput(instruction, earlier)
-		if err != nil {
-			return contract.InternalProgram{}, fmt.Errorf("flow: call %q: %w", instruction.ID, err)
-		}
-		internal.Instructions = append(internal.Instructions, contract.InternalInstruction{
-			Index:      index,
-			ID:         instruction.ID,
-			Kind:       instruction.Kind,
-			Node:       instruction.Node.Name,
-			References: references,
-		})
-		earlier[instruction.ID] = true
+		instructions[index] = lowering.Instruction{Kind: instruction.Kind, ID: instruction.ID, Node: instruction.Node.Name, Input: instruction.Input, Literal: instruction.Literal}
 	}
-	output, err := lowerReference(program.Output, earlier)
-	if err != nil {
-		return contract.InternalProgram{}, fmt.Errorf("flow: output: %w", err)
-	}
-	internal.Instructions = append(internal.Instructions, contract.InternalInstruction{
-		Index:      len(internal.Instructions),
-		ID:         OutputID,
-		Kind:       "output",
-		References: []contract.Reference{output},
-	})
-	return internal, nil
-}
-
-// lowerCallInput returns the references for one call's input. A call without
-// references receives the workflow input, so only "$input" may lower to none.
-func lowerCallInput(instruction Instruction, earlier map[string]bool) ([]contract.Reference, error) {
-	switch {
-	case instruction.Input == "$input":
-		return nil, nil
-	case instruction.Input == "$literal":
-		return nil, fmt.Errorf("literal input cannot be lowered: the engine program has no literal form")
-	}
-	reference, err := lowerReference(instruction.Input, earlier)
-	if err != nil {
-		return nil, fmt.Errorf("input %w", err)
-	}
-	return []contract.Reference{reference}, nil
-}
-
-// lowerReference converts "$step.<id>[.<field>…]" naming a call already in
-// earlier into a structural reference.
-func lowerReference(source string, earlier map[string]bool) (contract.Reference, error) {
-	const prefix = "$step."
-	if !strings.HasPrefix(source, prefix) {
-		return contract.Reference{}, fmt.Errorf("%q cannot be lowered: it does not name a call result", source)
-	}
-	parts := strings.Split(strings.TrimPrefix(source, prefix), ".")
-	for _, part := range parts {
-		if part == "" {
-			return contract.Reference{}, fmt.Errorf("%q has an empty field", source)
-		}
-	}
-	if !earlier[parts[0]] {
-		return contract.Reference{}, fmt.Errorf("%q does not reference an earlier call", source)
-	}
-	if len(parts) == 1 {
-		return contract.Reference{Step: parts[0]}, nil
-	}
-	return contract.Reference{Step: parts[0], Path: parts[1:]}, nil
+	return instructions
 }
 
 // violation is the panic value a builder raises when a definition breaks an

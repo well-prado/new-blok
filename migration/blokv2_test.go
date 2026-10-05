@@ -164,7 +164,7 @@ func TestStructuralMigrationRoundTrips(t *testing.T) {
 func TestMigratedWorkflowIDsDoNotCollapseSlugCollisions(t *testing.T) {
 	left := migratedWorkflowID("order quote")
 	right := migratedWorkflowID("order-quote")
-	if left == right || !validID.MatchString(left) || !validID.MatchString(right) || len(left) > 64 || len(right) > 64 {
+	if left == right || !contract.ValidID(left) || !contract.ValidID(right) || len(left) > 64 || len(right) > 64 {
 		t.Fatalf("workflow ids do not safely distinguish source names: %q and %q", left, right)
 	}
 }
@@ -250,5 +250,112 @@ func asDiagnostic(err error, target *Diagnostic) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// edgeIDs is the shared table both sides of the id grammar are measured
+// against. want pins the intended answer so the table cannot silently drift
+// together with the grammar; migration is then required to agree with
+// contract.ValidID on every row (#256).
+var edgeIDs = []struct {
+	name string
+	id   string
+	want bool
+}{
+	{"one character", "a", true},
+	{"64 characters", "a" + strings.Repeat("b", 63), true},
+	{"65 characters", "a" + strings.Repeat("b", 64), false},
+	{"dotted", "a.b", false},
+	{"uppercase", "Abc", false},
+	{"uppercase inside", "aBc", false},
+	{"leading digit", "1abc", false},
+	{"leading underscore", "_abc", false},
+	{"leading hyphen", "-abc", false},
+	{"inner underscore and hyphen", "a_b-c", true},
+	{"empty", "", false},
+	{"unicode letter", "café", false},
+	{"unicode leading letter", "éabc", false},
+	{"trailing newline", "a\n", false},
+	{"leading newline", "\na", false},
+	{"space", "a b", false},
+}
+
+func TestEdgeIDTableMatchesContractGrammar(t *testing.T) {
+	for _, row := range edgeIDs {
+		if got := contract.ValidID(row.id); got != row.want {
+			t.Fatalf("contract.ValidID(%q)=%v, the table expects %v; fix the table or the grammar deliberately", row.id, got, row.want)
+		}
+	}
+}
+
+// convertWithIDs drives the real public entry point with a one-step workflow
+// whose step id and inventory node id are the given values.
+func convertWithIDs(t *testing.T, stepID, nodeID string) (contract.Document, error) {
+	t.Helper()
+	source, err := json.Marshal(map[string]any{
+		"schemaVersion": "2",
+		"name":          "edge ids",
+		"version":       "1.0.0",
+		"steps":         []map[string]string{{"id": stepID, "use": "edge-node"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor := fixtureInventory()["catalog"]
+	descriptor.ID = nodeID
+	return Convert(source, map[string]contract.NodeDescriptor{"edge-node": descriptor})
+}
+
+func TestMigrationStepIDsAgreeWithContractValidID(t *testing.T) {
+	for _, row := range edgeIDs {
+		t.Run(row.name, func(t *testing.T) {
+			doc, err := convertWithIDs(t, row.id, "catalog")
+			if contract.ValidID(row.id) {
+				if err != nil {
+					t.Fatalf("contract.ValidID(%q) is true but migration rejected the step id: %v", row.id, err)
+				}
+				if err := doc.Validate(); err != nil {
+					t.Fatalf("migration accepted step id %q but the document rejects it: %v", row.id, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("contract.ValidID(%q) is false but migration accepted it as a step id", row.id)
+			}
+			if code := diagnosticCode(t, err); code != "unsupported_step_id" {
+				t.Fatalf("step id %q diagnostic = %q, want unsupported_step_id", row.id, code)
+			}
+		})
+	}
+}
+
+func TestMigrationInventoryNodeIDsAgreeWithContractValidID(t *testing.T) {
+	for _, row := range edgeIDs {
+		t.Run(row.name, func(t *testing.T) {
+			doc, err := convertWithIDs(t, "step", row.id)
+			if row.id == "" {
+				// An empty inventory id is not an error: migration derives
+				// one from the source `use` key, which is always in grammar.
+				if err != nil {
+					t.Fatalf("empty inventory id should fall back to the use slug: %v", err)
+				}
+				return
+			}
+			if contract.ValidID(row.id) {
+				if err != nil {
+					t.Fatalf("contract.ValidID(%q) is true but migration rejected the inventory id: %v", row.id, err)
+				}
+				if err := doc.Validate(); err != nil {
+					t.Fatalf("migration accepted inventory id %q but the document rejects it: %v", row.id, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("contract.ValidID(%q) is false but migration accepted it as an inventory id", row.id)
+			}
+			if code := diagnosticCode(t, err); code != "invalid_target_node_id" {
+				t.Fatalf("inventory id %q diagnostic = %q, want invalid_target_node_id", row.id, code)
+			}
+		})
 	}
 }
