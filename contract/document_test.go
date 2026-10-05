@@ -55,6 +55,11 @@ func TestDocumentReferencesRequireStrictlyEarlierInstructions(t *testing.T) {
 					t.Fatal(err)
 				}
 				d.Workflow.Instructions[0].Kind = kind
+				if kind == "wait" {
+					// A well-formed wait isolates the reference rule; malformed
+					// wait metadata is covered by TestWaitInstructionShape.
+					d.Workflow.Instructions[0].Wait = &WaitInstruction{Name: "approval", TimeoutMillis: 1000}
+				}
 				d.Workflow.Instructions[0].References = []Reference{{Step: target}}
 				assertDocumentBoundaryError(t, d, "invalid_reference", "workflow.instructions[0].references")
 			})
@@ -69,6 +74,9 @@ func TestDocumentReferencesRequireStrictlyEarlierInstructions(t *testing.T) {
 			d.Workflow.Instructions[1].Kind = kind
 			if kind == "call" {
 				d.Workflow.Instructions[1].Node = "quote-node"
+			}
+			if kind == "wait" {
+				d.Workflow.Instructions[1].Wait = &WaitInstruction{Name: "approval", TimeoutMillis: 1000}
 			}
 			encoded, err := json.Marshal(d)
 			if err != nil {
@@ -101,6 +109,84 @@ func TestDocumentReferencesRequireStrictlyEarlierInstructions(t *testing.T) {
 		}
 		d.Workflow.Instructions[1].ID = "calculate"
 		assertDocumentBoundaryError(t, d, "duplicate_id", "workflow.instructions")
+	})
+}
+
+// Issue #247: "output" is reserved only by flow, whose Lower synthesizes an
+// instruction under it. A document names its own output instruction, so a
+// call named "output" is valid and only a repeated id collides.
+func TestDocumentCallNamedOutputIsValidAndDuplicatesAreRejected(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "testdata", "contracts", "valid.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.Workflow.Instructions[0].ID = "output"
+	d.Workflow.Instructions[1].References[0].Step = "output"
+	p, err := d.Compile()
+	if err != nil || len(p.Instructions) != 2 || p.Instructions[0].ID != "output" || p.Instructions[1].ID != "respond" {
+		t.Fatalf("compile=%+v err=%v", p, err)
+	}
+	d.Workflow.Instructions[1].ID = "output"
+	assertDocumentBoundaryError(t, d, "duplicate_id", "workflow.instructions")
+}
+
+// TestWaitInstructionShape keeps the wait shape rule independent from the
+// reference rule: a malformed wait is rejected at its own path even when its
+// references would also be invalid, and wait metadata is refused elsewhere.
+func TestWaitInstructionShape(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "testdata", "contracts", "valid.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const maxTimeout = int64(365 * 24 * 60 * 60 * 1000)
+	cases := []struct {
+		name string
+		kind string
+		wait *WaitInstruction
+		refs []Reference
+		code string
+		path string
+	}{
+		{"missing metadata", "wait", nil, nil, "invalid_wait", "workflow.instructions[0].wait"},
+		{"blank name", "wait", &WaitInstruction{}, nil, "invalid_wait", "workflow.instructions[0].wait"},
+		{"oversized name", "wait", &WaitInstruction{Name: strings.Repeat("n", 181)}, nil, "invalid_wait", "workflow.instructions[0].wait"},
+		{"negative timeout", "wait", &WaitInstruction{Name: "approval", TimeoutMillis: -1}, nil, "invalid_wait", "workflow.instructions[0].wait"},
+		{"timeout beyond bound", "wait", &WaitInstruction{Name: "approval", TimeoutMillis: maxTimeout + 1}, nil, "invalid_wait", "workflow.instructions[0].wait"},
+		{"malformed wait reports shape before references", "wait", nil, []Reference{{Step: "respond"}}, "invalid_wait", "workflow.instructions[0].wait"},
+		{"wait metadata on a call", "call", &WaitInstruction{Name: "approval"}, nil, "unexpected_wait", "workflow.instructions[0].wait"},
+		{"valid wait with forward reference", "wait", &WaitInstruction{Name: "approval", TimeoutMillis: maxTimeout}, []Reference{{Step: "respond"}}, "invalid_reference", "workflow.instructions[0].references"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, err := Parse(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			d.Workflow.Instructions[0].Kind = tc.kind
+			d.Workflow.Instructions[0].Wait = tc.wait
+			d.Workflow.Instructions[0].References = tc.refs
+			assertDocumentBoundaryError(t, d, tc.code, tc.path)
+		})
+	}
+	t.Run("bounded wait compiles", func(t *testing.T) {
+		d, err := Parse(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		d.Workflow.Instructions[0].Kind = "wait"
+		d.Workflow.Instructions[0].Wait = &WaitInstruction{Name: strings.Repeat("n", 180), TimeoutMillis: maxTimeout}
+		p, err := d.Compile()
+		if err != nil || p.Instructions[0].Wait == nil || p.Instructions[0].Wait.TimeoutMillis != maxTimeout {
+			t.Fatalf("compile=%+v err=%v", p, err)
+		}
+		d.Workflow.Instructions[0].Wait.Name = "changed"
+		if p.Instructions[0].Wait.Name == "changed" {
+			t.Fatal("compiled wait aliases the document")
+		}
 	})
 }
 
@@ -175,4 +261,30 @@ func FuzzParseBounded(f *testing.F) {
 		}
 		_, _ = Parse(input)
 	})
+}
+
+// ValidID is the exported grammar documents validate ids with; flow checks
+// step ids with it (#251). Pin which ids it accepts and that a document
+// rejects exactly the others with invalid_id.
+func TestValidIDIsTheDocumentIDGrammar(t *testing.T) {
+	valid := []string{"a", "z9", "line_items", "line-items", "output", "a" + strings.Repeat("b", 63)}
+	invalid := []string{"", "a.b", "A", "Output", "1a", "-a", "_a", "a b", "a/b", "$step", "caf\u00e9", "a" + strings.Repeat("b", 64)}
+	for _, id := range valid {
+		if !ValidID(id) {
+			t.Fatalf("ValidID(%q)=false, want true", id)
+		}
+		if err := (Document{Version: CurrentVersion, Workflow: Workflow{ID: id}}).Validate(); err != nil && strings.Contains(err.Error(), "workflow.id") {
+			t.Fatalf("document rejected workflow id %q: %v", id, err)
+		}
+	}
+	for _, id := range invalid {
+		if ValidID(id) {
+			t.Fatalf("ValidID(%q)=true, want false", id)
+		}
+		err := Document{Version: CurrentVersion, Workflow: Workflow{ID: id}}.Validate()
+		var diagnostic *Error
+		if !errors.As(err, &diagnostic) || diagnostic.Code != "invalid_id" || diagnostic.Path != "workflow.id" {
+			t.Fatalf("document workflow id %q: err=%v, want invalid_id at workflow.id", id, err)
+		}
+	}
 }

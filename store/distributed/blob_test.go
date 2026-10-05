@@ -54,22 +54,24 @@ func TestS3BlobOutageBlocksReferenceAndResume(t *testing.T) {
 		}
 	}()
 	blockedCtx, blockedCancel := context.WithTimeout(context.Background(), 2*time.Second)
-	err = journal.CommitBlob(blockedCtx, owner, "unavailable-before-reference", blobs, payload)
+	beforeErrors := make(map[string]struct{})
+	if err := journal.CommitBlob(blockedCtx, owner, "unavailable-before-reference", blobs, payload); err != nil {
+		beforeErrors[errorLabel(err)] = struct{}{}
+	}
 	blockedCancel()
-	if !errors.Is(err, ErrBlobUnavailable) {
-		t.Fatalf("commit while object service unavailable = %v, want ErrBlobUnavailable", err)
-	}
-	value, err := journal.Read(ctx, bucket, "unavailable-before-reference")
-	if err != nil || value != nil {
-		t.Fatalf("outage created a durable reference: value=%s err=%v", value, err)
-	}
-	assertScenarioFixture(t, "blob-unavailable-before-reference", map[string]any{
-		"referenceCommitted": 0, "outputPublished": 0, "errors": []string{"blob_unavailable"},
-	})
 	if output, err := exec.Command("docker", composeArgs("unpause", "s3")...).CombinedOutput(); err != nil {
 		t.Fatalf("restore object service: %v: %s", err, output)
 	}
 	paused = false
+	// Measured after the object service is back: a reference committed or
+	// an output readable through it would both be visible now.
+	outputPublished := 0
+	if output, err := journal.ReadBlob(ctx, bucket, "unavailable-before-reference", blobs); err == nil && output != nil {
+		outputPublished++
+	}
+	assertScenarioFixture(t, "blob-unavailable-before-reference", map[string]any{
+		"referenceCommitted": committedEvents(t, ctx, journal, bucket, "unavailable-before-reference"), "outputPublished": outputPublished, "errors": sortedErrorLabels(beforeErrors),
+	})
 
 	if err := journal.CommitBlob(ctx, owner, "blob-backed-output", blobs, payload); err != nil {
 		t.Fatalf("commit verified blob reference: %v", err)
@@ -85,11 +87,14 @@ func TestS3BlobOutageBlocksReferenceAndResume(t *testing.T) {
 	paused = true
 	readCtx, readCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer readCancel()
-	if _, err := journal.ReadBlob(readCtx, bucket, "blob-backed-output", blobs); !errors.Is(err, ErrBlobUnavailable) {
-		t.Fatalf("resume read during object outage = %v, want ErrBlobUnavailable", err)
+	afterErrors := make(map[string]struct{})
+	resumeAllowed := true
+	if _, err := journal.ReadBlob(readCtx, bucket, "blob-backed-output", blobs); err != nil {
+		resumeAllowed = false
+		afterErrors[errorLabel(err)] = struct{}{}
 	}
 	assertScenarioFixture(t, "blob-unavailable-after-reference", map[string]any{
-		"referenceStillDurable": true, "resumeAllowed": false, "errors": []string{"blob_unavailable"},
+		"referenceStillDurable": committedEvents(t, ctx, journal, bucket, "blob-backed-output") == 1, "resumeAllowed": resumeAllowed, "errors": sortedErrorLabels(afterErrors),
 	})
 }
 
@@ -135,6 +140,7 @@ func TestPartitionTakeoverKeepsTimerSignalAndBlobReferences(t *testing.T) {
 	if err != nil {
 		t.Fatalf("take over stable partition: %v", err)
 	}
+	takeoverErrors := make(map[string]struct{})
 	for _, delivery := range []struct {
 		id      string
 		kind    string
@@ -143,10 +149,10 @@ func TestPartitionTakeoverKeepsTimerSignalAndBlobReferences(t *testing.T) {
 		{id: "timer-claim", kind: "timer-claim", payload: `{"timerID":"timer-record"}`},
 		{id: "signal-delivery", kind: "signal-delivery", payload: `{"signalID":"signal-record"}`},
 	} {
-		if err := journal.Commit(ctx, oldOwner, delivery.id, delivery.kind, []byte(delivery.payload)); !errors.Is(err, ErrOwnershipLost) {
-			t.Fatalf("stale owner %s commit = %v, want ErrOwnershipLost", delivery.kind, err)
+		if err := journal.Commit(ctx, oldOwner, delivery.id, delivery.kind, []byte(delivery.payload)); err != nil {
+			takeoverErrors[errorLabel(err)] = struct{}{}
 		}
-		if err := journal.Commit(ctx, newOwner, delivery.id, delivery.kind, []byte(delivery.payload)); err != nil {
+		if err := journal.Commit(ctx, newOwner, delivery.id, delivery.kind, []byte(delivery.payload)); err != nil && !errors.Is(err, ErrAlreadyWritten) {
 			t.Fatalf("new owner %s commit: %v", delivery.kind, err)
 		}
 		encoded, err := journal.Read(ctx, partition, delivery.id)
@@ -155,29 +161,29 @@ func TestPartitionTakeoverKeepsTimerSignalAndBlobReferences(t *testing.T) {
 			t.Fatalf("fenced %s record = %+v, err=%v", delivery.kind, record, err)
 		}
 	}
+	retained := map[string]bool{}
 	for id, kind := range map[string]string{"timer-record": "timer", "signal-record": "signal"} {
 		encoded, err := journal.Read(ctx, partition, id)
-		if err != nil {
-			t.Fatalf("read %s after takeover: %v", kind, err)
-		}
 		var record event
-		if err := json.Unmarshal(encoded, &record); err != nil || record.Kind != kind || record.Partition != partition {
-			t.Fatalf("%s record after takeover = %+v, err=%v", kind, record, err)
-		}
+		retained[kind] = err == nil && encoded != nil && json.Unmarshal(encoded, &record) == nil && record.Kind == kind && record.Partition == partition && record.Fence == oldOwner.Token
 	}
 	artifact, err := journal.ReadBlob(ctx, partition, "artifact-record", blobs)
-	if err != nil || string(artifact) != "synthetic retained artifact" {
-		t.Fatalf("blob reference after takeover = %q, err=%v", artifact, err)
-	}
-	if err := journal.Commit(ctx, oldOwner, "stale-after-migration", "state", []byte(`{"stale":true}`)); !errors.Is(err, ErrOwnershipLost) {
-		t.Fatalf("old owner commit after partition takeover = %v, want ErrOwnershipLost", err)
+	blobVerified := err == nil && string(artifact) == "synthetic retained artifact"
+	if err := journal.Commit(ctx, oldOwner, "stale-after-migration", "state", []byte(`{"stale":true}`)); err != nil {
+		takeoverErrors[errorLabel(err)] = struct{}{}
 	}
 	if err := journal.Commit(ctx, newOwner, "new-owner-state", "state", []byte(`{"current":true}`)); err != nil {
-		t.Fatalf("new owner commit after partition takeover: %v", err)
+		takeoverErrors[errorLabel(err)] = struct{}{}
 	}
+	oldCommitted := 0
+	for _, id := range []string{"timer-claim", "signal-delivery", "stale-after-migration"} {
+		staleCount, _ := committedByFence(t, ctx, journal, partition, id, oldOwner, newOwner)
+		oldCommitted += staleCount
+	}
+	_, newCommitted := committedByFence(t, ctx, journal, partition, "new-owner-state", oldOwner, newOwner)
 	assertScenarioFixture(t, "partition-takeover-timer-signal-blob", map[string]any{
-		"timerRecordRetained": true, "signalRecordRetained": true,
-		"blobDigestVerified": true, "oldOwnerCommitted": 0,
-		"newOwnerCommitted": 1, "errors": []string{"ownership_lost"},
+		"timerRecordRetained": retained["timer"], "signalRecordRetained": retained["signal"],
+		"blobDigestVerified": blobVerified, "oldOwnerCommitted": oldCommitted,
+		"newOwnerCommitted": newCommitted, "errors": sortedErrorLabels(takeoverErrors),
 	})
 }

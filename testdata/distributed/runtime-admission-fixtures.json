@@ -1,0 +1,7 @@
+{
+  "partitionCount": 8,
+  "tenant": "tenant-alpha",
+  "expectedPartition": "p-0004",
+  "candidateTenants": ["alpha", "alpha", "alpha", "bravo"],
+  "expectedFairOrder": ["alpha", "bravo", "alpha", "bravo"]
+}

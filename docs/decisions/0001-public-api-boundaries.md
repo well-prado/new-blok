@@ -93,6 +93,110 @@ Validate/Parse/Compile/Canonical tests prove rejection without executing
 business effects. This correction does not certify arbitrary control-flow
 programs or change typed authoring APIs.
 
+#### Field references select encoding/json keys (#241)
+
+A reference path segment selects a member of the JSON object its value
+encodes to, as `encoding/json` encodes it. The same path therefore resolves
+the same way whether the value is still a Go struct a native node returned or
+has crossed a JSON boundary (a checkpoint, a foreign runtime, a child
+workflow) as decoded maps.
+
+- **Old contract:** on a struct, a segment matched a field's json tag name
+  *or* its exact Go field name. Embedded structs were not flattened (the
+  embedded type's name returned the whole struct), `json:"-"` fields were
+  reachable under their Go name and under `-`, `omitempty`/`omitzero` fields
+  always existed, `,string` fields kept their native type, custom
+  `MarshalJSON`/`MarshalText` output was ignored, and a map whose key type was
+  not exactly `string` panicked the run.
+- **New contract:** the key set is the one `encoding/json` emits for the
+  value: promoted fields flattened under Go's embedding rules (shallowest
+  wins, a tagged field breaks a tie, a remaining tie drops the key; a field
+  promoted through a nil embedded pointer is absent), no `-` fields, a tagged
+  field only under its tag name, empty `omitempty` and zero `omitzero` fields
+  absent, `,string` scalars as their quoted text, values with their own
+  encoder (`MarshalJSON`, `MarshalJSONTo`, `MarshalText` or `AppendText`, by
+  value or pointer receiver) as that method writes them, map keys as their
+  encoded text, and duplicate names resolved to the last as a JSON decoder
+  would. A null value, including a nil map or slice, fails with
+  `cannot read "<key>" from null`; a non-object fails with
+  `cannot read "<key>" from a JSON <array|string|number|boolean>`;
+  descending into a value `encoding/json` cannot encode (a func, a map with
+  `bool` keys) fails with `value has no JSON encoding`.
+- **Work is bounded by the selected member.** A struct resolves through a key
+  index built once per type; siblings are never encoded. The index reads json
+  tags only in *plain form* (`internal/jsontag`): a valid UTF-8 name part
+  without quotes, backslashes or backticks, which `encoding/json` uses
+  verbatim as the key, and options that are each empty, a whole identifier,
+  `case:<identifier>` or `format:<value>`. Outside plain form, Go 1.27's
+  `encoding/json` decides the effect by its own parsing: it keeps the leading
+  identifier of a malformed option and still applies it (`,omitempty ` and
+  `,omitempty;` still omit, `,string ` still quotes), skips an option that
+  does not start with a letter (`, omitempty`), and reads quoted parts its own
+  way (`json:"'a,string'"` keeps the Go name and quotes). A struct with any
+  tag outside plain form therefore resolves against its whole encoding, as
+  does one using `embed` (an unnamed `embed` field is inlined) or `format:…`
+  (encoding fails). Within plain form, `omitempty`, `omitzero` and `string`
+  are modelled; every other identifier, including `case:…` (decoding only),
+  unknown options such as `required` and look-alikes such as `omitEmpty`, is
+  ignored by `encoding/json` and here. `omitempty` and `omitzero` are decided
+  from the selected field alone, with `encoding/json`'s definitions (v1's
+  emptiness, which the v2-backed implementation keeps for `encoding/json`,
+  and a type's own `IsZero`). The only member ever encoded is a `,string`
+  scalar. Map keys are named without encoding values. A container whose own
+  type has one of the four encoders is encoded whole, because its keys exist
+  nowhere else. The supported and tested implementation is Go 1.27's default
+  (v2-backed) `encoding/json`. Its v1 implementation (`GOEXPERIMENT=nojsonv2`)
+  names some keys differently (for example a `string`-kind map key with
+  `MarshalText`) and is untested: this repository does not build in that
+  mode (`internal/engine/observation.go` imports `encoding/json/v2`).
+- **Typed values stay typed.** A selected field is handed on as its Go value,
+  so native nodes receive their declared input types whether the source node
+  returned a `T` or a `*T`. Only a `,string` member, and members of a
+  container with its own encoder, are handed on decoded. Consequence: a
+  field whose type marshals through a pointer receiver, selected from inside
+  a pointer output, is handed on as its Go value, whose by-value encoding
+  differs from the member `encoding/json` wrote in place. Navigating *through*
+  such a field still follows the in-place encoding.
+- **Values JSON cannot carry.** NaN and ±Inf floats, `map[bool]…` and funcs
+  have no JSON form, so no decoded value exists to compare with. They do not
+  affect references to their siblings, and selecting such a field returns its
+  Go value as before.
+
+**Compatibility: behavioral.** No wire, document or journal format changes.
+A hand-written reference that relied on the old struct-only behavior now
+fails with `invalid_output_reference` / `invalid_input_reference`: a Go field
+name where a json tag renames the field, a `json:"-"` field, an embedded type's
+name, a field of a type with its own encoder, or an empty `omitempty` / zero
+`omitzero` field. A reference through a `,string` field now yields its quoted
+text. Migration: select the key the value has in its JSON (`blok generate`
+accessors do, #240; they now also skip `,string` fields, types with any of
+the four encoders and types with a tag outside plain form, and emit at most
+one accessor per key, for the field `encoding/json` writes, counting tagged
+embedded fields in the contest); read promoted fields at the parent level; move data the
+workflow must read out of `json:"-"`. No reference in this repository's
+examples, fixtures or scaffolds needed migration.
+
+Cost: selecting a three-byte field beside a 1 MiB sibling allocates 16 bytes
+at one segment and 32 bytes at five (the
+`TestReferenceWorkIsBoundedBySelectedMember` regression bound is 4 KiB),
+against 64 and 272 bytes on `main` before #241; the quote example's
+end-to-end run shows no measurable difference on the measuring machine.
+
+Fixtures: `testdata/references/json-keys.json` holds valid and rejected cases.
+`internal/engine/reference_test.go` resolves each against a typed node output
+and against its `encoding/json` round trip through the production
+interpreter, requires both to match the fixture, and asserts the Go types
+handed on, including for `T` versus `*T` outputs and for members selected by
+the shadowing, tag-dominance and duplicate-embedding rules.
+`internal/engine/reference_property_test.go` compares every candidate key of
+1,500 seeded random `reflect.StructOf` shapes, as `T` and `*T`, against
+`json.Marshal` → `json.Unmarshal`. Limits: a
+generated accessor for an `omitempty`/`omitzero` field is typed as always
+present, but its reference fails when the value is empty; the generator still
+emits no accessors for promoted fields; inspection capture (`observation.go`)
+keeps its own bounded walker, which truncates values with embedded,
+`,string` or `omitzero` fields instead of resolving them.
+
 #### Lowered call inputs keep their references (#244)
 
 `flow.Definition.Lower` lowers each call's recorded input to the same
@@ -124,6 +228,121 @@ through a call result or wait for a program literal form.
 `execution.Runner`. Lower does not yet check selected fields against node
 output schemas; the engine still validates each call input against the node's
 input schema before invoking it.
+
+#### The lowered output instruction id is reserved in flow (#247)
+
+`flow.Definition.Lower` appends one instruction of kind `output` with the id
+`flow.OutputID` (`"output"`) to return the workflow's result. Every
+id-taking builder (`Call`, `ArmCall`, `If`, `Choose`, `Each`, `Parallel`,
+`TryFinally`, `Child`, `Compare`, `Default`, `Template`) shares one id
+namespace and now panics with
+`flow: instruction id "output" is reserved for the workflow output instruction Lower appends; rename the step`
+when given that id, the same authoring-time failure a duplicate id already
+produces. Previously `flow.Call(builder, "output", …)` lowered to a program
+with two instructions named `output`; the engine reported two steps with that
+id, and the same structure written as a document fails `duplicate_id`.
+
+The id is reserved, rather than renamed to something no step can take, because
+it keeps one id grammar across flow, the canonical compiler and documents:
+document ids match `^[a-z][a-z0-9_-]{0,63}$`, flow ids were not grammar-checked
+(they are since #251, below),
+and the existing `output` id is what lowered programs, engine step results and
+inspection events already carry. The rule lives in flow because only flow
+synthesizes an instruction. The canonical compiler and the document validator
+synthesize nothing: a document names its own output instruction (the
+`valid.json` fixture calls it `respond`; migration picks `result` or `return`),
+so a document call named `output` is valid, and a document that repeats any id
+keeps failing `duplicate_id`. Documents therefore do not reserve the id. The
+agent catalog's workflow lowering already refused a call named `output` and
+now names the same `flow.OutputID` constant; its other divergences from
+`flow.Lower` remain #249.
+
+This is a behavioral validation tightening plus one additive exported constant
+(`flow.OutputID`), linked to
+[#247](https://github.com/well-prado/new-blok/issues/247). It is not a
+wire-shape or document-version change, and the lowered output id is unchanged.
+Only definitions using the id `output` for an authored step are affected.
+Those made of plain calls already lowered to a program with duplicate ids;
+a control construct named `output`, or a definition used only through
+`Program()` or `agent.RegisterWorkflow`, used to fail in `Lower` or be
+refused by the catalog, and now panics when the flow is defined instead.
+Migration: rename the step.
+`flow/reserved_output_test.go` proves rejection for every id-taking builder and
+that resembling ids (`outputs`, `output-step`, `result`) still lower to the
+canonical compiler's program; `internal/compile` and `contract` tests prove a
+document call named `output` compiles and a repeated id is rejected.
+
+#### Flow step ids follow the document id grammar (#251)
+
+Every id-taking builder (`Call`, `ArmCall`, `If`, `Choose`, `Each`,
+`Parallel`, `TryFinally`, `Child`, `Compare`, `Default`, `Template`) checks its
+step id in one place, `Builder.reserveID`, against the document id grammar
+`^[a-z][a-z0-9_-]{0,63}$`. A violation fails as
+`flow: instruction id "<id>" does not match the id grammar ^[a-z][a-z0-9_-]{0,63}$; rename the step`,
+the same authoring-time failure as the reserved `output` id and a duplicate
+id. The grammar is not copied: `contract` exports it as `contract.IDPattern`
+with `contract.ValidID`, and document validation now uses that function too.
+
+Previously flow accepted any id except `output` (#247) and an empty `Call`
+or `ArmCall` id. The
+`.` is the defect that matters: a reference to step `a.b` is recorded as
+`$step.a.b`, and lowering splits references on `.`, so with calls `a` and
+`a.b`, returning `a.b` lowered to `{Step: a, Path: [b]}` — field `b` of step
+`a` — with no error. Other out-of-grammar ids (uppercase, a leading digit,
+`-` or `_`, `/`, `$`, `:`, spaces, non-ASCII letters, more than 64
+characters, an empty id on a construct) had no document form, so the same
+structure written as a document fails `invalid_id`. One grammar now holds in
+flow, the canonical compiler and documents. The agent catalog's workflow
+lowering reads only programs built by `flow.Define`, so its step ids now obey
+the grammar as well; its other divergences from `flow.Lower` remain #249.
+
+`flow.Define` now returns every builder violation as its error instead of
+letting it escape as a panic: the id rules above, and the construct rules
+(an `Each` concurrency outside 1–1024, a missing arm, an empty field path,
+an empty `Child` workflow name or comparison operator, a literal that cannot
+be encoded, a raw `js/` template). Tooling that loads definitions — the
+scaffold's generated `New`, the parity harness — gets a diagnostic it can
+report instead of a crash, which is what `Define` returning an error always
+promised. Builders panic with an unexported error type and `Define` recovers
+only that type, so a panic the application's own build callback raises (a
+nil dereference, a deliberate `panic`) still propagates unchanged and is
+never reported as a definition error. `MustDefine` does not recover: a
+broken rule panics at the builder call that broke it, so the crash stack
+still names the offending line. A builder called outside `Define` (a
+`*Builder` kept after the callback returns) still panics.
+
+Compatibility: a behavioral validation tightening in `flow`, a behavioral
+change to `flow.Define`, and an additive `contract` export (`IDPattern`,
+`ValidID`), linked to [#251](https://github.com/well-prado/new-blok/issues/251).
+It is not a wire-shape or document-version change, and document validation
+is unchanged. Affected definitions:
+
+- a step id outside the grammar: `MustDefine` now panics and `Define` now
+  returns an error where both used to succeed. Migration: rename the step to
+  lowercase letters, digits, `_` or `-`, starting with a letter, at most 64
+  characters (`lineItems` becomes `line-items` or `line_items`). No id in
+  this repository's examples, scaffold, benchmarks, catalog or agent code
+  needed renaming.
+- `Define` given a callback that breaks any builder rule now returns
+  `(Definition{}, err)` instead of panicking; callers that recovered that
+  panic should check the error instead.
+- the panic value raised by builders and by `MustDefine` is now an `error`
+  whose message is unchanged; code asserting it is a `string` must use
+  `fmt.Sprint` or `error` instead.
+- the empty-id panic of `Call` and `ArmCall` changed from
+  `flow: call id is required` to the grammar message for `""`.
+
+`flow/id_grammar_test.go` proves rejection of fourteen grammar-invalid ids
+for every id-taking builder through both `Define` (error) and `MustDefine`
+(panic), that ids at the grammar's edges (`a`, a 64-character id) still lower
+to the canonical compiler's program, that `Define` returns construct
+violations, that a callback's own panic propagates, and that `MustDefine`'s
+panic stack reaches the builder call. `contract/document_test.go` pins
+`ValidID` to document validation's `invalid_id`. Limits: flow still does not
+grammar-check `Choose` case keys, the `Child` workflow name or `Spec.Name`
+(document workflow ids are a separate field that a flow `Spec.Name` such as
+`shop/quote` does not map to), and `migration/blokv2.go` keeps its own copy of
+the grammar.
 
 The initial portable contract is a bounded, JSON-compatible value subset with
 explicit semantics for missing, null, optional fields, objects, arrays, string,

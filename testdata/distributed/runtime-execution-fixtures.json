@@ -1,0 +1,14 @@
+{
+  "name": "two-ingress-idempotent-execution",
+  "ingressRequests": 12,
+  "expectedAccepted": 1,
+  "expectedDuplicates": 11,
+  "expectedConflicts": 0,
+  "expectedEffects": 1,
+  "expectedFinalState": "completed",
+  "sameKeyDifferentInputError": "request_conflict",
+  "conflictingIngressRequests": 12,
+  "expectedConflictAccepted": 1,
+  "expectedConflictDuplicates": 5,
+  "expectedConflictRejections": 6
+}

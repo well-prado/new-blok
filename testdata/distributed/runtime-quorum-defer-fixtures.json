@@ -1,0 +1,10 @@
+{
+  "expectedFailureClass": "persistence",
+  "expectedPrefixInvocations": 2,
+  "expectedExternalEffects": 1,
+  "expectedFinalState": "completed",
+  "expectedActiveRuns": 0,
+  "expectedOutput": "{\"value\":41}",
+  "expectedStateAfterOutage": "running",
+  "expectedActiveRunsAfterOutage": 1
+}

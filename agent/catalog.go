@@ -160,7 +160,7 @@ func RegisterWorkflow[I, O any](c *Catalog, wf flow.Definition[I, O], inputSchem
 	c.mu.RUnlock()
 	maxDepth, calls, tokens := 1, 0, 0
 	for _, instruction := range p.Instructions {
-		if (instruction.Kind != "call" && instruction.Kind != "child") || instruction.ID == "output" || seen[instruction.ID] {
+		if (instruction.Kind != "call" && instruction.Kind != "child") || instruction.ID == flow.OutputID || seen[instruction.ID] {
 			return ErrNotAgentSafe
 		}
 		key := instruction.Node.Name + "@" + instruction.Node.Version
@@ -210,7 +210,7 @@ func RegisterWorkflow[I, O any](c *Catalog, wf flow.Definition[I, O], inputSchem
 	if err != nil {
 		return err
 	}
-	program.Instructions = append(program.Instructions, contract.InternalInstruction{ID: "output", Kind: "output", References: []contract.Reference{ref}})
+	program.Instructions = append(program.Instructions, contract.InternalInstruction{ID: flow.OutputID, Kind: "output", References: []contract.Reference{ref}})
 	m.Effects, m.Capabilities, m.SecretRefs = unique(m.Effects), unique(m.Capabilities), unique(m.SecretRefs)
 	b, err := prepare(p.Spec.Name, p.Spec.Version, "composed workflow tool", inputSchema, outputSchema, m, metadata)
 	if err != nil {
