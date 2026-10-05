@@ -1,0 +1,82 @@
+{
+  "fixtureVersion": 1,
+  "synthetic": true,
+  "name": "quorum-loss-at-each-runtime-transition",
+  "admitBeforeCommit": {
+    "result": "unavailable",
+    "recordAfterRestore": "absent",
+    "retry": "accepted",
+    "secondRetry": "duplicate",
+    "acceptedEvents": 1,
+    "activeRuns": 1
+  },
+  "admitInFlight": {
+    "result": "unavailable",
+    "retryOneOf": [
+      "accepted",
+      "duplicate"
+    ],
+    "acceptedEvents": 1,
+    "activeRuns": 1
+  },
+  "signalBeforeCommit": {
+    "result": "unavailable",
+    "waitAfterRestore": "waiting",
+    "retry": "accepted",
+    "signaledEvents": 1,
+    "finalState": "completed",
+    "suffixEffects": 1
+  },
+  "signalInFlight": {
+    "result": "unavailable",
+    "retryOneOf": [
+      "accepted",
+      "duplicate"
+    ],
+    "signaledEvents": 1,
+    "finalState": "completed",
+    "suffixEffects": 1
+  },
+  "timerBeforeCommit": {
+    "result": "error",
+    "dueTimersAfterRestore": 1,
+    "retryFired": 1,
+    "timedOutEvents": 1,
+    "finalState": "completed",
+    "suffixEffects": 1
+  },
+  "timerInFlight": {
+    "result": "error",
+    "retryFiredOneOf": [
+      0,
+      1
+    ],
+    "timedOutEvents": 1,
+    "finalState": "completed",
+    "suffixEffects": 1
+  },
+  "finishInFlight": {
+    "result": "error",
+    "consistentSlotsAndState": true,
+    "finalState": "completed",
+    "completedEvents": 1,
+    "activeRuns": 0,
+    "externalEffects": 1
+  },
+  "effectCommitInFlight": {
+    "result": "error",
+    "finalStateOneOf": [
+      "completed",
+      "uncertain"
+    ],
+    "externalEffects": 1,
+    "effectDispatches": 1,
+    "activeRuns": 0
+  },
+  "lateSignalBeforeCommit": {
+    "result": "unavailable",
+    "retry": "late",
+    "waitAfterRestore": "timed_out",
+    "lateEvents": 1
+  }
+}

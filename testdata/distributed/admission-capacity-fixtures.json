@@ -1,0 +1,35 @@
+{
+  "fixtureVersion": 1,
+  "synthetic": true,
+  "name": "bounded-admission-tenant-monopoly",
+  "limits": {
+    "partitions": 8,
+    "partitionAdmissions": 5,
+    "tenantAdmissions": 2
+  },
+  "monopolizingTenantConcurrentSubmits": 5,
+  "secondTenantConcurrentSubmits": 2,
+  "expected": {
+    "monopolizerAccepted": 2,
+    "monopolizerAdmissionFull": 3,
+    "secondTenantAccepted": 2,
+    "secondTenantAdmissionFull": 0,
+    "thirdTenantWhilePartitionHasRoom": "accepted",
+    "fourthTenantWhilePartitionFull": "admission_full",
+    "duplicateWhileFull": "duplicate",
+    "activeRunsWhenFull": 5,
+    "activeRunsAfterTakeover": 5,
+    "firstFinishedTenant": "monopolizer",
+    "activeRunsAfterOneFinish": 4,
+    "monopolizerReadmittedAfterFinish": "accepted",
+    "fourthTenantAfterRefill": "admission_full",
+    "externalEffects": 1,
+    "httpOverTenantCapStatus": 429,
+    "httpRetryAfter": "1",
+    "httpQuorumLossStatus": 503,
+    "httpAcceptedStatus": 202,
+    "httpConflictStatus": 409,
+    "httpSignalQuorumLossStatus": 503,
+    "httpRecoveredAdmission": "accepted"
+  }
+}

@@ -3,10 +3,12 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"reflect"
 	"regexp"
 	"strings"
@@ -164,6 +166,32 @@ func (n Any) Invoke(ctx context.Context, input any) (any, error) {
 		return nil, &Error{Code: "invalid_node", Message: "node has no invocation boundary"}
 	}
 	return n.invoke(ctx, input)
+}
+
+// DecodeOutput restores a JSON-persisted node result to the node's declared
+// Go output type. Durable execution adapters use this when resuming a
+// completed step; it does not invoke the node or establish trust in the data.
+func (n Any) DecodeOutput(data []byte) (any, error) {
+	if n.outputType == nil {
+		var value any
+		decoder := json.NewDecoder(bytes.NewReader(data))
+		decoder.UseNumber()
+		if err := decoder.Decode(&value); err != nil {
+			return nil, err
+		}
+		if err := decoder.Decode(new(any)); err != io.EOF {
+			if err == nil {
+				return nil, errors.New("node: persisted output contains multiple JSON values")
+			}
+			return nil, err
+		}
+		return value, nil
+	}
+	value := reflect.New(n.outputType)
+	if err := json.Unmarshal(data, value.Interface()); err != nil {
+		return nil, err
+	}
+	return value.Elem().Interface(), nil
 }
 
 func (n Any) Mock(output any, returned error) (Any, error) {

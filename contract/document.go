@@ -72,12 +72,21 @@ type NodeDescriptor struct {
 }
 
 type Instruction struct {
-	ID         string         `json:"id"`
-	Kind       string         `json:"kind"`
-	Node       string         `json:"node,omitempty"`
-	References []Reference    `json:"references,omitempty"`
-	Output     OptionalString `json:"output,omitempty"`
-	Source     *SourceSpan    `json:"source,omitempty"`
+	ID         string           `json:"id"`
+	Kind       string           `json:"kind"`
+	Node       string           `json:"node,omitempty"`
+	Wait       *WaitInstruction `json:"wait,omitempty"`
+	References []Reference      `json:"references,omitempty"`
+	Output     OptionalString   `json:"output,omitempty"`
+	Source     *SourceSpan      `json:"source,omitempty"`
+}
+
+// WaitInstruction describes a durable signal wait with an optional timeout.
+// A zero timeout waits for a signal indefinitely; positive timeouts are
+// persisted once and do not restart when a run is resumed by a new owner.
+type WaitInstruction struct {
+	Name          string `json:"name"`
+	TimeoutMillis int64  `json:"timeoutMillis,omitempty"`
 }
 
 type Reference struct {
@@ -131,13 +140,14 @@ type InternalProgram struct {
 }
 
 type InternalInstruction struct {
-	Index      int            `json:"index"`
-	ID         string         `json:"id"`
-	Kind       string         `json:"kind"`
-	Node       string         `json:"node,omitempty"`
-	References []Reference    `json:"references,omitempty"`
-	Output     OptionalString `json:"output,omitempty"`
-	Source     *SourceSpan    `json:"source,omitempty"`
+	Index      int              `json:"index"`
+	ID         string           `json:"id"`
+	Kind       string           `json:"kind"`
+	Node       string           `json:"node,omitempty"`
+	Wait       *WaitInstruction `json:"wait,omitempty"`
+	References []Reference      `json:"references,omitempty"`
+	Output     OptionalString   `json:"output,omitempty"`
+	Source     *SourceSpan      `json:"source,omitempty"`
 }
 
 var semver = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
@@ -221,6 +231,13 @@ func (d Document) Validate() error {
 				return &Error{Code: "unknown_node", Path: path + ".node", Message: "referenced node is not declared"}
 			}
 		}
+		if in.Kind == "wait" {
+			if in.Wait == nil || in.Wait.Name == "" || len(in.Wait.Name) > 180 || in.Wait.TimeoutMillis < 0 || in.Wait.TimeoutMillis > 365*24*60*60*1000 {
+				return &Error{Code: "invalid_wait", Path: path + ".wait", Message: "wait requires a bounded signal name and timeout from zero through 365 days"}
+			}
+		} else if in.Wait != nil {
+			return &Error{Code: "unexpected_wait", Path: path + ".wait", Message: "wait metadata is only valid on wait instructions"}
+		}
 		for _, ref := range in.References {
 			if !instructionIDs[ref.Step] {
 				return &Error{Code: "invalid_reference", Path: path + ".references", Message: "references must target an earlier instruction"}
@@ -249,7 +266,12 @@ func (d Document) Compile() (InternalProgram, error) {
 	}
 	p := InternalProgram{WorkflowID: d.Workflow.ID, Version: d.Workflow.Version, Digest: d.Workflow.Digest, Bindings: append([]Binding(nil), d.Bindings...)}
 	for i, in := range d.Workflow.Instructions {
-		p.Instructions = append(p.Instructions, InternalInstruction{Index: i, ID: in.ID, Kind: in.Kind, Node: in.Node, References: append([]Reference(nil), in.References...), Output: in.Output, Source: in.Source})
+		var wait *WaitInstruction
+		if in.Wait != nil {
+			copy := *in.Wait
+			wait = &copy
+		}
+		p.Instructions = append(p.Instructions, InternalInstruction{Index: i, ID: in.ID, Kind: in.Kind, Node: in.Node, Wait: wait, References: append([]Reference(nil), in.References...), Output: in.Output, Source: in.Source})
 	}
 	sort.SliceStable(p.Bindings, func(i, j int) bool { return p.Bindings[i].ID < p.Bindings[j].ID })
 	return p, nil
