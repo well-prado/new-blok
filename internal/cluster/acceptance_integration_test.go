@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/well-prado/new-blok/contract"
+	"github.com/well-prado/new-blok/internal/clustertest"
 	"github.com/well-prado/new-blok/internal/engine"
 	"github.com/well-prado/new-blok/node"
 	"github.com/well-prado/new-blok/store/distributed"
@@ -666,6 +667,9 @@ func oneOf[T comparable](value T, allowed []T) bool {
 // behavior is that the caller is never acknowledged and a retry with the same
 // identity reconciles to exactly one committed transition.
 func TestQuorumLossAtEachRuntimeTransition(t *testing.T) {
+	// Voters are paused inside transaction hooks: hold the exclusive
+	// cluster lock before the test starts, not mid-transaction.
+	clustertest.Disrupt(t)
 	var fixture quorumTransitionFixture
 	readDistributedFixture(t, "quorum-transition-fixtures.json", &fixture)
 	const partition = "p-0000"
@@ -683,7 +687,7 @@ func TestQuorumLossAtEachRuntimeTransition(t *testing.T) {
 		}
 		tenant := tenantsInPartition(runtime, partition, "quorum-admit", 1)[0]
 		request := Submission{Tenant: tenant, RequestKey: "quorum-admit", Workflow: "acceptance-effect", Input: json.RawMessage(`{"value":1}`)}
-		restore := pauseQuorum(t, store)
+		restore := clustertest.PauseQuorum(t)
 		blocked, stop := context.WithTimeout(ctx, 3*time.Second)
 		got := admissionOutcome(runtime.Admit(blocked, request))
 		stop()
@@ -726,7 +730,7 @@ func TestQuorumLossAtEachRuntimeTransition(t *testing.T) {
 		tenant := tenantsInPartition(runtime, partition, "quorum-admit-flight", 1)[0]
 		request := Submission{Tenant: tenant, RequestKey: "quorum-admit-flight", Workflow: "acceptance-effect", Input: json.RawMessage(`{"value":2}`)}
 		var restore func()
-		hooked.arm("/events/accepted-", 0, false, func() { restore = pauseQuorum(t, store) })
+		hooked.arm("/events/accepted-", 0, false, func() { restore = clustertest.PauseQuorum(t) })
 		blocked, stop := context.WithTimeout(ctx, 4*time.Second)
 		got := admissionOutcome(runtime.Admit(blocked, request))
 		stop()
@@ -770,9 +774,9 @@ func TestQuorumLossAtEachRuntimeTransition(t *testing.T) {
 		payload := json.RawMessage(`{"approved":true}`)
 		var restore func()
 		if inFlight {
-			hooked.arm("/events/signal-", 0, false, func() { restore = pauseQuorum(t, store) })
+			hooked.arm("/events/signal-", 0, false, func() { restore = clustertest.PauseQuorum(t) })
 		} else {
-			restore = pauseQuorum(t, store)
+			restore = clustertest.PauseQuorum(t)
 		}
 		blocked, stop := context.WithTimeout(ctx, 4*time.Second)
 		got := signalOutcome(ingress.DeliverSignal(blocked, tenant, waitID, "quorum-signal", "synthetic-principal", payload, true))
@@ -826,9 +830,9 @@ func TestQuorumLossAtEachRuntimeTransition(t *testing.T) {
 		due := time.Now().UTC().Add(time.Second)
 		var restore func()
 		if inFlight {
-			hooked.arm("/events/timer-", 0, false, func() { restore = pauseQuorum(t, store) })
+			hooked.arm("/events/timer-", 0, false, func() { restore = clustertest.PauseQuorum(t) })
 		} else {
-			restore = pauseQuorum(t, store)
+			restore = clustertest.PauseQuorum(t)
 		}
 		blocked, stop := context.WithTimeout(ctx, 4*time.Second)
 		fired, fireErr := timers.FireDueWaits(blocked, owner, due, 8)
@@ -892,7 +896,7 @@ func TestQuorumLossAtEachRuntimeTransition(t *testing.T) {
 		}
 		waitID := WaitIDFor(admission.RunID, "approval")
 		payload := json.RawMessage(`{"approved":true}`)
-		restore := pauseQuorum(t, store)
+		restore := clustertest.PauseQuorum(t)
 		// The wait is already closed; the outage surfaces at the first
 		// linearizable read of the late-signal path.
 		blocked, stop := context.WithTimeout(ctx, 3*time.Second)
@@ -940,7 +944,7 @@ func TestQuorumLossAtEachRuntimeTransition(t *testing.T) {
 		waitID := WaitIDFor(admission.RunID, "approval")
 		payload := json.RawMessage(`{"approved":true}`)
 		var restore func()
-		hooked.arm("/events/late-signal-", 0, false, func() { restore = pauseQuorum(t, store) })
+		hooked.arm("/events/late-signal-", 0, false, func() { restore = clustertest.PauseQuorum(t) })
 		blocked, stop := context.WithTimeout(ctx, 3*time.Second)
 		got := signalOutcome(ingress.DeliverSignal(blocked, tenant, waitID, "late-signal", "synthetic-principal", payload, true))
 		stop()
@@ -975,7 +979,7 @@ func TestQuorumLossAtEachRuntimeTransition(t *testing.T) {
 		}
 		owner := acquireWhenFree(t, ctx, store, partition, "quorum-finish-owner", ownerTTL)
 		var restore func()
-		hooked.arm("/events/finish-", 0, false, func() { restore = pauseQuorum(t, store) })
+		hooked.arm("/events/finish-", 0, false, func() { restore = clustertest.PauseQuorum(t) })
 		blocked, stop := context.WithTimeout(ctx, 5*time.Second)
 		_, processErr := runtime.processOne(blocked, owner)
 		stop()
@@ -1032,7 +1036,7 @@ func TestQuorumLossAtEachRuntimeTransition(t *testing.T) {
 		}
 		owner := acquireWhenFree(t, ctx, store, partition, "quorum-effect-owner", ownerTTL)
 		var restore func()
-		hooked.arm("/events/committed-", 0, false, func() { restore = pauseQuorum(t, store) })
+		hooked.arm("/events/committed-", 0, false, func() { restore = clustertest.PauseQuorum(t) })
 		blocked, stop := context.WithTimeout(ctx, 5*time.Second)
 		_, processErr := runtime.processOne(blocked, owner)
 		stop()
