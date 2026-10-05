@@ -479,6 +479,7 @@ func (r *Runtime) Run(ctx context.Context, ownerID string) error {
 }
 
 func (r *Runtime) runPartition(ctx context.Context, partition, ownerID string) error {
+	consecutiveFailures := 0
 	for ctx.Err() == nil {
 		owner, err := r.store.Acquire(ctx, partition, ownerID, r.limits.OwnerTTL)
 		if err != nil {
@@ -511,28 +512,47 @@ func (r *Runtime) runPartition(ctx context.Context, partition, ownerID string) e
 				}
 			}
 		}()
+		var processErr error
 		for ownerCtx.Err() == nil {
 			_, err := r.processOne(ownerCtx, owner)
 			if errors.Is(err, ErrNoWork) {
+				consecutiveFailures = 0
 				if waitErr := waitContext(ownerCtx, 200*time.Millisecond); waitErr != nil {
 					break
 				}
 				continue
 			}
 			if err != nil {
+				processErr = err
 				cancelOwner()
 				break
 			}
+			consecutiveFailures = 0
 		}
 		cancelOwner()
 		<-renewDone
+		// Relinquish the exact fence explicitly, so another worker can take
+		// the partition at once instead of after lease expiry. Release is
+		// fenced: it is a no-op error if ownership was already lost.
+		releaseCtx, cancelRelease := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+		_ = r.store.Release(releaseCtx, owner)
+		cancelRelease()
 		if ctx.Err() != nil {
-			releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
-			_ = r.store.Release(releaseCtx, owner)
-			cancel()
 			return ctx.Err()
 		}
-		if err := waitContext(ctx, 250*time.Millisecond); err != nil {
+		backoff := 250 * time.Millisecond
+		if processErr != nil {
+			// A processing error may be deterministic (for example a
+			// registered artifact that does not match an accepted run). Back
+			// off exponentially, bounded by the owner TTL, so a faulty worker
+			// does not flap on the partition while healthy workers take it.
+			consecutiveFailures++
+			backoff = acquireRetryInterval << min(consecutiveFailures, 6)
+			if backoff > r.limits.OwnerTTL {
+				backoff = r.limits.OwnerTTL
+			}
+		}
+		if err := waitContext(ctx, backoff); err != nil {
 			return err
 		}
 	}

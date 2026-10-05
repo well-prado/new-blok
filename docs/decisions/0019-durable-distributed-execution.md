@@ -69,7 +69,13 @@ slot, re-reads and retries, and after a bounded number of attempts with free
 slots still visible reports retryable unavailability (HTTP 503), never 429. A request key already committed with a different input is a
 definite conflict (`ErrRequestConflict`, HTTP 409), including when two ingress
 nodes race. A standby worker retries partition acquisition at a bounded
-interval.
+interval. A worker whose processing fails (for example because its
+registered artifact does not match an accepted run) releases its exact
+partition fence at once, so a healthy worker can take over without waiting
+for lease expiry, and backs off exponentially up to the owner TTL before it
+tries to acquire again. Such a run still blocks a partition for as long as
+every worker that acquires it fails the same way; mismatched artifacts are an
+operator error the runtime reports but does not repair.
 
 Fencing rejects a stale owner's durable writes, not its external calls. A
 paused or partitioned owner that resumes after a takeover may still perform

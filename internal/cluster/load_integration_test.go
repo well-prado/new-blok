@@ -509,3 +509,89 @@ func sumCounts(values map[string]int) int {
 	}
 	return total
 }
+
+// TestWorkerReleasesPartitionAfterProcessingError runs a worker whose
+// registered artifact does not match an accepted run, a deterministic
+// processing error. A healthy worker must take the partition over promptly
+// instead of waiting for the faulty worker's lease to expire, and the faulty
+// worker must back off rather than flap on the partition.
+func TestWorkerReleasesPartitionAfterProcessingError(t *testing.T) {
+	var fixture struct {
+		FixtureVersion int    `json:"fixtureVersion"`
+		Synthetic      bool   `json:"synthetic"`
+		Name           string `json:"name"`
+		Limits         struct {
+			Partitions          int `json:"partitions"`
+			PartitionAdmissions int `json:"partitionAdmissions"`
+			TenantAdmissions    int `json:"tenantAdmissions"`
+			OwnerTTLMillis      int `json:"ownerTTLMillis"`
+		} `json:"limits"`
+		Expected struct {
+			FaultyOwnedFirst       bool    `json:"faultyWorkerOwnedFirst"`
+			MaxHandoverMillis      int     `json:"maxHandoverMillis"`
+			FinalState             string  `json:"finalState"`
+			ExternalEffects        int     `json:"externalEffects"`
+			MaxFaultyAcquisitionsS float64 `json:"maxFaultyAcquisitionsPerSecond"`
+		} `json:"expected"`
+	}
+	readDistributedFixture(t, "worker-error-release-fixtures.json", &fixture)
+	limits := Limits{Partitions: fixture.Limits.Partitions, PartitionAdmissions: fixture.Limits.PartitionAdmissions, TenantAdmissions: fixture.Limits.TenantAdmissions, OwnerTTL: time.Duration(fixture.Limits.OwnerTTLMillis) * time.Millisecond}
+	ledger := effectLedger(filepath.Join(t.TempDir(), "ledger"))
+	store := integrationDistributedStore(t)
+	healthy := newCountedEffectRuntime(t, integrationDistributedStore(t), ledger, limits)
+	faultyClient := &hookedClient{Client: integrationClient(t)}
+	faulty := newCountedEffectRuntime(t, integrationStoreFor(t, faultyClient), ledger, limits)
+	mismatched := faulty.workflows["acceptance-effect"]
+	mismatched.Program.Digest = "sha256:" + strings.Repeat("9", 64)
+	faulty.workflows["acceptance-effect"] = mismatched
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := healthy.Check(ctx); err != nil {
+		t.Fatal(err)
+	}
+	const partition = "p-0000"
+	tenant := tenantsInPartition(healthy, partition, "worker-error", 1)[0]
+	admission, err := healthy.Admit(ctx, Submission{Tenant: tenant, RequestKey: "worker-error", Workflow: "acceptance-effect", Input: json.RawMessage(`{"value":1}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	faultyCtx, stopFaulty := context.WithCancel(ctx)
+	faultyDone := make(chan error, 1)
+	go func() { faultyDone <- faulty.Run(faultyCtx, "faulty-worker") }()
+	defer func() {
+		stopFaulty()
+		<-faultyDone
+	}()
+	ownedFirst := false
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		if owner, err := store.CurrentOwner(ctx, partition); err == nil && owner.ID == "faulty-worker" {
+			ownedFirst = true
+			break
+		}
+	}
+	// Let the faulty worker hit its processing error at least once.
+	time.Sleep(300 * time.Millisecond)
+	grantsBefore := faultyClient.grant.Load()
+	started := time.Now()
+	healthyCtx, stopHealthy := context.WithCancel(ctx)
+	healthyDone := make(chan error, 1)
+	go func() { healthyDone <- healthy.Run(healthyCtx, "healthy-worker") }()
+	defer func() {
+		stopHealthy()
+		<-healthyDone
+	}()
+	var final RunRecord
+	for time.Since(started) < 3*limits.OwnerTTL {
+		final, err = healthy.GetRun(ctx, tenant, admission.RunID)
+		if err == nil && final.State == "completed" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	handover := time.Since(started)
+	acquisitionRate := float64(faultyClient.grant.Load()-grantsBefore) / handover.Seconds()
+	t.Logf("faulty worker owned first=%v; healthy worker completed the run after %s (owner TTL %s); faulty lease grants during handover=%.1f/s state=%s effects=%d", ownedFirst, handover.Round(time.Millisecond), limits.OwnerTTL, acquisitionRate, final.State, ledger.total("effect"))
+	if ownedFirst != fixture.Expected.FaultyOwnedFirst || handover > time.Duration(fixture.Expected.MaxHandoverMillis)*time.Millisecond || final.State != fixture.Expected.FinalState || ledger.total("effect") != fixture.Expected.ExternalEffects || acquisitionRate > fixture.Expected.MaxFaultyAcquisitionsS {
+		t.Fatalf("ownedFirst=%v handover=%s state=%s effects=%d faultyGrants=%.1f/s; fixture %+v", ownedFirst, handover, final.State, ledger.total("effect"), acquisitionRate, fixture.Expected)
+	}
+}
