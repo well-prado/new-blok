@@ -9,6 +9,23 @@ import (
 	"github.com/well-prado/new-blok/contract/inspection"
 )
 
+// RunOwner names the durable owner of runID for reader. The journal
+// authorizes inspection by exact principal, so the owner it can name is the
+// reader itself, and only for a run the reader owns.
+func (j *Journal) RunOwner(ctx context.Context, reader, runID string) (string, error) {
+	if reader == "" || runID == "" {
+		return "", ErrNotFound
+	}
+	var owner string
+	err := j.withRead(ctx, func(tx *sql.Tx) error {
+		if err := tx.QueryRowContext(ctx, `SELECT principal FROM journal_runs WHERE run_id=? AND principal=?`, runID, reader).Scan(&owner); err != nil {
+			return ErrNotFound
+		}
+		return nil
+	})
+	return owner, err
+}
+
 // ReadInspection authorizes before materializing payloads and performs the
 // bounded step selection in SQL. At most 200 steps and 100 attempts per step
 // are read for one request.

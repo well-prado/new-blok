@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"os"
+	"time"
 
 	"github.com/well-prado/new-blok/contract/capacity"
 )
@@ -104,6 +105,27 @@ func WriteDomainOf(database Database) (*WriteDomain, bool) {
 	}
 	domain := provider.WriteDomain()
 	return domain, domain != nil
+}
+
+// BusyTimeoutProvider is an optional Database capability reporting how long
+// a writer waits for the write lock before its transaction fails with
+// ErrBusy. Callers that wait for something of their own ahead of a write,
+// such as the worker queue's claim turn, bound that wait by it so they fail
+// as the store would. A wrapper that keeps the underlying database's waits
+// should forward it.
+type BusyTimeoutProvider interface {
+	BusyTimeout() time.Duration
+}
+
+// BusyTimeoutOf reports a database's busy timeout when it exposes a positive
+// one.
+func BusyTimeoutOf(database Database) (time.Duration, bool) {
+	provider, ok := database.(BusyTimeoutProvider)
+	if !ok {
+		return 0, false
+	}
+	timeout := provider.BusyTimeout()
+	return timeout, timeout > 0
 }
 
 // WithWriteDomain annotates err with the write domain it concerns, typically

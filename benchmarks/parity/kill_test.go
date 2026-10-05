@@ -168,15 +168,15 @@ func TestDurableMidExecutionKillRedelivers(t *testing.T) {
 			t.Fatal(err)
 		}
 		calls, effects := provider.ledger.snapshot()
-		// expected.New.Attempts (1) pins today's behaviour: the killed attempt's
-		// counter rolls back with its claim transaction. #245 questions whether
-		// that should consume MaxAttempts; change the contract with its decision.
+		// expected.New.Attempts (2): the killed attempt was committed when it
+		// started, so it consumes MaxAttempts and the recovery is the second
+		// attempt (#245).
 		if settled.Stats.Completed != expected.New.Completed || settled.Stats.Attempts != expected.New.Attempts || !equalJSON(settled.Response, expectedOutput(businessID)) || calls != expected.New.ProviderCalls || aborted != expected.New.AbortedByKill || effects != expected.New.CommittedEffects {
 			t.Fatalf("native mid-execution kill: settled=%s calls=%d aborted=%d effects=%d; want completed=%d attempts=%d output=%s calls=%d aborted=%d effects=%d", settledLine, calls, aborted, effects, expected.New.Completed, expected.New.Attempts, expectedOutput(businessID), expected.New.ProviderCalls, expected.New.AbortedByKill, expected.New.CommittedEffects)
 		}
 		report["new"] = map[string]any{"expected": expected.New, "settled": json.RawMessage(settledLine), "providerCalls": calls, "abortedByKill": aborted, "committedEffects": effects, "killToRedeliveredCompletionNs": recoveredAfter.Nanoseconds()}
 	}
-	report["limitations"] = []string{"one sample per engine; the redelivery delay is set by each queue's orphan policy (pg-boss expiry plus its 120 s maintenance interval vs. SQLite claim-transaction rollback), not by engine speed", "PostgreSQL and SQLite are different storage backends"}
+	report["limitations"] = []string{"one sample per engine; the redelivery delay is set by each queue's orphan policy (pg-boss expiry plus its 120 s maintenance interval vs. the worker queue's 30 s lease), not by engine speed", "PostgreSQL and SQLite are different storage backends"}
 	encoded, err := json.Marshal(report)
 	if err != nil {
 		t.Fatal(err)

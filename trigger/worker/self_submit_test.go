@@ -16,9 +16,8 @@ import (
 	"github.com/well-prado/new-blok/trigger"
 )
 
-// defaultBusyTimeout mirrors the SQLite backend's busy timeout. A nested
-// submission the queue cannot diagnose up front waits this long once.
-const defaultBusyTimeout = 5 * time.Second
+// A nested submission the queue cannot diagnose up front waits the SQLite
+// backend's busy timeout (defaultBusyTimeout) once.
 
 // hangBound fails a nested submission that never returns (#207) instead of
 // letting it run into the package's test timeout.
@@ -607,8 +606,10 @@ func TestQueueWritesAreMarkedAndReadsAreNot(t *testing.T) {
 	if _, err := queue.ProcessOnce(ctx, func(context.Context, Tx, Job) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
-	if got := marks.take(); len(got) != 1 || !got[0] {
-		t.Fatalf("ProcessOnce marks=%v; want one marked claim", got)
+	// The claim that starts the attempt and the handler's transaction that
+	// takes it over both write first (#245).
+	if got := marks.take(); len(got) != 2 || !got[0] || !got[1] {
+		t.Fatalf("ProcessOnce marks=%v; want a marked claim and a marked handler transaction", got)
 	}
 	if _, err := queue.Get(ctx, "job"); err != nil {
 		t.Fatal(err)
@@ -621,9 +622,9 @@ func TestQueueWritesAreMarkedAndReadsAreNot(t *testing.T) {
 	}
 }
 
-// TestClaimAccountingWritesAreMarked: charging a lost claim and deferring a
-// lost consumer write first and take turns in the store's writer queue
-// (#214), like the claim itself.
+// TestClaimAccountingWritesAreMarked: charging a lost claim, deferring a
+// lost consumer and releasing an attempt whose handler never ran write first
+// and take turns in the store's writer queue (#214), like the claim itself.
 func TestClaimAccountingWritesAreMarked(t *testing.T) {
 	ctx := context.Background()
 	marks := &writerMarks{Database: openSQLite(t, filepath.Join(t.TempDir(), "accounting.db"))}
@@ -639,13 +640,16 @@ func TestClaimAccountingWritesAreMarked(t *testing.T) {
 		t.Fatal(err)
 	}
 	marks.take()
-	if err := queue.chargeLostClaim(ctx, job); err != nil {
+	if err := queue.chargeLostClaim(ctx, job, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := queue.deferLost(ctx, job); err != nil {
+	if err := queue.deferLost(ctx, job, 0); err != nil {
 		t.Fatal(err)
 	}
-	if got := marks.take(); len(got) != 2 || !got[0] || !got[1] {
-		t.Fatalf("chargeLostClaim/deferLost marks=%v; want two marked writers", got)
+	if err := queue.release(ctx, job, 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := marks.take(); len(got) != 3 || !got[0] || !got[1] || !got[2] {
+		t.Fatalf("chargeLostClaim/deferLost/release marks=%v; want three marked writers", got)
 	}
 }
