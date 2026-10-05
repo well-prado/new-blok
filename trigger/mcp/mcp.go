@@ -143,6 +143,10 @@ type Config struct {
 	SessionTimeout time.Duration
 	// MaxPrincipals bounds the per-principal views kept in memory.
 	MaxPrincipals int
+	// Trace opts in to reading traceparent/tracestate from the HTTP request
+	// that carries a tool call, as the parent of the run the catalog starts
+	// for it (ADR 0020). Off by default.
+	Trace trigger.TraceIngress
 }
 
 // Server is an MCP endpoint over Streamable HTTP.
@@ -246,6 +250,9 @@ func New(application *app.Application, config Config) (*Server, error) {
 		config.MaxRequestBytes > MaxRequestBytesLimit || config.MaxSessions > MaxSessionsLimit || config.MaxSessionsPerPrincipal > config.MaxSessions ||
 		config.MaxPrincipals > MaxPrincipalsLimit {
 		return nil, errors.New("mcp: a timeout, concurrency, request size, session or principal bound exceeds its limit")
+	}
+	if err := config.Trace.Validate(); err != nil {
+		return nil, fmt.Errorf("mcp: %w", err)
 	}
 	probe := config.Budget
 	probe.Deadline = time.Now().Add(config.Timeout)
@@ -775,7 +782,15 @@ func (s *Server) handler(owner tool.Principal, t Tool, input schema.Schema, outp
 		}
 		budget := s.config.Budget
 		budget.Deadline, _ = ctx.Deadline()
-		out, err := s.config.Catalog.Invoke(ctx, principal, Call{Name: t.Name, Version: t.Version, Input: normalized, Approval: named, Budget: budget})
+		// The trace headers are read only now, after authentication,
+		// admission and validation. The catalog's policy (capabilities,
+		// budget, approval) never reads them (ADR 0020); a run it starts
+		// with this context joins them as its parent.
+		invokeCtx := ctx
+		if request.Extra != nil {
+			invokeCtx = s.config.Trace.Context(ctx, s.application.TracePolicy(), request.Extra.Header.Values(trigger.TraceparentField), request.Extra.Header.Values(trigger.TracestateField))
+		}
+		out, err := s.config.Catalog.Invoke(invokeCtx, principal, Call{Name: t.Name, Version: t.Version, Input: normalized, Approval: named, Budget: budget})
 		if err == nil && ctx.Err() != nil {
 			// The catalog returned after the deadline or after the client
 			// left: the call has already failed.

@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/well-prado/new-blok/contract/capacity"
+	"github.com/well-prado/new-blok/contract/observe"
 	"github.com/well-prado/new-blok/contract/schema"
 )
 
@@ -186,6 +187,11 @@ type Submission struct {
 	Kind      string
 	Payload   []byte
 	Principal Principal
+	// Trace is the optional parent trace context of the run this
+	// submission starts (TraceIngress). It is correlation data, never
+	// identity: a Submitter persists it with new work, never compares it,
+	// and keeps the first committed one when a duplicate carries another.
+	Trace observe.TraceContext
 }
 
 // Submitter is the shared durable admission port. Submit returns only after

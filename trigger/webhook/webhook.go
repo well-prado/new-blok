@@ -252,6 +252,12 @@ type Endpoint struct {
 	// ReadTimeout bounds how long an unauthenticated caller may take to send
 	// the body while holding an admission slot.
 	ReadTimeout time.Duration
+	// Trace opts in to reading the request's traceparent/tracestate and
+	// submitting it as the parent of the run the event starts (ADR 0020).
+	// The headers are not covered by the provider's signature: they are
+	// correlation only, and never part of the event's identity. Off by
+	// default.
+	Trace trigger.TraceIngress
 }
 
 type endpoint struct {
@@ -294,6 +300,9 @@ func New(application *app.Application, clock func() time.Time, endpoints []Endpo
 		parsed, err := schema.Parse(e.InputSchema)
 		if err != nil {
 			return nil, fmt.Errorf("webhook: endpoint %s schema: %w", e.Path, err)
+		}
+		if err := e.Trace.Validate(); err != nil {
+			return nil, fmt.Errorf("webhook: endpoint %s: %w", e.Path, err)
 		}
 		if e.MaxBodyBytes <= 0 {
 			e.MaxBodyBytes = DefaultMaxBodyBytes
@@ -376,7 +385,12 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	defer unbind()
 	ctx, cancel := context.WithTimeout(bound, e.SubmitTimeout)
 	defer cancel()
-	accepted, err := e.Submit.Submit(ctx, trigger.Submission{Key: SubmissionKey(e.Provider, verified.EventID), Kind: e.Kind, Payload: body, Principal: e.Principal})
+	// The trace context is read after verification and validation, and is
+	// not part of the key: a redelivery with another traceparent is the
+	// same event.
+	submission := trigger.Submission{Key: SubmissionKey(e.Provider, verified.EventID), Kind: e.Kind, Payload: body, Principal: e.Principal}
+	submission.Trace, _ = e.Trace.Parent(s.application.TracePolicy(), request.Header.Values(trigger.TraceparentField), request.Header.Values(trigger.TracestateField))
+	accepted, err := e.Submit.Submit(ctx, submission)
 	switch {
 	case errors.Is(err, trigger.ErrConflict):
 		respond(writer, http.StatusConflict, "error", "conflict")
