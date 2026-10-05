@@ -3,6 +3,8 @@ package workerbench
 import (
 	"context"
 	"errors"
+	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -79,4 +81,119 @@ func TestNativeOrderCancellationHasNoPublishedReceipt(t *testing.T) {
 	if effects != 0 {
 		t.Fatalf("canceled effect: %d", effects)
 	}
+}
+
+// charge posts one priced order to the provider in the given mode and reports
+// the HTTP status (or the transport error) on the returned channel.
+func charge(ctx context.Context, p *Provider, id, mode string) <-chan error {
+	out := make(chan error, 1)
+	go func() {
+		body := `{"orderId":"` + id + `","totalCents":3000,"mode":"` + mode + `"}`
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.Server.URL+"/charge", strings.NewReader(body))
+		if err != nil {
+			out <- err
+			return
+		}
+		req.Header.Set("Idempotency-Key", id)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			out <- err
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			err = errors.New(resp.Status)
+		}
+		out <- err
+	}()
+	return out
+}
+
+func waitFor(t *testing.T, c <-chan string, what string) {
+	t.Helper()
+	select {
+	case <-c:
+	case <-time.After(10 * time.Second):
+		t.Fatal(what)
+	}
+}
+
+func TestProviderBarrierHoldsUntilReleased(t *testing.T) {
+	for _, test := range []struct {
+		mode             string
+		effectsWhileHeld int
+	}{{"delay", 0}, {"late", 1}} {
+		t.Run(test.mode, func(t *testing.T) {
+			p := NewProvider()
+			defer p.Close()
+			result := charge(context.Background(), p, test.mode, test.mode)
+			if test.mode == "delay" {
+				waitFor(t, p.Held(), "request not parked")
+			} else {
+				waitFor(t, p.Committed(), "effect not committed")
+			}
+			select {
+			case err := <-result:
+				t.Fatalf("answered while parked: %v", err)
+			case <-time.After(250 * time.Millisecond):
+			}
+			if requests, effects := p.Counts(); requests != 1 || effects != test.effectsWhileHeld {
+				t.Fatalf("while parked: %d/%d", requests, effects)
+			}
+			p.Release()
+			p.Release()
+			if err := <-result; err != nil {
+				t.Fatal(err)
+			}
+			if requests, effects := p.Counts(); requests != 1 || effects != 1 {
+				t.Fatalf("after release: %d/%d", requests, effects)
+			}
+		})
+	}
+}
+
+func TestProviderBarrierAbandonedWhenCallerLeaves(t *testing.T) {
+	for _, mode := range []string{"delay", "late"} {
+		t.Run(mode, func(t *testing.T) {
+			p := NewProvider()
+			defer p.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			result := charge(ctx, p, mode, mode)
+			if mode == "delay" {
+				waitFor(t, p.Held(), "request not parked")
+			} else {
+				waitFor(t, p.Committed(), "effect not committed")
+			}
+			cancel()
+			if err := <-result; err == nil {
+				t.Fatal("canceled call succeeded")
+			}
+			waitFor(t, p.Abandoned(), "parked request not abandoned")
+			want := 0
+			if mode == "late" {
+				want = 1
+			}
+			// Releasing afterwards must not revive the abandoned request.
+			p.Release()
+			time.Sleep(50 * time.Millisecond)
+			if requests, effects := p.Counts(); requests != 1 || effects != want {
+				t.Fatalf("after abandon: %d/%d", requests, effects)
+			}
+		})
+	}
+}
+
+func TestProviderCloseUnblocksParkedRequest(t *testing.T) {
+	p := NewProvider()
+	result := charge(context.Background(), p, "close", "delay")
+	waitFor(t, p.Held(), "request not parked")
+	closed := make(chan struct{})
+	go func() { p.Close(); close(closed) }()
+	select {
+	case <-closed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close hung on a parked request")
+	}
+	<-result
 }
