@@ -100,6 +100,10 @@ func runGo(ctx context.Context, spec goCommand) (goRun, error) {
 	command.Stdout, command.Stderr = stdout, stderr
 	command.WaitDelay = pipeDrain
 	isolate(command)
+	// Set before Start: the copy goroutines that call the writers start
+	// inside it, after command.Process is assigned.
+	kill := sync.OnceFunc(func() { _ = killGroup(command.Process) })
+	stdout.onPanic, stderr.onPanic = kill, kill
 	if err := command.Start(); err != nil {
 		return goRun{}, &startError{err: err}
 	}
@@ -110,8 +114,6 @@ func runGo(ctx context.Context, spec goCommand) (goRun, error) {
 		return goRun{}, &startError{err: fmt.Errorf("start the process guard: %w", err)}
 	}
 	defer guard.release()
-	kill := sync.OnceFunc(func() { _ = killGroup(command.Process) })
-	stdout.onPanic, stderr.onPanic = kill, kill
 
 	exited := make(chan struct{})
 	var watcher sync.WaitGroup
