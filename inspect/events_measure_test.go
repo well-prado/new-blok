@@ -83,7 +83,10 @@ func TestEventStreamOverheadOnRunLatency(t *testing.T) {
 		newMode("no observer", nil, 0),
 		newMode("stream, zero capture, no readers", &inspect.EventStreamConfig{}, 0),
 		newMode("stream, full capture, no readers", &inspect.EventStreamConfig{Capture: fullCapture}, 0),
-		newMode("stream, full capture, 8 stalled readers", &inspect.EventStreamConfig{Capture: fullCapture, Hub: event.Config{QueueDepth: 2}}, 8),
+		// Each run is pre-attached so its readers exist before it starts. A
+		// recovered attach may displace only closed runs, so finished runs
+		// close quickly here (LateWindow 1 ms) to keep making room.
+		newMode("stream, full capture, 8 stalled readers", &inspect.EventStreamConfig{Capture: fullCapture, Hub: event.Config{QueueDepth: 2, LateWindow: time.Millisecond}}, 8),
 	}
 	program := gatedQuoteProgram()
 	share := func(string, string) error { return nil }
