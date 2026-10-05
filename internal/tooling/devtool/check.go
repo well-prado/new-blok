@@ -13,7 +13,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/well-prado/new-blok/internal/diagnostic"
 	"github.com/well-prado/new-blok/internal/generate"
@@ -41,6 +40,20 @@ type Options struct {
 	Go string
 	// Source discovers the project; DirectorySource when nil.
 	Source ProjectSource
+	// Env is the environment the go command starts from; os.Environ() when
+	// nil. Toolchain, proxy, module-mode and workspace settings in it are
+	// always replaced (goEnv).
+	Env []string
+
+	// onLine, for this package's tests, sees every line the go command
+	// writes, on the goroutine that reads it.
+	onLine func(stream string, line []byte)
+}
+
+func (o Options) observe(stream string, line []byte) {
+	if o.onLine != nil {
+		o.onLine(stream, line)
+	}
 }
 
 func (o Options) goBinary() string {
@@ -240,58 +253,29 @@ func checkWorkflowSteps(ctx context.Context, parsed *source, parseErr error, fou
 	return result
 }
 
-// positioned matches a compiler or vet position: path:line:col: message.
-var positioned = regexp.MustCompile(`^(\S+\.go):(\d+)(?::(\d+))?: (.*)$`)
-
 // vetPosition matches go vet -json's posn: path:line[:col].
 var vetPosition = regexp.MustCompile(`^(.*\.go)(:\d+(?::\d+)?)$`)
 
 // checkGoVet type-checks and vets every package with the go toolchain. It
-// compiles the packages but runs none of them.
+// compiles the packages but runs none of them, and never downloads (goEnv).
 func checkGoVet(ctx context.Context, options Options, workspace Workspace, found *diagnostics) (CheckResult, bool) {
 	if ctx.Err() != nil {
 		return CheckResult{Name: CheckGoVet, State: CheckInterrupted}, false
 	}
-	var (
-		mu       sync.Mutex
-		stdout   bytes.Buffer
-		problems []diagnostic.Diagnostic
-		pending  []string
-	)
-	flushPending := func() {
-		if len(pending) > 0 {
-			problems = append(problems, toolchainError(strings.Join(pending, "; ")))
-			pending = nil
-		}
-	}
-	stderr := func(line []byte) {
-		text := string(line)
-		mu.Lock()
-		defer mu.Unlock()
-		switch {
-		case strings.TrimSpace(text) == "" || strings.HasPrefix(text, "# "):
-			flushPending()
-		case strings.HasPrefix(text, "\t") && len(pending) == 0 && len(problems) > 0 && problems[len(problems)-1].Code == "go_compile_error":
-			last := &problems[len(problems)-1]
-			last.Actual += "; " + strings.TrimSpace(text)
-		default:
-			if match := positioned.FindStringSubmatch(text); match != nil {
-				flushPending()
-				problems = append(problems, compileError(workspace.Root, match))
-				return
-			}
-			pending = append(pending, strings.TrimSpace(relativeText(text, workspace.Root)))
-		}
-	}
-	run, err := runGo(ctx, options.goBinary(), workspace.Root, []string{"vet", "-json", "./..."}, func(line []byte) {
-		mu.Lock()
-		defer mu.Unlock()
-		stdout.Write(line)
-		stdout.WriteByte('\n')
-	}, stderr)
-	mu.Lock()
-	flushPending()
-	mu.Unlock()
+	var stdout bytes.Buffer
+	toolchain := &goDiagnostics{root: workspace.Root}
+	run, err := runGo(ctx, goCommand{
+		binary: options.goBinary(), dir: workspace.Root, args: []string{"vet", "-json", "./..."}, env: options.Env,
+		stdout: func(line []byte) {
+			options.observe("stdout", line)
+			stdout.Write(line)
+			stdout.WriteByte('\n')
+		},
+		stderr: func(line []byte) {
+			options.observe("stderr", line)
+			toolchain.line(string(line))
+		},
+	})
 	if errors.Is(err, errToolUnavailable) {
 		found.add(toolUnavailable(options.goBinary(), err))
 		return CheckResult{Name: CheckGoVet, State: CheckSkipped, Reason: "the go command could not be started"}, true
@@ -299,7 +283,7 @@ func checkGoVet(ctx context.Context, options Options, workspace Workspace, found
 	if err != nil && ctx.Err() == nil {
 		found.add(toolchainError(err.Error()))
 	}
-	problems = append(problems, vetFindings(stdout.Bytes(), workspace.Root)...)
+	problems := append(toolchain.result(), vetFindings(stdout.Bytes(), workspace.Root)...)
 	if ctx.Err() == nil && run.exitCode != 0 && len(problems) == 0 {
 		problems = append(problems, toolchainError("go vet exited with status "+strconv.Itoa(run.exitCode)+" without a diagnostic"))
 	}
@@ -307,18 +291,6 @@ func checkGoVet(ctx context.Context, options Options, workspace Workspace, found
 		found.add(problem)
 	}
 	return CheckResult{Name: CheckGoVet, State: stateOf(ctx, len(problems) > 0)}, false
-}
-
-func compileError(root string, match []string) diagnostic.Diagnostic {
-	position := relativePath(match[1], root) + ":" + match[2]
-	if match[3] != "" {
-		position += ":" + match[3]
-	}
-	return diagnostic.Diagnostic{Code: "go_compile_error", Source: position, Expected: "Go code that type-checks", Actual: relativeText(match[4], root), Remediation: "fix the Go compile error at this position", Message: "the Go code does not compile"}
-}
-
-func toolchainError(text string) diagnostic.Diagnostic {
-	return diagnostic.Diagnostic{Code: "go_toolchain_error", Expected: "the go command to load every package", Actual: text, Remediation: "fix the module or package problem the go command reports (go mod tidy resolves missing requirements)", Message: "the go command reported a problem"}
 }
 
 // vetFindings decodes go vet -json's stream: one object per package, keyed

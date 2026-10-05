@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -23,30 +26,93 @@ const (
 	pipeDrain = 2 * time.Second
 )
 
+// goCommand is one go invocation.
+type goCommand struct {
+	binary string
+	dir    string
+	args   []string
+	// env is the caller's environment; nil means os.Environ(). goEnv pins
+	// what may not come from it.
+	env            []string
+	stdout, stderr func([]byte)
+}
+
 // goRun is the outcome of one go command.
 type goRun struct {
 	exitCode int
 }
 
-// runGo runs the go command in dir and hands each output line to the given
-// callbacks, which are called from two goroutines. On cancellation the
-// command's process group is interrupted, then killed after InterruptGrace,
-// so neither go nor a test binary it started outlives this call. runGo
-// returns errToolUnavailable when the command cannot be started.
-func runGo(ctx context.Context, goBinary, dir string, args []string, stdout, stderr func([]byte)) (goRun, error) {
+// pinnedEnv are the go settings blok decides itself. The caller's
+// environment (and its go env file, which environment variables override)
+// cannot make check or test download a toolchain or a module, rewrite
+// go.mod or go.sum, follow a go.work, or inject flags such as -toolexec:
+//
+//   - GOTOOLCHAIN=local: run the installed go, never fetch another one;
+//   - GOPROXY=off: never reach a module proxy or VCS host, so a module
+//     missing from the cache is a diagnostic, not a download (this also
+//     disables checksum-database lookups);
+//   - GOFLAGS=-mod=readonly (or -mod=vendor with vendor/modules.txt):
+//     never edit go.mod or go.sum; this replaces the caller's GOFLAGS;
+//   - GOWORK=off: build the project's own module, not a workspace.
+func goEnv(base []string, dir string) []string {
+	if base == nil {
+		base = os.Environ()
+	}
+	mode := "-mod=readonly"
+	if info, err := os.Lstat(filepath.Join(dir, "vendor", "modules.txt")); err == nil && info.Mode().IsRegular() {
+		mode = "-mod=vendor"
+	}
+	pinned := []string{"GOTOOLCHAIN=local", "GOPROXY=off", "GOFLAGS=" + mode, "GOWORK=off"}
+	env := make([]string, 0, len(base)+len(pinned))
+	for _, entry := range base {
+		key, _, _ := strings.Cut(entry, "=")
+		keep := true
+		for _, setting := range pinned {
+			name, _, _ := strings.Cut(setting, "=")
+			keep = keep && !strings.EqualFold(key, name)
+		}
+		if keep {
+			env = append(env, entry)
+		}
+	}
+	return append(env, pinned...)
+}
+
+// runGo runs the go command and hands each output line to the callbacks,
+// which are called from two goroutines. The command runs in its own process
+// group, which blok stops in every way blok itself can stop:
+//
+//   - cancellation interrupts the group, then kills it after InterruptGrace;
+//   - a panic in a callback kills the group before runGo re-panics;
+//   - if blok dies outright (SIGKILL included), a guard process holding the
+//     other end of a pipe sees it close and kills the group (POSIX only).
+//
+// runGo returns errToolUnavailable when the command or its guard cannot
+// start.
+func runGo(ctx context.Context, spec goCommand) (goRun, error) {
 	if err := ctx.Err(); err != nil {
 		return goRun{}, err
 	}
-	command := exec.Command(goBinary, args...)
-	command.Dir = dir
-	command.Env = os.Environ()
-	command.Stdout = &lineWriter{emit: stdout}
-	command.Stderr = &lineWriter{emit: stderr}
+	command := exec.Command(spec.binary, spec.args...)
+	command.Dir = spec.dir
+	command.Env = goEnv(spec.env, spec.dir)
+	stdout, stderr := &lineWriter{emit: spec.stdout}, &lineWriter{emit: spec.stderr}
+	command.Stdout, command.Stderr = stdout, stderr
 	command.WaitDelay = pipeDrain
 	isolate(command)
 	if err := command.Start(); err != nil {
 		return goRun{}, &startError{err: err}
 	}
+	guard, err := startGuard(command.Process)
+	if err != nil {
+		_ = killGroup(command.Process)
+		_ = command.Wait()
+		return goRun{}, &startError{err: fmt.Errorf("start the process guard: %w", err)}
+	}
+	defer guard.release()
+	kill := sync.OnceFunc(func() { _ = killGroup(command.Process) })
+	stdout.onPanic, stderr.onPanic = kill, kill
+
 	exited := make(chan struct{})
 	var watcher sync.WaitGroup
 	watcher.Go(func() {
@@ -61,14 +127,19 @@ func runGo(ctx context.Context, goBinary, dir string, args []string, stdout, std
 		select {
 		case <-exited:
 		case <-timer.C:
-			_ = killGroup(command.Process)
+			kill()
 		}
 	})
-	err := command.Wait()
+	err = command.Wait()
 	close(exited)
 	watcher.Wait()
-	command.Stdout.(*lineWriter).flush()
-	command.Stderr.(*lineWriter).flush()
+	stdout.flush()
+	stderr.flush()
+	for _, writer := range []*lineWriter{stdout, stderr} {
+		if writer.panicked != nil {
+			panic(writer.panicked)
+		}
+	}
 	run := goRun{exitCode: command.ProcessState.ExitCode()}
 	var exitErr *exec.ExitError
 	if err != nil && !errors.As(err, &exitErr) && !errors.Is(err, exec.ErrWaitDelay) {
@@ -85,10 +156,13 @@ func (e *startError) Unwrap() error        { return e.err }
 func (e *startError) Is(target error) bool { return target == errToolUnavailable }
 
 // lineWriter splits a stream into bounded lines. The slice it emits is
-// reused; a callback copies what it keeps.
+// reused; a callback copies what it keeps. A panicking callback stops the
+// process group at once and is re-raised by runGo after the command exits.
 type lineWriter struct {
-	emit    func([]byte)
-	pending []byte
+	emit     func([]byte)
+	pending  []byte
+	onPanic  func()
+	panicked any
 }
 
 func (w *lineWriter) Write(data []byte) (int, error) {
@@ -112,10 +186,19 @@ func (w *lineWriter) Write(data []byte) (int, error) {
 }
 
 func (w *lineWriter) line() {
-	if w.emit != nil {
-		w.emit(bytes.TrimRight(w.pending, "\r"))
+	defer func() { w.pending = w.pending[:0] }()
+	if w.emit == nil || w.panicked != nil {
+		return
 	}
-	w.pending = w.pending[:0]
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			w.panicked = recovered
+			if w.onPanic != nil {
+				w.onPanic()
+			}
+		}
+	}()
+	w.emit(bytes.TrimRight(w.pending, "\r"))
 }
 
 func (w *lineWriter) flush() {

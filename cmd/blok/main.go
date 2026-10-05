@@ -16,7 +16,6 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"strings"
-	"syscall"
 
 	"github.com/well-prado/new-blok/internal/generate"
 	"github.com/well-prado/new-blok/internal/scaffold"
@@ -362,10 +361,12 @@ func execute(args []string, stdout, stderr io.Writer, stdin io.Reader) int {
 		// Signals are caught only for these commands, so Ctrl+C still ends
 		// an interactive blok new at once. Until stop, a further signal is
 		// absorbed: the first one already stops the go command, bounded by
-		// devtool.InterruptGrace.
-		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		// devtool.InterruptGrace. If blok is killed outright, devtool's
+		// process guard stops the go command instead.
+		ctx, stop := signal.NotifyContext(context.Background(), toolSignals...)
 		defer stop()
-		return runTool(ctx, args[0], args[1:], stdout, stderr)
+		ignoreBrokenPipe()
+		return guarded(args[0], stderr, func() int { return runTool(ctx, args[0], args[1:], stdout, stderr) })
 	}
 	if err := runWithIO(args, stdout, stdin); err != nil {
 		fmt.Fprintln(stderr, err)
@@ -375,6 +376,18 @@ func execute(args []string, stdout, stderr io.Writer, stdin io.Reader) int {
 }
 
 var toolCommands = map[string]bool{"check": true, "test": true, "inspect": true}
+
+// guarded turns a panic into exit 3 with the panic on stderr. devtool has
+// already killed any go command the panic interrupted.
+func guarded(command string, stderr io.Writer, run func() int) (code int) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			fmt.Fprintf(stderr, "blok %s: internal error: %v\n%s", command, recovered, debug.Stack())
+			code = devtool.ExitTool
+		}
+	}()
+	return run()
+}
 
 var toolUsage = map[string]string{
 	"check":   "Usage: blok check [--json] [directory]\n\nValidates the application without running any of its code: blok.json and\ngo.mod, node import independence, generated bindings, workflow step ids and\ngo vet (which type-checks every package).\n\nOptions:\n  --json   write the versioned machine-readable report\n\nExit codes: 0 passed, 1 problems found, 2 usage, 3 tool unavailable,\n4 output not written, 130 interrupted.",

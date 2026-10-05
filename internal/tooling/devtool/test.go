@@ -9,7 +9,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/well-prado/new-blok/internal/diagnostic"
 	"github.com/well-prado/new-blok/observe/redact"
@@ -121,16 +120,22 @@ func Test(ctx context.Context, options TestOptions) (report Report) {
 	args = append(args, "./...")
 
 	collector := newTestCollector(workspace)
+	toolchain := &goDiagnostics{root: workspace.Root}
 	var stderr []string
-	var mu sync.Mutex
-	run, err := runGo(ctx, options.goBinary(), workspace.Root, args, func(line []byte) {
-		collector.line(line)
-	}, func(line []byte) {
-		mu.Lock()
-		defer mu.Unlock()
-		if text := strings.TrimSpace(string(line)); text != "" && len(stderr) < MaxTestOutputLines {
-			stderr = append(stderr, redact.Message(relativeText(text, workspace.Root)))
-		}
+	run, err := runGo(ctx, goCommand{
+		binary: options.goBinary(), dir: workspace.Root, args: args, env: options.Env,
+		stdout: func(line []byte) {
+			options.observe("stdout", line)
+			collector.line(line)
+		},
+		stderr: func(line []byte) {
+			options.observe("stderr", line)
+			text := string(line)
+			toolchain.line(text)
+			if strings.TrimSpace(text) != "" && len(stderr) < MaxTestOutputLines {
+				stderr = append(stderr, strings.TrimSpace(relativeText(text, workspace.Root)))
+			}
+		},
 	})
 	if errors.Is(err, errToolUnavailable) {
 		found.add(toolUnavailable(options.goBinary(), err))
@@ -141,17 +146,16 @@ func Test(ctx context.Context, options TestOptions) (report Report) {
 		found.add(toolchainError(err.Error()))
 	}
 	result, failures := collector.result(ctx)
+	failures = dedupe(append(failures, toolchain.result()...))
 	found.truncated = found.truncated || collector.truncated
 	report.Tests = &result
 	for _, failure := range failures {
 		found.add(failure)
 	}
-	mu.Lock()
-	defer mu.Unlock()
 	if ctx.Err() == nil && run.exitCode != 0 && len(failures) == 0 {
 		text := "go test exited with status " + strconv.Itoa(run.exitCode)
 		if len(stderr) > 0 {
-			text = strings.Join(stderr, "; ")
+			text = strings.Join(redactLines(stderr), "; ")
 		}
 		found.add(toolchainError(text))
 	}
@@ -168,24 +172,23 @@ type testState struct {
 }
 
 type packageState struct {
-	status   string
-	dir      string
-	tests    map[string]*testState
-	output   []string
-	building bool
+	status string
+	dir    string
+	tests  map[string]*testState
+	output []string
 }
 
 // testCollector folds go test's event stream. It is fed from one goroutine.
 type testCollector struct {
 	workspace Workspace
 	packages  map[string]*packageState
-	compile   []diagnostic.Diagnostic
+	build     *goDiagnostics
 	tests     int
 	truncated bool
 }
 
 func newTestCollector(workspace Workspace) *testCollector {
-	return &testCollector{workspace: workspace, packages: map[string]*packageState{}}
+	return &testCollector{workspace: workspace, packages: map[string]*packageState{}, build: &goDiagnostics{root: workspace.Root}}
 }
 
 func (c *testCollector) pkg(importPath string) *packageState {
@@ -210,9 +213,7 @@ func (c *testCollector) line(line []byte) {
 	}
 	switch event.Action {
 	case "build-output":
-		if match := positioned.FindStringSubmatch(strings.TrimRight(event.Output, "\n")); match != nil {
-			c.compile = append(c.compile, compileError(c.workspace.Root, match))
-		}
+		c.build.line(event.Output)
 		return
 	case "build-fail":
 		return
@@ -265,19 +266,20 @@ func (c *testCollector) line(line []byte) {
 	}
 }
 
+// appendBounded keeps raw output; it is redacted as a whole by result.
 func appendBounded(lines []string, output, root string) []string {
 	text := strings.TrimRight(output, "\n")
 	if strings.TrimSpace(text) == "" || len(lines) >= MaxTestOutputLines {
 		return lines
 	}
-	return append(lines, redact.Message(relativeText(text, root)))
+	return append(lines, relativeText(text, root))
 }
 
 // result builds the sorted result and one diagnostic per failure: a compile
 // error, a failing leaf test, or a package that failed outside any test.
 func (c *testCollector) result(ctx context.Context) (TestResult, []diagnostic.Diagnostic) {
 	var result TestResult
-	failures := dedupe(c.compile)
+	failures := dedupe(c.build.result())
 	paths := make([]string, 0, len(c.packages))
 	for importPath := range c.packages {
 		paths = append(paths, importPath)
@@ -289,7 +291,7 @@ func (c *testCollector) result(ctx context.Context) (TestResult, []diagnostic.Di
 		if status == "" {
 			status = TestIncomplete
 		}
-		item := PackageResult{ImportPath: importPath, Dir: state.dir, Status: status}
+		item := PackageResult{ImportPath: redact.String(importPath), Dir: redact.String(state.dir), Status: status}
 		names := make([]string, 0, len(state.tests))
 		for name := range state.tests {
 			names = append(names, name)
@@ -298,9 +300,10 @@ func (c *testCollector) result(ctx context.Context) (TestResult, []diagnostic.Di
 		failedTests := 0
 		for _, name := range names {
 			test := state.tests[name]
-			record := TestRecord{Name: name, Status: test.status, Source: test.source}
+			output := redactLines(test.output)
+			record := TestRecord{Name: redact.String(name), Status: test.status, Source: redact.String(test.source)}
 			if test.status != TestPass {
-				record.Output = test.output
+				record.Output = output
 			}
 			item.Tests = append(item.Tests, record)
 			switch test.status {
@@ -310,7 +313,7 @@ func (c *testCollector) result(ctx context.Context) (TestResult, []diagnostic.Di
 				result.Failed++
 				failedTests++
 				if !failedChild(state.tests, name) {
-					failures = append(failures, testFailure(importPath, name, test))
+					failures = append(failures, testFailure(item.ImportPath, record.Name, record.Source, output))
 				}
 			case TestSkip:
 				result.Skipped++
@@ -319,7 +322,7 @@ func (c *testCollector) result(ctx context.Context) (TestResult, []diagnostic.Di
 			}
 		}
 		if status == TestFail && failedTests == 0 && ctx.Err() == nil {
-			failures = append(failures, diagnostic.Diagnostic{Code: "test_package_failed", Source: state.dir, Expected: "the package's tests to finish", Actual: lastLines(state.output, 3), Remediation: "fix what stopped the test binary (a panic, TestMain exit or timeout) and rerun blok test", Message: "package " + importPath + " failed outside any test"})
+			failures = append(failures, diagnostic.Diagnostic{Code: "test_package_failed", Source: item.Dir, Expected: "the package's tests to finish", Actual: lastLines(redactLines(state.output), 3), Remediation: "fix what stopped the test binary (a panic, TestMain exit or timeout) and rerun blok test", Message: "package " + item.ImportPath + " failed outside any test"})
 		}
 		result.Packages = append(result.Packages, item)
 	}
@@ -335,11 +338,13 @@ func failedChild(tests map[string]*testState, name string) bool {
 	return false
 }
 
-func testFailure(importPath, name string, test *testState) diagnostic.Diagnostic {
+// testFailure describes a failed leaf test from its already redacted name,
+// source and output.
+func testFailure(importPath, name, source string, output []string) diagnostic.Diagnostic {
 	// The first located message, with the continuation lines testing
 	// indents beneath it.
 	actual, located := "", false
-	for _, line := range test.output {
+	for _, line := range output {
 		match := testLocation.FindStringSubmatch(line)
 		if located && match != nil {
 			break
@@ -351,9 +356,9 @@ func testFailure(importPath, name string, test *testState) diagnostic.Diagnostic
 		}
 	}
 	if actual == "" {
-		actual = lastLines(test.output, 1)
+		actual = lastLines(output, 1)
 	}
-	return diagnostic.Diagnostic{Code: "test_failed", Source: test.source, Expected: "pass", Actual: actual, Remediation: "fix the failing assertion or the code under test, then rerun blok test", Message: "test " + name + " in " + importPath + " failed"}
+	return diagnostic.Diagnostic{Code: "test_failed", Source: source, Expected: "pass", Actual: actual, Remediation: "fix the failing assertion or the code under test, then rerun blok test", Message: "test " + name + " in " + importPath + " failed"}
 }
 
 func lastLines(lines []string, count int) string {

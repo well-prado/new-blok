@@ -295,3 +295,13 @@ func TestToolWriteFailureExitsFour(t *testing.T) {
 		t.Fatalf("exit=%d stderr=%q", code, processErr.String())
 	}
 }
+
+// TestToolPanicExitsThree: a panic inside a tool command becomes exit 3 with
+// the panic on stderr, not a crash with Go's exit 2 (which means usage).
+func TestToolPanicExitsThree(t *testing.T) {
+	var stderr bytes.Buffer
+	code := guarded("check", &stderr, func() int { panic("fixture panic") })
+	if code != devtool.ExitTool || !strings.HasPrefix(stderr.String(), "blok check: internal error: fixture panic\n") {
+		t.Fatalf("exit=%d stderr=%q", code, stderr.String())
+	}
+}

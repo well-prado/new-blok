@@ -48,7 +48,9 @@ type fixtureCase struct {
 		ErrorRecords  int    `json:"errorRecords"`
 		EffectRecords int    `json:"effectRecords"`
 		Redacted      *int   `json:"redacted"`
-		Unresolved    []struct {
+		// Forbidden strings must not appear anywhere in the encoded report.
+		Forbidden  []string `json:"forbidden"`
+		Unresolved []struct {
 			Kind   string `json:"kind"`
 			Source string `json:"source"`
 		} `json:"unresolved"`
@@ -68,6 +70,10 @@ type fixtureEdit struct {
 	Append  string    `json:"append"`
 	Write   *string   `json:"write"`
 	Delete  bool      `json:"delete"`
+	// Repeat writes the file Repeat times, replacing {n} in its name.
+	Repeat int `json:"repeat"`
+	// PadTo pads a written file with comment lines to at least this size.
+	PadTo int `json:"padTo"`
 }
 
 func repoRoot(t testing.TB) string {
@@ -173,11 +179,22 @@ func applyEdits(t *testing.T, dir string, edits []fixtureEdit, names *strings.Re
 				t.Fatal(err)
 			}
 		case edit.Write != nil:
-			if err := os.MkdirAll(filepath.Dir(name), 0o755); err != nil {
-				t.Fatal(err)
+			content := names.Replace(*edit.Write)
+			if edit.PadTo > 0 {
+				line := "// padding the file past the source size bound\n"
+				content += strings.Repeat(line, edit.PadTo/len(line)+1)
 			}
-			if err := os.WriteFile(name, []byte(names.Replace(*edit.Write)), 0o644); err != nil {
-				t.Fatal(err)
+			for index := range max(edit.Repeat, 1) {
+				target := name
+				if edit.Repeat > 0 {
+					target = strings.ReplaceAll(name, "{n}", strconv.Itoa(index))
+				}
+				if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(target, []byte(content), 0o644); err != nil {
+					t.Fatal(err)
+				}
 			}
 		default:
 			data, err := os.ReadFile(name)
@@ -311,6 +328,16 @@ func TestFixtures(t *testing.T) {
 				if got := outputRecords(report); got != item.Expected.OutputRecords {
 					t.Errorf("output records=%d want %d\n%s", got, item.Expected.OutputRecords, encoded)
 				}
+				for _, secret := range item.Expected.Forbidden {
+					if bytes.Contains(encoded, []byte(secret)) {
+						t.Errorf("the report contains %q\n%s", secret, encoded)
+					}
+				}
+				for _, got := range report.Diagnostics {
+					if !knownCode(got.Code) {
+						t.Errorf("diagnostic code %q is not in the registry", got.Code)
+					}
+				}
 				for index, want := range item.Expected.Diagnostics {
 					if index >= len(report.Diagnostics) {
 						break
@@ -323,7 +350,7 @@ func TestFixtures(t *testing.T) {
 						(want.Source != "" && got.Source != names.Replace(want.Source)) ||
 						(want.SourcePrefix != "" && !strings.HasPrefix(got.Source, names.Replace(want.SourcePrefix))) ||
 						(want.Step != "" && got.Step != want.Step) || (want.Field != "" && got.Field != want.Field) {
-						t.Errorf("diagnostic %d = %+v, want %+v", index, got, want)
+						t.Errorf("diagnostic %d = %+v, want %+v\n%s", index, got, want, encoded)
 					}
 				}
 				if item.Expected.Redacted != nil && (report.Catalog == nil || report.Catalog.Redacted != *item.Expected.Redacted) {
@@ -500,13 +527,16 @@ func TestInterruptFlushesPartialResults(t *testing.T) {
 	defer cancel()
 	canceled := make(chan time.Time, 1)
 	go func() {
+		// Cancel either way: when the slow test is running, or at the
+		// deadline, so a test that never starts cannot hang this one.
+		defer cancel()
 		for deadline := time.Now().Add(3 * time.Minute); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
 			if _, err := os.Stat(marker); err == nil {
 				canceled <- time.Now()
-				cancel()
 				return
 			}
 		}
+		close(canceled)
 	}()
 	report := Test(ctx, TestOptions{Options: Options{Root: dir}})
 	returned := time.Now()
@@ -519,7 +549,11 @@ func TestInterruptFlushesPartialResults(t *testing.T) {
 	}
 	// The interrupt itself stops go test and its test binary; the SIGKILL
 	// after InterruptGrace is only a backstop.
-	if elapsed := returned.Sub(<-canceled); elapsed >= InterruptGrace {
+	at, started := <-canceled
+	if !started {
+		t.Fatalf("the slow test never started\n%s", encode(t, report))
+	}
+	if elapsed := returned.Sub(at); elapsed >= InterruptGrace {
 		t.Fatalf("stopping took %s, not less than the %s grace", elapsed, InterruptGrace)
 	}
 	statuses := map[string]string{}

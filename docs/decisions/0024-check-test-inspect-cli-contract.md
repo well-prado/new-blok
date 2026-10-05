@@ -41,6 +41,9 @@ blok inspect [--json] [--fields LIST] [directory]
 | --- | --- | --- |
 | `check` | `go.mod`, `blok.json`, Go source (parsed, never loaded) | `go vet -json ./...`, which type-checks and compiles every package and runs none of them |
 | `test` | `go.mod`, `blok.json` | `go test -json ./...`: the application's own tests, in their own process |
+
+Neither `check` nor `test` downloads anything or edits the project (next
+section); `inspect` starts no process at all.
 | `inspect` | `go.mod`, `blok.json`, Go source (parsed) | nothing |
 
 `check` runs, in order: `project` (manifest and module), `node-imports`
@@ -63,6 +66,29 @@ happens where the application runs them: in its tests, under `blok test`.
 A duplicate step id is therefore reported by `check` statically and by
 `test` when `flow.Define` rejects it at run time (both asserted).
 
+### The go command's environment
+
+`check` and `test` start the go command from the caller's environment with
+four settings always replaced, because each could otherwise make blok fetch
+or run code the caller did not choose, or edit the project:
+
+| Setting | Value | Prevents |
+| --- | --- | --- |
+| `GOTOOLCHAIN` | `local` | downloading and running another toolchain (a `toolchain` line, `GOTOOLCHAIN=auto`) |
+| `GOPROXY` | `off` | any module or checksum-database request; a module missing from the cache is a diagnostic |
+| `GOFLAGS` | `-mod=readonly` (`-mod=vendor` with `vendor/modules.txt`) | rewriting `go.mod` or `go.sum`; it replaces the caller's `GOFLAGS`, so flags such as `-toolexec` or `-mod=mod` cannot be injected |
+| `GOWORK` | `off` | building a workspace instead of the project's own module |
+
+Environment variables take precedence over the go env file, so `go env -w`
+settings are replaced too. Everything else (`GOMODCACHE`, `GOCACHE`,
+`CGO_ENABLED`, `GOOS`…) is the caller's. A module that is not in the cache
+is `go_module_not_in_cache` at the import that needs it, naming the module
+("run go mod download"); a `go` directive newer than the installed toolchain
+is `go_toolchain_too_old` at `go.mod`. The go command's progress lines
+(`go: downloading …`) are informational, never diagnostics. A cold cache
+therefore gives the same specific answer on every run, and a project that
+needs nothing from the cache (the starter) passes with an empty one.
+
 ### Project discovery is a seam
 
 `ProjectSource` is the narrow port both `check` and `inspect` consume:
@@ -73,9 +99,16 @@ the root plus every package directory the go command would see (`vendor`,
 `testdata`, nested modules and `.`/`_` directories skipped). It never
 follows a symbolic link, so nothing outside the root is read, and it is
 bounded (20,000 Go files, 8 MiB per file, 1 MiB per manifest).
-**E12-T01 (#67) replaces `DirectorySource`** with its manifest-based
-discovery of both layouts; nothing else changes. This ADR does not decide
-node identity from directories: inspect reports what descriptors declare.
+**E12-T01 (#67, PR #300, ADR 0023) owns discovery and the manifest.**
+Once it merges, check and inspect consume `internal/tooling/layout`: its
+discovery replaces `DirectorySource` and the static `node.Define` /
+`flow.Define` reader in `devtool/static.go`, `blok.json` is read through
+`layout.LoadManifest` (strict, per ADR 0023: unknown fields are refused),
+and each manifest condition keeps the single code ADR 0023 gives it (for
+example `layout_manifest_invalid`, replacing `project_manifest_invalid`).
+Until then `DirectorySource` reads `blok.json` leniently. This ADR does not
+decide node identity from directories: inspect reports what descriptors
+declare.
 
 ### The report (`blok-cli/v1`)
 
@@ -111,6 +144,14 @@ node identity from directories: inspect reports what descriptors declare.
 - Bounds: 1,000 diagnostics, 10,000 tests, 64 output lines per test or
   package, 1 MiB per go output line. A report that drops anything says
   `"truncated": true`.
+- Redaction: every diagnostic field passes `observe/redact` (ADR 0021) as
+  the report is finished, whatever produced it — compiler text, test
+  output, go's standard error. Test output and go's standard error are
+  redacted as blocks: a PEM block, from its BEGIN line to its END line (or
+  to the end of the kept output), becomes one marker line, every other line
+  goes through `redact.Message`, and if the lines read together still look
+  sensitive the whole block becomes one marker. Test names, package paths,
+  directories and sources go through `redact.String`.
 
 `--json` writes the report as one indented JSON document. Without it the
 report is written for a person with stable line shapes:
@@ -125,8 +166,9 @@ report is written for a person with stable line shapes:
 | 1 | project invalid, a check or a test failed | the report | empty |
 | 2 | usage error | empty | one line |
 | 3 | the go command could not start (`go_toolchain_unavailable`) | the report | empty |
-| 4 | the report could not be written | whatever was written | one line |
-| 130 | SIGINT, SIGTERM or a canceled context | the report, whole | empty |
+| 3 | an internal error (a panic); any go command it interrupted is killed | nothing | the panic and its stack |
+| 4 | the report could not be written, including to a closed pipe (`--json \| head`): SIGPIPE is ignored for these commands | whatever was written | one line |
+| 130 | SIGINT, SIGTERM, SIGHUP, SIGQUIT or a canceled context | the report, whole | empty |
 
 Every invocation that gets past argument parsing writes exactly one report
 whose `exitCode` is the process exit code. `blok new`, `blok generate` and
@@ -146,7 +188,12 @@ whose `exitCode` is the process exit code. `blok new`, `blok generate` and
 | `workflow_step_id_invalid`, `workflow_step_id_reserved`, `workflow_step_id_duplicate` | check | the step-id rules of `flow.Define` |
 | `go_compile_error` | check, test | a positioned compiler error (identical from `go vet` and `go test`) |
 | `go_vet_finding` | check | a `go vet` analyzer finding; `field` names the analyzer |
-| `go_toolchain_error` | check, test | an unpositioned go command failure (for example a module that needs `go mod tidy`) |
+| `go_module_not_in_cache` | check, test | a required module is not in the module cache; `actual` names it ("run go mod download") |
+| `go_module_missing` | check, test | no module in `go.mod` provides an imported package |
+| `go_mod_needs_update` | check, test | `go.mod` needs changes the go command would have to write ("run go mod tidy") |
+| `go_sum_missing` | check, test | `go.sum` lacks an entry the build needs |
+| `go_toolchain_too_old` | check, test | the `go` directive needs a newer toolchain than the installed one |
+| `go_toolchain_error` | check, test | any other unpositioned go command failure |
 | `go_toolchain_unavailable` | check, test | the go command could not start (exit 3) |
 | `test_failed` | test | a failing leaf test; `source` is the first `file:line` it reported |
 | `test_package_failed` | test | a package failed outside any test (panic, `TestMain`, timeout) |
@@ -184,18 +231,34 @@ coverage.
   `catalog.unresolved` with its position and reason. It is never evaluated
   and never guessed.
 
-### Cancellation
+### Cancellation, and blok dying
 
-`blok check|test|inspect` catch SIGINT and SIGTERM (only these commands, so
-Ctrl+C still ends an interactive `blok new` at once). The first signal
-cancels the command's context. A go command it started runs in its own
-process group; on cancellation that group receives SIGINT, and SIGKILL after
-`InterruptGrace` (5 s) if it has not exited, so neither go nor a test binary
-outlives blok. Further signals are absorbed; blok exits within the grace. The
+`blok check|test|inspect` catch SIGINT, SIGTERM, SIGHUP and SIGQUIT (only
+these commands, so Ctrl+C still ends an interactive `blok new` at once). The
+first signal cancels the command's context. A go command blok starts runs in
+its own process group; on cancellation that group receives SIGINT, and
+SIGKILL after `InterruptGrace` (5 s) if it has not exited (a group that
+ignores SIGINT is killed at the grace). Further signals are absorbed. The
 report is then written whole: every check, package and test result gathered
 before the stop, a test that had started but not finished as `incomplete`,
 an `interrupted` diagnostic, `status: interrupted` and exit 130. A context
 already canceled starts no go command.
+
+A panic while go output is read kills the group at once, then reaches the
+CLI, which reports it on stderr and exits 3.
+
+blok can also die without running any code: SIGKILL, or a crash. For that,
+each go command gets a **pipe guard**: a `/bin/sh` process, in its own process
+group, whose standard input is a pipe only blok can write to. The kernel
+closes blok's end whenever blok exits, however it exits; the guard reads
+end-of-file and kills the go command's process group, test binaries
+included. When the go command finishes normally blok kills the guard before
+closing the pipe, so the guard never signals a group id the system may have
+reused. One mechanism serves macOS and Linux. Linux's `Pdeathsig` was not
+chosen: it would stop only the direct child, `go`, and never the test binary
+that `go` starts. The guard needs `/bin/sh`; if it cannot start, the command
+does not run (`go_toolchain_unavailable`, exit 3). The one window left open
+is the moment between starting the go command and starting its guard.
 
 ## Compatibility
 
@@ -207,12 +270,14 @@ already canceled starts no go command.
   exit codes.
 - **Unchanged**: `internal/diagnostic` (its #28 shape is reused as is),
   `internal/tooling/graphcheck`, `internal/generate`, `internal/scaffold`
-  and `blok.json` (read leniently: unknown fields are accepted, so #67 can
-  add fields without breaking check).
+  and `blok.json` (read leniently until #67's strict `layout.LoadManifest`
+  replaces the interim reader; see the discovery section).
+- The code registry is `devtool.Codes`; `TestCodeRegistryMatchesSourceAndADR`
+  keeps it, the code literals in the source and the table above identical.
 
 ## Evidence
 
-- `testdata/tooling/fixtures.json` predeclares 23 cases (29 runs across the
+- `testdata/tooling/fixtures.json` predeclares 28 cases (34 runs across the
   two layouts) against real applications created by `scaffold.Create` and
   tidied: exit code, status, every diagnostic's code and position, output,
   error and effect counts (effects: project files created, changed or
@@ -238,9 +303,28 @@ already canceled starts no go command.
   report, the finished test `pass`, the running one `incomplete`, empty
   stderr, and the test binary gone. `TestInterruptFlushesPartialResults`
   does the same through the API.
-- Writer failure: exit 4 with a stderr line for an in-process failing writer
-  and for a real process whose standard output refuses writes. A missing go
-  command exits 3.
+- Writer failure: exit 4 with a stderr line for an in-process failing writer,
+  for a real process whose standard output refuses writes, and for one
+  writing to a closed pipe. A missing go command exits 3.
+- No network, no writes: `TestNoNetworkNoWritesUnderAHostileEnvironment`
+  gives check and test `GOTOOLCHAIN=auto`, a `toolchain go1.27.9` line,
+  `GOFLAGS=-mod=mod`, an empty module cache, a dependency and a logging
+  module proxy. The proxy receives zero requests, no file changes, both cold
+  runs report the identical `go_module_not_in_cache` at the import, and the
+  project passes once the module is in the cache. A newer `go` directive is
+  `go_toolchain_too_old`, again with no request.
+- Blok dying: `TestToolDeathKillsTheGoCommand` sends SIGKILL to blok while an
+  application test runs; the guard kills the test binary and go, on macOS
+  and in the Linux container. Its first Linux run failed, and found a real
+  defect: dash rejects `kill -KILL -- -PGID`, so the guard did nothing there
+  while bash (macOS) accepted it. The guard now writes `kill -KILL -PGID`.
+  `TestPanicKillsTheGroup`, `TestGraceKillsAGroupThatIgnoresInterrupts` and
+  the SIGHUP and SIGQUIT rows of the interrupt test cover the other ways
+  blok stops.
+- Secrets: the `test-secret-output` and `inspect-secret-route` fixtures and
+  `TestStderrIsRedactedAndProgressIgnored` require a PEM key, an AWS key id
+  in a test name and route, and a bearer token in go's stderr to be absent
+  from the report.
 
 ## Limits
 
@@ -256,5 +340,14 @@ already canceled starts no go command.
   goldens pin Go 1.27.1 and may change with the toolchain.
 - Interrupt and process-group semantics are verified on darwin/arm64 and
   linux/arm64 (a container, not a bare host); amd64 hosts are not run here.
-  Windows kills the go command without a process group and a test binary
-  may outlive it: unverified, and owned by the Windows track (#156, #157).
+  Windows kills the go command without a process group, has no pipe guard,
+  and a test binary may outlive it: unverified, and owned by the Windows
+  track (#156, #157).
+- Redaction is observe/redact's pattern matching (ADR 0021): it fails
+  closed and can over-redact, as it does a path like `secret_test.go:7`
+  (read as a `secret…: value` pair); it cannot find a credential it does not
+  recognise.
+- Pinning `GOFLAGS` drops any other flags the caller set there (for example
+  `-tags`); blok check and test have no flag to pass them yet.
+- The go command's own telemetry follows the user's `go telemetry` mode; it
+  is not a module or toolchain fetch and blok does not change it.

@@ -120,7 +120,10 @@ func finish(report *Report, found *diagnostics, ctx context.Context, toolFailure
 	if ctx.Err() != nil {
 		found.add(interruptedDiagnostic(report.Command))
 	}
-	report.Diagnostics = append([]diagnostic.Diagnostic{}, found.items...)
+	report.Diagnostics = make([]diagnostic.Diagnostic, len(found.items))
+	for index, item := range found.items {
+		report.Diagnostics[index] = redactDiagnostic(item)
+	}
 	diagnostic.Sort(report.Diagnostics)
 	report.Truncated = found.truncated
 	report.Version = Version
