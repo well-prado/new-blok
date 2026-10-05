@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -56,11 +57,17 @@ func TestNativePersistentAppProcess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runner := engine.New(map[string]node.Any{
+	businessNodes, businessQuote, businessOrder, err := businessNativePrograms(providerURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := map[string]node.Any{
 		definition.Descriptor().Name: definition.Any(),
 		reserve.Descriptor().Name:    reserve.Any(),
 		commit.Descriptor().Name:     commit.Any(),
-	})
+	}
+	maps.Copy(registry, businessNodes)
+	runner := engine.New(registry)
 	var stdout sync.Mutex
 	mux := http.NewServeMux()
 	// A caller that disconnects cancels request.Context(), which the engine
@@ -90,6 +97,27 @@ func TestNativePersistentAppProcess(t *testing.T) {
 		}
 		writePersistentJSON(w, http.StatusOK, map[string]any{"ok": true, "response": result.Output})
 	})
+	for route, program := range map[string]contract.InternalProgram{"POST /business-quote": businessQuote, "POST /business-order": businessOrder} {
+		mux.HandleFunc(route, func(w http.ResponseWriter, request *http.Request) {
+			defer request.Body.Close()
+			var input map[string]any
+			if err := json.NewDecoder(http.MaxBytesReader(w, request.Body, 1<<20)).Decode(&input); err != nil {
+				writePersistentJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid request"})
+				return
+			}
+			result, err := runner.Run(request.Context(), program, input)
+			if err != nil {
+				code := ""
+				var classified interface{ ErrorCode() string }
+				if errors.As(err, &classified) {
+					code = classified.ErrorCode()
+				}
+				writePersistentJSON(w, http.StatusUnprocessableEntity, map[string]any{"ok": false, "error": err.Error(), "code": code})
+				return
+			}
+			writePersistentJSON(w, http.StatusOK, map[string]any{"ok": true, "response": result.Output})
+		})
+	}
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		writePersistentJSON(w, http.StatusOK, map[string]bool{"ready": true})
 	})

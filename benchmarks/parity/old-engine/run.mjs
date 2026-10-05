@@ -256,9 +256,116 @@ if (input.mode === "durable-worker-produce") {
 	await reserveConfig.init("parity-persistent-reserve-commit", {
 		nodes: { getNode: (name) => reserveNodes[name] ?? null },
 	}, reserveCommit._config);
+	// Business-logic workflows: the provider only supplies catalog data and
+	// records effects; every business value (subtotal, bulk discount, tax,
+	// total) is computed by these workflow nodes and carried between steps.
+	// benchmarks/parity/business_test.go holds the native twins.
+	const lineShape = { requestKey: z.string(), sku: z.string(), quantity: z.number().int() };
+	const pricedShape = { ...lineShape, unitCents: z.number().int(), subtotalCents: z.number().int(), discountCents: z.number().int(), taxCents: z.number().int(), totalCents: z.number().int() };
+	const businessError = (code, message) => Object.assign(new Error(message), { code });
+	const priceLine = (line) => {
+		if (!Number.isInteger(line.quantity) || line.quantity < 1 || line.quantity > 100) throw businessError("invalid_quantity", "quantity must be between 1 and 100");
+		const subtotalCents = line.unitCents * line.quantity;
+		const discountCents = line.quantity >= 10 ? Math.floor(subtotalCents / 10) : 0;
+		const taxable = subtotalCents - discountCents;
+		const taxCents = Math.floor((taxable * 825 + 5000) / 10000);
+		return { subtotalCents, discountCents, taxCents, totalCents: taxable + taxCents };
+	};
+	const providerJSON = async (signal, operation, key, body) => {
+		const response = await fetch(`${providerURL}/${operation}`, {
+			method: "POST",
+			headers: { "content-type": "application/json", "idempotency-key": key },
+			body: JSON.stringify(body),
+			signal,
+		});
+		const decoded = await response.json();
+		if (!response.ok) throw businessError(decoded.code ?? "provider_error", decoded.message ?? `provider status ${response.status}`);
+		return decoded;
+	};
+	const quoteLookup = defineNode({
+		name: "parity-business-quote-lookup",
+		description: "Reads the SKU's unit price from the provider catalog",
+		input: z.object(lineShape),
+		output: z.object({ ...lineShape, unitCents: z.number().int() }),
+		async execute(ctx, line) {
+			const entry = await providerJSON(ctx.signal, "catalog", `${line.requestKey}-catalog`, { sku: line.sku });
+			return { ...line, unitCents: entry.unitCents };
+		},
+	});
+	const quotePrice = defineNode({
+		name: "parity-business-quote-price",
+		description: "Computes subtotal, bulk discount, tax and total",
+		input: z.object({ ...lineShape, unitCents: z.number().int() }),
+		output: z.object(pricedShape),
+		async execute(_ctx, line) {
+			return { ...line, ...priceLine(line) };
+		},
+	});
+	const orderValidate = defineNode({
+		name: "parity-business-order-validate",
+		description: "Rejects an order line before any provider call",
+		input: z.object(lineShape),
+		output: z.object(lineShape),
+		async execute(_ctx, line) {
+			if (!Number.isInteger(line.quantity) || line.quantity < 1 || line.quantity > 100) throw businessError("invalid_quantity", "quantity must be between 1 and 100");
+			return line;
+		},
+	});
+	const orderReserve = defineNode({
+		name: "parity-business-order-reserve",
+		description: "Reserves stock and reads the reserved unit price",
+		input: z.object(lineShape),
+		output: z.object({ ...lineShape, unitCents: z.number().int(), reservationId: z.string() }),
+		async execute(ctx, line) {
+			const reservation = await providerJSON(ctx.signal, "order-reserve", `${line.requestKey}-reserve`, { sku: line.sku, quantity: line.quantity });
+			return { ...line, unitCents: reservation.unitCents, reservationId: reservation.reservationId };
+		},
+	});
+	const orderPrice = defineNode({
+		name: "parity-business-order-price",
+		description: "Computes the order's line totals",
+		input: z.object({ ...lineShape, unitCents: z.number().int(), reservationId: z.string() }),
+		output: z.object({ ...pricedShape, reservationId: z.string() }),
+		async execute(_ctx, line) {
+			return { ...line, ...priceLine(line) };
+		},
+	});
+	const orderCommit = defineNode({
+		name: "parity-business-order-commit",
+		description: "Commits the reservation at the node-computed total",
+		input: z.object({ ...pricedShape, reservationId: z.string() }),
+		output: z.object({ ...pricedShape, reservationId: z.string(), orderId: z.string(), status: z.string() }),
+		async execute(ctx, priced) {
+			const committed = await providerJSON(ctx.signal, "order-commit", `${priced.requestKey}-commit`, { reservationId: priced.reservationId, totalCents: priced.totalCents });
+			return { ...priced, orderId: committed.orderId, status: committed.status };
+		},
+	});
+	const businessQuote = await workflow("parity-business-quote", {
+		version: "1.0.0",
+		trigger: http.post("/parity/business-quote"),
+	}, (req) => {
+		const line = step("lookup", quoteLookup, req.body);
+		step("price", quotePrice, line);
+	});
+	const businessOrder = await workflow("parity-business-order", {
+		version: "1.0.0",
+		trigger: http.post("/parity/business-order"),
+	}, (req) => {
+		const line = step("validate", orderValidate, req.body);
+		const reserved = step("reserve", orderReserve, line);
+		const priced = step("price", orderPrice, reserved);
+		step("commit", orderCommit, priced);
+	});
+	const businessNodes = Object.fromEntries([quoteLookup, quotePrice, orderValidate, orderReserve, orderPrice, orderCommit].map((definition) => [definition.name, definition]));
+	const businessQuoteConfig = new Configuration();
+	await businessQuoteConfig.init("parity-business-quote", { nodes: { getNode: (name) => businessNodes[name] ?? null } }, businessQuote._config);
+	const businessOrderConfig = new Configuration();
+	await businessOrderConfig.init("parity-business-order", { nodes: { getNode: (name) => businessNodes[name] ?? null } }, businessOrder._config);
 	const routes = {
 		"/quote": { config, application, path: "/parity/quote" },
 		"/reserve-commit": { config: reserveConfig, application: reserveCommit, path: "/parity/reserve-commit" },
+		"/business-quote": { config: businessQuoteConfig, application: businessQuote, path: "/parity/business-quote" },
+		"/business-order": { config: businessOrderConfig, application: businessOrder, path: "/parity/business-order" },
 	};
 	const server = createServer(async (request, response) => {
 		if (request.method === "GET" && request.url === "/health") {
@@ -297,15 +404,15 @@ if (input.mode === "durable-worker-produce") {
 				_PRIVATE_: {},
 			};
 			await new Runner(route.config.steps).run(context);
-			outcome = { success: context.response.success, errorName: null, error: context.response.error?.message ?? null };
+			outcome = { success: context.response.success, errorName: null, error: context.response.error?.message ?? null, code: context.response.error?.code ?? null };
 			const status = context.response.success ? 200 : 422;
 			response.writeHead(status, { "content-type": "application/json" });
-			response.end(JSON.stringify({ ok: context.response.success, response: context.response.data, error: context.response.error?.message ?? null }));
+			response.end(JSON.stringify({ ok: context.response.success, response: context.response.data, error: outcome.error, code: outcome.code }));
 		} catch (error) {
-			outcome = { success: false, errorName: error instanceof Error ? error.name : "Error", error: error instanceof Error ? error.message : String(error) };
+			outcome = { success: false, errorName: error instanceof Error ? error.name : "Error", error: error instanceof Error ? error.message : String(error), code: error?.code ?? error?.cause?.code ?? null };
 			if (!response.headersSent && !controller.signal.aborted) {
 				response.writeHead(400, { "content-type": "application/json" });
-				response.end(JSON.stringify({ ok: false, error: outcome.error }));
+				response.end(JSON.stringify({ ok: false, error: outcome.error, code: outcome.code }));
 			}
 		} finally {
 			if (controller.signal.aborted) {

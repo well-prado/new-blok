@@ -2,7 +2,8 @@
   "schemaVersion": 1,
   "capturedDate": "2026-10-04",
   "evidenceClass": "bounded-local-synthetic-measurement",
-  "command": "GOMAXPROCS=2 go test -p=1 ./benchmarks/parity -run '^TestPerformanceDistributions$' -count=1 -v",
+  "command": "BLOK_PARITY_OLD_ENGINE=1 BLOK_PARITY_LIMITED_PERF=1 GOMAXPROCS=2 go test -p=1 ./benchmarks/parity -run '^TestLimitedHarnessPerformanceDistributions$' -count=1 -v",
+  "commandNote": "captured 2026-10-04 by TestPerformanceDistributions (added in 0887d8c); dbeeab1 renamed it TestLimitedHarnessPerformanceDistributions behind BLOK_PARITY_LIMITED_PERF, and the old-engine gate was added later. The command above reproduces this harness on the current tree; the samples themselves are historical and were not regenerated.",
   "environment": {
     "os": "macOS 27.0 arm64",
     "go": "go1.27.1 darwin/arm64",

@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -56,14 +55,7 @@ func TestPersistentApplicationDistributions(t *testing.T) {
 	quote := findWorkload(t, "quote-success")
 	provider := newProvider(t)
 	client := persistentHTTPClient()
-	nodeVersion, err := exec.Command("node", "--version").Output()
-	if err != nil {
-		t.Fatalf("read pinned old runtime version: %v", err)
-	}
-	sourceRevision, err := repositoryRevision()
-	if err != nil {
-		t.Fatalf("read new-framework source revision: %v", err)
-	}
+	provenance := captureProvenance(t)
 	var oldStartup, newStartup []int64
 	for sample := 0; sample < persistentStartupSamples; sample++ {
 		old, duration := startOldPersistentApp(t, provider.URL)
@@ -110,13 +102,11 @@ func TestPersistentApplicationDistributions(t *testing.T) {
 	oldIdleCPU, newIdleCPU := cpuPercentSamples(oldResources), cpuPercentSamples(newResources)
 	oldIdleRSS, newIdleRSS := rssSamples(oldResources), rssSamples(newResources)
 	encoded, err := json.Marshal(map[string]any{
-		"evidenceClass":   "persistent-synthetic-application-harness",
-		"toolVersions":    map[string]string{"node": strings.TrimSpace(string(nodeVersion)), "go": runtime.Version()},
-		"sourceRevisions": map[string]string{"newBlok": sourceRevision, "oldBlok": "7611e434f716a5a8efbed26613e546893d5bcba7"},
-		"host":            map[string]any{"os": runtime.GOOS, "arch": runtime.GOARCH, "logicalCPUs": runtime.NumCPU(), "gomaxprocs": runtime.GOMAXPROCS(0)},
-		"old":             map[string]any{"framework": "published Blok 2.5.0", "process": "one long-lived Node process; one resolved Configuration reused across HTTP requests", "startupNs": distribution("process-start-to-ready", "published Blok 2.5.0", oldStartup), "idleCpuPercent": summarizeFloat(oldIdleCPU), "idleResidentBytes": summarizeFloat(oldIdleRSS), "idleSamples": oldResources, "loadCpuPercent": summarizeFloat(cpuPercentSamples(oldLoadResult.Resources)), "loadResidentBytes": summarizeFloat(rssSamples(oldLoadResult.Resources)), "loadResourceSamples": oldLoadResult.Resources, "loadRequestNs": distribution("persistent-http-quote", "published Blok 2.5.0", oldLoadResult.Latencies), "loadRequests": len(oldLoadResult.Outputs), "loadLateStarts": oldLoadResult.LateStarts, "requestsPerWorker": oldLoadResult.PerWorker},
-		"new":             map[string]any{"framework": "new native Go engine", "process": "one long-lived Go test-helper process; Engine and lowered program reused across HTTP requests", "startupNs": distribution("process-start-to-ready", "new native Go engine", newStartup), "idleCpuPercent": summarizeFloat(newIdleCPU), "idleResidentBytes": summarizeFloat(newIdleRSS), "idleSamples": newResources, "loadCpuPercent": summarizeFloat(cpuPercentSamples(newLoadResult.Resources)), "loadResidentBytes": summarizeFloat(rssSamples(newLoadResult.Resources)), "loadResourceSamples": newLoadResult.Resources, "loadRequestNs": distribution("persistent-http-quote", "new native Go engine", newLoadResult.Latencies), "loadRequests": len(newLoadResult.Outputs), "loadLateStarts": newLoadResult.LateStarts, "requestsPerWorker": newLoadResult.PerWorker},
-		"idleWindowNs":    persistentIdleWindow.Nanoseconds(), "idleSamples": persistentIdleSamples,
+		"evidenceClass": "persistent-synthetic-application-harness",
+		"provenance":    provenance,
+		"old":           map[string]any{"framework": "published Blok 2.5.0", "process": "one long-lived Node process; one resolved Configuration reused across HTTP requests", "startupNs": distribution("process-start-to-ready", "published Blok 2.5.0", oldStartup), "idleCpuPercent": summarizeFloat(oldIdleCPU), "idleResidentBytes": summarizeFloat(oldIdleRSS), "idleSamples": oldResources, "loadCpuPercent": summarizeFloat(cpuPercentSamples(oldLoadResult.Resources)), "loadResidentBytes": summarizeFloat(rssSamples(oldLoadResult.Resources)), "loadResourceSamples": oldLoadResult.Resources, "loadRequestNs": distribution("persistent-http-quote", "published Blok 2.5.0", oldLoadResult.Latencies), "loadRequests": len(oldLoadResult.Outputs), "loadLateStarts": oldLoadResult.LateStarts, "requestsPerWorker": oldLoadResult.PerWorker},
+		"new":           map[string]any{"framework": "new native Go engine", "process": "one long-lived Go test-helper process; Engine and lowered program reused across HTTP requests", "startupNs": distribution("process-start-to-ready", "new native Go engine", newStartup), "idleCpuPercent": summarizeFloat(newIdleCPU), "idleResidentBytes": summarizeFloat(newIdleRSS), "idleSamples": newResources, "loadCpuPercent": summarizeFloat(cpuPercentSamples(newLoadResult.Resources)), "loadResidentBytes": summarizeFloat(rssSamples(newLoadResult.Resources)), "loadResourceSamples": newLoadResult.Resources, "loadRequestNs": distribution("persistent-http-quote", "new native Go engine", newLoadResult.Latencies), "loadRequests": len(newLoadResult.Outputs), "loadLateStarts": newLoadResult.LateStarts, "requestsPerWorker": newLoadResult.PerWorker},
+		"idleWindowNs":  persistentIdleWindow.Nanoseconds(), "idleSamples": persistentIdleSamples,
 		"loadConcurrency": persistentLoadWorkers, "loadOfferedRequestsPerSecond": persistentLoadWorkers * persistentLoadRatePerWorker, "loadWindowNs": persistentLoadWindow.Nanoseconds(), "loadResourceSampleWindowNs": persistentIdleWindow.Nanoseconds(), "loadResourceSampleCount": persistentLoadResourceSamples,
 		"resourceMeasurement": map[string]string{"tool": "ps -o rss= -o cputime=", "cpuPrecision": "ps cputime has 10 ms (centisecond) resolution on this macOS host; a 1-second window therefore resolves CPU in 1 percentage-point steps and an idle process can read exactly zero"},
 		"loadMeasurement":     map[string]string{"shape": "paced open loop: each worker starts one request per 1/rate interval, staggered across workers; identical offered rate for both processes; lateStarts counts requests that could not start on schedule", "executionOrder": "old process then new process; windows are sequential, not interleaved or counterbalanced", "providerKeys": "disjoint old/new prefixes; same schema and provider endpoint; each load request incurs one fresh provider effect", "interpretation": "raw descriptive distributions only; sequential load is not a controlled comparative performance claim"},
@@ -138,18 +128,10 @@ func TestPersistentDurableRecoveryDistributions(t *testing.T) {
 	requireUninstrumentedMeasurement(t)
 	requireOldEngine(t)
 	postgresURL := requireLoopbackPostgres(t)
-	postgresImage := os.Getenv("BLOK_PARITY_POSTGRES_IMAGE")
-	postgresImageDigest := os.Getenv("BLOK_PARITY_POSTGRES_IMAGE_DIGEST")
-	digestHex := strings.TrimPrefix(postgresImageDigest, "postgres@sha256:")
-	if postgresImage == "" || len(digestHex) != 64 || strings.Trim(digestHex, "0123456789abcdef") != "" {
-		t.Fatal("set BLOK_PARITY_POSTGRES_IMAGE and BLOK_PARITY_POSTGRES_IMAGE_DIGEST to record the disposable server image identity")
-	}
+	postgresContainer := inspectPostgresContainer(t, postgresURL)
 	expected := loadDurableRecoveryContract(t)
 	provider := newProvider(t)
-	sourceRevision, err := repositoryRevision()
-	if err != nil {
-		t.Fatalf("read new-framework source revision: %v", err)
-	}
+	provenance := captureProvenance(t)
 	expectedOutput := func(businessID string) json.RawMessage {
 		body := map[string]any{"jobId": businessID}
 		for key, value := range expected.ExpectedBody {
@@ -318,15 +300,14 @@ func TestPersistentDurableRecoveryDistributions(t *testing.T) {
 		t.Fatalf("durable recovery provider calls=%d committed effects=%d, want %d calls and %d effects", calls, effects, wantCalls, wantEffects)
 	}
 	encoded, err := json.Marshal(map[string]any{
-		"evidenceClass":   "persistent-durable-worker-recovery",
-		"toolVersions":    map[string]string{"node": nodeVersion(t), "go": runtime.Version(), "pgBoss": "10.4.2", "pg": "8.23.1"},
-		"sourceRevisions": map[string]string{"newBlok": sourceRevision, "oldBlok": "7611e434f716a5a8efbed26613e546893d5bcba7"},
-		"host":            map[string]any{"os": runtime.GOOS, "arch": runtime.GOARCH, "logicalCPUs": runtime.NumCPU(), "gomaxprocs": runtime.GOMAXPROCS(0)},
-		"old":             map[string]any{"framework": "published @blokjs packages 2.5.0", "adapter": "PgBossAdapter", "broker": "pg-boss 10.4.2 / PostgreSQL standard queue", "process": "producer SIGKILLed after both durable sends; fresh WorkerTrigger consumer and published Runner recover the jobs", "delivery": "two addJob calls with the same jobId store two pg-boss rows (singletonKey is not a dedupe key on a standard queue); both execute; provider idempotency keeps one effect; retryLimit=2; synthetic provider fails the first call", "expected": expected.Old},
-		"new":             map[string]any{"framework": "native engine", "adapter": "trigger/worker.Queue", "broker": "SQLite WAL synchronous=FULL", "process": "producer SIGKILLed after Enqueue commit; fresh process reopens SQLite and executes native Engine", "delivery": "two Enqueue calls with the same request key yield accepted=true then accepted=false (one stored job); MaxAttempts=3; synthetic provider fails the first call", "expected": expected.New},
-		"perSample":       observations,
-		"providerCalls":   calls, "committedEffects": effects,
-		"backendVersions": map[string]string{"postgresql": postgresVersion, "postgresImage": postgresImage, "postgresImageDigest": postgresImageDigest, "sqlite": sqliteVersion + " (WAL/synchronous=FULL)"},
+		"evidenceClass":     "persistent-durable-worker-recovery",
+		"provenance":        provenance,
+		"postgresContainer": postgresContainer,
+		"old":               map[string]any{"framework": "published @blokjs packages 2.5.0", "adapter": "PgBossAdapter", "broker": "pg-boss 10.4.2 / PostgreSQL standard queue", "process": "producer SIGKILLed after both durable sends; fresh WorkerTrigger consumer and published Runner recover the jobs", "delivery": "two addJob calls with the same jobId store two pg-boss rows (singletonKey is not a dedupe key on a standard queue); both execute; provider idempotency keeps one effect; retryLimit=2; synthetic provider fails the first call", "expected": expected.Old},
+		"new":               map[string]any{"framework": "native engine", "adapter": "trigger/worker.Queue", "broker": "SQLite WAL synchronous=FULL", "process": "producer SIGKILLed after Enqueue commit; fresh process reopens SQLite and executes native Engine", "delivery": "two Enqueue calls with the same request key yield accepted=true then accepted=false (one stored job); MaxAttempts=3; synthetic provider fails the first call", "expected": expected.New},
+		"perSample":         observations,
+		"providerCalls":     calls, "committedEffects": effects,
+		"backendVersions": map[string]string{"postgresql": postgresVersion, "sqlite": sqliteVersion + " (WAL/synchronous=FULL)"},
 		"oldRecoveryNs":   distribution("kill-to-first-completion", "published Blok 2.5.0 + pg-boss 10.4.2", oldRecovery),
 		"newRecoveryNs":   distribution("kill-to-first-completion", "native engine + SQLite WAL/FULL", newRecovery),
 		"samples":         persistentRecoveryRuns,
@@ -406,14 +387,6 @@ func nodeVersion(t *testing.T) string {
 		t.Fatalf("read pinned old runtime version: %v", err)
 	}
 	return strings.TrimSpace(string(output))
-}
-
-func repositoryRevision() (string, error) {
-	output, err := exec.Command("git", "rev-parse", "HEAD").Output()
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(output)), nil
 }
 
 func requireLoopbackPostgres(t *testing.T) string {

@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 	"time"
 )
@@ -83,7 +82,7 @@ func TestDurableMidExecutionKillRedelivers(t *testing.T) {
 			t.Fatalf("%s consumer never started the held provider call; stderr=%s", name, consumer.stderr.String())
 		}
 	}
-	report := map[string]any{"evidenceClass": "mid-execution-process-kill-redelivery", "toolVersions": map[string]string{"node": nodeVersion(t), "go": runtime.Version()}}
+	report := map[string]any{"evidenceClass": "mid-execution-process-kill-redelivery", "provenance": captureProvenance(t), "postgresContainer": inspectPostgresContainer(t, postgresURL)}
 
 	// Published Blok 2.5.0: PgBossAdapter + WorkerTrigger + Runner.
 	{
@@ -169,6 +168,9 @@ func TestDurableMidExecutionKillRedelivers(t *testing.T) {
 			t.Fatal(err)
 		}
 		calls, effects := provider.ledger.snapshot()
+		// expected.New.Attempts (1) pins today's behaviour: the killed attempt's
+		// counter rolls back with its claim transaction. #245 questions whether
+		// that should consume MaxAttempts; change the contract with its decision.
 		if settled.Stats.Completed != expected.New.Completed || settled.Stats.Attempts != expected.New.Attempts || !equalJSON(settled.Response, expectedOutput(businessID)) || calls != expected.New.ProviderCalls || aborted != expected.New.AbortedByKill || effects != expected.New.CommittedEffects {
 			t.Fatalf("native mid-execution kill: settled=%s calls=%d aborted=%d effects=%d; want completed=%d attempts=%d output=%s calls=%d aborted=%d effects=%d", settledLine, calls, aborted, effects, expected.New.Completed, expected.New.Attempts, expectedOutput(businessID), expected.New.ProviderCalls, expected.New.AbortedByKill, expected.New.CommittedEffects)
 		}

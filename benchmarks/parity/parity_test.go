@@ -175,11 +175,17 @@ type providerLedger struct {
 	seen    map[string]bool
 	attempt map[string]int
 	// aborted counts provider calls whose caller disconnected mid-call.
-	aborted     map[string]int
-	holdKeys    map[string]bool
-	gates       map[string]*providerGate
-	holdEntered chan string
+	aborted  map[string]int
+	holdKeys map[string]bool
+	// committedTotals records the total each order-commit call carried.
+	committedTotals map[string]any
+	gates           map[string]*providerGate
+	holdEntered     chan string
 }
+
+// businessCatalog is the provider's synthetic unit-price data for the
+// business-logic workloads.
+var businessCatalog = map[string]int{"coffee": 1500, "tea": 900}
 
 // reserveHoldFallback bounds how long /reserve waits for its caller to abort
 // before committing, so an engine that ignores cancellation fails visibly
@@ -1029,7 +1035,7 @@ func schemasForOperation(operation string) ([]byte, []byte) {
 
 func newProvider(t *testing.T) *ledgerServer {
 	t.Helper()
-	ledger := &providerLedger{seen: map[string]bool{}, attempt: map[string]int{}, aborted: map[string]int{}, holdKeys: map[string]bool{}, gates: map[string]*providerGate{}, holdEntered: make(chan string, 1)}
+	ledger := &providerLedger{seen: map[string]bool{}, attempt: map[string]int{}, aborted: map[string]int{}, holdKeys: map[string]bool{}, committedTotals: map[string]any{}, gates: map[string]*providerGate{}, holdEntered: make(chan string, 1)}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1079,6 +1085,38 @@ func newProvider(t *testing.T) *ledgerServer {
 				return
 			}
 			writeProviderJSON(w, http.StatusOK, map[string]any{"requestKey": key, "reserved": true})
+			return
+		}
+		if operation == "catalog" || operation == "order-reserve" || operation == "order-commit" {
+			// Business-logic workloads: the provider supplies catalog data and
+			// records effects, but computes no business value; totals come
+			// from the workflow nodes and are recorded as received.
+			defer ledger.mu.Unlock()
+			if operation != "order-commit" {
+				sku, _ := payload["sku"].(string)
+				unit, known := businessCatalog[sku]
+				if !known {
+					writeProviderJSON(w, http.StatusNotFound, map[string]any{"code": "unknown_sku", "message": "synthetic unknown sku"})
+					return
+				}
+				if operation == "catalog" {
+					writeProviderJSON(w, http.StatusOK, map[string]any{"sku": sku, "unitCents": unit})
+					return
+				}
+				if !ledger.seen[key] {
+					ledger.effects++
+					ledger.seen[key] = true
+				}
+				writeProviderJSON(w, http.StatusOK, map[string]any{"reservationId": "res-" + key, "unitCents": unit})
+				return
+			}
+			if !ledger.seen[key] {
+				ledger.effects++
+				ledger.seen[key] = true
+				ledger.committedTotals[key] = payload["totalCents"]
+			}
+			reservation, _ := payload["reservationId"].(string)
+			writeProviderJSON(w, http.StatusOK, map[string]any{"orderId": "ord-" + reservation, "status": "committed"})
 			return
 		}
 		if operation == "job-retry" && attempt == 1 {

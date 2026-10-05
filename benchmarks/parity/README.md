@@ -49,14 +49,22 @@ BLOK_PARITY_OLD_ENGINE=1 BLOK_PARITY_PERF=1 BLOK_PARITY_RAW_DIR=<dir> GOMAXPROCS
 docker run --rm -d --name p108-pg-<unique> --tmpfs /var/lib/postgresql/data:rw,size=512m \
   -e POSTGRES_HOST_AUTH_METHOD=trust -e POSTGRES_USER=parity108 -e POSTGRES_DB=parity108_test_ephemeral \
   -p 127.0.0.1::5432 postgres:17
-docker image inspect postgres:17 --format '{{index .RepoDigests 0}}'
+docker port p108-pg-<unique> 5432/tcp
 BLOK_PARITY_OLD_ENGINE=1 BLOK_PARITY_RECOVERY=1 BLOK_PARITY_RAW_DIR=<dir> \
   BLOK_PARITY_POSTGRES_URL=postgres://parity108@127.0.0.1:<port>/parity108_test_ephemeral \
-  BLOK_PARITY_POSTGRES_IMAGE=postgres:17 BLOK_PARITY_POSTGRES_IMAGE_DIGEST=postgres@sha256:<digest> \
+  BLOK_PARITY_POSTGRES_CONTAINER=p108-pg-<unique> \
   GOMAXPROCS=2 go test -p=1 ./benchmarks/parity -count=1 -v -timeout 15m \
   -run '^(TestPersistentDurableRecoveryDistributions|TestDurableMidExecutionKillRedelivers)$'
 docker stop p108-pg-<unique>
 ```
+
+The samplers read the server identity themselves: `docker inspect` on
+`BLOK_PARITY_POSTGRES_CONTAINER` gives the container and image IDs, the
+image's repository digests and the tmpfs mount, and the run fails unless that
+container publishes the loopback port in `BLOK_PARITY_POSTGRES_URL`. Each raw
+file also records `git rev-parse HEAD`, `git status --porcelain` (clean or the
+dirty paths), the test binary's arguments, the `BLOK_PARITY_*` environment,
+installed old package versions and the host load average.
 
 The recovery gate refuses any non-loopback host and any database whose name
 does not start with `parity108_test`. pg-boss creates its schema in that
@@ -66,9 +74,39 @@ would be instrumented and the old side would not.
 
 ## What is compared
 
+Workloads come in two classes (`contracts.json` → `workloadClasses`):
+
+- **business-logic** (`businessWorkloads`): every business value — subtotal,
+  bulk discount, tax, total — is computed by workflow nodes on each engine and
+  carried between steps (quote: catalog lookup → pricing; order: validate →
+  reserve → pricing → commit). The provider only returns catalog unit prices
+  and records effects, plus the total each commit carried. The old nodes
+  (`old-engine/run.mjs`, `parity-business-*`) and the native ones
+  (`business_test.go`) are separate implementations of the same written rules.
+  Cases cover a plain quote, the bulk-discount boundary (9 vs 10 vs 12 units),
+  unknown SKU at lookup and at reserve, and an invalid quantity rejected before
+  any provider call. Mutating the native discount threshold or tax rounding,
+  or the old workflow's discount threshold or commit wiring, turns
+  `TestBusinessLogicWorkflowsMatch` red.
+- **plumbing** (`workloads`): one-step pass-through workflows whose value is
+  computed by the provider. They prove input mapping, idempotency headers,
+  error classification, retry, cancellation, delivery and recovery mechanics,
+  not business-logic equivalence; `order-duplicate-delivery`'s single effect,
+  for example, comes from the provider's idempotency ledger.
+
+Which runtime path each comparison exercises:
+
+| Path | Old side | New side | Used by |
+|---|---|---|---|
+| Test runner | `@blokjs/core/testing` `runWorkflow()` in a fresh Node process, 100 ms timeout (`run.mjs`) | `engine.Run` in the test process | `TestExecutableOldAndNewEngineWorkloads` (quote, invalid SKU, order duplicate, in-process job retry) |
+| Long-lived HTTP apps | one Node process; `Configuration` + `Runner` reused across requests | one Go process; `engine.Run` reused across requests | business-logic workloads, cancellation, persistent load sampler |
+| Runner on JSON source | `Configuration.init` on the JSON + `Runner` | `migration.Convert` → `internal/compile` → `engine.Run` | migrated workflows |
+| Real triggers / queues | `WorkerTrigger` (`InMemoryAdapter`, `PgBossAdapter`), `WebhookTrigger`, `SSETrigger` | `trigger/worker.Queue`, webhook and SSE adapters, `engine.Run` per delivery | worker retry, webhook, SSE, durable recovery, mid-execution kill |
+
 | Workload (contract id) | Old (published 2.5.0) | New (native) | Result |
 |---|---|---|---|
-| `quote-success` | `runWorkflow` through the real `Configuration`/`Runner` | `flow` + `engine.Run` | identical output, 1 call, 1 effect |
+| `businessWorkloads` (9 cases) | long-lived Runner app, node-computed totals | long-lived engine app, node-computed totals | identical outputs and error codes, predeclared calls/effects, provider-recorded commit totals equal |
+| `quote-success` (plumbing) | `runWorkflow` through the real `Configuration`/`Runner` | `flow` + `engine.Run` | identical output, 1 call, 1 effect |
 | `quote-invalid-sku` | provider 422 → failed run | provider 422 → `unknown_sku` | 1 call, 0 effects on both; old keeps only the message, new keeps the stable code |
 | `order-duplicate-delivery` | invoked twice | invoked twice | 2 calls, 1 effect on both (provider idempotency; no HTTP-trigger dedupe is claimed) |
 | `job-retry` (in-process) | step retry: 2 calls, completes | call engine: 1 call, returns the temporary error | **differs by design**; new retries at the queue (next row) |
@@ -78,7 +116,7 @@ would be instrumented and the old side would not.
 | `order-reserve-commit-success` | long-lived Node HTTP app, two-step workflow | long-lived Go HTTP app, same two steps | identical output, 2 calls, 2 effects |
 | `order-cancel-in-flight` | caller disconnects while `reserve` is held: `ctx.signal` aborts the fetch | caller disconnects: `request.Context()` cancels the node call | on both: reserve aborted at the provider, `commit` never called, 0 effects, process keeps serving |
 | `durableRecovery` (5 samples) | producer SIGKILLed after two `PgBossAdapter.addJob` with one `jobId`; fresh consumer | producer SIGKILLed after two `Enqueue` with one request key; fresh consumer | same output; old stores **2 jobs** (pg-boss `singletonKey` is not a dedupe key on a standard queue), runs both: 3 calls, 1 effect; new stores 1: 2 calls, 1 effect |
-| `midExecutionKill` | consumer SIGKILLed mid-call; pg-boss expires the job (`expireInSeconds=5`) and retries it at its next maintenance pass (120 s default, not configurable through `PgBossAdapter` 2.5.0) | consumer SIGKILLed mid-call; claim, handler writes and ack share one SQLite transaction, so the claim rolls back and a fresh consumer claims at once | on both: killed call aborted, redelivered once, 2 calls, 1 effect, same output |
+| `midExecutionKill` (`attempts: 1` pins today's behaviour; #245) | consumer SIGKILLed mid-call; pg-boss expires the job (`expireInSeconds=5`) and retries it at its next maintenance pass (120 s default, not configurable through `PgBossAdapter` 2.5.0) | consumer SIGKILLed mid-call; claim, handler writes and ack share one SQLite transaction, so the claim rolls back and a fresh consumer claims at once | on both: killed call aborted, redelivered once, 2 calls, 1 effect, same output |
 | `migratedWorkflows` | the Blok v2 JSON source as given | `migration.Convert` → canonical compiler → engine | supported source: identical output, 1 call, 1 effect; `@trigger.body` source runs on old but is refused with `unsupported_trigger_projection` |
 
 Two findings about the engines themselves came out of executing them:
@@ -96,11 +134,12 @@ client/server protocol contract (`contracts.json` → `inertia`).
 
 ## Raw distributions
 
-[`performance-samples-2026-10-05.json`](../../testdata/parity/performance-samples-2026-10-05.json)
-holds the samplers' own raw JSON (written with `BLOK_PARITY_RAW_DIR`, not
-transcribed from logs): startup, idle CPU/RSS, load latency and CPU/RSS, five
-durable-recovery samples per engine, and one mid-execution-kill sample per
-engine, each with the measured source revision and versions.
+[`testdata/parity/raw/`](../../testdata/parity/raw/) holds the samplers' own
+output files, copied byte for byte from `BLOK_PARITY_RAW_DIR` (no wrapper):
+`persistent-application.json` (startup, idle CPU/RSS, load latency and
+CPU/RSS), `durable-recovery.json` (five samples per engine) and
+`mid-execution-kill.json` (one sample per engine). Each carries its own
+`provenance` block, and the recovery files a `postgresContainer` block.
 
 How to read them:
 
