@@ -64,6 +64,11 @@ type Definition[I, O any] struct {
 	program Program
 }
 
+// OutputID is the id of the instruction Lower appends to return the
+// workflow's output. Every builder rejects it as a step id, so a lowered
+// program never holds two instructions with this id (#247).
+const OutputID = "output"
+
 func (d Definition[I, O]) Program() Program { return cloneProgram(d.program) }
 
 // Lower converts a structurally authored definition into the engine's
@@ -110,7 +115,7 @@ func (d Definition[I, O]) Lower() (contract.InternalProgram, error) {
 	}
 	internal.Instructions = append(internal.Instructions, contract.InternalInstruction{
 		Index:      len(internal.Instructions),
-		ID:         "output",
+		ID:         OutputID,
 		Kind:       "output",
 		References: []contract.Reference{output},
 	})
@@ -212,6 +217,9 @@ func Call[I, O any](builder *Builder, id string, definition node.Definition[I, O
 }
 
 func (builder *Builder) reserveID(id string) {
+	if id == OutputID {
+		panic("flow: instruction id \"" + OutputID + "\" is reserved for the workflow output instruction Lower appends; rename the step")
+	}
 	if _, exists := builder.ids[id]; exists {
 		panic("flow: duplicate instruction id " + id)
 	}
