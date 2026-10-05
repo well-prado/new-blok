@@ -886,3 +886,26 @@ func fixtureErrorName(err error) string {
 		return "unexpected_error"
 	}
 }
+
+// TestLogArrivingAfterItsStepCompletedIsRecorded: a worker's log reaches
+// inspection asynchronously (contract/runtime Call.OnLog), so it can arrive
+// after its step, and its run, completed. It is still recorded with that
+// step, not dropped (#226).
+func TestLogArrivingAfterItsStepCompletedIsRecorded(t *testing.T) {
+	recorder := inspect.NewRecorder()
+	at := time.Date(2026, 10, 4, 0, 0, 0, 0, time.UTC)
+	recorder.Observe(inspection.Event{Kind: inspection.RunStarted, RunID: "run-1", Principal: "alice", At: at, Input: json.RawMessage(`{}`)})
+	recorder.Observe(inspection.Event{Kind: inspection.StepProcessing, RunID: "run-1", Principal: "alice", StepID: "quote", Attempt: 1, At: at})
+	recorder.Observe(inspection.Event{Kind: inspection.StepCompleted, RunID: "run-1", Principal: "alice", StepID: "quote", Attempt: 1, At: at.Add(time.Second), Output: json.RawMessage(`{}`)})
+	recorder.Observe(inspection.Event{Kind: inspection.RunCompleted, RunID: "run-1", Principal: "alice", At: at.Add(time.Second), Output: json.RawMessage(`{}`)})
+	recorder.Observe(inspection.Event{Kind: inspection.StepLog, RunID: "run-1", Principal: "alice", StepID: "quote", At: at.Add(500 * time.Millisecond), LogLevel: "INFO", LogMessage: "quote calculated", LogAttrs: json.RawMessage(`{}`)})
+	policy := fullPolicy()
+	policy.Fields[inspection.FieldLogs] = true
+	page, err := recorder.Inspect("alice", policy, inspection.Query{Version: inspection.Version, RunID: "run-1"})
+	if err != nil || page.Run.Status != inspection.StatusCompleted || len(page.Steps) != 1 {
+		t.Fatalf("page=%+v err=%v", page, err)
+	}
+	if logs := page.Steps[0].Logs; len(logs) != 1 || logs[0].Message != "quote calculated" || page.Steps[0].Status != inspection.StatusCompleted {
+		t.Fatalf("step=%+v; want the late log recorded on the completed step", page.Steps[0])
+	}
+}
