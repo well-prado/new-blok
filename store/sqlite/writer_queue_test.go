@@ -141,10 +141,13 @@ func TestUnmarkedTransactionsAreNotQueued(t *testing.T) {
 		})
 	}()
 	<-holding
-	if nestedErr != nil || nestedCount != 0 || nestedTook > 100*time.Millisecond {
+	// The writer holds its turn until after these reads, so a read that took
+	// a turn would fail with ErrBusy after the busy timeout; success alone
+	// shows it was not queued, however slow a loaded host is (#214).
+	if nestedErr != nil || nestedCount != 0 {
 		t.Fatalf("a read nested in the queued writer: count=%d after %v, err=%v", nestedCount, nestedTook, nestedErr)
 	}
-	if count, took, err := read(); err != nil || count != 0 || took > 100*time.Millisecond {
+	if count, took, err := read(); err != nil || count != 0 {
 		t.Fatalf("a read beside the queued writer: count=%d after %v, err=%v", count, took, err)
 	}
 	begin := time.Now()
@@ -160,7 +163,9 @@ func TestUnmarkedTransactionsAreNotQueued(t *testing.T) {
 	if domain, named := store.ErrorWriteDomain(err); !named || !store.SameWriteDomain(domain, mustWriteDomain(t, db)) {
 		t.Fatalf("the queue timeout named %v (named=%v); want the handle's domain", domain, named)
 	}
-	if elapsed < 200*time.Millisecond || elapsed > 2*time.Second {
+	// At least the busy timeout; the upper bound only catches a hang, since a
+	// loaded host may wake the waiter late.
+	if elapsed < 200*time.Millisecond || elapsed > 10*time.Second {
 		t.Fatalf("the queued writer gave up after %v; want the 200ms busy timeout", elapsed)
 	}
 }
