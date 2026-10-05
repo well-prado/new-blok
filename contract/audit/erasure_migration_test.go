@@ -16,6 +16,8 @@ import (
 
 	"github.com/well-prado/new-blok/contract/audit"
 	"github.com/well-prado/new-blok/internal/journal"
+	"github.com/well-prado/new-blok/internal/migration"
+	"github.com/well-prado/new-blok/store"
 	"github.com/well-prado/new-blok/store/sqlite"
 )
 
@@ -287,6 +289,11 @@ func TestMigrationSurvivesACrash(t *testing.T) {
 	}); err != nil || legacy != 1 {
 		t.Fatalf("crashed migration was not rolled back: legacy tombstones=%d err=%v", legacy, err)
 	}
+	// The stamp is written in the migration's transaction (#291), so the
+	// crash left none.
+	if version, stamped := journalStamp(t, db); stamped {
+		t.Fatalf("the crashed migration left journal stamp %d", version)
+	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -294,5 +301,20 @@ func TestMigrationSurvivesACrash(t *testing.T) {
 	if n := r.count(`SELECT COUNT(*) FROM sqlite_master WHERE name = 'journal_audit'`); n != 0 {
 		t.Fatal("the reopened journal did not migrate")
 	}
+	if version, stamped := journalStamp(t, r.db); !stamped || version != 3 {
+		t.Fatalf("the reopened journal is stamped %d (%v); want 3", version, stamped)
+	}
 	r.mustVerify(2)
+}
+
+func journalStamp(t *testing.T, db store.Database) (version int, stamped bool) {
+	t.Helper()
+	if err := db.WithTx(context.Background(), func(tx *sql.Tx) error {
+		var err error
+		version, stamped, err = migration.Stamped(context.Background(), tx, "journal")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return version, stamped
 }
