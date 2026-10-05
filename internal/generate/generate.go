@@ -78,17 +78,19 @@ func Source(source []byte, options Options) ([]byte, error) {
 		name := named.Obj().Name()
 		fmt.Fprintf(&output, "type %sRef struct { value flow.Ref[%s] }\n\n", name, name)
 		fmt.Fprintf(&output, "func %sFields(value flow.Ref[%s]) %sRef { return %sRef{value: value} }\n\n", name, name, name, name)
-		for index := 0; index < structure.NumFields(); index++ {
+		for _, index := range dominantFields(structure) {
 			field := structure.Field(index)
-			if !field.Exported() || field.Embedded() {
-				continue
-			}
 			fieldType, err := renderType(field.Type())
 			if err != nil {
 				return nil, fmt.Errorf("%s.%s: %w", name, field.Name(), err)
 			}
 			key, encoded := jsonKey(field.Name(), structure.Tag(index))
 			if !encoded {
+				continue
+			}
+			if quotedField(structure.Tag(index)) {
+				// A reference resolves a ",string" field to its quoted text,
+				// not to the field's Go type (#241).
 				continue
 			}
 			if strings.Contains(key, ".") {
@@ -148,24 +150,77 @@ func renderType(typeValue types.Type) (string, error) {
 	}
 }
 
+// dominantFields lists, in declaration order, the exported top-level
+// fields encoding/json writes, one per key: where several share a key, a
+// tagged field beats untagged ones and a remaining tie writes none (#241).
+// Embedded fields are skipped; their promoted keys never beat a top-level
+// one.
+func dominantFields(structure *types.Struct) []int {
+	type candidate struct {
+		index  int
+		tagged bool
+	}
+	byKey := map[string][]candidate{}
+	for index := 0; index < structure.NumFields(); index++ {
+		field := structure.Field(index)
+		if !field.Exported() || field.Embedded() {
+			continue
+		}
+		key, encoded := jsonKey(field.Name(), structure.Tag(index))
+		if !encoded {
+			continue
+		}
+		byKey[key] = append(byKey[key], candidate{index: index, tagged: namedByTag(structure.Tag(index))})
+	}
+	var selected []int
+	for _, candidates := range byKey {
+		var tagged []candidate
+		for _, candidate := range candidates {
+			if candidate.tagged {
+				tagged = append(tagged, candidate)
+			}
+		}
+		switch {
+		case len(candidates) == 1:
+			selected = append(selected, candidates[0].index)
+		case len(tagged) == 1:
+			selected = append(selected, tagged[0].index)
+		}
+	}
+	sort.Ints(selected)
+	return selected
+}
+
+// namedByTag reports whether the json tag itself names the key.
+func namedByTag(tag string) bool {
+	value, ok := reflect.StructTag(tag).Lookup("json")
+	name, _, _ := strings.Cut(value, ",")
+	return ok && name != ""
+}
+
+func quotedField(tag string) bool {
+	value, _ := reflect.StructTag(tag).Lookup("json")
+	_, options, _ := strings.Cut(value, ",")
+	for _, option := range strings.Split(options, ",") {
+		if option == "string" {
+			return true
+		}
+	}
+	return false
+}
+
 // jsonKey is the key encoding/json writes for a struct field, which is what
 // a workflow reference selects: the json tag's name when it has one,
 // otherwise the Go field name exactly. A field tagged "-" is never encoded,
-// so it gets no accessor (#240). Nor does a ",string" field: a reference
-// resolves it to its quoted text, not to the field's Go type (#241).
+// so it gets no accessor (#240).
 func jsonKey(field, tag string) (string, bool) {
 	value, tagged := reflect.StructTag(tag).Lookup("json")
 	if !tagged {
 		return field, true
 	}
-	name, options, _ := strings.Cut(value, ",")
+	name, _, _ := strings.Cut(value, ",")
 	if value == "-" {
 		return "", false
-	}
-	for _, option := range strings.Split(options, ",") {
-		if option == "string" {
-			return "", false
-		}
 	}
 	if name == "" {
 		return field, true
@@ -173,26 +228,46 @@ func jsonKey(field, tag string) (string, bool) {
 	return name, true
 }
 
-// customJSON reports whether a type, or a pointer to it, has a MarshalJSON
-// or MarshalText method with the encoding/json signature.
+// customJSON reports whether a type, or a pointer to it, has a method
+// Go 1.27's encoding/json calls instead of encoding its fields:
+// MarshalJSON() ([]byte, error), MarshalText() ([]byte, error),
+// AppendText([]byte) ([]byte, error) or MarshalJSONTo(*jsontext.Encoder)
+// error.
 func customJSON(named *types.Named) bool {
+	errorType := types.Universe.Lookup("error").Type()
+	isBytes := func(typ types.Type) bool {
+		slice, ok := typ.(*types.Slice)
+		return ok && types.Identical(slice.Elem(), types.Typ[types.Byte])
+	}
 	for _, receiver := range []types.Type{named, types.NewPointer(named)} {
 		methods := types.NewMethodSet(receiver)
-		for _, name := range []string{"MarshalJSON", "MarshalText"} {
+		for _, name := range []string{"MarshalJSON", "MarshalText", "AppendText", "MarshalJSONTo"} {
 			selection := methods.Lookup(nil, name)
 			if selection == nil {
 				continue
 			}
 			signature, ok := selection.Type().(*types.Signature)
-			if !ok || signature.Params().Len() != 0 || signature.Results().Len() != 2 {
+			if !ok {
 				continue
 			}
-			bytes, ok := signature.Results().At(0).Type().(*types.Slice)
-			if !ok || !types.Identical(bytes.Elem(), types.Typ[types.Byte]) {
-				continue
-			}
-			if types.Identical(signature.Results().At(1).Type(), types.Universe.Lookup("error").Type()) {
-				return true
+			params, results := signature.Params(), signature.Results()
+			switch name {
+			case "MarshalJSON", "MarshalText":
+				if params.Len() == 0 && results.Len() == 2 && isBytes(results.At(0).Type()) && types.Identical(results.At(1).Type(), errorType) {
+					return true
+				}
+			case "AppendText":
+				if params.Len() == 1 && isBytes(params.At(0).Type()) && results.Len() == 2 && isBytes(results.At(0).Type()) && types.Identical(results.At(1).Type(), errorType) {
+					return true
+				}
+			case "MarshalJSONTo":
+				// The parameter is *jsontext.Encoder; matching the shape
+				// keeps this independent of how imports were resolved.
+				if params.Len() == 1 && results.Len() == 1 && types.Identical(results.At(0).Type(), errorType) {
+					if _, pointer := params.At(0).Type().(*types.Pointer); pointer {
+						return true
+					}
+				}
 			}
 		}
 	}

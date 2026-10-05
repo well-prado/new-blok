@@ -73,6 +73,24 @@ func TestReferenceWorkIsBoundedBySelectedMember(t *testing.T) {
 	}
 }
 
+// optionLevel tags its key with an option encoding/json ignores; that must
+// not push the struct onto the whole-encoding path.
+type optionLevel struct {
+	Big []string `json:"big"`
+	ID  string   `json:"id,required"`
+}
+
+func TestIgnoredTagOptionKeepsWorkBounded(t *testing.T) {
+	const limit = 4 << 10
+	big := boundState(1)["source"].(boundLevel).Big
+	state := map[string]any{"source": optionLevel{Big: big, ID: "b-1"}}
+	perRun := bytesPerResolution(t, state, contract.Reference{Step: "source", Path: []string{"id"}})
+	t.Logf("%d bytes per resolution beside a %d-byte sibling", perRun, boundSiblingBytes)
+	if perRun > limit {
+		t.Fatalf("%d bytes per resolution; want at most %d", perRun, limit)
+	}
+}
+
 func BenchmarkReferenceBesideLargeSibling(b *testing.B) {
 	for _, segments := range []int{1, 5} {
 		state, reference := boundState(segments), boundPath(segments)
@@ -84,5 +102,22 @@ func BenchmarkReferenceBesideLargeSibling(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+type quotedLevel struct {
+	N int64 `json:"n,string"`
+}
+
+// BenchmarkReferenceStringOption: a ,string selection encodes the scalar
+// through probe structs built once with the type's key index.
+func BenchmarkReferenceStringOption(b *testing.B) {
+	state := map[string]any{"source": quotedLevel{N: 5}}
+	reference := contract.Reference{Step: "source", Path: []string{"n"}}
+	b.ReportAllocs()
+	for b.Loop() {
+		if value, err := resolveReference(state, reference); err != nil || value != "5" {
+			b.Fatalf("value=%#v err=%v", value, err)
+		}
 	}
 }

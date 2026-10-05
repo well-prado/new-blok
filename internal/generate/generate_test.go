@@ -143,3 +143,59 @@ func TestStringOptionFieldsGetNoAccessor(t *testing.T) {
 		t.Fatalf("missing Total accessor:\n%s", text)
 	}
 }
+
+// TestNewerEncodersGetNoFieldAccessors: Go 1.27's encoding/json also calls
+// AppendText and MarshalJSONTo, by value or pointer receiver (#241).
+func TestNewerEncodersGetNoFieldAccessors(t *testing.T) {
+	source := []byte("package shop\n\n" +
+		"type Appends struct{ Secret int64 }\n\n" +
+		"func (Appends) AppendText(b []byte) ([]byte, error) { return b, nil }\n\n" +
+		"type PointerAppends struct{ Secret int64 }\n\n" +
+		"func (*PointerAppends) AppendText(b []byte) ([]byte, error) { return b, nil }\n\n" +
+		"// Encoder stands in for jsontext.Encoder: the generator type-checks\n" +
+		"// one file without imports.\n" +
+		"type Encoder struct{}\n\n" +
+		"type EncodesTo struct{ Secret int64 }\n\n" +
+		"func (EncodesTo) MarshalJSONTo(*Encoder) error { return nil }\n\n" +
+		"type Plain struct{ Secret int64 }\n")
+	generated, err := Source(source, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(generated)
+	for _, absent := range []string{"AppendsRef", "PointerAppendsRef", "EncodesToRef"} {
+		if strings.Contains(text, absent) {
+			t.Fatalf("type with its own encoder got %s:\n%s", absent, text)
+		}
+	}
+	if !strings.Contains(text, "func (r PlainRef) Secret() flow.Ref[int64]") {
+		t.Fatalf("missing Plain accessor:\n%s", text)
+	}
+}
+
+// TestSharedKeyGetsOneAccessor: when fields share a key, encoding/json
+// writes the tagged one and drops a tie; the generator emits exactly that
+// field's accessor, or none (#241).
+func TestSharedKeyGetsOneAccessor(t *testing.T) {
+	source := []byte("package shop\n\ntype Line struct {\n" +
+		"\tName string\n" +
+		"\tAlias int64 `json:\"Name\"`\n" +
+		"\tLeft int64 `json:\"side\"`\n" +
+		"\tRight int64 `json:\"side\"`\n" +
+		"\tCount int64 `json:\"n,string\"`\n" +
+		"\tTotal int64 `json:\"n\"`\n" +
+		"}\n")
+	generated, err := Source(source, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(generated)
+	if !strings.Contains(text, `func (r LineRef) Alias() flow.Ref[int64] { return flow.Select[Line, int64](r.value, "Name") }`) {
+		t.Fatalf("missing the dominant Name accessor:\n%s", text)
+	}
+	for _, absent := range []string{"func (r LineRef) Name()", "func (r LineRef) Left()", "func (r LineRef) Right()", "func (r LineRef) Count()", "func (r LineRef) Total()"} {
+		if strings.Contains(text, absent) {
+			t.Fatalf("unexpected %s:\n%s", absent, text)
+		}
+	}
+}

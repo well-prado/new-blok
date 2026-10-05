@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"math"
@@ -124,6 +125,40 @@ type refBoxed struct {
 
 type refCode string
 
+// refEncodesTo, refAppendsText and refPointerAppender use the encoders Go
+// 1.27's encoding/json added: MarshalJSONTo and AppendText.
+type refEncodesTo struct{ Secret int }
+
+func (refEncodesTo) MarshalJSONTo(encoder *jsontext.Encoder) error {
+	return encoder.WriteToken(jsontext.String("viaTo"))
+}
+
+type refAppendsText struct{ Secret int }
+
+func (refAppendsText) AppendText(text []byte) ([]byte, error) { return append(text, "app"...), nil }
+
+type refPointerAppender struct{ Secret int }
+
+func (*refPointerAppender) AppendText(text []byte) ([]byte, error) {
+	return append(text, "papp"...), nil
+}
+
+type refHoldsPointerAppender struct {
+	P refPointerAppender `json:"p"`
+}
+
+// refAppendKey is a map key whose AppendText upper-cases it.
+type refAppendKey string
+
+func (k refAppendKey) AppendText(text []byte) ([]byte, error) {
+	return append(text, strings.ToUpper(string(k))...), nil
+}
+
+// refIgnoredOption carries a tag option encoding/json ignores.
+type refIgnoredOption struct {
+	ID string `json:"id,required"`
+}
+
 // refUpperKey is a string-kind map key with its own text form; encoding/json
 // writes the text form, not the string.
 type refUpperKey string
@@ -176,6 +211,15 @@ func referenceSources() map[string]any {
 		"orderValue":         refOuter{Order: refOrder{ID: "o-1", Price: refCents{Cents: 1500}}},
 		"orderPointer":       &refOuter{Order: refOrder{ID: "o-1", Price: refCents{Cents: 1500}}},
 		"twice":              RefTwice{RefLeft{RefShared{V: RefShapeA{V: 1}}}, RefRight{RefShared{V: RefShapeA{V: 2}}}},
+		"untaggedFirst":      RefUntaggedFirst{RefPlainShape{Key: RefShapeB{V: 1}}, RefTaggedShape{Key: RefShapeA{V: 1}}},
+		"tieThenTagged":      RefTieThenTagged{RefPlainShape{Key: RefShapeB{V: 1}}, RefPlainShapeC{Key: RefShapeB{V: 1}}, RefTaggedShape{Key: RefShapeA{V: 1}}},
+		"recursive":          RefRecursive{RefRecursive: &RefRecursive{V: 2}, V: 1},
+		"encodesTo":          refEncodesTo{Secret: 1},
+		"appendsText":        refAppendsText{Secret: 1},
+		"appendKeyMap":       map[refAppendKey]int{"x": 1},
+		"appenderInPointer":  &refHoldsPointerAppender{},
+		"appenderInValue":    refHoldsPointerAppender{},
+		"ignoredOption":      refIgnoredOption{ID: "b-1"},
 	}
 }
 
@@ -387,6 +431,29 @@ type refOuter struct {
 	Order refOrder `json:"order"`
 }
 
+type RefPlainShapeC struct {
+	Key RefShapeB
+}
+
+// RefUntaggedFirst lists the untagged "Key" before the tagged one.
+type RefUntaggedFirst struct {
+	RefPlainShape
+	RefTaggedShape
+}
+
+// RefTieThenTagged: two untagged "Key"s tie, then a tagged one breaks it.
+type RefTieThenTagged struct {
+	RefPlainShape
+	RefPlainShapeC
+	RefTaggedShape
+}
+
+// RefRecursive embeds itself; key indexing must terminate.
+type RefRecursive struct {
+	*RefRecursive
+	V int
+}
+
 // TestTypedReferencesKeepGoTypes: native nodes assert their declared input
 // type, so a selected field is handed on as its Go value, the same for a T
 // and a *T output. Only a ,string member and members inside a container
@@ -418,6 +485,9 @@ func TestTypedReferencesKeepGoTypes(t *testing.T) {
 		{"shadowStruct", []string{"data"}, RefShapeB{V: 1}},
 		{"tagDominantStruct", []string{"Key"}, RefShapeA{V: 1}},
 		{"twice", []string{"V"}, nil},
+		{"untaggedFirst", []string{"Key"}, RefShapeA{V: 1}},
+		{"tieThenTagged", []string{"Key"}, RefShapeA{V: 1}},
+		{"recursive", []string{"V"}, 1},
 	} {
 		t.Run(tc.source+"."+strings.Join(tc.path, "."), func(t *testing.T) {
 			got := resolveValue(t, sources[tc.source], tc.path)

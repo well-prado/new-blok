@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding"
 	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"fmt"
 	"reflect"
 	"strconv"
@@ -19,29 +20,50 @@ import (
 // an object is the one encoding/json emits for it: promoted fields of
 // embedded structs flattened, json:"-" fields absent, a tagged field only
 // under its tag name, empty omitempty and zero omitzero fields absent,
-// ,string fields as their quoted text, and custom MarshalJSON/MarshalText
-// output as written.
+// ,string fields as their quoted text, and values with their own encoder
+// (MarshalJSON, MarshalJSONTo, MarshalText, AppendText) as written.
 //
 // Work is bounded by the selected member, never by its siblings. A struct
 // resolves through a per-type key index, built once per type. Each tag's
 // key name is delegated to encoding/json through a one-field struct with
-// the same json tag, so unusual tags follow the linked implementation (Go
-// 1.27's default and its GOEXPERIMENT=nojsonv2 v1 implementation name them
-// differently). omitempty and omitzero are decided from the selected field
-// alone; a ,string scalar is the only member encoded. Map keys are named
-// without encoding values. Only a container whose own type has a custom
-// marshaler is encoded whole, because its keys exist nowhere else.
+// the same json tag, so unusual tags follow encoding/json's own parsing.
+// omitempty and omitzero are decided from the selected field alone; a
+// ,string scalar is the only member encoded. Map keys are named without
+// encoding values. Only a container whose own type has a custom encoder
+// (MarshalJSON, MarshalJSONTo, MarshalText or AppendText) is encoded whole,
+// because its keys exist nowhere else.
+//
+// Supported and tested: Go 1.27's default, v2-backed encoding/json. The
+// GOEXPERIMENT=nojsonv2 (v1) implementation is untested: this repository
+// does not build in that mode (observation.go imports encoding/json/v2).
 //
 // A selected field is handed on as its Go value, so native nodes receive
 // their declared input types whether the output was a T or a *T. The
 // exception is a ,string field, whose member is its quoted text.
 
 var (
-	jsonMarshalerType = reflect.TypeFor[json.Marshaler]()
-	textMarshalerType = reflect.TypeFor[encoding.TextMarshaler]()
-	jsonNumberType    = reflect.TypeFor[json.Number]()
-	stringType        = reflect.TypeFor[string]()
+	jsonNumberType = reflect.TypeFor[json.Number]()
+	stringType     = reflect.TypeFor[string]()
+	// customEncoders are the method sets encoding/json calls instead of
+	// encoding a value's own fields or kind. Go 1.27's default (v2-backed)
+	// encoding/json honours all four, by value or pointer receiver.
+	customEncoders = []reflect.Type{
+		reflect.TypeFor[json.Marshaler](),
+		reflect.TypeFor[jsonv2.MarshalerTo](),
+		reflect.TypeFor[encoding.TextMarshaler](),
+		reflect.TypeFor[encoding.TextAppender](),
+	}
 )
+
+// encodesItself reports whether typ has one of customEncoders' methods.
+func encodesItself(typ reflect.Type) bool {
+	for _, encoder := range customEncoders {
+		if typ.Implements(encoder) {
+			return true
+		}
+	}
+	return false
+}
 
 // field selects the member name of the JSON object current encodes to.
 func field(current reflect.Value, name string) (reflect.Value, error) {
@@ -94,13 +116,19 @@ func kindError(current reflect.Value, name string) error {
 		if current.IsNil() {
 			return nullError(name)
 		}
-		if current.Type().Elem().Kind() == reflect.Uint8 {
-			pointer := reflect.PointerTo(current.Type().Elem())
-			if !pointer.Implements(jsonMarshalerType) && !pointer.Implements(textMarshalerType) {
-				return fmt.Errorf("cannot read %q from a JSON string", name)
-			}
+		if current.Type().Elem().Kind() != reflect.Uint8 {
+			return fmt.Errorf("cannot read %q from a JSON array", name)
 		}
-		return fmt.Errorf("cannot read %q from a JSON array", name)
+		if !encodesItself(reflect.PointerTo(current.Type().Elem())) {
+			return fmt.Errorf("cannot read %q from a JSON string", name)
+		}
+		// Bytes with their own encoders: ask encoding/json. The value is the
+		// one being descended into, so this is bounded by the selection.
+		encoded, err := encodeInPlace(current)
+		if err != nil {
+			return unencodableError(name, err)
+		}
+		return fmt.Errorf("cannot read %q from a JSON %s", name, jsonKind(encoded))
 	case reflect.Array:
 		if current.Type().Elem().Kind() != reflect.Uint8 {
 			return fmt.Errorf("cannot read %q from a JSON array", name)
@@ -123,8 +151,7 @@ func mapMember(current reflect.Value, name string) (reflect.Value, error) {
 		return reflect.Value{}, nullError(name)
 	}
 	key := current.Type().Key()
-	textual := key.Implements(textMarshalerType) || reflect.PointerTo(key).Implements(textMarshalerType) ||
-		key.Implements(jsonMarshalerType) || reflect.PointerTo(key).Implements(jsonMarshalerType)
+	textual := encodesItself(reflect.PointerTo(key))
 	var found reflect.Value
 	switch {
 	case !textual && key.Kind() == reflect.String:
@@ -234,25 +261,26 @@ func structMember(current reflect.Value, name string) (reflect.Value, error) {
 	if selected.omitEmpty && emptyValue(value) || selected.omitZero && zeroValue(value) {
 		return reflect.Value{}, missingError(name)
 	}
-	if !selected.quoted || !quotable(selected.field.Type) {
+	if selected.probe == nil {
 		return value, nil
 	}
 	// ,string re-encodes a scalar as text; encoding/json decides whether it
 	// applies and what the text is. The member is a scalar, so this is
 	// bounded by the selection.
-	member, present, err := encodeMember(selected.probe, value)
+	quoted, err := encodeProbe(selected.probe, value)
 	if err != nil {
 		// NaN or ±Inf: no JSON form exists to disagree with.
 		return value, nil
 	}
-	if !present {
+	if bytes.Equal(quoted, []byte("{}")) {
 		return reflect.Value{}, missingError(name)
 	}
-	plain, _, err := encodeMember(probeType(selected.field, selected.plainTag), value)
-	if err != nil || !bytes.Equal(plain, member) {
-		return decodeMember(member, name)
+	// Both probes carry the same key, so equal encodings mean the option
+	// changed nothing and the Go value is the member.
+	if plain, err := encodeProbe(selected.plainProbe, value); err == nil && bytes.Equal(plain, quoted) {
+		return value, nil
 	}
-	return value, nil
+	return decodeMember(probeMember(quoted), name)
 }
 
 // quotable reports the kinds encoding/json's ,string option can apply to:
@@ -292,32 +320,27 @@ func zeroValue(value reflect.Value) bool {
 	return value.IsZero()
 }
 
-// encodeMember encodes value as the single field of probe, where it sits:
+// encodeProbe encodes value as the single field of probe, where it sits:
 // addressable values reach pointer-receiver methods.
-func encodeMember(probeStruct reflect.Type, value reflect.Value) ([]byte, bool, error) {
+func encodeProbe(probeStruct reflect.Type, value reflect.Value) ([]byte, error) {
 	probe := reflect.New(probeStruct)
 	probe.Elem().Field(0).Set(value)
-	var encoded []byte
-	var err error
 	if value.CanAddr() {
-		encoded, err = json.Marshal(probe.Interface())
-	} else {
-		encoded, err = json.Marshal(probe.Elem().Interface())
+		return json.Marshal(probe.Interface())
 	}
-	if err != nil {
-		return nil, false, err
-	}
+	return json.Marshal(probe.Elem().Interface())
+}
+
+// probeMember returns the member of a one-key object encoding/json wrote.
+func probeMember(encoded []byte) []byte {
 	var members map[string]json.RawMessage
-	if err := json.Unmarshal(encoded, &members); err != nil {
-		return nil, false, err
-	}
-	if len(members) == 0 {
-		return nil, false, nil
+	if json.Unmarshal(encoded, &members) != nil {
+		return nil
 	}
 	for _, member := range members {
-		return member, true, nil
+		return member
 	}
-	return nil, false, nil
+	return nil
 }
 
 func decodeMember(member []byte, name string) (reflect.Value, error) {
@@ -405,35 +428,33 @@ func jsonKind(encoded []byte) string {
 	}
 }
 
-// customEncoding reports whether encoding/json would call a MarshalJSON or
-// MarshalText method for value where it sits.
+// customEncoding reports whether encoding/json would call one of the
+// customEncoders' methods for value where it sits: pointer-receiver methods
+// only apply to addressable values.
 func customEncoding(value reflect.Value) bool {
 	typ := value.Type()
-	if typ.Implements(jsonMarshalerType) || typ.Implements(textMarshalerType) {
+	if encodesItself(typ) {
 		return true
 	}
-	if typ.Kind() != reflect.Pointer && value.CanAddr() {
-		pointer := reflect.PointerTo(typ)
-		return pointer.Implements(jsonMarshalerType) || pointer.Implements(textMarshalerType)
-	}
-	return false
+	return typ.Kind() != reflect.Pointer && value.CanAddr() && encodesItself(reflect.PointerTo(typ))
 }
 
 type structKey struct {
-	index     []int
-	probe     reflect.Type // for ,string: one-field struct with the field's type and json tag
-	plainTag  string       // the json tag without the string option
-	omitEmpty bool
-	omitZero  bool
-	quoted    bool
-	field     reflect.StructField
+	index []int
+	// For a ,string field: one-field structs with the field's type and its
+	// json tag, with and without the string option, built with the plan.
+	probe      reflect.Type
+	plainProbe reflect.Type
+	omitEmpty  bool
+	omitZero   bool
+	quoted     bool
+	field      reflect.StructField
 }
 
 type structPlan struct {
 	keys map[string]structKey
-	// unsupported marks tags using options this index does not model
-	// (encoding/json/v2 options such as inline or format); such structs
-	// resolve against their whole encoding.
+	// unsupported marks tags using embed or format, which this index does
+	// not model; such structs resolve against their whole encoding.
 	unsupported bool
 }
 
@@ -451,7 +472,7 @@ type tagName struct {
 const probeFieldName = "BlokReferenceProbe"
 
 // keyForTag asks encoding/json which key a tag names, so unusual tags follow
-// the linked implementation. An empty name means the tag names no key and
+// encoding/json's own tag parsing. An empty name means the tag names no key and
 // the Go field name applies.
 func keyForTag(tag string) tagName {
 	if cached, ok := tagNames.Load(tag); ok {
@@ -575,15 +596,12 @@ func structPlanFor(typ reflect.Type) structPlan {
 					if key == "" {
 						key = structField.Name
 					}
-					plainTag := tag
-					if quoted {
-						plainTag = withoutStringOption(tag)
-					}
 					leaf := structField
 					leaf.Anonymous = false
-					selected := structKey{index: index, field: leaf, plainTag: plainTag, omitEmpty: omitEmpty, omitZero: omitZero, quoted: quoted}
-					if quoted {
+					selected := structKey{index: index, field: leaf, omitEmpty: omitEmpty, omitZero: omitZero, quoted: quoted}
+					if quoted && quotable(leaf.Type) {
 						selected.probe = probeType(leaf, tag)
+						selected.plainProbe = probeType(leaf, withoutStringOption(tag))
 					}
 					best[key] = append(best[key], candidate{key: selected, tagged: named})
 					if count[entry.typ] > 1 {
@@ -619,22 +637,22 @@ func structPlanFor(typ reflect.Type) structPlan {
 	return cached.(structPlan)
 }
 
-// tagOptions recognizes the options whose effect this index models; any
-// other option makes the struct resolve against its whole encoding.
+// tagOptions reads the options encoding/json acts on when encoding. Go
+// 1.27's default encoding/json also acts on embed (an unnamed embed field is
+// inlined) and format (encoding fails); a struct using either resolves
+// against its whole encoding (known=false). Every other option, including
+// case:… (decoding only) and look-alikes such as omitEmpty, is ignored by
+// encoding/json, so it is ignored here.
 func tagOptions(options string) (omitEmpty, omitZero, quoted, known bool) {
-	if options == "" {
-		return false, false, false, true
-	}
 	for _, option := range strings.Split(options, ",") {
-		switch option {
-		case "omitempty":
+		switch {
+		case option == "omitempty":
 			omitEmpty = true
-		case "omitzero":
+		case option == "omitzero":
 			omitZero = true
-		case "string":
+		case option == "string":
 			quoted = true
-		case "":
-		default:
+		case option == "embed", option == "format", strings.HasPrefix(option, "format:"):
 			return false, false, false, false
 		}
 	}

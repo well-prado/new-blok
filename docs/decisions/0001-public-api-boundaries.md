@@ -113,8 +113,9 @@ workflow) as decoded maps.
   wins, a tagged field breaks a tie, a remaining tie drops the key; a field
   promoted through a nil embedded pointer is absent), no `-` fields, a tagged
   field only under its tag name, empty `omitempty` and zero `omitzero` fields
-  absent, `,string` scalars as their quoted text, containers with their own
-  `MarshalJSON`/`MarshalText` as that method writes them, map keys as their
+  absent, `,string` scalars as their quoted text, values with their own
+  encoder (`MarshalJSON`, `MarshalJSONTo`, `MarshalText` or `AppendText`, by
+  value or pointer receiver) as that method writes them, map keys as their
   encoded text, and duplicate names resolved to the last as a JSON decoder
   would. A null value, including a nil map or slice, fails with
   `cannot read "<key>" from null`; a non-object fails with
@@ -128,19 +129,25 @@ workflow) as decoded maps.
   `encoding/json` encodes a field tagged `json:"it's"` under `"it"` and a
   `string`-kind map key with `MarshalText` under its text, while its v1
   implementation (`GOEXPERIMENT=nojsonv2`) falls back to the Go field name
-  and uses the raw string. `omitempty` and `omitzero` are decided from the
+  and uses the raw string. The supported and tested implementation is Go
+  1.27's default; the v1 mode is untested, because this repository does not
+  build in it (`internal/engine/observation.go` imports `encoding/json/v2`).
+  `omitempty` and `omitzero` are decided from the
   selected field alone, with `encoding/json`'s definitions (v1's emptiness,
   which the v2-backed implementation keeps for `encoding/json`, and a type's
   own `IsZero`). The only member ever encoded is a `,string` scalar. Map keys are
-  named without encoding values. A container whose own type has a custom
-  marshaler is the one case encoded whole, because its keys exist nowhere
-  else. Tags using options this index does not model (`encoding/json/v2`
-  options such as `inline` or `format`) also resolve against the whole
-  encoding.
+  named without encoding values. A container whose own type has one of the
+  four encoders is the one case encoded whole, because its keys exist
+  nowhere else. Of the tag options Go 1.27's `encoding/json` parses, `embed`
+  (an unnamed `embed` field is inlined) and `format:…` (encoding fails) are
+  not modelled, so a struct using either also resolves against its whole
+  encoding. Every other option, including `case:…` (decoding only), unknown
+  options such as `required`, and look-alikes such as `omitEmpty`, is ignored
+  by `encoding/json` and here.
 - **Typed values stay typed.** A selected field is handed on as its Go value,
   so native nodes receive their declared input types whether the source node
   returned a `T` or a `*T`. Only a `,string` member, and members of a
-  container with its own marshaler, are handed on decoded. Consequence: a
+  container with its own encoder, are handed on decoded. Consequence: a
   field whose type marshals through a pointer receiver, selected from inside
   a pointer output, is handed on as its Go value, whose by-value encoding
   differs from the member `encoding/json` wrote in place. Navigating *through*
@@ -154,11 +161,12 @@ workflow) as decoded maps.
 A hand-written reference that relied on the old struct-only behavior now
 fails with `invalid_output_reference` / `invalid_input_reference`: a Go field
 name where a json tag renames the field, a `json:"-"` field, an embedded type's
-name, a field of a type with its own marshaler, or an empty `omitempty` / zero
+name, a field of a type with its own encoder, or an empty `omitempty` / zero
 `omitzero` field. A reference through a `,string` field now yields its quoted
 text. Migration: select the key the value has in its JSON (`blok generate`
-accessors do, #240; they now also skip `,string` fields and types with their
-own marshaler); read promoted fields at the parent level; move data the
+accessors do, #240; they now also skip `,string` fields and types with any
+of the four encoders, and emit one accessor per key, for the field
+`encoding/json` writes); read promoted fields at the parent level; move data the
 workflow must read out of `json:"-"`. No reference in this repository's
 examples, fixtures or scaffolds needed migration.
 
@@ -173,7 +181,10 @@ Fixtures: `testdata/references/json-keys.json` holds valid and rejected cases.
 and against its `encoding/json` round trip through the production
 interpreter, requires both to match the fixture, and asserts the Go types
 handed on, including for `T` versus `*T` outputs and for members selected by
-the shadowing, tag-dominance and duplicate-embedding rules. Limits: a
+the shadowing, tag-dominance and duplicate-embedding rules.
+`internal/engine/reference_property_test.go` compares every candidate key of
+1,500 seeded random `reflect.StructOf` shapes, as `T` and `*T`, against
+`json.Marshal` → `json.Unmarshal`. Limits: a
 generated accessor for an `omitempty`/`omitzero` field is typed as always
 present, but its reference fails when the value is empty; the generator still
 emits no accessors for promoted fields; inspection capture (`observation.go`)
