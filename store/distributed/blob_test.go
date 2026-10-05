@@ -2,6 +2,8 @@ package distributed
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,8 +12,56 @@ import (
 	"testing"
 	"time"
 
+	"github.com/minio/minio-go/v7"
 	"github.com/well-prado/new-blok/internal/clustertest"
 )
+
+// sharedBlobBucket is the one bucket every distributed blob test uses. A
+// SeaweedFS bucket owns a collection, and every collection claims volume
+// slots from a small fixed budget (five on a small disk). A bucket per test
+// leaks slots on a long-lived dev cluster until every upload fails with "No
+// writable volumes" (#292), so the bucket is created once per cluster and
+// never removed; tests isolate themselves with payloads no other test shares.
+const sharedBlobBucket = "blok-distributed-tests"
+
+// sharedBlobStore returns the cluster's shared test bucket, creating it on
+// first use.
+func sharedBlobStore(t *testing.T, endpoint string) *S3BlobStore {
+	t.Helper()
+	blobs, err := NewS3BlobStore(endpoint, sharedBlobBucket, "spike-access", "spike-secret-only-local", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := blobs.EnsureBucket(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return blobs
+}
+
+// uniqueBlobPayload returns a payload no other test or run shares. Blob keys
+// are the content digest, so a unique payload is a unique key: that is the
+// per-test isolation inside the shared bucket.
+func uniqueBlobPayload(label string) []byte {
+	return []byte(fmt.Sprintf("%s %d-%d", label, os.Getpid(), time.Now().UnixNano()))
+}
+
+// removeBlobPayloads deletes the objects the given payloads were stored
+// under, so the shared bucket does not accumulate data across runs.
+func removeBlobPayloads(t *testing.T, blobs *S3BlobStore, payloads ...[]byte) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		for _, payload := range payloads {
+			digest := sha256.Sum256(payload)
+			if err := blobs.client.RemoveObject(ctx, blobs.bucket, hex.EncodeToString(digest[:]), minio.RemoveObjectOptions{}); err != nil {
+				t.Errorf("remove synthetic blob object: %v", err)
+			}
+		}
+	})
+}
 
 func TestS3BlobOutageBlocksReferenceAndResume(t *testing.T) {
 	endpoint := os.Getenv("BLOK_DISTRIBUTED_S3_ENDPOINT")
@@ -20,34 +70,18 @@ func TestS3BlobOutageBlocksReferenceAndResume(t *testing.T) {
 	}
 	// Wait for the cluster lock before this test's deadlines start.
 	clustertest.Endpoints(t)
-	bucket := fmt.Sprintf("blok-%d", time.Now().UnixNano())
-	blobs, err := NewS3BlobStore(endpoint, bucket, "spike-access", "spike-secret-only-local", false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	setupCtx, setupCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	if err := blobs.EnsureBucket(setupCtx); err != nil {
-		setupCancel()
-		t.Fatal(err)
-	}
-	setupCancel()
-	t.Cleanup(func() {
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cleanupCancel()
-		if err := blobs.RemoveBucket(cleanupCtx); err != nil {
-			t.Errorf("remove synthetic blob bucket: %v", err)
-		}
-	})
+	blobs := sharedBlobStore(t, endpoint)
+	payload := uniqueBlobPayload("synthetic durable artifact for distributed-store spike")
+	removeBlobPayloads(t, blobs, payload)
+	partition := fmt.Sprintf("blob-%d", time.Now().UnixNano())
 
 	journal, _ := integrationStore(t, "BLOK_DISTRIBUTED_ENDPOINTS")
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	owner, err := journal.Acquire(ctx, bucket, "blob-owner", 15*time.Second)
+	owner, err := journal.Acquire(ctx, partition, "blob-owner", 15*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload := []byte("synthetic durable artifact for distributed-store spike")
-
 	if output, err := exec.Command("docker", composeArgs("pause", "s3")...).CombinedOutput(); err != nil {
 		t.Fatalf("pause object service before reference commit: %v: %s", err, output)
 	}
@@ -70,17 +104,17 @@ func TestS3BlobOutageBlocksReferenceAndResume(t *testing.T) {
 	// Measured after the object service is back: a reference committed or
 	// an output readable through it would both be visible now.
 	outputPublished := 0
-	if output, err := journal.ReadBlob(ctx, bucket, "unavailable-before-reference", blobs); err == nil && output != nil {
+	if output, err := journal.ReadBlob(ctx, partition, "unavailable-before-reference", blobs); err == nil && output != nil {
 		outputPublished++
 	}
 	assertScenarioFixture(t, "blob-unavailable-before-reference", map[string]any{
-		"referenceCommitted": committedEvents(t, ctx, journal, bucket, "unavailable-before-reference"), "outputPublished": outputPublished, "errors": sortedErrorLabels(beforeErrors),
+		"referenceCommitted": committedEvents(t, ctx, journal, partition, "unavailable-before-reference"), "outputPublished": outputPublished, "errors": sortedErrorLabels(beforeErrors),
 	})
 
 	if err := journal.CommitBlob(ctx, owner, "blob-backed-output", blobs, payload); err != nil {
 		t.Fatalf("commit verified blob reference: %v", err)
 	}
-	read, err := journal.ReadBlob(ctx, bucket, "blob-backed-output", blobs)
+	read, err := journal.ReadBlob(ctx, partition, "blob-backed-output", blobs)
 	if err != nil || string(read) != string(payload) {
 		t.Fatalf("read verified blob = %q, err=%v", read, err)
 	}
@@ -93,12 +127,12 @@ func TestS3BlobOutageBlocksReferenceAndResume(t *testing.T) {
 	defer readCancel()
 	afterErrors := make(map[string]struct{})
 	resumeAllowed := true
-	if _, err := journal.ReadBlob(readCtx, bucket, "blob-backed-output", blobs); err != nil {
+	if _, err := journal.ReadBlob(readCtx, partition, "blob-backed-output", blobs); err != nil {
 		resumeAllowed = false
 		afterErrors[errorLabel(err)] = struct{}{}
 	}
 	assertScenarioFixture(t, "blob-unavailable-after-reference", map[string]any{
-		"referenceStillDurable": committedEvents(t, ctx, journal, bucket, "blob-backed-output") == 1, "resumeAllowed": resumeAllowed, "errors": sortedErrorLabels(afterErrors),
+		"referenceStillDurable": committedEvents(t, ctx, journal, partition, "blob-backed-output") == 1, "resumeAllowed": resumeAllowed, "errors": sortedErrorLabels(afterErrors),
 	})
 }
 
@@ -109,23 +143,11 @@ func TestPartitionTakeoverKeepsTimerSignalAndBlobReferences(t *testing.T) {
 	}
 	// Wait for the cluster lock before this test's deadlines start.
 	clustertest.Endpoints(t)
-	bucket := fmt.Sprintf("blok-%d", time.Now().UnixNano())
-	blobs, err := NewS3BlobStore(endpoint, bucket, "spike-access", "spike-secret-only-local", false)
-	if err != nil {
-		t.Fatal(err)
-	}
+	blobs := sharedBlobStore(t, endpoint)
+	artifactPayload := uniqueBlobPayload("synthetic retained artifact")
+	removeBlobPayloads(t, blobs, artifactPayload)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	if err := blobs.EnsureBucket(ctx); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cleanupCancel()
-		if err := blobs.RemoveBucket(cleanupCtx); err != nil {
-			t.Errorf("remove synthetic migration bucket: %v", err)
-		}
-	})
 	journal, _ := integrationStore(t, "BLOK_DISTRIBUTED_ENDPOINTS")
 	partition := fmt.Sprintf("migration-%d", time.Now().UnixNano())
 	oldOwner, err := journal.Acquire(ctx, partition, "before-migration", 2*time.Second)
@@ -138,11 +160,24 @@ func TestPartitionTakeoverKeepsTimerSignalAndBlobReferences(t *testing.T) {
 	if err := journal.Commit(ctx, oldOwner, "signal-record", "signal", []byte(`{"name":"synthetic"}`)); err != nil {
 		t.Fatal(err)
 	}
-	if err := journal.CommitBlob(ctx, oldOwner, "artifact-record", blobs, []byte("synthetic retained artifact")); err != nil {
+	if err := journal.CommitBlob(ctx, oldOwner, "artifact-record", blobs, artifactPayload); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(2400 * time.Millisecond)
-	newOwner, err := journal.Acquire(ctx, partition, "after-migration", 10*time.Second)
+	// etcd revokes an expired lease on its own schedule (it checks on a
+	// 500ms tick), so the old lease can outlive its 2s TTL by a moment.
+	// Retry while the old owner still holds the partition; the takeover
+	// semantics under test are unchanged. With a warm bucket this race is
+	// no longer hidden behind a slow first upload (#292).
+	var newOwner Owner
+	takeoverDeadline := time.Now().Add(8 * time.Second)
+	for {
+		newOwner, err = journal.Acquire(ctx, partition, "after-migration", 10*time.Second)
+		if !errors.Is(err, ErrOwnershipLost) || time.Now().After(takeoverDeadline) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 	if err != nil {
 		t.Fatalf("take over stable partition: %v", err)
 	}
@@ -174,7 +209,7 @@ func TestPartitionTakeoverKeepsTimerSignalAndBlobReferences(t *testing.T) {
 		retained[kind] = err == nil && encoded != nil && json.Unmarshal(encoded, &record) == nil && record.Kind == kind && record.Partition == partition && record.Fence == oldOwner.Token
 	}
 	artifact, err := journal.ReadBlob(ctx, partition, "artifact-record", blobs)
-	blobVerified := err == nil && string(artifact) == "synthetic retained artifact"
+	blobVerified := err == nil && string(artifact) == string(artifactPayload)
 	if err := journal.Commit(ctx, oldOwner, "stale-after-migration", "state", []byte(`{"stale":true}`)); err != nil {
 		takeoverErrors[errorLabel(err)] = struct{}{}
 	}
