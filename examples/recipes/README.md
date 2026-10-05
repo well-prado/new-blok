@@ -71,9 +71,11 @@ go run ./examples/recipes/cmd/shop migrate-status
 go run ./examples/recipes/cmd/shop serve
 ```
 
-These PowerShell instructions are not native Windows execution evidence.
-Clean-machine setup, standard-user permissions, Ctrl+C and SQLite reopen
-validation remain required under #157; this recipe is not Windows-certified.
+These PowerShell instructions are unverified: they have not been executed on
+native Windows and are not Windows execution evidence. Clean-machine setup,
+standard-user permissions, Ctrl+C and SQLite reopen validation belong to the
+separate Windows track (#297, #157). This recipe makes no Windows support,
+installation or certification claim.
 
 The independent consumer module at
 [`external/shopapp`](external/shopapp) imports the exported recipe and SQLite
