@@ -1,0 +1,17 @@
+A Go node and a nodejs node claim one identity across runtimes.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+
+go 1.27.0
+-- nodes/go/quote/quote.go --
+package n
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/quote", "1.0.0", handle)
+-- nodes/nodejs/quote/node.json --
+{"name":"shop/quote","version":"1.0.0"}
+-- @expect --
+{"diagnostics":[["layout_duplicate_identity","nodes/nodejs/quote"]]}

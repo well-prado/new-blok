@@ -1,0 +1,27 @@
+Two workflows declare one identity.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"classic","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+
+go 1.27.0
+-- runtimes/go/nodes/quote/quote.go --
+package n
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/quote", "1.0.0", handle)
+-- workflows/a/a.go --
+package a
+
+import "github.com/well-prado/new-blok/flow"
+
+var W = flow.MustDefine[int, int](flow.Spec{Name: "shop/flow", Version: "1.0.0"}, nil)
+-- workflows/b/b.go --
+package b
+
+import f "github.com/well-prado/new-blok/flow"
+
+var W = f.MustDefine[int, int](f.Spec{"shop/flow", "1.0.0", f.Memory}, nil)
+-- @expect --
+{"diagnostics":[["layout_duplicate_identity","workflows/b/b.go:5"]]}

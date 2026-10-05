@@ -1,0 +1,30 @@
+A node imports another node (classic): forbidden. Its same-node and shared-package imports are allowed.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"classic","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+
+go 1.27.0
+-- internal/domain/domain.go --
+package domain
+-- runtimes/go/nodes/alpha/alpha.go --
+package alpha
+
+import (
+	"example.com/shop/internal/domain"
+	"example.com/shop/runtimes/go/nodes/alpha/deep/deeper"
+	"example.com/shop/runtimes/go/nodes/beta"
+	"github.com/well-prado/new-blok/node"
+)
+
+var Node = node.MustDefine("shop/alpha", "1.0.0", nil)
+-- runtimes/go/nodes/alpha/deep/deeper/deeper.go --
+package deeper
+-- runtimes/go/nodes/beta/beta.go --
+package beta
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/beta", "1.0.0", nil)
+-- @expect --
+{"diagnostics":[["layout_node_imports_node","runtimes/go/nodes/alpha/alpha.go"]]}

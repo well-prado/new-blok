@@ -1,0 +1,22 @@
+Links above the files: the unified nodes/ base and an intermediate element of a declared workflow path. Opening through them would silently read aliased source; each is reported instead.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":"","workflows":["flows/orders"]}
+-- go.mod --
+module example.com/shop
+-- elsewhere/go/quote/quote.go --
+package quote
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/quote", "1.0.0", nil)
+-- real/orders/orders.go --
+package orders
+
+import "github.com/well-prado/new-blok/flow"
+
+var W = flow.MustDefine[int, int](flow.Spec{Name: "shop/orders", Version: "1.0.0"}, nil)
+-- @links --
+nodes -> elsewhere
+flows -> real
+-- @expect --
+{"diagnostics":[["layout_symlink_alias","flows"],["layout_symlink_alias","nodes"]]}

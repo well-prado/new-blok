@@ -1,0 +1,21 @@
+One node name at two versions in one source tree (unified).
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+
+go 1.27.0
+-- nodes/go/v1/v1.go --
+package n
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/quote", "1.0.0", handle)
+-- nodes/go/v2/v2.go --
+package n
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/quote", "2.0.0", handle)
+-- @expect --
+{"diagnostics":[["layout_duplicate_version","nodes/go/v2"]]}

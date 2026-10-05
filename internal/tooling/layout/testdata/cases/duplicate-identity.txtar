@@ -1,0 +1,21 @@
+Two node directories declare the same identity: directory names differ, so only descriptor-based detection catches it.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"classic","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+
+go 1.27.0
+-- runtimes/go/nodes/a/a.go --
+package n
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/quote", "1.0.0", handle)
+-- runtimes/go/nodes/b/b.go --
+package n
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/quote", "1.0.0", handle)
+-- @expect --
+{"diagnostics":[["layout_duplicate_identity","runtimes/go/nodes/b"]]}

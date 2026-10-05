@@ -1,0 +1,27 @@
+A node's nested file imports a workflow package: nodes never import workflows.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+
+go 1.27.0
+-- nodes/go/alpha/alpha.go --
+package alpha
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/alpha", "1.0.0", nil)
+-- nodes/go/alpha/helper/helper.go --
+package helper
+
+import "example.com/shop/workflows/orders"
+
+var _ = orders.W
+-- workflows/orders/orders.go --
+package orders
+
+import "github.com/well-prado/new-blok/flow"
+
+var W = flow.MustDefine[int, int](flow.Spec{Name: "shop/orders", Version: "1.0.0"}, nil)
+-- @expect --
+{"diagnostics":[["layout_node_imports_workflow","nodes/go/alpha/helper/helper.go"]]}
