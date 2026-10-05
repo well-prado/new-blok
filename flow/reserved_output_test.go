@@ -5,7 +5,6 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/well-prado/new-blok/contract"
 	"github.com/well-prado/new-blok/flow"
 )
 
@@ -108,10 +107,11 @@ func TestEveryIDTakingBuilderRejectsTheReservedOutputID(t *testing.T) {
 }
 
 // The reservation is exact: ids that merely resemble it still lower, and
-// lower to the same program the canonical compiler produces.
+// lower to the same program the canonical compiler produces. "Output" is
+// outside the id grammar (#251) and is covered by id_grammar_test.go.
 func TestIDsResemblingTheReservedOutputIDStillLower(t *testing.T) {
 	n := newConformanceNodes(t)
-	for _, id := range []string{"outputs", "output-step", "result", "Output"} {
+	for _, id := range []string{"outputs", "output-step", "output_step", "result"} {
 		t.Run(id, func(t *testing.T) {
 			program, err := flow.MustDefine(conformanceSpec, func(b *flow.Builder, in flow.Ref[object]) flow.Ref[object] {
 				return flow.Call(b, id, n.reserve, in)
@@ -123,21 +123,10 @@ func TestIDsResemblingTheReservedOutputIDStillLower(t *testing.T) {
 			if !reflect.DeepEqual(program.Instructions, want) {
 				t.Fatalf("instructions=%+v want %+v", program.Instructions, want)
 			}
-			if !validDocumentID(id) {
-				return
-			}
 			canonical, err := canonicalProgram(t, n.descriptors(), want)
 			if err != nil || !reflect.DeepEqual(canonical.Instructions, program.Instructions) {
 				t.Fatalf("canonical=%+v err=%v", canonical.Instructions, err)
 			}
 		})
 	}
-}
-
-// validDocumentID reports whether id is expressible in a contract document,
-// whose ids are lowercase; flow ids are not grammar-checked.
-func validDocumentID(id string) bool {
-	err := contract.Document{Version: contract.CurrentVersion, Workflow: contract.Workflow{ID: id}}.Validate()
-	diagnostic, ok := err.(*contract.Error)
-	return !ok || diagnostic.Path != "workflow.id"
 }
