@@ -243,8 +243,9 @@ is never parsed before verification.
   processes open a queue that needs a column, all but one fail busy at once:
   50 of 60 concurrent opens failed before #233. `worker.New` therefore
   retries the idempotent migration while it fails busy, with a short growing
-  pause, for up to 10 s, and the same probe now has no failures. An opener
-  that still loses for 10 s fails startup as before; nothing is corrupted.
+  pause, starting new attempts for up to 10 s (so `New` can take 10 s plus
+  one busy timeout), and the same probe now has no failures. An opener that
+  still loses fails startup as before; nothing is corrupted.
 - Only the Standard Webhooks scheme is built in. Provider-specific schemes
   (with their own header formats and key distribution) are written against
   `Verifier`, as the tests do for a synthetic provider.

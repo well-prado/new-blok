@@ -366,8 +366,10 @@ func New(ctx context.Context, database store.Database, clock func() time.Time) (
 	return queue, nil
 }
 
-// migrationBudget bounds how long New retries a schema migration that lost
-// a race with another opener.
+// migrationBudget bounds how long New keeps starting new attempts at a
+// schema migration that lost a race with another opener. An attempt that
+// starts within it may still wait up to the store's busy timeout for the
+// write lock, so New can take the budget plus one busy timeout.
 const migrationBudget = 10 * time.Second
 
 // migrate runs the schema transaction, retrying it while it fails busy (#233).
