@@ -4,5 +4,7 @@
   "expectedExternalEffects": 1,
   "expectedFinalState": "completed",
   "expectedActiveRuns": 0,
-  "expectedOutput": "{\"value\":41}"
+  "expectedOutput": "{\"value\":41}",
+  "expectedStateAfterOutage": "running",
+  "expectedActiveRunsAfterOutage": 1
 }

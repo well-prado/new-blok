@@ -829,6 +829,8 @@ func TestStepJournalQuorumLossDefersAcceptedRun(t *testing.T) {
 		ExpectedFinalState        string `json:"expectedFinalState"`
 		ExpectedActiveRuns        int    `json:"expectedActiveRuns"`
 		ExpectedOutput            string `json:"expectedOutput"`
+		ExpectedStateAfterOutage  string `json:"expectedStateAfterOutage"`
+		ExpectedActiveAfterOutage int    `json:"expectedActiveRunsAfterOutage"`
 	}
 	fixtureData, err := os.ReadFile("../../testdata/distributed/runtime-quorum-defer-fixtures.json")
 	if err != nil {
@@ -938,6 +940,18 @@ func TestStepJournalQuorumLossDefersAcceptedRun(t *testing.T) {
 			t.Fatalf("restore voter %s: %v: %s", paused[index], unpauseErr, output)
 		}
 		paused = paused[:index]
+	}
+	afterOutage, err := runtime.GetRun(ctx, tenant, admission.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activeAfterOutage, err := store.ListActiveRunIDs(ctx, partition, runtime.limits.PartitionAdmissions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("after the journal outage: run state=%s owner=%s active=%d", afterOutage.State, afterOutage.OwnerID, len(activeAfterOutage))
+	if afterOutage.State != fixture.ExpectedStateAfterOutage || afterOutage.OwnerID != owner.ID || len(activeAfterOutage) != fixture.ExpectedActiveAfterOutage {
+		t.Fatalf("after outage run=%+v active=%v; fixture state=%s active=%d owned by the failed owner", afterOutage, activeAfterOutage, fixture.ExpectedStateAfterOutage, fixture.ExpectedActiveAfterOutage)
 	}
 	var newOwner distributed.Owner
 	for newOwner.ID == "" {

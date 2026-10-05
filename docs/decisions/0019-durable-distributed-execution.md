@@ -57,7 +57,7 @@ Every transition below was exercised against a real three-voter etcd cluster
 | Admission | Reject, never acknowledged (`ErrUnavailable`, HTTP 503 + `Retry-After`); nothing durable | Not acknowledged; a retry with the same request key reconciles to exactly one accepted run |
 | Signal delivery | Reject (`ErrUnavailable`, 503); wait stays open | Not acknowledged; a retry with the same signal ID is accepted or reported as a duplicate, never twice |
 | Due timer | Error; the timer index entry is kept for the next poll | Error; the next poll fires it or finds it already fired, never twice |
-| Pure step result | The run stays accepted with its slots; the step is re-dispatched | Same |
+| Pure step result | The run stays `running` (claimed by the failed owner) and keeps its slots; the worker leaves the partition; the next owner re-claims the run and re-dispatches the pure step under a new attempt | Same |
 | Effectful step result | The run is reported uncertain unless recovery finds the committed result; the effect is never invoked again automatically | Same |
 | Finish | The run keeps its slots and non-terminal state | Terminal state and slot release commit together or not at all; a later owner finishes without re-invoking committed steps |
 
@@ -88,9 +88,15 @@ stronger guarantees must check the step's operation key or the owner fence.
 Ordinary in-memory `Engine.Run` remains unchanged and uses no journal. Durable
 execution requires stable workflow artifact digests, a typed input decoder,
 and an application-composed cluster runtime. Existing SQL journal APIs remain
-available and are not replaced by a speculative storage interface. The
-distributed state records are incarnation-scoped; data retention and online
-resharding are separate concerns.
+available and are not replaced by a speculative storage interface. Only the
+partition owner leases and the immutable runtime settings are keyed by the
+cluster incarnation (`/blok/v1/incarnations/<incarnation>/...`). Events, run,
+step and wait projections, admission slots and the timer index are keyed by
+partition (`/blok/v1/partitions/<partition>/...`) and survive an incarnation
+rotation, which is what lets a restored cluster keep its data under a fresh
+fence. Every read and write of them is guarded by a compare on the current
+incarnation, and each event records the incarnation and fence it was
+committed under. Data retention and online resharding are separate concerns.
 
 This decision does not imply independent-host or multi-region durability,
 production S3 replication, general exactly-once effects, automatic artifact
@@ -113,8 +119,9 @@ retention contract is therefore explicit but not size-bounded: events remain
 available for the lifetime of the cluster incarnation and must not be pruned
 individually, because they are the stable identities used to reconcile
 ambiguous commits. Operators are responsible for retaining snapshots and audit
-records through their required horizon, then retiring the entire incarnation
-as a unit; this implementation provides no automated retirement, backup
+records through their required horizon, then retiring the partition keyspace
+explicitly: rotating the incarnation fences old owners but does not delete
+partition data. This implementation provides no automated retirement, backup
 inventory, or compaction. Bounded admission and indexed scheduling do not
 bound this append-only history, so long-lived or high-volume production use is
 not claimed. A bounded event-retention/compaction contract remains required
