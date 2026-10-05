@@ -270,21 +270,31 @@ func (r *Registry) Lookup(name, version string) (Any, bool) {
 // catalog boundaries. Canonical hashing alone is not descriptor validation.
 func ValidateDescriptor(d Descriptor) error { return validateDescriptor(d) }
 
+// The descriptor grammars are compiled once: Define runs on every invoke of a
+// catalog workflow tool, and recompiling them was about a quarter of its CPU
+// (#319). They are not contract.IDPattern: node names allow "/" and run to 128
+// bytes, document ids do neither.
+var (
+	capabilityGrammar = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$`)
+	nameGrammar       = regexp.MustCompile(`^[a-z][a-z0-9_/-]{0,127}$`)
+	versionGrammar    = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
+)
+
 func validateDescriptor(d Descriptor) error {
 	if len(d.RequiredCapabilities) > 128 {
 		return &Error{Code: "invalid_capability", Message: "too many required capabilities"}
 	}
 	seen := map[string]bool{}
 	for _, cap := range d.RequiredCapabilities {
-		if seen[cap] || !regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$`).MatchString(cap) || strings.Contains(cap, "orchestrate") {
+		if seen[cap] || !capabilityGrammar.MatchString(cap) || strings.Contains(cap, "orchestrate") {
 			return &Error{Code: "invalid_capability", Message: "invalid required capability"}
 		}
 		seen[cap] = true
 	}
-	if !regexp.MustCompile(`^[a-z][a-z0-9_/-]{0,127}$`).MatchString(d.Name) || strings.Contains(d.Name, "..") {
+	if !nameGrammar.MatchString(d.Name) || strings.Contains(d.Name, "..") {
 		return &Error{Code: "invalid_node_identity", Message: "node name must be a stable namespace, not a path"}
 	}
-	if !regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`).MatchString(d.Version) {
+	if !versionGrammar.MatchString(d.Version) {
 		return &Error{Code: "invalid_node_version", Message: "node version must be major.minor.patch"}
 	}
 	if strings.TrimSpace(d.Description) == "" {
