@@ -12,7 +12,8 @@ The SQLite configuration used by the port is:
 
 - WAL journal mode;
 - `synchronous=FULL`;
-- a 5-second busy timeout on every pooled connection;
+- a 5-second busy timeout on every pooled connection, configurable through
+  `sqlite.Backend.BusyTimeout`, that also bounds the writer queue (#214);
 - foreign-key enforcement enabled.
 
 `Database.WithTx` returns only after the transaction commit succeeds. Durable
@@ -69,7 +70,8 @@ handler or catalog that writes before or around `engine.Run`, or a custom
 `tool.Gate` whose `Publish` reads a busy store after a native tool's
 effect). Retrying such work is safe only if its writes are idempotent. A worker
 whose consumer is canceled while it waits reports `ErrConsumerLost`, after
-up to the busy timeout, because the driver does not interrupt a busy wait.
+up to the busy timeout, because its claim transaction is deliberately not
+canceled with the consumer.
 
 Measured with 4 workers draining 200 instant jobs, 5 samples per run
 (`NEWBLOK_MEASURE_CLAIM=1 go test -run TestMeasureClaimContention -v
@@ -151,6 +153,74 @@ is tested at its single-transaction boundary, so its outer retry cannot hide
 the defect. `provider/database_contention_test.go` verifies the same contention
 and then verifies duplicate/conflicting operation behavior and exactly one
 business row plus one outbox row. These tests fail on the pre-fix callbacks.
-The existing 5-second busy timeout still bounds waiting: writer starvation or
-an exhausted timeout may legitimately return an error. This is not a promise
-of unlimited contention tolerance.
+The existing 5-second busy timeout still bounds waiting: an exhausted timeout
+may legitimately return an error. This is not a promise of unlimited
+contention tolerance.
+
+## Fair writer queue (#214)
+
+SQLite's busy handler is not a queue. A writer that finds the lock taken
+sleeps for 1, 2, 5, … up to 100 ms between polls, so the writers that have
+waited longest poll least often, and writers that just arrived keep taking
+the lock first. Measured with 200 submissions (16 in flight) and 4 workers on
+one handle (macOS arm64, go1.27.1), no transaction held the write lock for
+1 ms (p50 43 µs). Yet the longest wait reached the full 5 s busy timeout, and
+submissions failed `store.ErrBusy` in 5 of 8 runs. A writer was starved, not
+slowed.
+
+The framework's own writers therefore take turns.
+- **Marked writers:** a transaction whose context is marked `store.Writer` is
+  queued per `sqlite` handle, first come first served, before it begins.
+- **Who marks:** every journal transition (not schema creation, which only
+  reads when the journal is reopened), the worker's submission, claim and
+  claim-accounting writes, provider records, cron cursor writes and approval
+  records. All of these write first (#176, #179, above), so holding the turn
+  from begin to commit is holding the write lock.
+- **Bound:** the wait is bounded by the busy timeout, and fails as SQLite's
+  would: `store.ErrBusy` annotated with the handle's write domain. A handler
+  that submits to the store its own claim holds therefore still fails after
+  one busy wait (#207).
+- **`:memory:`:** every `:memory:` handle shares one database and one queue.
+
+On the same harness (`NEWBLOK_MEASURE_WRITER_WAITS=1 go test -run
+TestMeasureWriterWaits -count=8 -v ./trigger/worker/`) with the queue, there
+were no busy failures in 16 runs:
+
+| build | longest wait |
+|---|---|
+| plain | 2.2–3.0 ms |
+| `-race` | 19–27 ms |
+
+That is what an ordered queue predicts: contenders × hold time.
+
+**Unmarked transactions are not queued**, and behave exactly as before.
+- **Reads:** they run beside a writer on a committed snapshot (WAL; `:memory:`
+  uses its memdb lock instead). That includes a read nested inside a marked
+  writer's own callback on the same handle, such as a worker handler reading
+  its store.
+- **Callbacks that do work before writing:** they hold no turn while they do
+  it.
+- **Contention:** unmarked writers contend in SQLite's busy handler, as do
+  writers on other handles or in other processes.
+
+An earlier draft queued every unmarked transaction instead. Independent review
+showed that a handler's ordinary read of its own store then waited out the
+busy timeout, and the job was dead-lettered as a nested submission.
+
+**Limits**
+- **Opting in:** mark only a callback that writes first and does no slow work,
+  since it holds the turn as long as it holds the lock.
+- **Unenforced:** the mark is not enforced. An unmarked framework write would
+  silently lose its ordering, so tests assert the marks on each writer path:
+  journal transitions, worker Enqueue, claim, `chargeLostClaim` and
+  `deferLost`, provider `Execute`, cron `Add` and tick flush, approval
+  `Record`.
+- **Two waits:** a marked writer that then meets an unmarked or out-of-handle
+  writer in SQLite waits up to the busy timeout again there. Its total wait
+  can therefore reach twice the timeout.
+
+| Change | Class | Migration |
+| --- | --- | --- |
+| `store.Writer` / `store.IsWriter` | additive | Optional; unmarked transactions are unchanged |
+| `sqlite.Backend.BusyTimeout` | additive | Zero keeps 5 s |
+| Marked `sqlite` writers on one handle take turns | behavioral | Same bound and `store.ErrBusy`; a wrapper that lowered `PRAGMA busy_timeout` inside a transaction no longer shortens a marked writer's wait for its turn, so set `BusyTimeout` instead |

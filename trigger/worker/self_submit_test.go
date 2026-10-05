@@ -177,7 +177,15 @@ func processBounded(queue *Queue, handler Handler) (bool, error) {
 
 func openSQLite(t *testing.T, path string) store.Database {
 	t.Helper()
-	database, err := (sqlite.Backend{}).Open(context.Background(), path)
+	return openSQLiteWaiting(t, path, 0)
+}
+
+// openSQLiteWaiting opens path with a busy timeout of wait (zero for the
+// backend's default). A writer queued behind another on the same handle
+// waits this long before ErrBusy (#214).
+func openSQLiteWaiting(t *testing.T, path string, wait time.Duration) store.Database {
+	t.Helper()
+	database, err := (sqlite.Backend{BusyTimeout: wait}).Open(context.Background(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,8 +207,8 @@ func TestHandlerSelfSubmitWithDetachedContextFails(t *testing.T) {
 // write domain but does not name it on its busy errors. The queue names its
 // own domain on the saturation it returns, so the job fails the same way.
 func TestHandlerSelfSubmitToUnannotatedBackendFails(t *testing.T) {
-	database := openSQLite(t, filepath.Join(t.TempDir(), "self.db"))
 	wait := 250 * time.Millisecond
+	database := openSQLiteWaiting(t, filepath.Join(t.TempDir(), "self.db"), wait)
 	nested := unannotatedBusyDatabase{forwardingShortBusyDatabase{shortBusyDatabase{Database: database, timeout: wait}}}
 	runSelfSubmit(t, selfSubmit{outer: database, nested: nested, detach: true, wait: wait})
 }
@@ -210,10 +218,10 @@ func TestHandlerSelfSubmitToUnannotatedBackendFails(t *testing.T) {
 // context check even with the handler's context. The store still names the
 // domain it was busy on, so the job fails as a nested submission (#207).
 func TestHandlerSelfSubmitThroughOpaqueWrapperFails(t *testing.T) {
-	database := openSQLite(t, filepath.Join(t.TempDir(), "self.db"))
+	wait := 250 * time.Millisecond
+	database := openSQLiteWaiting(t, filepath.Join(t.TempDir(), "self.db"), wait)
 	for _, detach := range []bool{false, true} {
 		t.Run(fmt.Sprintf("detach=%v", detach), func(t *testing.T) {
-			wait := 250 * time.Millisecond
 			runSelfSubmit(t, selfSubmit{outer: database, nested: shortBusyDatabase{Database: database, timeout: wait}, detach: detach, wait: wait})
 		})
 	}
@@ -288,8 +296,8 @@ func TestHandlerDetachedSubmitToAnotherBusyStoreDefers(t *testing.T) {
 	for _, opaque := range []bool{false, true} {
 		t.Run(fmt.Sprintf("opaque=%v", opaque), func(t *testing.T) {
 			ctx := context.Background()
-			outerDB := openSQLite(t, filepath.Join(t.TempDir(), "outer.db"))
-			otherDB := openSQLite(t, filepath.Join(t.TempDir(), "other.db"))
+			outerDB := openSQLiteWaiting(t, filepath.Join(t.TempDir(), "outer.db"), wait)
+			otherDB := openSQLiteWaiting(t, filepath.Join(t.TempDir(), "other.db"), wait)
 			var otherQueueDB store.Database = forwardingShortBusyDatabase{shortBusyDatabase{Database: otherDB, timeout: wait}}
 			if opaque {
 				otherQueueDB = shortBusyDatabase{Database: otherDB, timeout: wait}
@@ -365,8 +373,8 @@ func TestHandlerJoinedSaturationIsClassifiedByEveryDomain(t *testing.T) {
 			expected := nestedStoreExpected(t, scenario.expected)
 			wait := 250 * time.Millisecond
 			ctx := context.Background()
-			outerDB := openSQLite(t, filepath.Join(t.TempDir(), "outer.db"))
-			otherDB := openSQLite(t, filepath.Join(t.TempDir(), "other.db"))
+			outerDB := openSQLiteWaiting(t, filepath.Join(t.TempDir(), "outer.db"), wait)
+			otherDB := openSQLiteWaiting(t, filepath.Join(t.TempDir(), "other.db"), wait)
 			outer, err := New(ctx, outerDB, time.Now)
 			if err != nil {
 				t.Fatal(err)
@@ -453,7 +461,7 @@ func TestNestedSubmissionJoinedWithRetryableErrorIsNotRetried(t *testing.T) {
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			ctx := context.Background()
-			database := openSQLite(t, filepath.Join(t.TempDir(), "jobs.db"))
+			database := openSQLiteWaiting(t, filepath.Join(t.TempDir(), "jobs.db"), wait)
 			queue, err := New(ctx, database, time.Now)
 			if err != nil {
 				t.Fatal(err)
@@ -504,5 +512,140 @@ func TestNestedSubmissionJoinedWithRetryableErrorIsNotRetried(t *testing.T) {
 				t.Fatalf("job=%+v; want state=%s attempt=%d deferrals=%d error=%q", job, expected.State, expected.Attempt, expected.Deferrals, expected.JobError)
 			}
 		})
+	}
+}
+
+// TestHandlerReadingItsOwnStoreCompletes: a handler that reads its own store
+// through an ordinary transaction, as examples/order's Service.Get does,
+// runs beside its claim and completes. Only the store's marked writers are
+// queued (#214); a read nested in a claim is not one of them.
+func TestHandlerReadingItsOwnStoreCompletes(t *testing.T) {
+	ctx := context.Background()
+	database := openSQLite(t, filepath.Join(t.TempDir(), "read.db"))
+	queue, err := New(ctx, database, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queue.Enqueue(ctx, EnqueueRequest{RequestKey: "job", Kind: "job", Payload: []byte(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	var readErr error
+	began := time.Now()
+	processed, err := processBounded(queue, func(handlerCtx context.Context, _ Tx, _ Job) error {
+		var jobs int
+		readErr = database.WithTx(handlerCtx, func(tx *sql.Tx) error {
+			return tx.QueryRowContext(handlerCtx, `SELECT COUNT(*) FROM worker_jobs`).Scan(&jobs)
+		})
+		if readErr == nil && jobs != 1 {
+			readErr = fmt.Errorf("read %d jobs", jobs)
+		}
+		if _, err := queue.Get(handlerCtx, "job"); err != nil && readErr == nil {
+			readErr = err
+		}
+		return readErr
+	})
+	if err != nil || !processed {
+		t.Fatalf("processed=%v err=%v", processed, err)
+	}
+	if readErr != nil {
+		t.Fatalf("the handler's read of its own store failed: %v", readErr)
+	}
+	if took := time.Since(began); took > time.Second {
+		t.Fatalf("the handler's read waited %v", took)
+	}
+	if job, err := queue.Get(ctx, "job"); err != nil || job.State != StateCompleted {
+		t.Fatalf("job=%+v err=%v; want completed", job, err)
+	}
+}
+
+// writerMarks records whether each transaction reached the store marked as
+// a writer.
+type writerMarks struct {
+	store.Database
+	mu    sync.Mutex
+	marks []bool
+}
+
+func (d *writerMarks) WriteDomain() *store.WriteDomain {
+	w, _ := store.WriteDomainOf(d.Database)
+	return w
+}
+
+func (d *writerMarks) WithTx(ctx context.Context, fn func(*sql.Tx) error) error {
+	d.mu.Lock()
+	d.marks = append(d.marks, store.IsWriter(ctx))
+	d.mu.Unlock()
+	return d.Database.WithTx(ctx, fn)
+}
+
+func (d *writerMarks) take() []bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	marks := d.marks
+	d.marks = nil
+	return marks
+}
+
+// TestQueueWritesAreMarkedAndReadsAreNot: the queue's write-first
+// transactions take turns in the store's writer queue and its reads do not
+// (#214). Losing a mark would let a write contend unordered again; adding
+// one to a read would queue it behind running handlers.
+func TestQueueWritesAreMarkedAndReadsAreNot(t *testing.T) {
+	ctx := context.Background()
+	marks := &writerMarks{Database: openSQLite(t, filepath.Join(t.TempDir(), "marks.db"))}
+	queue, err := New(ctx, marks, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marks.take()
+	if _, err := queue.Enqueue(ctx, EnqueueRequest{RequestKey: "job", Kind: "job", Payload: []byte(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if got := marks.take(); len(got) != 1 || !got[0] {
+		t.Fatalf("Enqueue marks=%v; want one marked writer", got)
+	}
+	if _, err := queue.ProcessOnce(ctx, func(context.Context, Tx, Job) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if got := marks.take(); len(got) != 1 || !got[0] {
+		t.Fatalf("ProcessOnce marks=%v; want one marked claim", got)
+	}
+	if _, err := queue.Get(ctx, "job"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queue.Settled(ctx, "job"); err != nil {
+		t.Fatal(err)
+	}
+	if got := marks.take(); len(got) != 2 || got[0] || got[1] {
+		t.Fatalf("Get/Settled marks=%v; want two unmarked reads", got)
+	}
+}
+
+// TestClaimAccountingWritesAreMarked: charging a lost claim and deferring a
+// lost consumer write first and take turns in the store's writer queue
+// (#214), like the claim itself.
+func TestClaimAccountingWritesAreMarked(t *testing.T) {
+	ctx := context.Background()
+	marks := &writerMarks{Database: openSQLite(t, filepath.Join(t.TempDir(), "accounting.db"))}
+	queue, err := New(ctx, marks, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queue.Enqueue(ctx, EnqueueRequest{RequestKey: "job", Kind: "job", Payload: []byte(`{}`), MaxAttempts: 3}); err != nil {
+		t.Fatal(err)
+	}
+	job, err := queue.Get(ctx, "job")
+	if err != nil {
+		t.Fatal(err)
+	}
+	marks.take()
+	if err := queue.chargeLostClaim(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.deferLost(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	if got := marks.take(); len(got) != 2 || !got[0] || !got[1] {
+		t.Fatalf("chargeLostClaim/deferLost marks=%v; want two marked writers", got)
 	}
 }

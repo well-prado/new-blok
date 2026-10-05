@@ -659,8 +659,9 @@ func TestClaimPredicateAndOrder(t *testing.T) {
 // TestCanceledClaimWaitReportsConsumerLost: a worker waiting for the write
 // lock held by another worker's handler, whose consumer is canceled
 // meanwhile, reports ErrConsumerLost (not SQLITE_BUSY) within the busy
-// timeout, and leaves the job untouched. The SQLite driver does not
-// interrupt a busy wait, so it cannot return sooner.
+// timeout, and leaves the job untouched. Its transaction is not canceled
+// with the consumer, so the wait for its write turn runs out the busy
+// timeout before it can report.
 func TestCanceledClaimWaitReportsConsumerLost(t *testing.T) {
 	ctx := context.Background()
 	database, err := (sqlite.Backend{}).Open(ctx, filepath.Join(t.TempDir(), "cancel.db"))
@@ -704,6 +705,10 @@ func TestCanceledClaimWaitReportsConsumerLost(t *testing.T) {
 	close(release)
 	if !errors.Is(err, ErrConsumerLost) || elapsed > 7*time.Second {
 		t.Fatalf("a canceled worker waited %v for the lock and returned %v", elapsed, err)
+	}
+	// The report keeps what the wait itself ended with.
+	if !errors.Is(err, store.ErrBusy) {
+		t.Fatalf("the consumer-lost report %v dropped the busy wait it replaced", err)
 	}
 	if err := <-first; err != nil {
 		t.Fatal(err)

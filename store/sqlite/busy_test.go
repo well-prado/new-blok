@@ -58,7 +58,7 @@ func TestBusyWriteLockMatchesErrBusy(t *testing.T) {
 	if domain, named := store.ErrorWriteDomain(err); !named || !store.SameWriteDomain(domain, mustWriteDomain(t, db)) {
 		t.Fatalf("the busy error %v named domain %v (named=%v); want the database's own", err, domain, named)
 	}
-	if elapsed < time.Duration(busyTimeout)*time.Millisecond {
+	if elapsed < defaultBusyTimeout {
 		t.Fatalf("the write gave up after %v, before the busy timeout", elapsed)
 	}
 	if err := <-held; err != nil {

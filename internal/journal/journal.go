@@ -834,7 +834,14 @@ func (j *Journal) Operation(ctx context.Context, operationKey string) (Operation
 }
 
 func (j *Journal) withTx(ctx context.Context, name string, fn func(*sql.Tx) error) error {
-	err := j.database.WithTx(ctx, func(tx *sql.Tx) error {
+	// Every transition writes first, so it takes its turn in the store's
+	// writer queue (#214). Schema creation does not: reopening a journal
+	// only reads that its tables exist, so it is not queued.
+	txCtx := store.Writer(ctx)
+	if name == "schema" {
+		txCtx = ctx
+	}
+	err := j.database.WithTx(txCtx, func(tx *sql.Tx) error {
 		// Reserve the writer before reading a snapshot. SQLite cannot wait when
 		// upgrading a read transaction to a writer; even an empty UPDATE takes
 		// the writer reservation without changing any committed values.

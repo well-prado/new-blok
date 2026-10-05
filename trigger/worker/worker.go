@@ -459,7 +459,7 @@ func (q *Queue) Enqueue(ctx context.Context, request EnqueueRequest) (EnqueueRes
 	// ID from the clock let equal payloads collide under a coarse clock.
 	jobID := "job:" + digest([]byte(request.RequestKey))[:32]
 	var result EnqueueResult
-	err = q.withTx(ctx, func(tx *sql.Tx) error {
+	err = q.withTx(store.Writer(ctx), func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `INSERT INTO worker_jobs
 			(job_id, request_key, kind, payload_json, payload_digest, max_attempts, principal_json, state, available_at, created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(request_key) DO NOTHING`,
@@ -535,9 +535,12 @@ type claimedWriteDomain struct {
 // effects without an idempotency key or reconciliation path.
 //
 // Only the claim statement and the handler observe ctx. The claim holds
-// nothing while it waits for the store's write lock, so a consumer canceled
-// meanwhile is reported as ErrConsumerLost; the SQLite driver does not
-// interrupt a busy wait, so that report can take up to the busy timeout.
+// nothing while it waits for its turn in the store's writer queue (#214) or
+// for the write lock, so a consumer canceled meanwhile is reported as
+// ErrConsumerLost. Neither wait is interrupted by ctx (the claim's
+// transaction deliberately is not canceled with it), so that report can
+// take up to the busy timeout, or twice that when a writer on another
+// handle then holds the lock.
 // Everything after the claim runs on a context ctx cannot cancel, so losing
 // the consumer rolls the claim back synchronously before ProcessOnce returns
 // instead of leaving database/sql to abort it in the background while the
@@ -564,7 +567,10 @@ func (q *Queue) ProcessOnce(ctx context.Context, handler Handler) (bool, error) 
 			activeDomain.active.Store(false)
 		}
 	}()
-	err := q.withTx(txCtx, func(tx *sql.Tx) error {
+	// The claim writes first (#176), so it takes its turn in the store's
+	// writer queue (#214); the handler then runs inside that turn, as it
+	// runs inside the write lock.
+	err := q.withTx(store.Writer(txCtx), func(tx *sql.Tx) error {
 		job, lease, err := q.claim(ctx, tx)
 		if errors.Is(err, ErrNotFound) {
 			return nil
@@ -663,6 +669,11 @@ func (q *Queue) ProcessOnce(ctx context.Context, handler Handler) (bool, error) 
 		// contexts no longer represent a held write lock.
 		activeDomain.active.Store(false)
 	}
+	if err != nil && !processed && !errors.Is(err, ErrConsumerLost) && ctx.Err() != nil {
+		// The consumer was lost while this worker waited for its write
+		// turn (#214): it claimed nothing, so the job is untouched.
+		err = fmt.Errorf("%w: %w", ErrConsumerLost, errors.Join(ctx.Err(), err))
+	}
 	if errors.Is(err, ErrConsumerLost) && lost.ID != "" {
 		if deferErr := q.deferLost(txCtx, lost); deferErr != nil {
 			err = errors.Join(err, deferErr)
@@ -688,7 +699,7 @@ func (q *Queue) ProcessOnce(ctx context.Context, handler Handler) (bool, error) 
 // attempt: the job is retried after a backoff, or dead once its attempts
 // are spent. A crash before it commits leaves one uncounted redelivery.
 func (q *Queue) chargeLostClaim(ctx context.Context, job Job) error {
-	return q.withTx(ctx, func(tx *sql.Tx) error {
+	return q.withTx(store.Writer(ctx), func(tx *sql.Tx) error {
 		state, available := StateDead, q.now()
 		if job.Attempt < job.MaxAttempts {
 			state = StatePending
@@ -705,7 +716,7 @@ func (q *Queue) chargeLostClaim(ctx context.Context, job Job) error {
 // the claim has been rolled back. A crash between the two leaves one
 // uncounted redelivery, never an acknowledged one.
 func (q *Queue) deferLost(ctx context.Context, job Job) error {
-	return q.withTx(ctx, func(tx *sql.Tx) error {
+	return q.withTx(store.Writer(ctx), func(tx *sql.Tx) error {
 		state, message := StatePending, ""
 		if job.Deferrals+1 > MaxDeferrals {
 			state, message = StateDead, DeferralExhausted

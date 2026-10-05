@@ -40,6 +40,27 @@ type Database interface {
 	Close() error
 }
 
+type writerKey struct{}
+
+// Writer marks ctx for a WithTx that writes before anything else and holds
+// the write lock until it commits. A backend may then queue such
+// transactions first come first served instead of leaving them to contend
+// for the lock, where the longest waiters can be starved (#214). Mark only
+// a callback whose first statement writes and that does no slow work, since
+// it holds the queue as long as it holds the lock. Mark only the context
+// passed to WithTx. An unmarked transaction is not queued and behaves as it
+// always has: a read, or work done before the first write, never waits for
+// the queue.
+func Writer(ctx context.Context) context.Context {
+	return context.WithValue(ctx, writerKey{}, true)
+}
+
+// IsWriter reports whether ctx was marked by Writer.
+func IsWriter(ctx context.Context) bool {
+	marked, _ := ctx.Value(writerKey{}).(bool)
+	return marked
+}
+
 // WriteDomain identifies databases that contend for the same write lock.
 // Its identity is opaque to callers.
 type WriteDomain struct {
