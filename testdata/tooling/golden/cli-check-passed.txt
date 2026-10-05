@@ -1,0 +1,6 @@
+project example.com/shop (classic layout)
+check layout          passed
+check bindings        passed
+check workflow-steps  passed
+check go-vet          passed
+blok check: passed

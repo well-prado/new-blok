@@ -1,0 +1,44 @@
+{
+  "version": "blok-cli/v1",
+  "command": "check",
+  "status": "failed",
+  "exitCode": 1,
+  "project": {
+    "name": "shop",
+    "module": "example.com/shop",
+    "runtime": "go",
+    "layout": "unified",
+    "triggers": [
+      "http"
+    ]
+  },
+  "checks": [
+    {
+      "name": "layout",
+      "state": "failed"
+    },
+    {
+      "name": "bindings",
+      "state": "passed"
+    },
+    {
+      "name": "workflow-steps",
+      "state": "skipped",
+      "reason": "layout discovery failed, so the workflows are unknown"
+    },
+    {
+      "name": "go-vet",
+      "state": "passed"
+    }
+  ],
+  "diagnostics": [
+    {
+      "code": "layout_node_imports_node",
+      "source": "nodes/go/tax/tax.go",
+      "expected": "same node, shared package or external module",
+      "actual": "example.com/shop/nodes/go/quote",
+      "remediation": "nodes never import nodes; compose them in a workflow, or move shared code to a domain package",
+      "message": "a node imports another node"
+    }
+  ]
+}

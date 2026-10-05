@@ -1,0 +1,11 @@
+project example.com/shop (classic layout)
+build-failed example.com/shop/cmd/shop
+build-failed example.com/shop/internal/app
+no-tests     example.com/shop/runtimes/go/nodes/quote
+build-failed example.com/shop/workflows/quotes
+tests: 0 passed, 0 failed, 0 skipped, 0 incomplete
+workflows/quotes/quotes.go:18:37: go_compile_error: the Go code does not compile
+  expected: Go code that type-checks
+  actual: quote.OutputFields(result).TotalCentz undefined (type quote.OutputRef has no field or method TotalCentz)
+  fix: fix the Go compile error at this position
+blok test: failed, 1 problem
