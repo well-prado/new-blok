@@ -77,9 +77,13 @@ type lexer struct {
 	line int
 	toks []jsToken
 	refs []reference
-	// ambiguous lists the lines of every "/" whose lexical goal the
-	// context cannot decide; any entry makes the file unverified.
-	ambiguous []int
+	// irregular lists every position that makes the file unverified at
+	// the lexical level: a "/" whose goal the context cannot decide, and
+	// HTML-like comments.
+	irregular []jsUnverified
+	// lineStart is true when only whitespace and comments precede the
+	// current position on its line (Annex B "-->" comments).
+	lineStart bool
 
 	parens     []bool // per open "(": preceded by if/while/for/with
 	brackets   int
@@ -92,8 +96,13 @@ type lexer struct {
 // maxTokens bounds one file's token stream (files are at most 1 MiB).
 const maxTokens = 1 << 20
 
-func lex(src []byte) ([]jsToken, []reference, []int, error) {
-	l := &lexer{src: src, line: 1}
+// ambiguity records a "/" whose goal needs a parser.
+func (l *lexer) ambiguity() {
+	l.irregular = append(l.irregular, jsUnverified{line: l.line, code: CodeAmbiguousSyntax, form: "regular expression or division"})
+}
+
+func lex(src []byte) ([]jsToken, []reference, []jsUnverified, error) {
+	l := &lexer{src: src, line: 1, lineStart: true}
 	if len(src) >= 3 && src[0] == 0xef && src[1] == 0xbb && src[2] == 0xbf { // byte order mark
 		l.pos = 3
 	}
@@ -120,7 +129,7 @@ func lex(src []byte) ([]jsToken, []reference, []int, error) {
 		return nil, nil, nil, &lexError{l.line, "unbalanced brackets at end of file"}
 	}
 	l.toks = append(l.toks, jsToken{kind: tokEOF, line: l.line})
-	return l.toks, l.refs, l.ambiguous, nil
+	return l.toks, l.refs, l.irregular, nil
 }
 
 func (l *lexer) emit(kind tokenKind, text, value string, line int) {
@@ -151,6 +160,18 @@ func (l *lexer) skipSpaceAndComments() error {
 		case isLineTerminator(c):
 			l.newline(c)
 			l.pos++
+			l.lineStart = true
+		case c == '<' && strings.HasPrefix(string(l.src[l.pos:min(len(l.src), l.pos+4)]), "<!--"),
+			c == '-' && l.lineStart && strings.HasPrefix(string(l.src[l.pos:min(len(l.src), l.pos+3)]), "-->"):
+			// Annex B HTML-like comments: CommonJS reads "<!--" anywhere,
+			// and "-->" at the start of a line, as a line comment; a
+			// module refuses both. They are lexed as comments (so a
+			// template opened after one cannot swallow the next line) and
+			// the file is unverified, because the two goals disagree.
+			l.irregular = append(l.irregular, jsUnverified{line: l.line, code: CodeUnsupportedForm, form: "HTML-like comment"})
+			for l.pos < len(l.src) && !isLineTerminator(l.src[l.pos]) {
+				l.pos++
+			}
 		case c == '/' && l.pos+1 < len(l.src) && l.src[l.pos+1] == '/':
 			start, line := l.pos, l.line
 			for l.pos < len(l.src) && !isLineTerminator(l.src[l.pos]) {
@@ -165,6 +186,7 @@ func (l *lexer) skipSpaceAndComments() error {
 			for _, b := range l.src[l.pos : l.pos+2+end] {
 				if b == '\n' {
 					l.line++
+					l.lineStart = true
 				}
 			}
 			l.pos += end + 4
@@ -176,6 +198,7 @@ func (l *lexer) skipSpaceAndComments() error {
 			case '\u2028', '\u2029':
 				l.line++
 				l.pos += size
+				l.lineStart = true
 			default:
 				return nil
 			}
@@ -268,7 +291,7 @@ func (l *lexer) regexAllowed() bool {
 			return false
 		}
 		if contextualKeywords[p.text] {
-			l.ambiguous = append(l.ambiguous, l.line)
+			l.ambiguity()
 		}
 		return regexKeywords[p.text]
 	case tokPunct:
@@ -277,7 +300,7 @@ func (l *lexer) regexAllowed() bool {
 			if l.lastParen {
 				// if (x) /re/ is a regular expression, but a head
 				// misjudged as control would hide a division.
-				l.ambiguous = append(l.ambiguous, l.line)
+				l.ambiguity()
 			}
 			return l.lastParen
 		case "]", "++", "--":
@@ -286,11 +309,11 @@ func (l *lexer) regexAllowed() bool {
 			// A block, class body, function or object literal: which
 			// one a "}" closes needs a parser (function () {} / 1,
 			// L: {} /re/), so it is never guessed silently.
-			l.ambiguous = append(l.ambiguous, l.line)
+			l.ambiguity()
 			return l.lastBrace == braceBlock || l.lastBrace == braceClass
 		case ">":
 			// a > /re/, or TypeScript's instantiation f<T> / 2
-			l.ambiguous = append(l.ambiguous, l.line)
+			l.ambiguity()
 			return true
 		case "!":
 			// TypeScript's postfix non-null assertion (a! / b): a prefix
@@ -342,6 +365,7 @@ var punctuators = []string{
 }
 
 func (l *lexer) next() error {
+	l.lineStart = false
 	c := l.src[l.pos]
 	line := l.line
 	switch {

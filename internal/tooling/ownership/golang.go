@@ -31,6 +31,9 @@ type goAdapter struct {
 	// environment holds findings about the whole module's resolution
 	// (a go.work or vendor directory); every Go unit carries them.
 	environment []diagnostic.Diagnostic
+	// nodes are the discovered node directories and files, for matching
+	// //go:embed patterns.
+	nodes []layout.Node
 }
 
 // nonGoSources are files go build compiles beside Go source (cgo, assembly,
@@ -44,7 +47,7 @@ type replacement struct {
 }
 
 func newGoAdapter(files *projectFiles, project *layout.Project) *goAdapter {
-	a := &goAdapter{files: files, module: project.Module}
+	a := &goAdapter{files: files, module: project.Module, nodes: project.Nodes}
 	if data, problem := files.read("go.mod"); problem == nil {
 		a.replaces, a.modErr = localReplacements(data)
 	}
@@ -147,9 +150,11 @@ func (a *goAdapter) Analyze(dir string) Analysis {
 				case strings.HasPrefix(comment.Text, "//go:linkname"):
 					analysis.Findings = append(analysis.Findings, finding(CodeUnsupportedForm, at(rel, line), "//go:linkname", "//go:linkname binds a symbol of any linked package without an import; it cannot be verified"))
 				case strings.HasPrefix(comment.Text, "//go:embed"):
-					if edge, ok := embedEdge(dir, at(rel, line), comment.Text); ok {
+					edge, findings := a.embed(dir, at(rel, line), comment.Text)
+					if len(edge.Targets) > 0 {
 						analysis.Edges = append(analysis.Edges, edge)
 					}
+					analysis.Findings = append(analysis.Findings, findings...)
 				}
 			}
 		}
@@ -320,19 +325,71 @@ func unquote(s string) string {
 	return s
 }
 
-// embedEdge turns a //go:embed directive into an edge whose targets are the
-// directories or files its patterns name (up to the first wildcard). Their
-// ownership is checked; embedded data is not traversed as code.
-func embedEdge(dir, source, directive string) (Edge, bool) {
+// embed turns a //go:embed directive into an edge whose targets are every
+// discovered file of another node the patterns match (Go's rules: each
+// pattern element is a path.Match glob, a directory embeds its tree, and
+// without the all: prefix names starting with "." or "_" below a matched
+// directory are left out), plus the directory or file each pattern names up
+// to its first wildcard. Their ownership is checked; embedded data is not
+// traversed as code. A pattern that reaches into another node's directory
+// but matches none of its discovered files is unverified: it may match
+// files discovery does not list.
+func (a *goAdapter) embed(dir, source, directive string) (Edge, []diagnostic.Diagnostic) {
 	edge := Edge{Source: source, Specifier: strings.TrimSpace(strings.TrimPrefix(directive, "//go:embed"))}
+	var findings []diagnostic.Diagnostic
+	own, _ := layout.NodeRoot(dir)
 	for _, field := range strings.Fields(edge.Specifier) {
-		pattern := strings.TrimPrefix(strings.Trim(field, "\"`"), "all:")
-		if cut := strings.IndexAny(pattern, "*?[\\"); cut >= 0 {
-			pattern = pattern[:cut]
+		pattern := strings.Trim(field, "\"`")
+		pattern, all := strings.CutPrefix(pattern, "all:")
+		if prefix := pattern[:strings.IndexAny(pattern+"*", "*?[\\")]; prefix != "" {
+			if target, inside := cleanJoin(dir, strings.TrimSuffix(prefix, "/")); inside && target != "" {
+				edge.Targets = append(edge.Targets, Target{Unit: target, NoFollow: true})
+			}
 		}
-		if target, inside := cleanJoin(dir, pattern); inside && target != "" {
-			edge.Targets = append(edge.Targets, Target{Unit: target, NoFollow: true})
+		elements := strings.Split(pattern, "/")
+		for _, node := range a.nodes {
+			if node.Dir == own {
+				continue
+			}
+			rel, under := node.Dir, true
+			if dir != "" {
+				rel, under = strings.CutPrefix(node.Dir, dir+"/")
+			}
+			if !under || !globPrefix(elements, strings.Split(rel, "/")) {
+				continue
+			}
+			matched := false
+			for _, file := range node.Files {
+				parts := strings.Split(rel+"/"+file, "/")
+				if len(elements) > len(parts) || !globPrefix(elements, parts) {
+					continue
+				}
+				hidden := false
+				for _, element := range parts[len(elements):] {
+					hidden = hidden || strings.HasPrefix(element, ".") || strings.HasPrefix(element, "_")
+				}
+				if hidden && !all {
+					continue
+				}
+				matched = true
+				edge.Targets = append(edge.Targets, Target{Unit: node.Dir + "/" + file, NoFollow: true})
+			}
+			if !matched {
+				findings = append(findings, finding(CodeUnsupportedForm, source, field, "the //go:embed pattern reaches into node directory "+node.Dir+" but matches none of its discovered files; it cannot be verified"))
+			}
 		}
 	}
-	return edge, len(edge.Targets) > 0
+	return edge, findings
+}
+
+// globPrefix reports whether every element of the shorter of pattern and
+// path matches: the pattern names an ancestor of path, path itself, or a
+// path below it.
+func globPrefix(pattern, parts []string) bool {
+	for i := 0; i < len(pattern) && i < len(parts); i++ {
+		if matched, err := path.Match(pattern[i], parts[i]); err != nil || !matched {
+			return false
+		}
+	}
+	return true
 }

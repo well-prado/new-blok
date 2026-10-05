@@ -100,7 +100,7 @@ func (a *nodeAdapter) Analyze(file string) Analysis {
 		analysis.Findings = append(analysis.Findings, *problem)
 		return analysis
 	}
-	scan, err := scanJS(data)
+	scan, err := scanJS(data, hasExtension(name, []string{".d.ts", ".d.mts", ".d.cts"}))
 	if err != nil && !hasExtension(name, scriptExtensions) {
 		// Node's CommonJS loader runs a required file with any other
 		// extension, or none, as JavaScript; one that does not lex as

@@ -50,12 +50,15 @@ func TestNativeStartersVerify(t *testing.T) {
 	}
 }
 
-// TestNodeExampleVerifies adds Node.js nodes to the starter using the
-// repository's real Node.js SDK source and its real worker fixture node
-// file (unchanged import text in the unified layout). Every node is
-// verified: the SDK is shared code, and the composition root imports both
-// Node.js nodes.
-func TestNodeExampleVerifies(t *testing.T) {
+// TestNodeExample adds Node.js nodes to the starter using the repository's
+// real Node.js SDK source and its real worker fixture node file (unchanged
+// import text in the unified layout), plus a node written only in the
+// allowlist's safe forms. Nothing is a violation, and the composition root
+// imports every node. The allowlist (ADR 0025) fails closed on the SDK's
+// own code — computed keys such as text[at] and Object.prototype — so the
+// nodes that reach the SDK are unverified, and every finding lies in the
+// SDK's files, not in a node; the safe-form node is verified.
+func TestNodeExample(t *testing.T) {
 	repository := filepath.Join("..", "..", "..")
 	read := func(rel string) string {
 		data, err := os.ReadFile(filepath.Join(repository, filepath.FromSlash(rel)))
@@ -72,6 +75,7 @@ func TestNodeExampleVerifies(t *testing.T) {
 			}
 			fixtures := layout.NodeDir(name, "nodejs", "fixtures")
 			format := layout.NodeDir(name, "nodejs", "format")
+			clean := layout.NodeDir(name, "nodejs", "greet")
 			sdkImport := "../../../sdk/nodejs/index.js"
 			nodes, types := read("testdata/worker/nodejs/nodes.ts"), read("testdata/worker/nodejs/types.ts")
 			if !strings.Contains(nodes, sdkImport) {
@@ -95,13 +99,34 @@ func TestNodeExampleVerifies(t *testing.T) {
 				format + "/node.json":     `{"name":"shop/format-receipt","version":"1.0.0","runtime":"nodejs"}`,
 				format + "/index.ts":      "import { defineNode } from \"@blok/nodejs-sdk\";\nimport { cents } from \"./money.js\";\nexport const format = defineNode<{ total: number }, { text: string }, null>({ name: \"shop/format-receipt\", version: \"1.0.0\", description: \"Formats a receipt\", input: { type: \"object\" }, output: { type: \"object\" }, dependencies: null, execute: (_ctx, input) => ({ text: cents(input.total) }) });\n",
 				format + "/money.ts":      "export const cents = (total: number): string => (total / 100).toFixed(2);\n",
-				"app/worker/nodes.ts":     "import { nodes } from \"../../" + fixtures + "/index.js\";\nimport { format } from \"../../" + format + "/index.js\";\nexport const all = [...nodes, format];\n",
+				"app/worker/nodes.ts":     "import { nodes } from \"../../" + fixtures + "/index.js\";\nimport { format } from \"../../" + format + "/index.js\";\nimport { greet } from \"../../" + clean + "/index.js\";\nexport const all = [...nodes, format, greet];\n",
+				clean + "/node.json":      `{"name":"shop/greet","version":"1.0.0","runtime":"nodejs"}`,
+				clean + "/index.ts":       "import { title } from \"./title.js\";\nexport const greet = (names: string[]): string => `hello ${title(names[0] ?? \"\")} and ${names.length - 1} more`;\n",
+				clean + "/title.ts":       "export const title = (s: string): string => s.slice(0, 1).toUpperCase() + s.slice(1);\n",
 			}
 			writeFiles(t, root, files)
-			report := requireVerified(t, root, 3)
+			report, err := CheckDir(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(report.Nodes) != 4 {
+				t.Fatalf("nodes=%+v", report.Nodes)
+			}
 			for _, node := range report.Nodes {
-				if node.Runtime == "nodejs" && node.Units < 2 {
-					t.Fatalf("node %+v did not reach the SDK", node)
+				want := StatusUnverified
+				if node.Runtime == layout.GoRuntime || node.Dir == clean {
+					want = StatusVerified
+				}
+				if node.Status != want || node.Units == 0 {
+					t.Fatalf("node %+v; want %s over a non-empty graph", node, want)
+				}
+			}
+			if len(report.Diagnostics) == 0 {
+				t.Fatal("the SDK's computed keys must keep the nodes that reach it unverified")
+			}
+			for _, d := range report.Diagnostics {
+				if Class(d.Code) != ClassUnverified || !strings.HasPrefix(d.Source, "sdk/nodejs/") {
+					t.Fatalf("a finding outside the SDK, or a violation: %+v", d)
 				}
 			}
 		})

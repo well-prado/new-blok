@@ -43,10 +43,10 @@ func TestImportForms(t *testing.T) {
 		{"export type from", `export type { T } from "./t"; export type * from "./u"`, []string{"1 export-from ./t", "1 export-from ./u"}},
 		{"local export list is not an import", `const a = 1; export { a }; export default a;`, nil},
 		{"import equals", `import fs = require("node:fs"); export import x = require("./x")`, []string{"1 import-equals ./x", "1 import-equals node:fs"}},
-		{"namespace alias is not an import", `import A = B.C;`, nil},
+		{"namespace alias is not an import", `import A = B.C;`, []string{"1 ownership_unsupported_form import"}},
 		{"require", `const x = require("./x"); const y = require(` + "`./y`" + `)`, []string{"1 require ./x", "1 require ./y"}},
 		{"require.resolve", `const p = require.resolve("./p")`, []string{"1 require.resolve ./p"}},
-		{"module.require", `module.require("./m")`, []string{"1 ownership_unsupported_form .require"}},
+		{"module.require", `module.require("./m")`, []string{"1 ownership_unsupported_form .require", "1 ownership_unsupported_form module"}},
 		{"dynamic static", `await import("./lazy.js")`, []string{"1 import() ./lazy.js"}},
 		{"typeof import", `type T = typeof import("./t")`, []string{"1 import() ./t"}},
 		{"import.meta.resolve", `import.meta.resolve("./r")`, []string{"1 import.meta.resolve ./r"}},
@@ -63,31 +63,39 @@ func TestImportForms(t *testing.T) {
 		{"object literal then division keeps the import", "const x = {a: 1} / 2; require(\"..\\u002fb\"); const y = 1 / 1;", []string{"1 ownership_ambiguous_syntax regular expression or division", "1 require ../b"}},
 		{"hashbang holding a quote", "#!/usr/bin/env node --title='x\nrequire('./a')", []string{"2 require ./a"}},
 		{"byte order mark before a hashbang", "\ufeff#!/usr/bin/env node\nrequire('./a')", []string{"2 require ./a"}},
-		{"ordinary names stay verified", "const binding = 1; const { env } = process; globalThis.fetch(binding); module.exports = env; if (require.main) {}", []string{"1 ownership_unsupported_form require.main"}},
-		{"process.binding", `process.binding("fs")`, []string{"1 ownership_unsupported_form .binding"}},
-		{"global object as a value", `Reflect.get(globalThis, k)`, []string{"1 ownership_unsupported_form globalThis as a value"}},
-		{"module beyond exports", `module.paths.push(x); module.exports = 1`, []string{"1 ownership_unsupported_form module.paths"}},
+		{"ordinary names stay verified", "const binding = 1; const env = process.env; module.exports = env.X; exports.y = arr[0] + arr[i - 1] + arr[n++] + o[\"name\"] + t[(a - 1) * 2]; this.x = 1; class K { constructor(a) { this.#p = a } }", nil},
+		{"allowlist: computed keys", "o[k]; o[\"con\" + \"structor\"]; o[f(1) - 1]; o[a ? 1 : 2]; o[\"constructor\"]", []string{"1 ownership_unsupported_form computed member access", "1 ownership_unsupported_form computed member access", "1 ownership_unsupported_form computed member access", "1 ownership_unsupported_form computed member access", "1 ownership_unsupported_form computed member access", "1 ownership_unsupported_form string constructor"}},
+		{"allowlist: sensitive strings", "const a = \"process\"; const b = `mainModule`; const c = 'prototype'", []string{"1 ownership_unsupported_form string mainModule", "1 ownership_unsupported_form string process", "1 ownership_unsupported_form string prototype"}},
+		{"allowlist: bare module and this", "const m = module; const g = (function () { return this; })()", []string{"1 ownership_unsupported_form module", "1 ownership_unsupported_form this"}},
+		{"allowlist: destructured constructor", "const { constructor: F } = () => 0", []string{"1 ownership_unsupported_form constructor"}},
+		{"allowlist: process beyond its data members", "const mm = process.mainModule; process.env.X", []string{"1 ownership_unsupported_form .mainModule", "1 ownership_unsupported_form process"}},
+		{"allowlist: import.meta data", "const u = import.meta.url; const d = import.meta.dirname; const e = import.meta.env", []string{"1 ownership_unsupported_form import"}},
+		{"HTML-like comments are line comments and unverified", "<!-- `\nrequire('./a');\n<!-- `\n --> x `\n", []string{"1 ownership_unsupported_form HTML-like comment", "2 require ./a", "3 ownership_unsupported_form HTML-like comment", "4 ownership_unsupported_form HTML-like comment"}},
+		{"instantiation expression then division is ambiguous", "const y = f<number> / 2; require(\"..\\u002fb\"); const z = 1 / 1;", []string{"1 ownership_ambiguous_syntax regular expression or division"}},
+		{"process.binding", `process.binding("fs")`, []string{"1 ownership_unsupported_form .binding", "1 ownership_unsupported_form process"}},
+		{"global object as a value", `Reflect.get(globalThis, k)`, []string{"1 ownership_unsupported_form Reflect", "1 ownership_unsupported_form globalThis"}},
+		{"module beyond exports", `module.paths.push(x); module.exports = 1`, []string{"1 ownership_unsupported_form module"}},
 		{"CommonJS wrapper arguments", `arguments[1]("../b")`, []string{"1 ownership_unsupported_form arguments"}},
-		{"constructor routes", "const AF = Object.getPrototypeOf(async () => {}).constructor; const n = x.constructor.name", []string{"1 ownership_unsupported_form .constructor"}},
+		{"constructor routes", "const AF = Object.getPrototypeOf(async () => {}).constructor; const n = x.constructor.name", []string{"1 ownership_unsupported_form .constructor", "1 ownership_unsupported_form .constructor"}},
 		{"division then import", "const q = a / b; import c from './c'", []string{"1 import ./c"}},
 		{"regex after block", "function f() {}\n/'/.test(s); import d from './d'", []string{"2 import ./d", "2 ownership_ambiguous_syntax regular expression or division"}},
-		{"property keys and members", `const o = { import: 1, require: 2 }; o.import(); o.default.import(1)`, nil},
+		{"sensitive keys and members are not trusted", `const o = { import: 1, require: 2 }; o.import(); o.default.import(1)`, []string{"1 ownership_unsupported_form .import", "1 ownership_unsupported_form .import", "1 ownership_unsupported_form import", "1 ownership_unsupported_form require", "1 ownership_unsupported_form unrecognized import declaration"}},
 		{"methods named like loaders are not trusted", `class K { import(a) {} require(a) { return a } }`, []string{"1 ownership_dynamic_import import(expression)", "1 ownership_dynamic_import require(expression)"}},
 		{"dynamic import computed", `import(name)`, []string{"1 ownership_dynamic_import import(expression)"}},
 		{"dynamic import template", "import(`./${name}.js`)", []string{"1 ownership_dynamic_import import(expression)"}},
 		{"require computed", `require("./" + name)`, []string{"1 ownership_dynamic_import require(expression)"}},
-		{"require as value", `const r = require; r("./x")`, []string{"1 ownership_unsupported_form require as a value"}},
-		{"require typeof is fine", `if (typeof require === "function") {}`, nil},
+		{"require as value", `const r = require; r("./x")`, []string{"1 ownership_unsupported_form require"}},
+		{"typeof require is not trusted either", `if (typeof require === "function") {}`, []string{"1 ownership_unsupported_form require"}},
 		{"eval", `eval("require('../b')")`, []string{"1 ownership_unsupported_form eval"}},
 		{"Function constructor", `new Function("return 1")`, []string{"1 ownership_unsupported_form Function"}},
 		{"createRequire", `const req = createRequire(import.meta.url)`, []string{"1 ownership_unsupported_form createRequire"}},
-		{"getBuiltinModule", `process.getBuiltinModule("module")`, []string{"1 ownership_unsupported_form .getBuiltinModule"}},
+		{"getBuiltinModule", `process.getBuiltinModule("module")`, []string{"1 ownership_unsupported_form .getBuiltinModule", "1 ownership_unsupported_form process", "1 ownership_unsupported_form string module"}},
 		{"worker", `new Worker("./w.js")`, []string{"1 ownership_unsupported_form Worker"}},
-		{"require.cache", `delete require.cache[k]`, []string{"1 ownership_unsupported_form require.cache"}},
+		{"require.cache", `delete require.cache[k]`, []string{"1 ownership_unsupported_form computed member access", "1 ownership_unsupported_form require"}},
 		{"Function as a type is not trusted either", `let f: Function`, []string{"1 ownership_unsupported_form Function"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			scan, err := scanJS([]byte(tc.source))
+			scan, err := scanJS([]byte(tc.source), false)
 			if err != nil {
 				t.Fatalf("lex: %v", err)
 			}
@@ -109,7 +117,7 @@ func TestLexErrorsFailClosed(t *testing.T) {
 		"f())",
 		`const r = /unterminated`,
 	} {
-		if _, err := scanJS([]byte(source)); err == nil {
+		if _, err := scanJS([]byte(source), false); err == nil {
 			t.Errorf("lexed %q without error", source)
 		}
 	}
@@ -136,7 +144,7 @@ func TestRepositoryNodeSourcesLex(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			scan, err := scanJS(data)
+			scan, err := scanJS(data, false)
 			if err != nil {
 				t.Errorf("%s: %v", file, err)
 				return nil
