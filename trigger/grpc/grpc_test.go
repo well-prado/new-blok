@@ -323,7 +323,11 @@ func TestDeadlinesAndCancellation(t *testing.T) {
 			Method: orders.Methods().ByName("Place"), Workflow: "place", WorkflowInput: f.Order, InputSchema: f.Order, OutputSchema: f.Placed, Authorize: tgrpc.AllowAuthenticated,
 			Timeout: tc.binding,
 			Handle: func(ctx context.Context, call tgrpc.Call) (json.RawMessage, error) {
-				deadline, _ := ctx.Deadline()
+				deadline, ok := ctx.Deadline()
+				if !ok {
+					// A workflow with no deadline is never the shorter bound.
+					deadline = time.Now().Add(time.Hour)
+				}
 				bounded <- deadline
 				if tc.ignore {
 					time.Sleep(300 * time.Millisecond)
