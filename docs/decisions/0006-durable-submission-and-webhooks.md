@@ -5,7 +5,8 @@
 - Amended: #188 (worker nested-store diagnostics and saturation), #207
   (undetected self-submits fail after one busy wait), #245 (a started
   attempt is committed before its handler runs), #267 (a panicking handler
-  fails its attempt and releases the write lock)
+  fails its attempt and releases the write lock), #290 (retention of
+  finished jobs and the dedupe window)
 - Roadmap: E09-T02 ([#55](https://github.com/well-prado/new-blok/issues/55))
 - Amends: [ADR 0005](0005-trigger-adapter-contract.md) (webhook declaration)
 - Consumers: webhook now; cron (#56) and pubsub (#57) are expected to submit
@@ -281,6 +282,124 @@ This is not a strict FIFO:
 Jobs enqueued before the column existed keep 0 and fall back to `job_id`
 among themselves.
 
+### Retention of finished jobs (#290)
+
+A job row holds everything its producer handed the queue: the request key,
+the payload, the principal, the trace context, and for a failed job the
+handler's error text. Before #290 nothing ever deleted a completed or dead
+job, so all of it was kept forever, and the dedupe record above lived
+exactly as long as the row. `Queue.Compact(ctx, worker.Retention{...})` is
+the queue's erasure, built like journal compaction (ADR 0021 §7).
+
+**What is erased.** `Retention.Completed` and `Retention.Dead` are separate
+cutoffs: a completed or dead job whose last update (its finish) is strictly
+before its state's cutoff is erased. A zero cutoff erases nothing of that
+state, so dead letters, which ADR 0022 counts as retained for an operator,
+stay until the application gives them a cutoff of their own. Pending and
+processing jobs (waiting on a backoff, under a live lease, or stalled under
+an expired one) are never read by `Compact`, however old. Each erased job's
+row is deleted and replaced, in the same transaction, by a tombstone in
+`worker_compacted`: the SHA-256 of its request key, its job id, kind,
+state, attempt and max-attempt counts, creation and finish times, the time
+it was compacted, and one *identity digest* over its kind, payload digest
+and encoded principal. Payload, principal, trace context, error text and
+the request key itself are gone with the row. The request key is digested
+because it is application-chosen and may carry personal data, as the
+journal's tombstones and audit prune tombstones digest theirs; the
+principal is folded into the identity digest rather than digested alone, so
+it cannot be confirmed from the tombstone without the exact payload too.
+
+**The dedupe window.** The submission contract above says `accepted=false`
+means the key was already committed with the same kind, payload and
+principal, and a key reused with other content is a conflict, never silently
+deduplicated. Erasing the row must not quietly turn a provider's late resend
+into a second run. So a compacted job keeps its identity, and only its
+identity, for a dedupe window that the application ends explicitly:
+
+- Within the window, a submission of a compacted job's key with the same
+  kind, payload and principal is a duplicate: `Enqueue` returns
+  `Accepted=false` and a `Job` with `Compacted=true`, its ID, kind, state
+  and attempt counts, and no payload, principal, trace or error (erased
+  content is never returned again, as for erased reconciliations).
+  `Submit` returns `false`; nothing is inserted and nothing runs. The trace
+  is not identity, so a duplicate with another trace is still a duplicate.
+- Within the window, the same key with another kind, payload or principal
+  is `worker.ErrRequestConflict` (`trigger.ErrConflict`), as it was while
+  the row lived.
+- `Get` returns the tombstone (`Job.Compacted`), and `Settled` stays true.
+- `Retention.Tombstones` ends the window: tombstones of jobs that finished
+  strictly before it are deleted. A key whose tombstone is gone is unknown
+  again: `Get` reports `ErrNotFound`, `Settled` is true, and a new
+  submission under it is accepted as a new job. The zero time keeps every
+  tombstone, which is the default and the only setting that keeps "a key
+  once committed is never run twice" without a horizon. An application
+  that ends the window must end it later than any producer can resend:
+  for a webhook, later than the provider's redelivery horizon.
+
+`Enqueue` checks the tombstone inside its insert: the insert is
+`INSERT … SELECT … WHERE NOT EXISTS (tombstone) ON CONFLICT(request_key) DO
+NOTHING`, one statement, so the transaction still writes first (#176) and
+a concurrent `Compact` cannot slip between the check and the insert (both
+hold the write lock).
+
+**Legal hold and minimum.** `worker.WithRetentionHold` and
+`worker.WithMinRetention` are queue options, not `Compact` arguments, so
+whoever schedules compaction cannot bypass them, as with
+`journal.Config.Hold` and `MinRetention`. The hold sees each candidate
+(`RetainedJob`: id, request key, kind, state, principal, finish time) and
+keeps it, with all of its content, when it returns true. A hold that panics
+keeps the job (fails closed) and the pass goes on. The minimum clamps each
+cutoff to `now − minimum`, so no job younger than it is erased whatever
+cutoff is passed; `New` refuses a negative minimum. Held jobs are counted
+in `CompactionReport.Held` and stay eligible on every later pass.
+
+**Bounded batches.** `Compact` works in write transactions of at most
+`Retention.Batch` rows (`worker.DefaultCompactBatch` = 256 when zero,
+refused above `worker.MaxCompactBatch` = 4096), each marked `store.Writer`
+(#214) and writing first: its first statement makes sure the erasure
+counter row exists. Candidates are read with a keyset cursor on
+(`updated_at`, `job_id`) through a new partial index,
+`worker_jobs_finished ON worker_jobs (state, updated_at, job_id) WHERE
+state IN ('completed','dead')`, so each batch costs its own rows and never
+rescans the history before it, and a held job never stalls the cursor. The
+write lock is released between batches, so other writers, claims and
+submissions take their turns in the store's writer queue. Tombstone expiry
+is batched the same way through an index on `finished_at`. Measured on the
+author's macOS arm64 host under a load average of about 6 to 20: compacting
+200,000 completed jobs with the default batch took 782 transactions and
+11–24 s in three runs; the median transaction (including its wait for the
+writer turn and its durable commit) held 12–23 ms, the longest 68–492 ms.
+Unfinished jobs are not in the index, so claims do not maintain it; every
+job that finishes adds one entry. Twelve interleaved runs of 2,000 trivial
+jobs on the same host gave median enqueue rates of about 13.6 k/s on
+`origin/main` against 12.6 k/s with #290, and processing 2.29 k/s against
+2.19 k/s. The spread within each arm was larger than that difference, so
+it is not resolved.
+
+**Bytes, not just rows.** Erasure relies on the store-wide
+`secure_delete=ON` (#281) to zero the deleted cells, index entries and
+overflow pages, then purges the write-ahead log with the store's optional
+`store.Purger.PurgeLog`, under the journal's pending-purge pattern: each
+batch that erased a job increments `erasure_generation` in `worker_meta` in
+the same transaction, a successful purge records the generation it covered
+as `purged_generation`, and every later `Compact`, even one that erases
+nothing and even in a restarted process, retries the purge while the debt
+is unpaid. `CompactionReport.LogPurged` and `PurgePending` report it as the
+journal's report does. A reader that keeps the log in use blocks the purge
+for that pass only.
+
+**The census.** `Census` (#105, ADR 0022) still reads only unfinished and
+dead jobs through `worker_jobs_unfinished`. Compaction never changes its
+pending, waiting, active and stalled counts or the backlog lag. Its
+`DeadLetters` counts dead jobs still retained for an operator: a dead job
+`Compact` erased is no longer one (its payload is gone; it cannot be
+inspected or replayed), while a held dead job still is.
+
+**Schema.** `worker.New` creates `worker_compacted`, its `finished_at`
+index, `worker_meta` and `worker_jobs_finished` in place, with `CREATE …
+IF NOT EXISTS` inside the existing retried schema transaction (#233), so
+reopening changes nothing. No existing column changes.
+
 ### Webhook admission
 
 `trigger/webhook` declares durable / redeliver / caller: an event is
@@ -363,6 +482,10 @@ is never parsed before verification.
 | A handler that panics or calls `runtime.Goexit` fails its attempt (#267): `worker.HandlerPanicked` | behavioral, additive | No schema change. The panic still propagates from `ProcessOnce` unchanged. Where a recovered panic left the job leased with its handle transaction open, and the store busy for every writer until the process exited, the job is now pending after a backoff with error `handler_panicked`, or dead once its attempts are spent |
 | Jobs tied on `created_at` are claimed in enqueue order; `enqueue_seq` column and index | behavioral, schema | added by `worker.New`; existing jobs keep 0 and stay in `job_id` order among themselves |
 | `trigger.Submission.Trace`, `worker.EnqueueRequest.Trace`, `worker.Job.Trace`; `traceparent` and `tracestate` columns (#276, ADR 0020) | additive, schema | added by `worker.New` like `principal_json`; existing jobs carry no trace. The trace is not part of request identity: the same key with another trace is a duplicate that keeps the first. Workers from before #276 on the same store ignore the columns, so their jobs start root runs |
+| `worker.Queue.Compact`, `Retention`, `CompactionReport`, `RetainedJob`, `WithRetentionHold`, `WithMinRetention`, `DefaultCompactBatch`, `MaxCompactBatch`, `Job.Compacted` (#290) | additive | none. Nothing is erased until the application calls `Compact`; existing `New` calls compile unchanged |
+| `worker_compacted` and `worker_meta` tables; `worker_jobs_finished` and `worker_compacted_finished` indexes (#290) | schema | created by `worker.New` in place and idempotently. The first open of an existing queue indexes every finished job once, inside the schema transaction |
+| A key whose job was compacted answers from its tombstone (#290) | behavioral | only after `Compact` ran: a duplicate is `Accepted=false` with `Job.Compacted`, other content conflicts, `Get` returns the tombstone. Once `Retention.Tombstones` passes, the key is new again |
+| Workers from before #290 on the same store | compatibility limit | they do not read tombstones: a duplicate of a compacted job submitted through an old binary is accepted and runs again, and its `Get` reports not found. Run one version per store, as #245 already requires |
 | New package `trigger/webhook` | additive | none |
 
 ## Limits
@@ -387,8 +510,22 @@ is never parsed before verification.
   `Verifier`, as the tests do for a synthetic provider.
 - Secret values come from application configuration; there is no secret
   provider integration yet (E10).
-- The deduplication record lives as long as the job row; retention is the
-  queue's (E07).
+- The deduplication record lives as long as the job's tombstone (#290):
+  forever unless the application sets `Retention.Tombstones`. Tombstones
+  are small (digests, counts and times) but they do accumulate, one per
+  compacted job, for as long as the window lasts.
+- The queue does not schedule its own compaction: the application calls
+  `Compact` with its cutoffs, for example from a cron trigger.
+- Tombstone digests are pseudonymous, not anonymous: anyone holding the
+  database can confirm a guessed low-entropy request key, or a guessed
+  exact payload and principal, by hashing it. The kind, attempt counts and
+  times are kept in clear. The hold runs inside the write transaction, so a
+  slow hold holds every writer.
+- Erasure reaches the database file and its log, not copies: a backup taken
+  before `Compact` still holds the content, and content deleted before
+  secure deletion was on stays in free space until `store.Purger.PurgeFree`
+  (ADR 0021 §7 applies unchanged). Run `Compact` on a restored database
+  before serving it.
 - Each job now commits two write transactions instead of one. The #245
   review measured worker throughput on trivial jobs about 20 % lower:
   5.5–7.1 k jobs/s on `origin/main` against 4.9–5.7 k jobs/s with #245,

@@ -103,8 +103,8 @@
       "question": "How does an adapter hand verified work to durable admission and acknowledge only after commit?",
       "owner": "E09-T02",
       "status": "implemented",
-      "decision": "trigger.Submitter commits a keyed submission with its principal before returning; duplicates are reported, conflicts refused. worker.Queue implements it; webhooks acknowledge only after it returns (ADR 0006).",
-      "evidence": ["webhook-signed-mutations", "webhook-key-rotation", "webhook-crash-around-ack", "webhook-concurrent-duplicates", "webhook-trigger-conformance"]
+      "decision": "trigger.Submitter commits a keyed submission with its principal before returning; duplicates are reported, conflicts refused. worker.Queue implements it; webhooks acknowledge only after it returns. Queue.Compact erases finished jobs past their retention to digest-only tombstones that keep duplicates deduplicated and conflicts refused until the application ends the dedupe window, never touching unfinished jobs, respecting a fail-closed legal hold and a legal minimum, in bounded write batches followed by a pending log purge (ADR 0006, #290).",
+      "evidence": ["webhook-signed-mutations", "webhook-key-rotation", "webhook-crash-around-ack", "webhook-concurrent-duplicates", "webhook-trigger-conformance", "worker-retention-byte-search", "worker-retention-unfinished-untouched", "worker-retention-dedupe-window", "worker-retention-hold-and-minimum", "worker-retention-census", "worker-retention-bounded-batches", "worker-retention-pending-purge"]
     },
     {
       "id": "pubsub-delivery-transfer",

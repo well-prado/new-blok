@@ -162,8 +162,25 @@ queue table is shared by worker kinds in that database), then run:
 go run ./examples/recipes/cmd/shop teardown
 ```
 
-Teardown drops only `shop_*` and the selected worker queue table. It leaves the
-SQLite file and any unrelated application tables in place.
+Teardown drops only `shop_*` and the selected worker queue's tables
+(`worker_jobs`, and the `worker_compacted` tombstones and `worker_meta`
+counters of compacted jobs). It leaves the SQLite file and any unrelated
+application tables in place.
+
+### Retention of finished jobs
+
+Completed and dead jobs keep their payload, principal and trace context
+until the application erases them. This recipe's `serve` loop does not: an
+application with an erasure obligation calls `Application.Queue.Compact`
+on a schedule, for example
+`queue.Compact(ctx, worker.Retention{Completed: time.Now().Add(-30 * 24 * time.Hour)})`,
+optionally with a `Dead` cutoff once dead letters have been reviewed. A
+legal hold and a legal minimum are queue options
+(`worker.WithRetentionHold`, `worker.WithMinRetention`) given to
+`worker.New`; this recipe's `shop.New` opens its queue without them. A duplicate of a compacted job is
+still deduplicated by its digest-only tombstone (ADR 0006, "Retention of
+finished jobs"). The recipe's own `shop_outbox` rows are application data
+with their own retention, which the recipe does not implement.
 
 ### Executable evidence and source map
 
