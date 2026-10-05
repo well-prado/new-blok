@@ -136,7 +136,13 @@ principal never appears on the wire.
 **Authorization.** The application's `Authenticate` yields the reader
 (401 otherwise). `Authorize(reader, owner)` defaults to the owner only; a
 refused reader gets the same 404 as an unknown run. Run IDs and principals
-are at most 256 bytes.
+are at most 256 bytes. `Authorize` and `Policy(principal)` are evaluated once
+per connection, not per frame: a change of grant reaches an open
+subscription when it reconnects, which `MaxDuration` bounds. A run's owner
+never changes during a subscription. Every connection is admitted against
+the reader limits (`MaxSubscribers`, `SubscribersPerPrincipal`) right after
+authentication and before it replays, follows or reads durable state; a
+replay-only connection holds its admission until it has been written.
 
 **Frames and cursors.** Each frame is `id`, `event` (the inspection kind,
 `gap`, `snapshot` or `end`) and one line of compact JSON. Ids are
@@ -174,14 +180,37 @@ dropped by the runtime, as before; the window cannot recover it.
 
 **Recovery.** The hub is memory. With `Source` configured (the journal's
 `inspection.Source`), a run this process has no history of is read from
-durable state *as the reader*, so the journal authorizes again; the reader
-gets a `gap` (`restart` for an old cursor, `history_unavailable` without one)
-and a `snapshot` frame `{source: journal, reconstructed: true, page,
-unavailable: [...]}` built by `InspectSource` with the same field policy and
-a 64 KiB bound. A non-terminal recovered run is then followed live, so a
-resumed execution in this process streams normally. The snapshot holds
-journal facts only: transient transitions, logs, and steps that had not yet
-written a journal fact are not reconstructed.
+durable state *as the reader*, so the source authorizes again, and the reader
+gets a `gap` and a `snapshot` frame `{source: journal, reconstructed: true,
+page, unavailable: [...]}` built by `InspectSource` with the same field
+policy and a 64 KiB bound.
+
+Following such a run live needs its **durable owner**, because the engine
+publishes under the run's trusted principal and readers are authorized
+against it. A source that also implements `inspect.RunOwnerSource`
+(`RunOwner(ctx, reader, runID)`; the journal does, and being owner-only it
+names the reader for the reader's own runs) has the run attached under that
+owner; the reader is then checked with `Authorize(reader, owner)`, the gap is
+`restart` for an old cursor or `history_unavailable` without one, and a
+non-terminal run is followed live, so a resumed execution in this process
+streams normally. A source that cannot name the owner yields the gap
+(`history_unavailable`), the snapshot and `end`, without ids and without
+following; the reader reconnects for a fresh reconstruction or for the live
+run once the engine publishes it. The reader never becomes the owner. As a
+second line, a publication whose trusted owner differs from a *recovered*
+run's attached owner wins: the run is replaced by a new incarnation, its
+followers are detached (`reowned`) to re-authorize, and `Stats.Reowned`
+counts it; a live run's owner is never reclaimed (a conflicting publisher is
+rejected and counted).
+
+Recovered runs have their own budget: one reader principal may hold
+`RecoveredPerPrincipal` (16) attached runs, and at the budget its own least
+recently used unfollowed recovered run is recycled. A recovered run may
+displace only another recovered run or a closed one, never a live run; when
+every retained run is live, the read is refused as saturated.
+
+The snapshot holds journal facts only: transient transitions, logs, and
+steps that had not yet written a journal fact are not reconstructed.
 
 **Bounds** (zero takes the default; above the hard limit `New` refuses):
 
@@ -191,12 +220,13 @@ written a journal fact are not reconstructed.
 | frames / bytes per run | 1,024 / 256 KiB | 16,384 / 16 MiB | evict oldest; reader sees `retention` gap |
 | `MaxRuns × RunBytes` | 64 MiB | 1 GiB | refused at `New` |
 | frame `MaxEventBytes` | 32 KiB | 1 MiB | payloads → `{"$truncated":true}`, else `dropped` gap |
-| readers total / per run / per principal | 64 / 8 / 16 | 4,096 each | empty stream with `retry:` and `: saturated` |
+| admitted readers total / per principal; live followers per run | 64 / 16; 8 | 4,096 each | empty stream with `retry:` and `: saturated` |
+| recovered runs per reader principal | 16 | 16,384 | recycle own LRU unfollowed recovered run; none free: saturated |
 | reader queue `QueueDepth` | 32 | 1,024 | disconnect `slow_subscriber`; resume from cursor |
-| `MaxSubscribers × QueueDepth × MaxEventBytes` | 64 MiB | 256 MiB | refused at `New` |
+| `MaxSubscribers × (QueueDepth × MaxEventBytes + RunBytes)`: a live queue plus one run's replay per reader | 80 MiB | 256 MiB | refused at `New` |
 | subscription `MaxDuration` | 30 min | 2 h | ends; client resumes from cursor |
 | heartbeat / write timeout | 15 s / 5 s | 1 min / 1 min | write timeout ends the subscription |
-| durable snapshot read / size | 5 s / 64 KiB | 1 min / 1 MiB | no snapshot; the gap is still sent |
+| durable snapshot read / size (one per admitted reader) | 5 s / 64 KiB | 1 min / 1 MiB | no snapshot; the gap is still sent |
 
 `Hub.Close` ends every subscription (`shutdown`) and refuses new ones while
 publication continues, so stopping the stream never affects a run.

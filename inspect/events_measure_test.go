@@ -94,7 +94,7 @@ func TestEventStreamOverheadOnRunLatency(t *testing.T) {
 				var subs []*event.Subscriber
 				if current.stalled > 0 {
 					hub := current.stream.Hub()
-					if err := hub.AttachRecovered(runID, "alice", false); err != nil {
+					if err := hub.AttachRecovered(runID, "alice", "alice", false); err != nil {
 						t.Fatal(err)
 					}
 					for reader := 0; reader < current.stalled; reader++ {
@@ -117,6 +117,8 @@ func TestEventStreamOverheadOnRunLatency(t *testing.T) {
 					default:
 						t.Fatalf("%s: a stalled reader was not cut off", current.name)
 					}
+					// The reader's connection ends, releasing its admission.
+					current.stream.Hub().Unsubscribe(sub, "test")
 				}
 			}
 		}
@@ -157,7 +159,7 @@ func TestEventStreamDeliveryLatencyLeaksAndRetainedMemory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pacedApp := newLiveApp(t, liveConfig{stream: inspect.EventStreamConfig{Capture: fullCapture, Hub: event.Config{QueueDepth: 1024, MaxSubscribers: 8, SubscribersPerRun: 8, SubscribersPerPrincipal: 8, LateWindow: 10 * time.Millisecond}}, nodes: map[string]node.Any{"test/gate": paced.Any()}})
+	pacedApp := newLiveApp(t, liveConfig{stream: inspect.EventStreamConfig{Capture: fullCapture, Hub: event.Config{QueueDepth: 512, MaxSubscribers: 8, SubscribersPerRun: 8, SubscribersPerPrincipal: 8, LateWindow: 10 * time.Millisecond}}, nodes: map[string]node.Any{"test/gate": paced.Any()}})
 	result := pacedApp.start("latency-run", "alice", quote.Input{SKU: "coffee", Quantity: 1})
 	stream := awaitStream(t, context.Background(), pacedApp.eventsURL("latency-run"), "alice")
 	close(pacedLogs)

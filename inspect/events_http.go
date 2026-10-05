@@ -155,14 +155,33 @@ func (h *eventHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reque
 	}
 	fields := h.fields(principal)
 	hub := h.stream.hub
-	replay, err := hub.Subscribe(runID, principal, cursor, h.cfg.Authorize)
+	// Admission comes first: every connection counts against the reader
+	// limits before it replays, follows or reads durable state.
+	admission, err := hub.Admit(principal)
+	var replay event.Replay
+	if err == nil {
+		defer admission.Release()
+		replay, err = admission.Subscribe(runID, cursor, h.cfg.Authorize)
+	}
 	var snapshot *inspection.Page
 	if errors.Is(err, event.ErrNotFound) && h.cfg.Source != nil {
 		page, sourceErr := h.snapshot(request.Context(), principal, runID, fields)
 		if sourceErr == nil {
-			if err = hub.AttachRecovered(runID, principal, terminalStatus(page.Run.Status)); err == nil {
-				replay, err = hub.Subscribe(runID, principal, cursor, h.cfg.Authorize)
-				snapshot = &page
+			snapshot = &page
+			if owners, ok := h.cfg.Source.(RunOwnerSource); ok {
+				// Follow live only under the run's durable owner, so the
+				// engine's trusted publications reach it and the reader is
+				// authorized against the real owner.
+				var owner string
+				if owner, err = h.owner(request.Context(), owners, principal, runID); err != nil {
+					err = event.ErrNotFound
+				} else if err = hub.AttachRecovered(runID, owner, principal, terminalStatus(page.Run.Status)); err == nil {
+					replay, err = admission.Subscribe(runID, cursor, h.cfg.Authorize)
+				}
+			} else {
+				// The source cannot name the owner: serve the reconstruction
+				// once, without following live.
+				replay, err = event.Replay{Gap: &event.Gap{Reason: event.GapUnavailable}, Finished: true}, nil
 			}
 		}
 	}
@@ -404,6 +423,25 @@ func (s *eventSession) flush() error {
 		return err
 	}
 	return s.control.Flush()
+}
+
+// RunOwnerSource is an inspection.Source that can also name the durable
+// owner of a run it lets reader see. With it, a run this process has no live
+// history of is followed live under its real owner; without it, the reader
+// gets the reconstruction only.
+type RunOwnerSource interface {
+	inspection.Source
+	RunOwner(ctx context.Context, reader, runID string) (string, error)
+}
+
+func (h *eventHandler) owner(parent context.Context, source RunOwnerSource, principal, runID string) (string, error) {
+	ctx, cancel := context.WithTimeout(parent, h.cfg.SourceTimeout)
+	defer cancel()
+	owner, err := source.RunOwner(ctx, principal, runID)
+	if err == nil && (owner == "" || len(owner) > event.MaxIdentityBytes) {
+		err = event.ErrNotFound
+	}
+	return owner, err
 }
 
 type recoveredSnapshot struct {

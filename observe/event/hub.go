@@ -37,6 +37,7 @@ const (
 	DefaultSubscribersPerPrincipal = 16
 	DefaultQueueDepth              = 32
 	DefaultLateWindow              = 2 * time.Second
+	DefaultRecoveredPerPrincipal   = 16
 
 	MaxRunsLimit       = 1 << 14
 	MaxEventsPerRun    = 1 << 14
@@ -47,8 +48,9 @@ const (
 	MaxLateWindow      = 30 * time.Second
 	// MaxRetainedBytes bounds MaxRuns × RunBytes.
 	MaxRetainedBytes = 1 << 30
-	// MaxQueuedBytes bounds MaxSubscribers × QueueDepth × MaxEventBytes: the
-	// most that subscriber queues can pin beyond the retained history.
+	// MaxQueuedBytes bounds MaxSubscribers × (QueueDepth × MaxEventBytes +
+	// RunBytes): the most that readers can pin beyond the retained history,
+	// a live queue plus one run's replay each.
 	MaxQueuedBytes = 256 << 20
 	// MaxCursorBytes bounds a cursor before it is parsed.
 	MaxCursorBytes = 128
@@ -109,11 +111,18 @@ type Config struct {
 	// MaxEventBytes bounds one frame's data. A larger observation is
 	// dropped and replaced by a gap marker.
 	MaxEventBytes int
-	// MaxSubscribers, SubscribersPerRun and SubscribersPerPrincipal bound
-	// readers; a subscription beyond them is refused with ErrSaturated.
+	// MaxSubscribers and SubscribersPerPrincipal bound admitted readers
+	// (Admit): every connection, whether it follows live, only replays, or
+	// first needs a durable read. SubscribersPerRun bounds live followers of
+	// one run. A reader beyond them is refused with ErrSaturated.
 	MaxSubscribers          int
 	SubscribersPerRun       int
 	SubscribersPerPrincipal int
+	// RecoveredPerPrincipal bounds the runs one reader principal has
+	// attached from durable state (AttachRecovered). At the budget its own
+	// least recently used unfollowed recovered run is recycled; a recovered
+	// run never evicts a run that is still live.
+	RecoveredPerPrincipal int
 	// QueueDepth frames may wait for one subscriber. A publication that
 	// finds the queue full disconnects that subscriber ("slow_subscriber")
 	// instead of waiting; it resumes from its cursor.
@@ -141,6 +150,7 @@ func (c Config) withDefaults() (Config, error) {
 		{&c.SubscribersPerRun, DefaultSubscribersPerRun, MaxSubscribersCap, "SubscribersPerRun"},
 		{&c.SubscribersPerPrincipal, DefaultSubscribersPerPrincipal, MaxSubscribersCap, "SubscribersPerPrincipal"},
 		{&c.QueueDepth, DefaultQueueDepth, MaxQueueDepth, "QueueDepth"},
+		{&c.RecoveredPerPrincipal, DefaultRecoveredPerPrincipal, MaxRunsLimit, "RecoveredPerPrincipal"},
 	}
 	for _, item := range defaults {
 		if *item.value < 0 {
@@ -165,8 +175,8 @@ func (c Config) withDefaults() (Config, error) {
 	if int64(c.MaxRuns)*int64(c.RunBytes) > MaxRetainedBytes {
 		return c, fmt.Errorf("observe/event: MaxRuns × RunBytes exceeds %d bytes", MaxRetainedBytes)
 	}
-	if int64(c.MaxSubscribers)*int64(c.QueueDepth)*int64(c.MaxEventBytes) > MaxQueuedBytes {
-		return c, fmt.Errorf("observe/event: MaxSubscribers × QueueDepth × MaxEventBytes exceeds %d bytes", MaxQueuedBytes)
+	if int64(c.MaxSubscribers)*(int64(c.QueueDepth)*int64(c.MaxEventBytes)+int64(c.RunBytes)) > MaxQueuedBytes {
+		return c, fmt.Errorf("observe/event: MaxSubscribers × (QueueDepth × MaxEventBytes + RunBytes) exceeds %d bytes", MaxQueuedBytes)
 	}
 	if c.SubscribersPerRun > c.MaxSubscribers || c.SubscribersPerPrincipal > c.MaxSubscribers {
 		return c, errors.New("observe/event: a per-run or per-principal subscriber limit exceeds MaxSubscribers")
@@ -179,8 +189,9 @@ func (c Config) withDefaults() (Config, error) {
 
 // Stats is counters only; it never exposes contents or principals.
 type Stats struct {
-	Runs, Frames, RetainedBytes, Subscribers int
-	Published                                uint64
+	// Readers are admitted connections; Subscribers are live queues.
+	Runs, Frames, RetainedBytes, Readers, Subscribers int
+	Published                                         uint64
 	// Dropped observations: invalid or oversized, or no run slot.
 	Dropped uint64
 	// Rejected publications: wrong owner, or a non-late observation after
@@ -192,6 +203,9 @@ type Stats struct {
 	RejectedSubscribers uint64
 	LateDelivered       uint64
 	LateDropped         uint64
+	// Reowned counts recovered runs whose attached owner differed from the
+	// trusted publisher; the publisher won (see Publish).
+	Reowned uint64
 }
 
 // Frame is one immutable, already-projected observation. Its bytes are
@@ -247,6 +261,8 @@ type run struct {
 	finished   bool
 	finishedAt time.Time
 	recovered  bool
+	// attachedBy is the reader whose durable read attached a recovered run.
+	attachedBy string
 	element    *list.Element
 }
 
@@ -260,7 +276,9 @@ type Hub struct {
 	lru         *list.List // of *run, least recently used first
 	nextInc     uint64
 	subscribers int
+	readers     int
 	byReader    map[string]int
+	recoveredBy map[string]int
 	stats       Stats
 	retained    int
 	closed      bool
@@ -277,7 +295,7 @@ func New(config Config) (*Hub, error) {
 	if _, err := rand.Read(raw[:]); err != nil {
 		return nil, fmt.Errorf("observe/event: create epoch: %w", err)
 	}
-	return &Hub{cfg: config, epoch: hex.EncodeToString(raw[:]), runs: map[string]*run{}, lru: list.New(), byReader: map[string]int{}}, nil
+	return &Hub{cfg: config, epoch: hex.EncodeToString(raw[:]), runs: map[string]*run{}, lru: list.New(), byReader: map[string]int{}, recoveredBy: map[string]int{}}, nil
 }
 
 // Config returns the effective configuration.
@@ -290,6 +308,7 @@ func (h *Hub) Stats() Stats {
 	stats.Runs = len(h.runs)
 	stats.RetainedBytes = h.retained
 	stats.Subscribers = h.subscribers
+	stats.Readers = h.readers
 	for _, item := range h.runs {
 		stats.Frames += len(item.frames)
 	}
@@ -339,6 +358,15 @@ func (h *Hub) Publish(runID, owner string, item Item) (string, error) {
 	}
 	now := h.cfg.Clock()
 	current := h.runs[runID]
+	if current != nil && current.owner != owner && current.recovered {
+		// The owner of a recovered run came from a durable read; the
+		// publisher is the engine's trusted invocation. The publisher wins:
+		// followers are detached so they re-authorize against the real
+		// owner, and the new incarnation opens with a gap.
+		h.stats.Reowned++
+		h.removeLocked(current, "reowned")
+		current = nil
+	}
 	if current != nil && current.owner != owner {
 		h.stats.Rejected++
 		return "", ErrUnauthorized
@@ -368,7 +396,7 @@ func (h *Hub) Publish(runID, owner string, item Item) (string, error) {
 		return "", ErrNotFound
 	}
 	if current == nil {
-		created, err := h.createLocked(runID, owner, now)
+		created, err := h.createLocked(runID, owner, now, false)
 		if err != nil {
 			h.stats.Dropped++
 			return "", err
@@ -453,12 +481,14 @@ func (h *Hub) touchLocked(item *run) {
 	}
 }
 
-func (h *Hub) createLocked(runID, owner string, now time.Time) (*run, error) {
+func (h *Hub) createLocked(runID, owner string, now time.Time, recovered bool) (*run, error) {
 	if len(h.runs) >= h.cfg.MaxRuns {
 		var victim *run
 		for element := h.lru.Front(); element != nil; element = element.Next() {
 			candidate := element.Value.(*run)
-			if len(candidate.subs) == 0 {
+			// A recovered run may displace only another recovered run or a
+			// closed one, never a run that is still live.
+			if len(candidate.subs) == 0 && (!recovered || candidate.recovered || h.closedLocked(candidate, now)) {
 				victim = candidate
 				break
 			}
@@ -476,9 +506,20 @@ func (h *Hub) createLocked(runID, owner string, now time.Time) (*run, error) {
 	return item, nil
 }
 
+// closedLocked reports a run that is finished and past its late window.
+func (h *Hub) closedLocked(item *run, now time.Time) bool {
+	return item.finished && (item.finishedAt.IsZero() || !now.Before(item.finishedAt.Add(h.cfg.LateWindow)))
+}
+
 func (h *Hub) removeLocked(item *run, reason string) {
 	for sub := range item.subs {
 		h.detachLocked(item, sub, reason)
+	}
+	if item.attachedBy != "" {
+		if h.recoveredBy[item.attachedBy]--; h.recoveredBy[item.attachedBy] <= 0 {
+			delete(h.recoveredBy, item.attachedBy)
+		}
+		item.attachedBy = ""
 	}
 	h.retained -= item.bytes
 	if item.element != nil {
@@ -494,18 +535,16 @@ func (h *Hub) detachLocked(item *run, sub *Subscriber, reason string) {
 	}
 	delete(item.subs, sub)
 	h.subscribers--
-	if h.byReader[sub.reader]--; h.byReader[sub.reader] <= 0 {
-		delete(h.byReader, sub.reader)
-	}
 	sub.close(reason)
 }
 
-// AttachRecovered makes a run known from durable state followable after an
-// authorized durable read established that owner owns it. The run has no
-// live history: a reader without a cursor of this incarnation is told so by
-// a gap. A terminal run is closed at once.
-func (h *Hub) AttachRecovered(runID, owner string, terminal bool) error {
-	if !validIdentity(runID) || !validIdentity(owner) {
+// AttachRecovered makes a run known from durable state followable. owner
+// must be the run's durable owner as the durable source reports it, never
+// the reader; reader is whose read attached it, for its recovered budget.
+// The run has no live history: a reader without a cursor of this incarnation
+// is told so by a gap. A terminal run is closed at once.
+func (h *Hub) AttachRecovered(runID, owner, reader string, terminal bool) error {
+	if !validIdentity(runID) || !validIdentity(owner) || !validIdentity(reader) {
 		return ErrNotFound
 	}
 	h.mu.Lock()
@@ -519,11 +558,29 @@ func (h *Hub) AttachRecovered(runID, owner string, terminal bool) error {
 		}
 		return nil
 	}
-	item, err := h.createLocked(runID, owner, h.cfg.Clock())
+	if h.recoveredBy[reader] >= h.cfg.RecoveredPerPrincipal {
+		var own *run
+		for element := h.lru.Front(); element != nil; element = element.Next() {
+			candidate := element.Value.(*run)
+			if candidate.attachedBy == reader && len(candidate.subs) == 0 {
+				own = candidate
+				break
+			}
+		}
+		if own == nil {
+			h.stats.RejectedSubscribers++
+			return ErrSaturated
+		}
+		h.removeLocked(own, "evicted")
+		h.stats.EvictedRuns++
+	}
+	item, err := h.createLocked(runID, owner, h.cfg.Clock(), true)
 	if err != nil {
+		h.stats.RejectedSubscribers++
 		return err
 	}
-	item.recovered = true
+	item.recovered, item.attachedBy = true, reader
+	h.recoveredBy[reader]++
 	if terminal {
 		// Closed immediately: the late window belongs to the process that
 		// saw the terminal transition.
@@ -560,13 +617,16 @@ type Replay struct {
 
 // Subscriber is a bounded queue of frames for one reader.
 type Subscriber struct {
-	events chan *Frame
-	done   chan struct{}
-	once   sync.Once
-	reason string
-	runID  string
-	reader string
-	inc    uint64
+	events    chan *Frame
+	done      chan struct{}
+	once      sync.Once
+	reason    string
+	runID     string
+	reader    string
+	inc       uint64
+	admission *Admission
+	// ownsAdmission: Hub.Subscribe admitted it, so Unsubscribe releases it.
+	ownsAdmission bool
 }
 
 func (s *Subscriber) Events() <-chan *Frame { return s.events }
@@ -589,13 +649,77 @@ func SameOwner(reader, owner string) error {
 	return ErrUnauthorized
 }
 
-// Subscribe authorizes reader before any retained data is selected, then
+// Admission is one admitted reader connection. Every connection is admitted
+// before it does any work, including a durable read or a replay that will
+// not follow live, so reader limits bound all of them.
+type Admission struct {
+	hub      *Hub
+	reader   string
+	once     sync.Once
+	released bool
+}
+
+// Admit admits one connection of reader within MaxSubscribers and
+// SubscribersPerPrincipal.
+func (h *Hub) Admit(reader string) (*Admission, error) {
+	if !validIdentity(reader) {
+		return nil, ErrNotFound
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return nil, ErrClosed
+	}
+	if h.readers >= h.cfg.MaxSubscribers || h.byReader[reader] >= h.cfg.SubscribersPerPrincipal {
+		h.stats.RejectedSubscribers++
+		return nil, ErrSaturated
+	}
+	h.readers++
+	h.byReader[reader]++
+	return &Admission{hub: h, reader: reader}, nil
+}
+
+// Release ends the admission. It is idempotent.
+func (a *Admission) Release() {
+	if a == nil {
+		return
+	}
+	a.once.Do(func() {
+		h := a.hub
+		h.mu.Lock()
+		a.released = true
+		h.readers--
+		if h.byReader[a.reader]--; h.byReader[a.reader] <= 0 {
+			delete(h.byReader, a.reader)
+		}
+		h.mu.Unlock()
+	})
+}
+
+// Subscribe admits reader and subscribes it; Unsubscribe releases both.
+// It is Admit followed by Admission.Subscribe.
+func (h *Hub) Subscribe(runID, reader, cursor string, authorize Authorizer) (Replay, error) {
+	admission, err := h.Admit(reader)
+	if err != nil {
+		return Replay{}, err
+	}
+	replay, err := admission.Subscribe(runID, cursor, authorize)
+	if err != nil || replay.Subscriber == nil {
+		admission.Release()
+	} else {
+		replay.Subscriber.ownsAdmission = true
+	}
+	return replay, err
+}
+
+// Subscribe authorizes the admitted reader before any retained data is selected, then
 // selects the replay after cursor and registers the live queue under one
 // lock, so no frame falls between them. An unauthorized reader gets
 // ErrNotFound, exactly as for an unknown run. authorize runs outside the
 // hub's lock.
-func (h *Hub) Subscribe(runID, reader, cursor string, authorize Authorizer) (Replay, error) {
-	if !validIdentity(runID) || !validIdentity(reader) {
+func (a *Admission) Subscribe(runID, cursor string, authorize Authorizer) (Replay, error) {
+	h, reader := a.hub, a.reader
+	if !validIdentity(runID) {
 		return Replay{}, ErrNotFound
 	}
 	if authorize == nil {
@@ -628,7 +752,7 @@ func (h *Hub) Subscribe(runID, reader, cursor string, authorize Authorizer) (Rep
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.closed {
+	if h.closed || a.released {
 		return Replay{}, ErrClosed
 	}
 	current = h.runs[runID]
@@ -679,14 +803,13 @@ func (h *Hub) Subscribe(runID, reader, cursor string, authorize Authorizer) (Rep
 			return result, nil
 		}
 	}
-	if len(current.subs) >= h.cfg.SubscribersPerRun || h.subscribers >= h.cfg.MaxSubscribers || h.byReader[reader] >= h.cfg.SubscribersPerPrincipal {
+	if len(current.subs) >= h.cfg.SubscribersPerRun {
 		h.stats.RejectedSubscribers++
 		return Replay{}, ErrSaturated
 	}
-	sub := &Subscriber{events: make(chan *Frame, h.cfg.QueueDepth), done: make(chan struct{}), runID: runID, reader: reader, inc: current.inc}
+	sub := &Subscriber{events: make(chan *Frame, h.cfg.QueueDepth), done: make(chan struct{}), runID: runID, reader: reader, inc: current.inc, admission: a}
 	current.subs[sub] = struct{}{}
 	h.subscribers++
-	h.byReader[reader]++
 	h.touchLocked(current)
 	result.Subscriber = sub
 	return result, nil
@@ -703,6 +826,9 @@ func (h *Hub) Unsubscribe(sub *Subscriber, reason string) {
 	}
 	h.mu.Unlock()
 	sub.close(reason)
+	if sub.ownsAdmission {
+		sub.admission.Release()
+	}
 }
 
 // Close ends every subscription ("shutdown") and refuses new ones.

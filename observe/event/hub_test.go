@@ -59,14 +59,15 @@ func TestConfigBoundsAreValidatedAndDefaulted(t *testing.T) {
 		t.Fatalf("defaults=%+v", got)
 	}
 	for name, config := range map[string]Config{
-		"negative":           {MaxRuns: -1},
-		"runs over limit":    {MaxRuns: MaxRunsLimit + 1},
-		"event over run":     {MaxEventBytes: 64 << 10, RunBytes: 64 << 10},
-		"retained over 1GiB": {MaxRuns: MaxRunsLimit, RunBytes: MaxRunBytesLimit},
-		"queues over 256MiB": {MaxSubscribers: MaxSubscribersCap, QueueDepth: MaxQueueDepth, SubscribersPerRun: 1, SubscribersPerPrincipal: 1},
-		"late window":        {LateWindow: MaxLateWindow + time.Second},
-		"negative window":    {LateWindow: -time.Second},
-		"per-run over max":   {MaxSubscribers: 2, SubscribersPerRun: 3, SubscribersPerPrincipal: 1},
+		"negative":            {MaxRuns: -1},
+		"runs over limit":     {MaxRuns: MaxRunsLimit + 1},
+		"event over run":      {MaxEventBytes: 64 << 10, RunBytes: 64 << 10},
+		"retained over 1GiB":  {MaxRuns: MaxRunsLimit, RunBytes: MaxRunBytesLimit},
+		"queues over 256MiB":  {MaxSubscribers: MaxSubscribersCap, QueueDepth: MaxQueueDepth, SubscribersPerRun: 1, SubscribersPerPrincipal: 1},
+		"replays over 256MiB": {MaxSubscribers: 1024, QueueDepth: 1, MaxEventBytes: 4096, SubscribersPerRun: 1, SubscribersPerPrincipal: 1},
+		"late window":         {LateWindow: MaxLateWindow + time.Second},
+		"negative window":     {LateWindow: -time.Second},
+		"per-run over max":    {MaxSubscribers: 2, SubscribersPerRun: 3, SubscribersPerPrincipal: 1},
 	} {
 		if _, err := New(config); err == nil {
 			t.Errorf("%s: config accepted: %+v", name, config)
@@ -394,17 +395,17 @@ func TestStartOnFinishedRunSupersedesAndRecoveredRunsReportMissingHistory(t *tes
 	if old.Subscriber.Reason() != "superseded" {
 		t.Fatalf("reason=%q", old.Subscriber.Reason())
 	}
-	if err := hub.AttachRecovered("run-1", "mallory", false); !errors.Is(err, ErrUnauthorized) {
+	if err := hub.AttachRecovered("run-1", "mallory", "mallory", false); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("recovered owner mismatch err=%v", err)
 	}
-	if err := hub.AttachRecovered("run-r", "alice", false); err != nil {
+	if err := hub.AttachRecovered("run-r", "alice", "alice", false); err != nil {
 		t.Fatal(err)
 	}
 	replay, err := hub.Subscribe("run-r", "alice", "", nil)
 	if err != nil || replay.Gap == nil || replay.Gap.Reason != GapUnavailable || replay.Subscriber == nil || !replay.Recovered {
 		t.Fatalf("recovered replay=%+v err=%v", replay, err)
 	}
-	if err := hub.AttachRecovered("run-t", "alice", true); err != nil {
+	if err := hub.AttachRecovered("run-t", "alice", "alice", true); err != nil {
 		t.Fatal(err)
 	}
 	if replay, err := hub.Subscribe("run-t", "alice", "", nil); err != nil || replay.Subscriber != nil || replay.Gap == nil {
@@ -484,5 +485,112 @@ func TestConcurrentPublishersAndSubscribers(t *testing.T) {
 	wg.Wait()
 	if stats := hub.Stats(); stats.Subscribers != 0 {
 		t.Fatalf("subscribers leaked: %+v", stats)
+	}
+}
+
+// TestTrustedPublisherReclaimsARecoveredRunAttachedUnderAnotherOwner is the
+// hub's defence for review finding F1: if a recovered run was attached
+// under an owner other than the engine's trusted publisher, the publisher
+// wins visibly: followers are detached to re-authorize, nothing is silently
+// rejected, and the real owner can follow.
+func TestTrustedPublisherReclaimsARecoveredRunAttachedUnderAnotherOwner(t *testing.T) {
+	hub := newHub(t, Config{})
+	if err := hub.AttachRecovered("run-1", "bob", "bob", false); err != nil {
+		t.Fatal(err)
+	}
+	bob, err := hub.Subscribe("run-1", "bob", "", nil)
+	if err != nil || bob.Subscriber == nil {
+		t.Fatalf("bob=%+v err=%v", bob, err)
+	}
+	if _, err := hub.Publish("run-1", "alice", Item{Name: "run.started", Data: []byte(`{}`), Start: true}); err != nil {
+		t.Fatalf("trusted publication: %v", err)
+	}
+	<-bob.Subscriber.Done()
+	if bob.Subscriber.Reason() != "reowned" {
+		t.Fatalf("bob reason=%q", bob.Subscriber.Reason())
+	}
+	if _, err := hub.Subscribe("run-1", "bob", "", nil); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("bob after reclaim err=%v", err)
+	}
+	alice, err := hub.Subscribe("run-1", "alice", "", nil)
+	if err != nil || len(alice.Frames) != 1 || alice.Frames[0].Name() != "run.started" {
+		t.Fatalf("alice replay=%v err=%v", names(alice.Frames), err)
+	}
+	if stats := hub.Stats(); stats.Reowned != 1 || stats.Rejected != 0 || stats.Published != 1 {
+		t.Fatalf("stats=%+v", stats)
+	}
+	// A live run's owner is never reclaimed: that is a real conflict.
+	if _, err := hub.Publish("run-1", "mallory", step(1)); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("conflicting live publisher err=%v", err)
+	}
+}
+
+// TestRecoveredRunsRecycleTheirOwnBudgetAndNeverEvictLiveRuns is review
+// finding F2 at the hub.
+func TestRecoveredRunsRecycleTheirOwnBudgetAndNeverEvictLiveRuns(t *testing.T) {
+	hub := newHub(t, Config{MaxRuns: 3, RecoveredPerPrincipal: 2})
+	hub.Publish("live-a", "carol", Item{Name: "run.started", Data: []byte(`{}`), Start: true})
+	for _, runID := range []string{"old-1", "old-2", "old-3", "old-4"} {
+		if err := hub.AttachRecovered(runID, "mallory", "mallory", true); err != nil {
+			t.Fatalf("%s: %v", runID, err)
+		}
+	}
+	if _, err := hub.Subscribe("live-a", "carol", "", nil); err != nil {
+		t.Fatalf("carol's live run was evicted by recovered reads: %v", err)
+	}
+	if _, err := hub.Subscribe("old-1", "mallory", "", nil); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("mallory's oldest recovered run should have been recycled: %v", err)
+	}
+	if stats := hub.Stats(); stats.Runs != 3 {
+		t.Fatalf("stats=%+v", stats)
+	}
+	// With only live runs retained, a recovered read is refused, not served
+	// by evicting one.
+	full := newHub(t, Config{MaxRuns: 2})
+	full.Publish("live-a", "carol", Item{Name: "run.started", Data: []byte(`{}`), Start: true})
+	full.Publish("live-b", "dave", Item{Name: "run.started", Data: []byte(`{}`), Start: true})
+	if err := full.AttachRecovered("old-1", "mallory", "mallory", false); !errors.Is(err, ErrSaturated) {
+		t.Fatalf("recovered read evicted a live run: %v", err)
+	}
+	// A closed run may make room.
+	full.Publish("live-b", "dave", Item{Name: "run.completed", Data: []byte(`{}`), Terminal: true})
+	closedClock := newHub(t, Config{MaxRuns: 1, LateWindow: time.Millisecond})
+	closedClock.Publish("done", "dave", Item{Name: "run.started", Data: []byte(`{}`), Start: true})
+	closedClock.Publish("done", "dave", Item{Name: "run.completed", Data: []byte(`{}`), Terminal: true})
+	time.Sleep(5 * time.Millisecond)
+	if err := closedClock.AttachRecovered("old-1", "mallory", "mallory", true); err != nil {
+		t.Fatalf("a closed run should make room: %v", err)
+	}
+}
+
+// TestAdmissionBoundsEveryConnection is review finding F3 at the hub: a
+// replay that will not follow live still holds its admission.
+func TestAdmissionBoundsEveryConnection(t *testing.T) {
+	hub := newHub(t, Config{MaxSubscribers: 2, SubscribersPerRun: 2, SubscribersPerPrincipal: 2})
+	hub.Publish("run-1", "alice", Item{Name: "run.started", Data: []byte(`{}`), Start: true})
+	hub.AttachRecovered("closed", "alice", "alice", true)
+	first, err := hub.Admit("alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay, err := first.Subscribe("closed", "", nil)
+	if err != nil || replay.Subscriber != nil {
+		t.Fatalf("closed replay=%+v err=%v", replay, err)
+	}
+	second, _ := hub.Admit("alice")
+	if _, err := hub.Admit("alice"); !errors.Is(err, ErrSaturated) {
+		t.Fatalf("third connection err=%v", err)
+	}
+	if stats := hub.Stats(); stats.Readers != 2 || stats.Subscribers != 0 {
+		t.Fatalf("stats=%+v", stats)
+	}
+	first.Release()
+	first.Release()
+	second.Release()
+	if _, err := first.Subscribe("run-1", "", nil); !errors.Is(err, ErrClosed) {
+		t.Fatalf("subscribe on a released admission err=%v", err)
+	}
+	if stats := hub.Stats(); stats.Readers != 0 {
+		t.Fatalf("stats=%+v", stats)
 	}
 }
