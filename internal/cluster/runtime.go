@@ -207,6 +207,12 @@ func (r *Runtime) Admit(ctx context.Context, request Submission) (Admission, err
 		globalSlot := globalSlots[rand.IntN(len(globalSlots))]
 		tenantSlot := tenantSlots[rand.IntN(len(tenantSlots))]
 		run := RunRecord{RunID: runID, Tenant: request.Tenant, RequestKey: request.RequestKey, Workflow: request.Workflow, ArtifactDigest: workflow.Program.Digest, InputDigest: inputDigest, Input: append(json.RawMessage(nil), canonicalInput...), State: "accepted", GlobalSlot: globalSlot, TenantSlot: tenantSlot}
+		// The accepted record must leave room for everything the runtime
+		// adds before the run finishes, or it is admitted but can never be
+		// claimed (#254).
+		if err := checkEncoded(maxNonTerminalRun(run)); err != nil {
+			return Admission{}, fmt.Errorf("%w: workflow input leaves no room for run metadata: %w", ErrInvalid, err)
+		}
 		encoded, _ := json.Marshal(run)
 		// Capacity slot choices are transaction-local allocation details. Keep
 		// them out of the stable admission event identity so concurrent ingress
@@ -236,6 +242,9 @@ func (r *Runtime) Admit(ctx context.Context, request Submission) (Admission, err
 				return Admission{}, ErrRequestConflict
 			}
 			return Admission{RunID: runID, Accepted: false, State: existing.State}, nil
+		}
+		if tooLargeErr := classifyTooLarge(err, callerOwnsAll); tooLargeErr != nil {
+			return Admission{}, tooLargeErr
 		}
 		if !errors.Is(err, distributed.ErrAdmissionSlotTaken) {
 			return Admission{}, fmt.Errorf("%w: %v", ErrUnavailable, err)

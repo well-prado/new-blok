@@ -175,6 +175,17 @@ func (r *Runtime) DeliverSignal(ctx context.Context, tenant, waitID, signalID, p
 		if commitErr == nil {
 			return SignalResult{Accepted: true}, nil
 		}
+		// The signal owns the wait record and the event that embeds it, and
+		// a transaction over the etcd transport bound: the run record alone
+		// fits it with room to spare (distributed.MinRequestBytes), so only
+		// a large signal can push it over. The run record is the runtime's;
+		// admission reserves its metadata headroom, so its overflow is an
+		// internal defect, never the caller's 400.
+		if err := classifyTooLarge(commitErr, func(tooLarge *distributed.RecordTooLargeError) bool {
+			return tooLarge.Record != "state" || tooLarge.StateID == stateID
+		}); err != nil {
+			return SignalResult{}, err
+		}
 		latestData, latestRevision, readErr := r.store.ReadState(ctx, partition, stateID)
 		if readErr != nil {
 			return SignalResult{}, fmt.Errorf("%w: reconcile signal race after %v: %v", ErrUnavailable, commitErr, readErr)
@@ -222,6 +233,9 @@ func (r *Runtime) commitLateSignal(ctx context.Context, owner distributed.Owner,
 	err := r.store.Commit(ctx, owner, id, "wait.signal_late", data)
 	if err == nil {
 		return nil
+	}
+	if tooLargeErr := classifyTooLarge(err, callerOwnsAll); tooLargeErr != nil {
+		return tooLargeErr
 	}
 	if !errors.Is(err, distributed.ErrAlreadyWritten) {
 		// A storage outage or an owner change between reading the owner

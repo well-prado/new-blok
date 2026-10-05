@@ -112,6 +112,74 @@ and a missing or mismatched artifact fails closed. The S3 integration test
 proves the existing content-addressed blob adapter across takeover, not an
 artifact-registry integration.
 
+Records are bounded after encoding (#254). The edge bound `MaxInputBytes`
+counts request bytes, but `encoding/json` HTML-escapes `<`, `>` and `&` to six
+bytes each, so a body under the edge bound can encode into a much larger
+record. Three things are bounded, all before a transaction is sent:
+
+- **Each record.** Every encoded state projection and event payload is at most
+  `distributed.MaxPayloadBytes` (512 KiB).
+- **Each transaction.** The whole etcd request (keys, values, compares and
+  protobuf framing, estimated from above) is at most the smaller of etcd's
+  `--max-request-bytes` and the client's `MaxCallSendMsgSize`. Both default to
+  etcd's own defaults (1.5 MiB and 2 MiB). A deployment that changes either
+  must pass its values with `distributed.WithRequestLimits`. `distributed.New`
+  refuses limits below `MinRequestBytes` (two records at the bound plus
+  64 KiB), so every two-record transaction (admission, claim, suspension,
+  finish) fits whenever its records do. Only a transaction with three or more
+  records (a signal or timer that re-admits its run) can exceed the request
+  bound. If etcd itself still answers "request is too large", or gRPC
+  answers ResourceExhausted for a message over its size limit, the error is
+  reported the same way. etcd's NOSPACE alarm is not a size rejection and
+  stays an ordinary error.
+- **Each run's growth.** Admission accepts a run only if its record still fits
+  with the largest metadata the runtime adds before a terminal transition:
+  the longest non-terminal state and an owner ID of 180 bytes (the store's
+  name limit) at its worst encoding (six bytes each), plus a maximal fence.
+  Claim, suspension, takeover by a longer owner ID, and signal or timer
+  re-admission therefore never outgrow the bound. Terminal output and error
+  codes are not covered yet (#265).
+
+The store reports each case as `distributed.ErrRecordTooLarge`, as a
+`*RecordTooLargeError` that names the record (a state ID, the event payload,
+or the whole request). The runtime classifies it by whose record it is:
+
+| Over-bound part | Classification | HTTP |
+|---|---|---|
+| Admission input, or a run record that leaves no metadata headroom | `ErrInvalid` | 400, no `Retry-After` |
+| A signal's wait record, its event, or its late-signal record | `ErrInvalid` | 400, no `Retry-After` |
+| A signal transaction over the request bound | `ErrInvalid`: the run record alone fits with room to spare, so only a large signal pushes it over, and a smaller signal is accepted | 400, no `Retry-After` |
+| A run record the runtime grew (unreachable for runs admitted with headroom; possible for a run stored without it) | `ErrRecordOverflow`: definite, and not the caller's fault | 500, no `Retry-After` |
+| A genuine storage outage | `ErrUnavailable` | 503 + `Retry-After` (unchanged) |
+
+400 rather than 413, because both handlers already answer a body over the
+edge bound with 400 and map `ErrInvalid` to 400. "Too large" then has one
+status, whichever layer detects it. In each case nothing durable was
+written, and retrying the same request can never succeed. The effective bound
+for HTML-heavy input is therefore about one sixth of `MaxInputBytes`, minus
+the run-metadata headroom (about 1.1 KiB).
+
+Compatibility classification for #254: behavioral, and additive in the API.
+- Requests that encode over a bound used to get a permanent 503 +
+  `Retry-After`, or a 202 for a run that could never be claimed. They now get
+  a definite 400. A tiny signal to a run stored without headroom gets a 500
+  instead of a misleading 400. Admission accepts about 1.1 KiB less encoded
+  input than before.
+- Additive exports: `ErrRecordTooLarge`, `RecordTooLargeError`,
+  `RequestLimits`, `WithRequestLimits`, `CheckRecord`, `MinRequestBytes`, the
+  two default limits, and `cluster.ErrRecordOverflow`. `distributed.New`
+  gains variadic options and stays source compatible.
+- Persisted bytes are unchanged. Records are still encoded with HTML
+  escaping, so stored run, wait and event bytes are unaffected. So are the
+  canonical input digest that matches a retried request key, the
+  byte-for-byte event comparison that reconciles an ambiguous late-signal or
+  admission commit, and the `testdata/distributed` fixtures. Mixed-version
+  replicas agree on every record.
+- Encoding with `SetEscapeHTML(false)` was considered and rejected. It would
+  let such payloads through, but it changes the stored bytes and the input
+  digest of any input containing those characters. A request or late signal
+  retried across a rolling upgrade could then be reported as a conflict.
+
 Timer and signal records are persisted as fenced, tenant-scoped transitions;
 signal/timer races have one committed winner. A journaled wait now suspends the
 run after its committed prefix, then a signal or due timer atomically records
