@@ -362,7 +362,14 @@ func TestDeadlinesAndCancellation(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatalf("%s: the workflow kept running", tc.name)
 		}
-		if server := <-answered; server != tc.code {
+		server := <-answered
+		// The client's reset at its own deadline can reach the server
+		// before the server's slightly later deadline; it then reads as a
+		// cancel, indistinguishable on the wire (#230, statusFor).
+		if tc.name == "client deadline shorter" && server == codes.Canceled {
+			continue
+		}
+		if server != tc.code {
 			t.Fatalf("%s: the server answered %v, want %v", tc.name, server, tc.code)
 		}
 	}
