@@ -297,31 +297,36 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 		case "wait":
 			if journal == nil || instruction.Wait == nil {
 				step.Error = &Error{Code: "wait_requires_durable_runner", Class: "configuration", Step: instruction.ID}
-				result.Steps = append(result.Steps, step)
+				step.FinishedAt = time.Now().UTC()
+				appendStep(step)
 				return result, step.Error
 			}
 			waitJournal, ok := journal.(WaitJournal)
 			if !ok {
 				step.Error = &Error{Code: "wait_journal_unavailable", Class: "configuration", Step: instruction.ID}
-				result.Steps = append(result.Steps, step)
+				step.FinishedAt = time.Now().UTC()
+				appendStep(step)
 				return result, step.Error
 			}
 			plan, err := json.Marshal(instruction.Wait)
 			if err != nil {
 				step.Error = &Error{Code: "wait_identity_encode", Class: "persistence", Step: instruction.ID, Err: err}
-				result.Steps = append(result.Steps, step)
+				step.FinishedAt = time.Now().UTC()
+				appendStep(step)
 				return result, step.Error
 			}
 			identity := stepIdentity(runID, program.Digest, instruction.ID, plan)
 			waitResult, ready, waitErr := waitJournal.Await(ctx, WaitIdentity{Step: identity, Name: instruction.Wait.Name, TimeoutMillis: instruction.Wait.TimeoutMillis})
 			if waitErr != nil {
 				step.Error = journalFailure("journal_wait", instruction.ID, waitErr, nil)
-				result.Steps = append(result.Steps, step)
+				step.FinishedAt = time.Now().UTC()
+				appendStep(step)
 				return result, step.Error
 			}
 			if !ready {
 				step.Error = &Error{Code: "run_suspended", Class: "waiting", Step: instruction.ID, Suspended: true}
-				result.Steps = append(result.Steps, step)
+				step.FinishedAt = time.Now().UTC()
+				appendStep(step)
 				return result, step.Error
 			}
 			state[instruction.ID] = waitResult
@@ -360,20 +365,23 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 				persistedInput, err = json.Marshal(callInput)
 				if err != nil {
 					step.Error = &Error{Code: "journal_input_encode", Class: "persistence", Step: instruction.ID, Err: err}
-					result.Steps = append(result.Steps, step)
+					step.FinishedAt = time.Now().UTC()
+					appendStep(step)
 					return result, step.Error
 				}
 				identity = stepIdentity(runID, program.Digest, instruction.ID, persistedInput)
 				persistedOutput, completed, loadErr := journal.Load(ctx, identity)
 				if loadErr != nil {
 					step.Error = journalFailure("journal_step_load", instruction.ID, loadErr, definition.Descriptor().Effects)
-					result.Steps = append(result.Steps, step)
+					step.FinishedAt = time.Now().UTC()
+					appendStep(step)
 					return result, step.Error
 				}
 				if completed {
 					if schemaErr := validateRawSchema(definition.Descriptor().OutputSchema, persistedOutput); schemaErr != nil {
 						step.Error = &Error{Code: "journal_output_invalid", Class: "persistence", Step: instruction.ID, Err: schemaErr}
-						result.Steps = append(result.Steps, step)
+						step.FinishedAt = time.Now().UTC()
+						appendStep(step)
 						return result, step.Error
 					}
 					output, decodeErr := definition.DecodeOutput(persistedOutput)
@@ -382,18 +390,21 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 					}
 					if decodeErr != nil {
 						step.Error = &Error{Code: "journal_output_invalid", Class: "persistence", Step: instruction.ID, Err: decodeErr}
-						result.Steps = append(result.Steps, step)
+						step.FinishedAt = time.Now().UTC()
+						appendStep(step)
 						return result, step.Error
 					}
 					committed, cloneErr := value.Clone(output)
 					if cloneErr != nil {
 						step.Error = &Error{Code: "output_ownership", Class: "validation", Step: instruction.ID, Err: cloneErr}
-						result.Steps = append(result.Steps, step)
+						step.FinishedAt = time.Now().UTC()
+						appendStep(step)
 						return result, step.Error
 					}
 					state[instruction.ID] = committed
 					step.Output = committed
-					result.Steps = append(result.Steps, step)
+					step.FinishedAt = time.Now().UTC()
+					appendStep(step)
 					if len(definition.Descriptor().Effects) > 0 {
 						effected = instruction.ID
 					}
@@ -402,7 +413,8 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 				attempt, beginErr := journal.Begin(ctx, identity, persistedInput, definition.Descriptor().Effects)
 				if beginErr != nil {
 					step.Error = journalFailure("journal_step_begin", instruction.ID, beginErr, definition.Descriptor().Effects)
-					result.Steps = append(result.Steps, step)
+					step.FinishedAt = time.Now().UTC()
+					appendStep(step)
 					return result, step.Error
 				}
 				stepAttempt = attempt
@@ -423,7 +435,8 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 					}
 				}
 				step.Error = classifyJournaledFailure("node_error", instruction.ID, err, definition.Descriptor().Effects, effected, journal != nil)
-				result.Steps = append(result.Steps, step)
+				step.FinishedAt = time.Now().UTC()
+				appendStep(step)
 				return result, step.Error
 			}
 			if err := validateSchema(definition.Descriptor().OutputSchema, output); err != nil {
@@ -483,7 +496,8 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 					} else {
 						step.Error = &Error{Code: "journal_step_complete", Class: "persistence", Step: instruction.ID, Err: encodeErr}
 					}
-					result.Steps = append(result.Steps, step)
+					step.FinishedAt = time.Now().UTC()
+					appendStep(step)
 					return result, step.Error
 				}
 			}

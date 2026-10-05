@@ -114,14 +114,7 @@ func validateInstructions(instructions []contract.InternalInstruction, maxDepth 
 			return fmt.Errorf("unknown_opcode: %s", instruction.Kind)
 		}
 		if instruction.Kind == "wait" {
-			if instruction.Wait == nil || instruction.Wait.Name == "" || instruction.Wait.TimeoutMillis < 0 || instruction.Wait.TimeoutMillis > 365*24*60*60*1000 {
-				return fmt.Errorf("invalid_wait: %s requires a valid name and timeout between zero and 365 days", instruction.ID)
-			}
-		} else if instruction.Wait != nil {
-			return fmt.Errorf("unexpected_wait: %s", instruction.ID)
-		}
-		if instruction.Kind == "wait" {
-			if instruction.Wait == nil || instruction.Wait.Name == "" || instruction.Wait.TimeoutMillis < 0 || instruction.Wait.TimeoutMillis > 365*24*60*60*1000 {
+			if instruction.Wait == nil || instruction.Wait.Name == "" || len(instruction.Wait.Name) > 180 || instruction.Wait.TimeoutMillis < 0 || instruction.Wait.TimeoutMillis > 365*24*60*60*1000 {
 				return fmt.Errorf("invalid_wait: %s requires a valid name and timeout between zero and 365 days", instruction.ID)
 			}
 		} else if instruction.Wait != nil {
