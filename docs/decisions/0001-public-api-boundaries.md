@@ -229,6 +229,48 @@ through a call result or wait for a program literal form.
 output schemas; the engine still validates each call input against the node's
 input schema before invoking it.
 
+#### The lowered output instruction id is reserved in flow (#247)
+
+`flow.Definition.Lower` appends one instruction of kind `output` with the id
+`flow.OutputID` (`"output"`) to return the workflow's result. Every
+id-taking builder (`Call`, `ArmCall`, `If`, `Choose`, `Each`, `Parallel`,
+`TryFinally`, `Child`, `Compare`, `Default`, `Template`) shares one id
+namespace and now panics with
+`flow: instruction id "output" is reserved for the workflow output instruction Lower appends; rename the step`
+when given that id, the same authoring-time failure a duplicate id already
+produces. Previously `flow.Call(builder, "output", …)` lowered to a program
+with two instructions named `output`; the engine reported two steps with that
+id, and the same structure written as a document fails `duplicate_id`.
+
+The id is reserved, rather than renamed to something no step can take, because
+it keeps one id grammar across flow, the canonical compiler and documents:
+document ids match `^[a-z][a-z0-9_-]{0,63}$`, flow ids are not grammar-checked,
+and the existing `output` id is what lowered programs, engine step results and
+inspection events already carry. The rule lives in flow because only flow
+synthesizes an instruction. The canonical compiler and the document validator
+synthesize nothing: a document names its own output instruction (the
+`valid.json` fixture calls it `respond`; migration picks `result` or `return`),
+so a document call named `output` is valid, and a document that repeats any id
+keeps failing `duplicate_id`. Documents therefore do not reserve the id. The
+agent catalog's workflow lowering already refused a call named `output` and
+now names the same `flow.OutputID` constant; its other divergences from
+`flow.Lower` remain #249.
+
+This is a behavioral validation tightening plus one additive exported constant
+(`flow.OutputID`), linked to
+[#247](https://github.com/well-prado/new-blok/issues/247). It is not a
+wire-shape or document-version change, and the lowered output id is unchanged.
+Only definitions using the id `output` for an authored step are affected.
+Those made of plain calls already lowered to a program with duplicate ids;
+a control construct named `output`, or a definition used only through
+`Program()` or `agent.RegisterWorkflow`, used to fail in `Lower` or be
+refused by the catalog, and now panics when the flow is defined instead.
+Migration: rename the step.
+`flow/reserved_output_test.go` proves rejection for every id-taking builder and
+that resembling ids (`outputs`, `output-step`, `result`) still lower to the
+canonical compiler's program; `internal/compile` and `contract` tests prove a
+document call named `output` compiles and a repeated id is rejected.
+
 The initial portable contract is a bounded, JSON-compatible value subset with
 explicit semantics for missing, null, optional fields, objects, arrays, string,
 boolean, signed integer, exact decimal/money, timestamp, bytes/blob reference

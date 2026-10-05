@@ -104,6 +104,28 @@ func TestDocumentReferencesRequireStrictlyEarlierInstructions(t *testing.T) {
 	})
 }
 
+// Issue #247: "output" is reserved only by flow, whose Lower synthesizes an
+// instruction under it. A document names its own output instruction, so a
+// call named "output" is valid and only a repeated id collides.
+func TestDocumentCallNamedOutputIsValidAndDuplicatesAreRejected(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "testdata", "contracts", "valid.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.Workflow.Instructions[0].ID = "output"
+	d.Workflow.Instructions[1].References[0].Step = "output"
+	p, err := d.Compile()
+	if err != nil || len(p.Instructions) != 2 || p.Instructions[0].ID != "output" || p.Instructions[1].ID != "respond" {
+		t.Fatalf("compile=%+v err=%v", p, err)
+	}
+	d.Workflow.Instructions[1].ID = "output"
+	assertDocumentBoundaryError(t, d, "duplicate_id", "workflow.instructions")
+}
+
 func assertDocumentBoundaryError(t *testing.T, d Document, code, path string) {
 	t.Helper()
 	encoded, err := json.Marshal(d)
