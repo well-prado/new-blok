@@ -263,8 +263,18 @@ func (d Document) Canonical() ([]byte, error) {
 	return json.Marshal(p)
 }
 
+// IDPattern is the grammar every document id matches: workflow, instruction,
+// binding and node descriptor ids. flow step ids follow it too (#251), so an
+// authored step id never contains the "." that separates reference fields.
+const IDPattern = `^[a-z][a-z0-9_-]{0,63}$`
+
+var idGrammar = regexp.MustCompile(IDPattern)
+
+// ValidID reports whether id matches IDPattern.
+func ValidID(id string) bool { return idGrammar.MatchString(id) }
+
 func validID(v, path string) error {
-	if !regexp.MustCompile(`^[a-z][a-z0-9_-]{0,63}$`).MatchString(v) {
+	if !ValidID(v) {
 		return &Error{Code: "invalid_id", Path: path, Message: "id must start with a lowercase letter and contain at most 64 lowercase letters, digits, underscore or hyphen"}
 	}
 	return nil

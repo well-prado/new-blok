@@ -198,3 +198,29 @@ func FuzzParseBounded(f *testing.F) {
 		_, _ = Parse(input)
 	})
 }
+
+// ValidID is the exported grammar documents validate ids with; flow checks
+// step ids with it (#251). Pin which ids it accepts and that a document
+// rejects exactly the others with invalid_id.
+func TestValidIDIsTheDocumentIDGrammar(t *testing.T) {
+	valid := []string{"a", "z9", "line_items", "line-items", "output", "a" + strings.Repeat("b", 63)}
+	invalid := []string{"", "a.b", "A", "Output", "1a", "-a", "_a", "a b", "a/b", "$step", "caf\u00e9", "a" + strings.Repeat("b", 64)}
+	for _, id := range valid {
+		if !ValidID(id) {
+			t.Fatalf("ValidID(%q)=false, want true", id)
+		}
+		if err := (Document{Version: CurrentVersion, Workflow: Workflow{ID: id}}).Validate(); err != nil && strings.Contains(err.Error(), "workflow.id") {
+			t.Fatalf("document rejected workflow id %q: %v", id, err)
+		}
+	}
+	for _, id := range invalid {
+		if ValidID(id) {
+			t.Fatalf("ValidID(%q)=true, want false", id)
+		}
+		err := Document{Version: CurrentVersion, Workflow: Workflow{ID: id}}.Validate()
+		var diagnostic *Error
+		if !errors.As(err, &diagnostic) || diagnostic.Code != "invalid_id" || diagnostic.Path != "workflow.id" {
+			t.Fatalf("document workflow id %q: err=%v, want invalid_id at workflow.id", id, err)
+		}
+	}
+}
