@@ -436,7 +436,14 @@ func New(ctx context.Context, database store.Database, clock func() time.Time, o
 			if err := ensureColumn(ctx, tx, "traceparent", "TEXT NOT NULL DEFAULT ''"); err != nil {
 				return err
 			}
-			return ensureColumn(ctx, tx, "tracestate", "TEXT NOT NULL DEFAULT ''")
+			if err := ensureColumn(ctx, tx, "tracestate", "TEXT NOT NULL DEFAULT ''"); err != nil {
+				return err
+			}
+			// The operational census (ADR 0022) reads only unfinished and
+			// dead jobs through this covering partial index, so its cost
+			// follows the live queue, not the completed history (#105).
+			_, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS worker_jobs_unfinished ON worker_jobs (state, lease_until, available_at) WHERE state <> 'completed'`)
+			return err
 		})
 	}); err != nil {
 		return nil, fmt.Errorf("worker: schema: %w", err)
@@ -808,7 +815,9 @@ func (q *Queue) handle(ctx, txCtx context.Context, handler Handler, job Job, lea
 	// runtime.Goexit instead of returning (#267).
 	inHandler := false
 	var activeDomain *claimedWriteDomain
+	live := liveHandler{turn: q.claimTurn, job: job.ID}
 	defer func() {
+		liveHandlers.Delete(live)
 		if activeDomain != nil {
 			activeDomain.active.Store(false)
 		}
@@ -869,6 +878,7 @@ func (q *Queue) handle(ctx, txCtx context.Context, handler Handler, job Job, lea
 			handlerCtx = context.WithValue(handlerCtx, claimedWriteDomainKey{}, activeDomain)
 		}
 		ran, inHandler = true, true
+		liveHandlers.Store(live, struct{}{})
 		handlerErr := handler(handlerCtx, Tx{claim: claimed}, job)
 		inHandler = false
 		if ctx.Err() != nil {

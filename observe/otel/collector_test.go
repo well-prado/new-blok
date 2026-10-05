@@ -48,6 +48,13 @@ type metricPoint struct {
 	attrs map[string]string
 	value float64
 	count uint64
+	// kind is sum, gauge or histogram; monotonic marks a counter sum. unit,
+	// bounds and buckets let a test render the point as Prometheus text.
+	kind      string
+	monotonic bool
+	unit      string
+	bounds    []float64
+	buckets   []uint64
 }
 
 func newCollector(t *testing.T) *collector {
@@ -148,11 +155,15 @@ func flatten(m *metricspb.Metric) []metricPoint {
 	switch data := m.Data.(type) {
 	case *metricspb.Metric_Sum:
 		for _, p := range data.Sum.DataPoints {
-			out = append(out, metricPoint{name: m.Name, attrs: attrs(p.Attributes), value: float64(p.GetAsInt()) + p.GetAsDouble()})
+			out = append(out, metricPoint{name: m.Name, attrs: attrs(p.Attributes), value: float64(p.GetAsInt()) + p.GetAsDouble(), kind: "sum", monotonic: data.Sum.IsMonotonic, unit: m.Unit})
+		}
+	case *metricspb.Metric_Gauge:
+		for _, p := range data.Gauge.DataPoints {
+			out = append(out, metricPoint{name: m.Name, attrs: attrs(p.Attributes), value: float64(p.GetAsInt()) + p.GetAsDouble(), kind: "gauge", unit: m.Unit})
 		}
 	case *metricspb.Metric_Histogram:
 		for _, p := range data.Histogram.DataPoints {
-			out = append(out, metricPoint{name: m.Name, attrs: attrs(p.Attributes), count: p.Count, value: p.GetSum()})
+			out = append(out, metricPoint{name: m.Name, attrs: attrs(p.Attributes), count: p.Count, value: p.GetSum(), kind: "histogram", unit: m.Unit, bounds: p.ExplicitBounds, buckets: p.BucketCounts})
 		}
 	}
 	return out
