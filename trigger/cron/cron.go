@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/well-prado/new-blok/contract/schema"
+	"github.com/well-prado/new-blok/internal/migration"
 	"github.com/well-prado/new-blok/store"
 	"github.com/well-prado/new-blok/trigger"
 )
@@ -187,8 +188,13 @@ func New(ctx context.Context, database store.Database, submit trigger.Submitter,
 	if clock == nil {
 		clock = systemClock{}
 	}
-	if err := database.WithTx(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS cron_cursors (
+	// The stamp is read before it is written, so concurrent first opens of
+	// an existing store race; the schema transaction is retried while it
+	// loses (#235, #291).
+	if err := migration.Retry(ctx, func() error {
+		return database.WithTx(ctx, func(tx *sql.Tx) error {
+			return migration.Apply(ctx, tx, migration.Schema{Component: "cron", Supported: schemaVersion, Infer: migration.Present("cron_cursors")}, func(int) error {
+				_, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS cron_cursors (
 			name TEXT PRIMARY KEY,
 			digest TEXT NOT NULL,
 			last_occurrence INTEGER NOT NULL,
@@ -196,12 +202,19 @@ func New(ctx context.Context, database store.Database, submit trigger.Submitter,
 			pending INTEGER,
 			updated_at INTEGER NOT NULL
 		)`)
-		return err
+				return err
+			})
+		})
 	}); err != nil {
 		return nil, fmt.Errorf("cron: schema: %w", err)
 	}
 	return &Scheduler{database: database, submit: submit, tracker: tracker, clock: clock, entries: map[string]*entry{}, wake: make(chan struct{}, 1)}, nil
 }
+
+// schemaVersion is the highest cron schema version this binary understands
+// (#291). Version 1 is cron_cursors as it has been since cron was
+// introduced. New refuses a store stamped with a newer one.
+const schemaVersion = 1
 
 // SubmissionKey is the durable identity of an occurrence.
 func SubmissionKey(name string, instant time.Time) string {

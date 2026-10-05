@@ -1,0 +1,84 @@
+Node.js nodes that stay independent. Node a imports its own helper (a .js
+specifier that TypeScript maps to helper.ts), a nested domain file, shared
+code by relative path, by tsconfig alias, by package.json imports and by a
+local workspace package, built-in modules, a declared registry dependency
+that is not installed, JSON, a static dynamic import of its own file and a
+type reference. A composition root outside every node imports both nodes.
+A test file in node a imports node b; tests are not part of the node.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+-- package.json --
+{
+  "name": "shop",
+  "private": true,
+  "type": "module",
+  "workspaces": ["packages/*"],
+  "imports": { "#shared/*": "./shared/*.ts" },
+  "dependencies": { "zod": "3.23.8" }
+}
+-- tsconfig.json --
+{
+  // JSON with comments, as TypeScript allows
+  "compilerOptions": {
+    "module": "NodeNext",
+    "paths": { "@shared/*": ["./shared/*"], },
+  },
+}
+-- shared/format.ts --
+export const format = (n: number): string => n.toFixed(2);
+-- shared/round.ts --
+import { format } from "./format.js";
+export const round = (n: number) => Number(format(n));
+-- packages/money/package.json --
+{"name":"@shop/money","type":"module","exports":{".":{"types":"./index.d.ts","default":"./index.js"}}}
+-- packages/money/index.js --
+export const cents = (n) => Math.round(n * 100);
+-- packages/money/index.d.ts --
+export declare const cents: (n: number) => number;
+-- nodes/nodejs/a/node.json --
+{"name":"shop/a","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/a/index.ts --
+/// <reference path="./domain/env.d.ts" />
+import { createHash } from "node:crypto";
+import { readFile } from "fs/promises";
+import { z } from "zod";
+import { helper } from "./helper.js";
+import { rate } from "./domain/rates/rate.js";
+import { format } from "../../../shared/format.js";
+import { round } from "@shared/round.js";
+import { round as again } from "#shared/round";
+import { cents } from "@shop/money";
+import config from "./config.json" with { type: "json" };
+const pattern = /from "..\/b"/;
+export async function run(n: number) {
+  const lazy = await import("./lazy.js");
+  return [createHash, readFile, z, helper, rate, format, round, again, cents, config, pattern, lazy];
+}
+// Evaluating this module would throw: the check must only parse it.
+throw new Error("ownership executed source");
+-- nodes/nodejs/a/helper.ts --
+export const helper = 1;
+-- nodes/nodejs/a/lazy.ts --
+export const lazy = true;
+-- nodes/nodejs/a/config.json --
+{"rate": 2}
+-- nodes/nodejs/a/domain/env.d.ts --
+declare const ENV: string;
+-- nodes/nodejs/a/domain/rates/rate.ts --
+import { helper } from "../../helper.js";
+export const rate = helper * 2;
+-- nodes/nodejs/a/index.test.ts --
+import { b } from "../b/index.js";
+-- nodes/nodejs/b/node.json --
+{"name":"shop/b","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/b/index.mjs --
+const { round } = await import("#shared/round");
+export const b = round;
+-- app/registry.ts --
+import { run } from "../nodes/nodejs/a/index.js";
+import { b } from "../nodes/nodejs/b/index.mjs";
+export const nodes = [run, b];
+-- @expect --
+{"nodes":[["nodes/nodejs/a","verified"],["nodes/nodejs/b","verified"]],"diagnostics":[],"units":{"nodes/nodejs/a":10,"nodes/nodejs/b":3}}

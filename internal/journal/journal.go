@@ -181,62 +181,106 @@ func New(ctx context.Context, database store.Database, config Config) (*Journal,
 	// while it loses (#235).
 	if err := migration.Retry(ctx, func() error {
 		return j.withTx(ctx, "schema", func(tx *sql.Tx) error {
-			for _, statement := range schemaStatements {
-				if _, err := tx.ExecContext(ctx, statement); err != nil {
-					return fmt.Errorf("schema: %w", err)
-				}
-			}
-			rows, err := tx.QueryContext(ctx, `PRAGMA table_info(journal_runs)`)
-			if err != nil {
-				return err
-			}
-			hasPrincipal := false
-			for rows.Next() {
-				var cid, notnull, pk int
-				var name, typ string
-				var def any
-				if err := rows.Scan(&cid, &name, &typ, &notnull, &def, &pk); err != nil {
-					rows.Close()
-					return err
-				}
-				if name == "principal" {
-					hasPrincipal = true
-				}
-			}
-			if err := rows.Close(); err != nil {
-				return err
-			}
-			if !hasPrincipal {
-				if _, err := tx.ExecContext(ctx, `ALTER TABLE journal_runs ADD COLUMN principal TEXT NOT NULL DEFAULT ''`); err != nil {
-					return err
-				}
-			}
-			for _, column := range []struct{ table, name, declaration string }{
-				{"journal_runs", "error_code", `TEXT NOT NULL DEFAULT ''`},
-				{"journal_runs", "error_class", `TEXT NOT NULL DEFAULT ''`},
-				{"journal_operations", "input_json", `BLOB`},
-				{"journal_attempts", "input_json", `BLOB`},
-				{"journal_scopes", "input_json", `BLOB`},
-			} {
-				if err := ensureColumn(ctx, tx, column.table, column.name, column.declaration); err != nil {
-					return err
-				}
-			}
-			if err := j.migrateErasure(ctx, tx); err != nil {
-				return err
-			}
-			// A reconciliation records the tenant that decided it (#286).
-			// The column is added once; every open then fixes the tenant of
-			// any row without one, from its verified audit record or "".
-			if err := ensureColumn(ctx, tx, "journal_reconciliations", "tenant", `TEXT`); err != nil {
-				return err
-			}
-			return backfillReconciliationTenants(ctx, tx)
+			return migration.Apply(ctx, tx, migration.Schema{Component: "journal", Supported: schemaVersion, Infer: inferSchemaVersion}, func(int) error {
+				return j.migrate(ctx, tx)
+			})
 		})
 	}); err != nil {
 		return nil, err
 	}
 	return j, nil
+}
+
+// schemaVersion is the highest journal schema version this binary
+// understands (#291): 1 before #281, 2 with #281's erasure tables
+// (journal_compacted, journal_meta, and journal_reconciliations rebuilt
+// with digests and erased_at), 3 with #286's reconciliation tenant. New
+// refuses a journal stamped with a newer one. Raise it with every change
+// an older binary would misread, together with the migration step that
+// makes it. It is a variable only so tests can stand in for an older
+// binary.
+var schemaVersion = 3
+
+// inferSchemaVersion classifies a journal written before the stamp existed
+// by its shape: 0 when it has no tables yet, 3 when its reconciliations
+// carry a tenant (#286), 2 when they carry erased_at (#281), else 1.
+func inferSchemaVersion(ctx context.Context, tx *sql.Tx) (int, error) {
+	if found, err := migration.TableExists(ctx, tx, "journal_runs"); err != nil || !found {
+		return 0, err
+	}
+	for _, shape := range []struct {
+		column  string
+		version int
+	}{{"tenant", 3}, {"erased_at", 2}} {
+		found, err := migration.ColumnExists(ctx, tx, "journal_reconciliations", shape.column)
+		if err != nil {
+			return 0, err
+		}
+		if found {
+			return shape.version, nil
+		}
+	}
+	return 1, nil
+}
+
+// migrate brings the journal's tables to the current shape. Every step is
+// guarded by the shape it changes and runs on every open, not only when the
+// stamp is older: a binary from before #291 cannot see the stamp, and a
+// pre-#281 one recreates journal_audit, or a pre-#286 one inserts a
+// reconciliation without a tenant, in a journal already stamped current.
+// The next open repairs both.
+func (j *Journal) migrate(ctx context.Context, tx *sql.Tx) error {
+	for _, statement := range schemaStatements {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("schema: %w", err)
+		}
+	}
+	rows, err := tx.QueryContext(ctx, `PRAGMA table_info(journal_runs)`)
+	if err != nil {
+		return err
+	}
+	hasPrincipal := false
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, typ string
+		var def any
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &def, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		if name == "principal" {
+			hasPrincipal = true
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if !hasPrincipal {
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE journal_runs ADD COLUMN principal TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	for _, column := range []struct{ table, name, declaration string }{
+		{"journal_runs", "error_code", `TEXT NOT NULL DEFAULT ''`},
+		{"journal_runs", "error_class", `TEXT NOT NULL DEFAULT ''`},
+		{"journal_operations", "input_json", `BLOB`},
+		{"journal_attempts", "input_json", `BLOB`},
+		{"journal_scopes", "input_json", `BLOB`},
+	} {
+		if err := ensureColumn(ctx, tx, column.table, column.name, column.declaration); err != nil {
+			return err
+		}
+	}
+	if err := j.migrateErasure(ctx, tx); err != nil {
+		return err
+	}
+	// A reconciliation records the tenant that decided it (#286).
+	// The column is added once; every open then fixes the tenant of
+	// any row without one, from its verified audit record or "".
+	if err := ensureColumn(ctx, tx, "journal_reconciliations", "tenant", `TEXT`); err != nil {
+		return err
+	}
+	return backfillReconciliationTenants(ctx, tx)
 }
 
 func ensureColumn(ctx context.Context, tx *sql.Tx, table, column, declaration string) error {

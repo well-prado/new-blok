@@ -1,0 +1,46 @@
+Review probes (PR #314, Review R), Go controls that held: a go.mod
+replace naming node b's directory, directly and through a shared module.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+
+replace example.com/bmod => ./nodes/go/b
+
+replace example.com/lib => ./lib
+-- lib/go.mod --
+module example.com/lib
+
+replace example.com/shop => ../
+-- lib/lib.go --
+package lib
+
+import _ "example.com/bmod"
+-- nodes/go/b/b.go --
+package b
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/b", "1.0.0", nil)
+-- nodes/go/b/go.mod --
+module example.com/bmod
+-- nodes/go/go-root-replace-to-node/go_root_replace_to_node.go --
+package go_root_replace_to_node
+
+import (
+	"github.com/well-prado/new-blok/node"
+	_ "example.com/bmod"
+)
+
+var Node = node.MustDefine("probe/go-root-replace-to-node", "1.0.0", nil)
+-- nodes/go/go-shared-module-replace/go_shared_module_replace.go --
+package go_shared_module_replace
+
+import (
+	"github.com/well-prado/new-blok/node"
+	_ "example.com/lib"
+)
+
+var Node = node.MustDefine("probe/go-shared-module-replace", "1.0.0", nil)
+-- @expect --
+{"diagnostics":[["ownership_node_imports_node","nodes/go/go-root-replace-to-node/go_root_replace_to_node.go:5"],["ownership_transitive_node_import","nodes/go/go-shared-module-replace/go_shared_module_replace.go:5"]],"nodes":[["nodes/go/b","verified"],["nodes/go/go-root-replace-to-node","violation"],["nodes/go/go-shared-module-replace","violation"]]}

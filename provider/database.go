@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 
+	"github.com/well-prado/new-blok/internal/migration"
 	"github.com/well-prado/new-blok/store"
 )
 
@@ -17,22 +18,40 @@ func NewRecords(ctx context.Context, database store.Database) (*Records, error) 
 	if Missing(database) {
 		return nil, errors.New("provider: missing database")
 	}
-	err := database.WithTx(ctx, func(tx *sql.Tx) error {
-		for _, statement := range []string{
-			`CREATE TABLE IF NOT EXISTS provider_records (record_id TEXT PRIMARY KEY, operation_key TEXT NOT NULL UNIQUE, value TEXT NOT NULL)`,
-			`CREATE TABLE IF NOT EXISTS provider_outbox (event_id TEXT PRIMARY KEY, record_id TEXT NOT NULL UNIQUE, payload BLOB NOT NULL, state TEXT NOT NULL)`,
-		} {
-			if _, err := tx.ExecContext(ctx, statement); err != nil {
-				return err
-			}
-		}
-		return nil
+	// The stamp is read before it is written, so concurrent first opens of
+	// an existing store race; the schema transaction is retried while it
+	// loses (#235, #291).
+	err := migration.Retry(ctx, func() error {
+		return database.WithTx(ctx, func(tx *sql.Tx) error {
+			return migration.Apply(ctx, tx, migration.Schema{Component: "provider", Supported: schemaVersion, Infer: migration.Present("provider_records", "provider_outbox")}, func(int) error {
+				for _, statement := range []string{
+					`CREATE TABLE IF NOT EXISTS provider_records (record_id TEXT PRIMARY KEY, operation_key TEXT NOT NULL UNIQUE, value TEXT NOT NULL)`,
+					`CREATE TABLE IF NOT EXISTS provider_outbox (event_id TEXT PRIMARY KEY, record_id TEXT NOT NULL UNIQUE, payload BLOB NOT NULL, state TEXT NOT NULL)`,
+				} {
+					if _, err := tx.ExecContext(ctx, statement); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+		})
 	})
+	// A refusal names only the component and two versions, so it is
+	// returned as is; any other startup failure stays redacted.
+	if newer := (*store.NewerSchemaError)(nil); errors.As(err, &newer) {
+		return nil, newer
+	}
 	if err != nil {
 		return nil, &Error{Class: Invalid, Code: "database_startup"}
 	}
 	return &Records{database: database}, nil
 }
+
+// schemaVersion is the highest provider-records schema version this binary
+// understands (#291). Version 1 is provider_records and provider_outbox as
+// they have been since they were introduced. NewRecords refuses a store
+// stamped with a newer one.
+const schemaVersion = 1
 
 var errConflict = errors.New("provider: operation conflict")
 

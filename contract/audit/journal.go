@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/well-prado/new-blok/internal/migration"
 	"github.com/well-prado/new-blok/store"
 )
 
@@ -66,9 +67,31 @@ func NewJournal(ctx context.Context, database store.Database, cfg Config) (*Jour
 		cfg.Clock = time.Now
 	}
 	j := &Journal{database: database, cfg: cfg}
-	err := database.WithTx(ctx, func(tx *sql.Tx) error {
-		for _, statement := range []string{
-			`CREATE TABLE IF NOT EXISTS audit_records_v1 (
+	// The stamp is read before it is written, so concurrent first opens of
+	// an existing store race; the idempotent schema transaction is retried
+	// while it loses (#235, #291).
+	err := migration.Retry(ctx, func() error {
+		return database.WithTx(ctx, func(tx *sql.Tx) error {
+			return migration.Apply(ctx, tx, migration.Schema{Component: "audit", Supported: schemaVersion, Infer: migration.Present("audit_records_v1")}, func(int) error {
+				return createTables(ctx, tx)
+			})
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return j, nil
+}
+
+// schemaVersion is the highest audit schema version this binary
+// understands (#291). Version 1 is the shape #80 introduced, with
+// audit_pruned_v1; no audit migration has changed it since. NewJournal
+// refuses a store stamped with a newer one.
+const schemaVersion = 1
+
+func createTables(ctx context.Context, tx *sql.Tx) error {
+	for _, statement := range []string{
+		`CREATE TABLE IF NOT EXISTS audit_records_v1 (
 				seq INTEGER PRIMARY KEY AUTOINCREMENT,
 				id TEXT NOT NULL UNIQUE,
 				kind TEXT NOT NULL,
@@ -79,25 +102,20 @@ func NewJournal(ctx context.Context, database store.Database, cfg Config) (*Jour
 				record BLOB NOT NULL CHECK(length(record) <= 16384),
 				digest TEXT NOT NULL,
 				UNIQUE(tenant, tenant_seq))`,
-			`CREATE INDEX IF NOT EXISTS audit_records_v1_time ON audit_records_v1(recorded_at, seq)`,
-			`CREATE INDEX IF NOT EXISTS audit_records_v1_kind ON audit_records_v1(kind, id)`,
-			`CREATE TABLE IF NOT EXISTS audit_meta_v1 (name TEXT PRIMARY KEY, value INTEGER NOT NULL)`,
-			// A pruned record leaves the sha256 of its id (ids are
-			// application-chosen and may carry personal data) and its kind,
-			// so Verify can tell a pruned record from a missing one.
-			`CREATE TABLE IF NOT EXISTS audit_pruned_v1 (id_digest TEXT PRIMARY KEY, kind TEXT NOT NULL, pruned_at INTEGER NOT NULL)`,
-			`INSERT INTO audit_meta_v1 (name, value) SELECT 'records', COUNT(*) FROM audit_records_v1 WHERE true ON CONFLICT(name) DO NOTHING`,
-		} {
-			if _, err := tx.ExecContext(ctx, statement); err != nil {
-				return err
-			}
+		`CREATE INDEX IF NOT EXISTS audit_records_v1_time ON audit_records_v1(recorded_at, seq)`,
+		`CREATE INDEX IF NOT EXISTS audit_records_v1_kind ON audit_records_v1(kind, id)`,
+		`CREATE TABLE IF NOT EXISTS audit_meta_v1 (name TEXT PRIMARY KEY, value INTEGER NOT NULL)`,
+		// A pruned record leaves the sha256 of its id (ids are
+		// application-chosen and may carry personal data) and its kind,
+		// so Verify can tell a pruned record from a missing one.
+		`CREATE TABLE IF NOT EXISTS audit_pruned_v1 (id_digest TEXT PRIMARY KEY, kind TEXT NOT NULL, pruned_at INTEGER NOT NULL)`,
+		`INSERT INTO audit_meta_v1 (name, value) SELECT 'records', COUNT(*) FROM audit_records_v1 WHERE true ON CONFLICT(name) DO NOTHING`,
+	} {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return err
 		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
 	}
-	return j, nil
+	return nil
 }
 
 // Shares reports whether the journal writes to database. An owner that

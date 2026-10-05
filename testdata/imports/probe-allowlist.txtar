@@ -1,0 +1,101 @@
+Review probes, round 2 (PR #314): six routes that still loaded node b
+under Node 24 while the node was verified, now each unverified by the
+allowlist (ADR 0025): module as a value with a bracketed "require" key,
+the Function constructor through a "constructor" string key or a
+destructured constructor key, process with computed keys, a sloppy
+function's this passed to Reflect.get, and Annex B HTML-like comments
+("<!--" anywhere, "-->" at a line start) that a template literal would
+otherwise swallow. A TypeScript instantiation expression before "/" is
+ambiguous. Controls: a JSON import with attributes, a .node addon, dlopen,
+a computed tsconfig-alias import, a file using only the enumerated safe
+forms (verified), and a declaration file, to which the allowlist does not
+apply.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+-- nodes/nodejs/allowlist-clean/index.js --
+const env = process.env;
+const list = [1, 2, 3];
+module.exports = { first: list[0], last: list[list.length - 1], name: env["HOME"], here: import.meta.url };
+class K { constructor(a) { this.a = a; } }
+exports.K = K;
+-- nodes/nodejs/allowlist-clean/node.json --
+{"name":"probe/allowlist-clean","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/b/d.json --
+{}
+-- nodes/nodejs/b/index.js --
+module.exports = 1;
+-- nodes/nodejs/b/node.json --
+{"name":"shop/b","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/ctor-computed/index.js --
+const F = (() => 0)["constructor"]; module.exports = F("return process.mainModule.require")()(__dirname + "/../b/index.js");
+-- nodes/nodejs/ctor-computed/node.json --
+{"name":"probe/ctor-computed","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/ctor-destructure/index.js --
+const { constructor: F } = () => 0; module.exports = F("return process.mainModule.require")()(__dirname + "/../b/index.js");
+-- nodes/nodejs/ctor-destructure/node.json --
+{"name":"probe/ctor-destructure","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/declarations-exempt/index.js --
+module.exports = require("./types.js");
+-- nodes/nodejs/declarations-exempt/node.json --
+{"name":"probe/declarations-exempt","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/declarations-exempt/types.d.ts --
+declare const process: { mainModule: unknown };
+export type F = Function;
+-- nodes/nodejs/declarations-exempt/types.js --
+module.exports = {};
+-- nodes/nodejs/generic-div/index.ts --
+declare const f: <T>(x: T) => number;
+const y = f<number> / 2; require("..\u002fb\u002findex.js"); const z = 1 / 1;
+export {};
+-- nodes/nodejs/generic-div/node.json --
+{"name":"probe/generic-div","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/html-close-comment/index.js --
+/*
+*/ --> `
+module.exports = require("../b/index.js");
+--> `
+-- nodes/nodejs/html-close-comment/node.json --
+{"name":"probe/html-close-comment","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/html-comment/index.js --
+<!-- `
+module.exports = require("../b/index.js");
+<!-- `
+-- nodes/nodejs/html-comment/node.json --
+{"name":"probe/html-comment","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/json-with/index.mjs --
+import d from "../b/d.json" with { type: "json" };
+export default d;
+-- nodes/nodejs/json-with/node.json --
+{"name":"probe/json-with","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/module-alias-bracket/index.js --
+const m = module; module.exports = m["require"]("../b/index.js");
+-- nodes/nodejs/module-alias-bracket/node.json --
+{"name":"probe/module-alias-bracket","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/node-addon/index.js --
+require("../../../shared/x.node");
+-- nodes/nodejs/node-addon/node.json --
+{"name":"probe/node-addon","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/paths-wild-dynamic/index.ts --
+const n = "index"; export const x = import(`@b/${n}`);
+-- nodes/nodejs/paths-wild-dynamic/node.json --
+{"name":"probe/paths-wild-dynamic","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/process-bracket/index.js --
+const mm = process["main" + "Module"]; module.exports = mm["req" + "uire"](__dirname + "/../b/index.js");
+-- nodes/nodejs/process-bracket/node.json --
+{"name":"probe/process-bracket","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/process-dlopen/index.js --
+const m = { exports: {} }; process.dlopen(m, __dirname + "/x.node");
+-- nodes/nodejs/process-dlopen/node.json --
+{"name":"probe/process-dlopen","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/this-reflect/index.js --
+const g = (function () { return this; })(); const p = Reflect.get(g, "pro" + "cess"); const mm = Reflect.get(p, "main" + "Module"); module.exports = Reflect.get(mm, "re" + "quire").call(mm, __dirname + "/../b/index.js");
+-- nodes/nodejs/this-reflect/node.json --
+{"name":"probe/this-reflect","version":"1.0.0","runtime":"nodejs"}
+-- shared/x.node --
+bin
+-- tsconfig.json --
+{"compilerOptions":{"paths":{"@b/*":["./nodes/nodejs/b/*"]}}}
+-- @expect --
+{"diagnostics":[["ownership_ambiguous_syntax","nodes/nodejs/generic-div/index.ts:2"],["ownership_dynamic_import","nodes/nodejs/paths-wild-dynamic/index.ts:1"],["ownership_node_imports_node","nodes/nodejs/html-close-comment/index.js:3"],["ownership_node_imports_node","nodes/nodejs/html-comment/index.js:2"],["ownership_node_imports_node","nodes/nodejs/json-with/index.mjs:1"],["ownership_source_unsupported","shared/x.node"],["ownership_unsupported_form","nodes/nodejs/ctor-computed/index.js:1"],["ownership_unsupported_form","nodes/nodejs/ctor-computed/index.js:1"],["ownership_unsupported_form","nodes/nodejs/ctor-destructure/index.js:1"],["ownership_unsupported_form","nodes/nodejs/html-close-comment/index.js:2"],["ownership_unsupported_form","nodes/nodejs/html-close-comment/index.js:4"],["ownership_unsupported_form","nodes/nodejs/html-comment/index.js:1"],["ownership_unsupported_form","nodes/nodejs/html-comment/index.js:3"],["ownership_unsupported_form","nodes/nodejs/module-alias-bracket/index.js:1"],["ownership_unsupported_form","nodes/nodejs/module-alias-bracket/index.js:1"],["ownership_unsupported_form","nodes/nodejs/module-alias-bracket/index.js:1"],["ownership_unsupported_form","nodes/nodejs/process-bracket/index.js:1"],["ownership_unsupported_form","nodes/nodejs/process-bracket/index.js:1"],["ownership_unsupported_form","nodes/nodejs/process-dlopen/index.js:1"],["ownership_unsupported_form","nodes/nodejs/process-dlopen/index.js:1"],["ownership_unsupported_form","nodes/nodejs/this-reflect/index.js:1"],["ownership_unsupported_form","nodes/nodejs/this-reflect/index.js:1"]],"nodes":[["nodes/nodejs/allowlist-clean","verified"],["nodes/nodejs/b","verified"],["nodes/nodejs/ctor-computed","unverified"],["nodes/nodejs/ctor-destructure","unverified"],["nodes/nodejs/declarations-exempt","verified"],["nodes/nodejs/generic-div","unverified"],["nodes/nodejs/html-close-comment","violation"],["nodes/nodejs/html-comment","violation"],["nodes/nodejs/json-with","violation"],["nodes/nodejs/module-alias-bracket","unverified"],["nodes/nodejs/node-addon","unverified"],["nodes/nodejs/paths-wild-dynamic","unverified"],["nodes/nodejs/process-bracket","unverified"],["nodes/nodejs/process-dlopen","unverified"],["nodes/nodejs/this-reflect","unverified"]]}

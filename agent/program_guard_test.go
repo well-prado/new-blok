@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"go/parser"
 	"go/token"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/well-prado/new-blok/contract"
 	"github.com/well-prado/new-blok/flow"
@@ -177,6 +179,16 @@ func TestCatalogDoesNotImportTheEngineOrTheLowering(t *testing.T) {
 // 10000-step default for a workflow at the 10000-call ceiling, whose lowered
 // program has 10001 instructions with the output. Without it that workflow
 // registers and then always fails with step_budget_exceeded.
+//
+// The test asserts that outcome, not how long it takes (#304). Its run does
+// 10000 dispatches, each building a node, so it takes seconds and, under
+// -race on a loaded machine, more than a minute. The 1-minute deadline of
+// confBudget timed that work and failed with "context deadline exceeded"
+// though the step bound was right. The deadline is now the test binary's
+// own -timeout, less a margin, so the run is bounded only by the safety
+// limit go test already enforces. A missing or short bound still turns it
+// red whatever the load: the engine refuses a program longer than its step
+// budget with step_budget_exceeded before it dispatches anything.
 func TestWorkflowAtTheCallCeilingRuns(t *testing.T) {
 	r := &recorder{}
 	n := newConfNodes(r)
@@ -194,10 +206,34 @@ func TestWorkflowAtTheCallCeilingRuns(t *testing.T) {
 	}
 	budget := confBudget()
 	budget.MaxCalls = calls
-	if _, err := c.Invoke(context.Background(), confPrincipal(), confSpec.Name, confSpec.Version, []byte(`{"sku":"coffee","quantity":2}`), budget); err != nil {
+	budget.Deadline = safetyDeadline(t)
+	output, err := c.Invoke(context.Background(), confPrincipal(), confSpec.Name, confSpec.Version, []byte(`{"sku":"coffee","quantity":2}`), budget)
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("invoke %d calls ran into the test's -timeout safety bound (%s); this is the run being slow, not the step bound: %v", calls, budget.Deadline.Format(time.RFC3339), err)
+	}
+	if err != nil {
 		t.Fatalf("invoke %d calls with MaxCalls %d: %v", calls, calls, err)
+	}
+	if want := `{"committed":"coffee","quantity":2}`; string(output) != want {
+		t.Fatalf("output %s; want %s", output, want)
 	}
 	if got := len(r.inputs["conf/commit"]); got != calls {
 		t.Fatalf("dispatched %d calls; want %d", got, calls)
 	}
+}
+
+// safetyDeadline is the deadline for a run whose duration depends on load:
+// the test binary's -timeout less a margin, or an hour under -timeout 0.
+// The margin leaves the run time to notice the deadline and the test time
+// to report it, instead of the -timeout panic; under the default 10m it is
+// 2m, because a catalog run builds every dispatch node before the engine
+// first checks its context.
+func safetyDeadline(t *testing.T) time.Time {
+	t.Helper()
+	deadline, ok := t.Deadline()
+	if !ok {
+		return time.Now().Add(time.Hour)
+	}
+	margin := min(time.Until(deadline)/4, 2*time.Minute)
+	return deadline.Add(-margin)
 }

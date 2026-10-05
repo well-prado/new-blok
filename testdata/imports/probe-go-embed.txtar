@@ -1,0 +1,64 @@
+Review probe, round 2 (PR #314), Go: //go:embed patterns were checked only
+up to their first wildcard, so a root-package pattern nodes/*/b/*.go or
+all:nodes embedded node b's files while the importing node was verified.
+Each pattern element is now matched against every discovered node file
+(all: included), and embedding another node's files is a node import. A
+shared all: embed of the package's own assets stays verified.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- embedglob/glob.go --
+package embedglob
+
+import "embed"
+
+//go:embed */b.go
+var F embed.FS
+-- go.mod --
+module example.com/shop
+-- lib.go --
+package shop
+
+import "embed"
+
+//go:embed nodes/*/b/*.go
+var F embed.FS
+
+//go:embed all:nodes
+var G embed.FS
+-- nodes/go/b/_hidden.txt --
+x
+-- nodes/go/b/b.go --
+package b
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/b", "1.0.0", nil)
+-- nodes/go/embed-root/embed_root.go --
+package embed_root
+
+import (
+	"github.com/well-prado/new-blok/node"
+	_ "example.com/shop"
+)
+
+var Node = node.MustDefine("probe/embed-root", "1.0.0", nil)
+-- nodes/go/embed-shared/embed_shared.go --
+package embed_shared
+
+import (
+	"github.com/well-prado/new-blok/node"
+	_ "example.com/shop/rootdata"
+)
+
+var Node = node.MustDefine("probe/embed-shared", "1.0.0", nil)
+-- rootdata/assets/a.txt --
+x
+-- rootdata/data.go --
+package rootdata
+
+import "embed"
+
+//go:embed all:assets
+var A embed.FS
+-- @expect --
+{"diagnostics":[["ownership_transitive_node_import","nodes/go/embed-root/embed_root.go:5"],["ownership_transitive_node_import","nodes/go/embed-root/embed_root.go:5"]],"nodes":[["nodes/go/b","verified"],["nodes/go/embed-root","violation"],["nodes/go/embed-shared","verified"]]}

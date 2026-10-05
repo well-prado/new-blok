@@ -1,0 +1,118 @@
+Review probes (PR #314, Review R): files and packages. A required file
+with no script extension (none, .txt) runs as JavaScript under require, so
+it is analyzed as JavaScript, and one that does not lex is unverified. An
+installed link is checked before a declaration is trusted: a link into a
+node is a violation even for a declared registry dependency, and a link to
+shared project code is never followed (unverified). Undeclared installed
+code is unverified. The remaining probes are resolution controls that
+already held: export *, #imports, tsconfig paths and extends, exports
+arrays and conditions, .mts/.cts, JSX, index files and letter case.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- configs/base.json --
+{"compilerOptions":{"baseUrl":"..","paths":{"@b":["nodes/nodejs/b/index.js"]}}}
+-- go.mod --
+module example.com/shop
+-- nodes/nodejs/b/index.js --
+module.exports = 1;
+-- nodes/nodejs/b/node.json --
+{"name":"shop/b","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/binary-required/index.js --
+module.exports = require("../../../shared/blob.dat");
+-- nodes/nodejs/binary-required/node.json --
+{"name":"probe/binary-required","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/case-macos/index.js --
+require("../B/index.js");
+-- nodes/nodejs/case-macos/node.json --
+{"name":"probe/case-macos","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/export-star/index.mjs --
+export * from "../../../shared/h.mjs";
+-- nodes/nodejs/export-star/node.json --
+{"name":"probe/export-star","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/exports-array-null/index.js --
+require("pkg/x");
+-- nodes/nodejs/exports-array-null/node.json --
+{"name":"probe/exports-array-null","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/extless-cjs/index.js --
+module.exports = require("../../../shared/helper");
+-- nodes/nodejs/extless-cjs/node.json --
+{"name":"probe/extless-cjs","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/imports-hash-star/index.js --
+module.exports = require("#x/index.js");
+-- nodes/nodejs/imports-hash-star/node.json --
+{"name":"probe/imports-hash-star","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/imports-hash/index.js --
+module.exports = require("#x");
+-- nodes/nodejs/imports-hash/node.json --
+{"name":"probe/imports-hash","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/imports-hash/package.json --
+{"imports":{"#x":"./../b/index.js"}}
+-- nodes/nodejs/index-resolution/index.js --
+require("../b");
+-- nodes/nodejs/index-resolution/node.json --
+{"name":"probe/index-resolution","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/jsx/index.jsx --
+import b from "../b/index.js";
+export default () => <div/>;
+-- nodes/nodejs/jsx/node.json --
+{"name":"probe/jsx","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/mts-cts/index.mts --
+import x from "../../../shared/h.cjs";
+export default x;
+-- nodes/nodejs/mts-cts/node.json --
+{"name":"probe/mts-cts","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/nm-realdir-in-node/index.js --
+module.exports = require("evil");
+-- nodes/nodejs/nm-realdir-in-node/node.json --
+{"name":"probe/nm-realdir-in-node","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/nm-realdir-in-node/node_modules/evil/index.js --
+module.exports = require("../../../b/index.js");
+-- nodes/nodejs/nm-symlink-node-declared/index.js --
+module.exports = require("other");
+-- nodes/nodejs/nm-symlink-node-declared/node.json --
+{"name":"probe/nm-symlink-node-declared","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/nm-symlink-shared/index.js --
+module.exports = require("helper");
+-- nodes/nodejs/nm-symlink-shared/node.json --
+{"name":"probe/nm-symlink-shared","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/tsconfig-extends-rel/index.ts --
+import x from "@b";
+export default x;
+-- nodes/nodejs/tsconfig-extends-rel/node.json --
+{"name":"probe/tsconfig-extends-rel","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/tsconfig-extends-rel/tsconfig.json --
+{"extends":"../../../configs/base.json"}
+-- nodes/nodejs/tsconfig-paths-star/index.ts --
+import x from "@b/index";
+export default x;
+-- nodes/nodejs/tsconfig-paths-star/node.json --
+{"name":"probe/tsconfig-paths-star","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/txt-ext-cjs/index.js --
+module.exports = require("../../../shared/helper.txt");
+-- nodes/nodejs/txt-ext-cjs/node.json --
+{"name":"probe/txt-ext-cjs","version":"1.0.0","runtime":"nodejs"}
+-- package.json --
+{"workspaces":["packages/*"],"imports":{"#x/*":"./nodes/nodejs/b/*"},"dependencies":{"other":"^1.0.0"}}
+-- packages/pkg/package.json --
+{"name":"pkg","exports":{"./x":[null,{"node":{"require":"./x.cjs"}}]}}
+-- packages/pkg/x.cjs --
+require("../../nodes/nodejs/b/index.js");
+-- shared/blob.dat --
+'unterminated
+-- shared/h.cts --
+export = require("../nodes/nodejs/b/index.js");
+-- shared/h.mjs --
+export * from "../nodes/nodejs/b/index.js";
+-- shared/helper --
+module.exports = require("../nodes/nodejs/b/index.js");
+-- shared/helper.txt --
+module.exports = require("../nodes/nodejs/b/index.js");
+-- shared/helperdir/index.js --
+module.exports = require("../../nodes/nodejs/b/index.js");
+-- tsconfig.json --
+{"compilerOptions":{"paths":{"@b/*":["./nodes/nodejs/b/*"]}}}
+-- @links --
+node_modules/helper -> ../shared/helperdir
+node_modules/other -> ../nodes/nodejs/b
+-- @expect --
+{"diagnostics":[["layout_symlink_alias","node_modules/helper"],["layout_symlink_alias","node_modules/other"],["ownership_import_case_mismatch","nodes/nodejs/case-macos/index.js:1"],["ownership_import_unresolved","nodes/nodejs/nm-realdir-in-node/index.js:1"],["ownership_node_imports_node","nodes/nodejs/case-macos/index.js:1"],["ownership_node_imports_node","nodes/nodejs/imports-hash-star/index.js:1"],["ownership_node_imports_node","nodes/nodejs/imports-hash/index.js:1"],["ownership_node_imports_node","nodes/nodejs/index-resolution/index.js:1"],["ownership_node_imports_node","nodes/nodejs/nm-symlink-node-declared/index.js:1"],["ownership_node_imports_node","nodes/nodejs/tsconfig-extends-rel/index.ts:1"],["ownership_node_imports_node","nodes/nodejs/tsconfig-paths-star/index.ts:1"],["ownership_source_unsupported","nodes/nodejs/jsx/index.jsx"],["ownership_source_unsupported","shared/blob.dat"],["ownership_transitive_node_import","nodes/nodejs/export-star/index.mjs:1"],["ownership_transitive_node_import","nodes/nodejs/exports-array-null/index.js:1"],["ownership_transitive_node_import","nodes/nodejs/extless-cjs/index.js:1"],["ownership_transitive_node_import","nodes/nodejs/mts-cts/index.mts:1"],["ownership_transitive_node_import","nodes/nodejs/txt-ext-cjs/index.js:1"]],"nodes":[["nodes/nodejs/b","verified"],["nodes/nodejs/binary-required","unverified"],["nodes/nodejs/case-macos","violation"],["nodes/nodejs/export-star","violation"],["nodes/nodejs/exports-array-null","violation"],["nodes/nodejs/extless-cjs","violation"],["nodes/nodejs/imports-hash","violation"],["nodes/nodejs/imports-hash-star","violation"],["nodes/nodejs/index-resolution","violation"],["nodes/nodejs/jsx","unverified"],["nodes/nodejs/mts-cts","violation"],["nodes/nodejs/nm-realdir-in-node","unverified"],["nodes/nodejs/nm-symlink-node-declared","violation"],["nodes/nodejs/nm-symlink-shared","unverified"],["nodes/nodejs/tsconfig-extends-rel","violation"],["nodes/nodejs/tsconfig-paths-star","violation"],["nodes/nodejs/txt-ext-cjs","violation"]]}

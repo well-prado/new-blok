@@ -1,0 +1,22 @@
+A relative import of another node fails, by .js specifier (TypeScript
+source), by directory, and by require in a CommonJS file. Classic layout.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"classic","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+-- runtimes/nodejs/nodes/a/node.json --
+{"name":"shop/a","version":"1.0.0","runtime":"nodejs"}
+-- runtimes/nodejs/nodes/a/index.ts --
+import { b } from "../b/index.js";
+export const a = b;
+-- runtimes/nodejs/nodes/b/node.json --
+{"name":"shop/b","version":"1.0.0","runtime":"nodejs"}
+-- runtimes/nodejs/nodes/b/index.ts --
+export const b = 1;
+-- runtimes/nodejs/nodes/c/node.json --
+{"name":"shop/c","version":"1.0.0","runtime":"nodejs"}
+-- runtimes/nodejs/nodes/c/index.cjs --
+const b = require("../b");
+module.exports = { b };
+-- @expect --
+{"nodes":[["runtimes/nodejs/nodes/a","violation"],["runtimes/nodejs/nodes/b","verified"],["runtimes/nodejs/nodes/c","violation"]],"diagnostics":[["ownership_node_imports_node","runtimes/nodejs/nodes/a/index.ts:1"],["ownership_node_imports_node","runtimes/nodejs/nodes/c/index.cjs:1"]]}

@@ -1,0 +1,36 @@
+Alias evasion: tsconfig paths and baseUrl give another node a bare name.
+The root tsconfig extends a base config that declares the paths; with no
+baseUrl they resolve against the base config's directory. Node a uses the
+paths alias, node d an export-from re-export of a directory through it,
+and node c, whose own tsconfig sets baseUrl to the project root, a bare
+project path.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+-- config/tsconfig.base.json --
+{ "compilerOptions": { "paths": { "@nodes/*": ["../nodes/nodejs/*"] } } }
+-- tsconfig.json --
+{ "extends": "./config/tsconfig.base", "compilerOptions": { "strict": true } }
+-- nodes/nodejs/c/tsconfig.json --
+{ "compilerOptions": { "baseUrl": "../../.." } }
+-- nodes/nodejs/a/node.json --
+{"name":"shop/a","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/a/index.ts --
+import { b } from "@nodes/b/index.js";
+export const a = b;
+-- nodes/nodejs/b/node.json --
+{"name":"shop/b","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/b/index.ts --
+export const b = 1;
+-- nodes/nodejs/c/node.json --
+{"name":"shop/c","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/c/index.ts --
+import { b } from "nodes/nodejs/b/index";
+export const c = b;
+-- nodes/nodejs/d/node.json --
+{"name":"shop/d","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/d/index.ts --
+export { b as d } from "@nodes/b";
+-- @expect --
+{"nodes":[["nodes/nodejs/a","violation"],["nodes/nodejs/b","verified"],["nodes/nodejs/c","violation"],["nodes/nodejs/d","violation"]],"diagnostics":[["ownership_node_imports_node","nodes/nodejs/a/index.ts:1"],["ownership_node_imports_node","nodes/nodejs/c/index.ts:1"],["ownership_node_imports_node","nodes/nodejs/d/index.ts:1"]]}

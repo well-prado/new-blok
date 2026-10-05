@@ -343,9 +343,9 @@ func TestPruningTheRecordDoesNotChangeWhoOwnsTheReconciliation(t *testing.T) {
 	r.reopen().mustVerify(1)
 }
 
-// TestRowWithoutATenantIsOwnedByNobodyUntilTheNextOpen: an older binary
-// (#291) can still open a migrated journal and insert a reconciliation
-// without a tenant. Until the journal is opened again, nobody owns it: every
+// TestRowWithoutATenantIsOwnedByNobodyUntilTheNextOpen: a binary built
+// before #291, which has no schema version check, can still open a migrated
+// journal and insert a reconciliation without a tenant. Until the journal is opened again, nobody owns it: every
 // re-delivery, the deciding and the system tenant's included, is answered
 // as for a never-reconciled operation and writes nothing, so ownership is
 // never derived from audit at re-delivery time. The next open fixes it from
@@ -505,7 +505,7 @@ func TestTamperedRecordDoesNotLendItsTenant(t *testing.T) {
 
 // TestRecordPrunedBeforeTheUpgradeLeavesTheRowUnowned: a reconciliation
 // from before #286 whose audit record was pruned before the journal was
-// opened by a #286 binary (or by an older binary after it, #291) has no
+// opened by a #286 binary (or by a pre-#291 binary after it) has no
 // record to take its tenant from, but a prune tombstone proves it had one.
 // It must not become the system tenant's: the row stays without a tenant,
 // owned by nobody, so no re-delivery is answered and none writes anything,

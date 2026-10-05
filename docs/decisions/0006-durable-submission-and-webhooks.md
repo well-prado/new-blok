@@ -426,7 +426,11 @@ inspected or replayed), while a held dead job still is.
 **Schema.** `worker.New` creates `worker_compacted`, its `finished_at`
 index, `worker_meta` and `worker_jobs_finished` in place, with `CREATE …
 IF NOT EXISTS` inside the existing retried schema transaction (#233), so
-reopening changes nothing. No existing column changes.
+reopening changes nothing. No existing column changes. Since #291 the queue
+stamps its schema version (`worker` 2 with the tombstones, 1 before them)
+in that transaction, and a binary that supports only version 1 refuses a
+queue stamped 2 at open, so it cannot accept a duplicate of a compacted
+job (ADR 0003, "Schema versions").
 
 ### Webhook admission
 
@@ -513,7 +517,8 @@ is never parsed before verification.
 | `worker.Queue.Compact`, `Retention`, `CompactionReport`, `RetainedJob`, `WithRetentionHold`, `WithMinRetention`, `DefaultCompactBatch`, `MaxCompactBatch`, `Job.Compacted` (#290) | additive | none. Nothing is erased until the application calls `Compact`; existing `New` calls compile unchanged |
 | `worker_compacted` and `worker_meta` tables; `worker_jobs_finished` and `worker_compacted_finished` indexes (#290) | schema | created by `worker.New` in place and idempotently. The first open of an existing queue indexes every finished job once, inside the schema transaction |
 | A key whose job was compacted answers from its tombstone (#290) | behavioral | only after `Compact` ran: a duplicate is `Accepted=false` with `Job.Compacted`, other content conflicts, `Get` returns the tombstone. Once `Retention.Tombstones` passes, the key is new again |
-| Workers from before #290 on the same store | compatibility limit | they do not read tombstones: a duplicate of a compacted job submitted through an old binary is accepted and runs again, and its `Get` reports not found. Run one version per store, as #245 already requires |
+| Workers from before #290 on the same store | compatibility limit | they do not read tombstones: a duplicate of a compacted job submitted through an old binary is accepted and runs again, and its `Get` reports not found. Run one version per store, as #245 already requires. From #291 on, a worker built for an older queue schema than the store's is refused at open instead; workers built before #291 have no such check |
+| The queue's schema version is stamped in `blok_schema_versions`; `worker.New` refuses a queue stamped newer than it supports with `store.NewerSchemaError` (#291) | schema, behavioral | Created on the first open by #291; an unstamped queue is classified by shape (1 without `worker_compacted`, 2 with it) and stamped. A downgrade below a release that raised the version is refused at open |
 | New package `trigger/webhook` | additive | none |
 
 ## Limits
