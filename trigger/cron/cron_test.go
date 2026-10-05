@@ -432,6 +432,9 @@ func TestDenseSchedulesProfile(t *testing.T) {
 	if steadyCPU > denseTickBound || catchUpCPU > denseTickBound {
 		t.Fatalf("steady %v CPU, catch-up %v CPU, bound %v", steadyCPU, catchUpCPU, denseTickBound)
 	}
+	if steady > denseWallBackstop || catchUp > denseWallBackstop {
+		t.Fatalf("steady %v, catch-up %v wall, backstop %v", steady, catchUp, denseWallBackstop)
+	}
 }
 
 // TestRunFiresOnTheClock drives Run with the fake clock: firings happen when
