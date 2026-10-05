@@ -166,6 +166,7 @@ func sortedErrorLabels(observed map[string]struct{}) []string {
 
 func TestReplicaPauseCatchupAndQuorumLoss(t *testing.T) {
 	store, client := integrationStore(t, "BLOK_DISTRIBUTED_ENDPOINTS")
+	endpoints := strings.Split(os.Getenv("BLOK_DISTRIBUTED_ENDPOINTS"), ",")
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	partition := fmt.Sprintf("replica-%d", time.Now().UnixNano())
@@ -184,10 +185,10 @@ func TestReplicaPauseCatchupAndQuorumLoss(t *testing.T) {
 			_, _ = exec.Command("docker", composeArgs("unpause", "etcd3")...).CombinedOutput()
 		}
 	}()
-	if err := waitEndpointAt(ctx, "127.0.0.1:2379"); err != nil {
+	if err := waitEndpointAt(ctx, endpoints[0]); err != nil {
 		t.Fatalf("remaining voters did not establish a linearizable quorum: %v", err)
 	}
-	majorityClient, err := clientv3.New(clientv3.Config{Endpoints: []string{"http://127.0.0.1:2379", "http://127.0.0.1:22379"}, DialTimeout: 2 * time.Second})
+	majorityClient, err := clientv3.New(clientv3.Config{Endpoints: endpoints[:2], DialTimeout: 2 * time.Second})
 	if err != nil {
 		t.Fatalf("connect through remaining voters: %v", err)
 	}
@@ -203,7 +204,7 @@ func TestReplicaPauseCatchupAndQuorumLoss(t *testing.T) {
 		t.Fatalf("resume replica: %v: %s", err, output)
 	}
 	paused = false
-	if err := waitRead(ctx, client, "127.0.0.1:32379", eventKey(partition, "catchup")); err != nil {
+	if err := waitRead(ctx, client, endpoints[2], eventKey(partition, "catchup")); err != nil {
 		t.Fatalf("recovered replica did not catch up: %v", err)
 	}
 	assertScenarioFixture(t, "one-voter-paused", map[string]any{
@@ -314,7 +315,7 @@ func TestNetworkPartitionedVoterAllowsMajorityCommitAndCatchesUp(t *testing.T) {
 		}
 		recoveryCtx, recoveryCancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer recoveryCancel()
-		if err := waitEndpointAt(recoveryCtx, "127.0.0.1:32379"); err != nil {
+		if err := waitEndpointAt(recoveryCtx, endpoints[2]); err != nil {
 			t.Errorf("wait for isolated voter quorum recovery: %v", err)
 		}
 	}()
@@ -708,6 +709,22 @@ func waitRead(ctx context.Context, client *clientv3.Client, endpoint, key string
 }
 
 func composeArgs(args ...string) []string {
+	if len(args) > 1 && os.Getenv("BLOK_DISTRIBUTED_ETCD_VOTERS") != "" {
+		voters := integrationEtcdVoters()
+		services := map[string]string{"etcd1": voters[0], "etcd2": voters[1], "etcd3": voters[2]}
+		mapped := []string{args[0]}
+		for _, service := range args[1:] {
+			voter, ok := services[service]
+			if !ok {
+				mapped = nil
+				break
+			}
+			mapped = append(mapped, voter)
+		}
+		if mapped != nil {
+			return mapped
+		}
+	}
 	_, file, _, _ := runtime.Caller(0)
 	composePath := filepath.Join(filepath.Dir(file), "..", "..", "benchmarks", "distributed", "compose.yaml")
 	return append([]string{"compose", "-p", "blok-distributed-spike", "-f", composePath}, args...)

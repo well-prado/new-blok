@@ -859,9 +859,17 @@ func TestScheduleWaitClassifiesQuorumLossAsUnavailable(t *testing.T) {
 		}
 		paused = paused[:index]
 	}
-	if _, _, err := store.ReadState(ctx, partition, "recovery-check"); err != nil {
-		t.Fatalf("quorum did not recover after restoring all voters: %v", err)
+	var recoveryErr error
+	for ctx.Err() == nil {
+		if _, _, recoveryErr = store.ReadState(ctx, partition, "recovery-check"); recoveryErr == nil {
+			return
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
+	t.Fatalf("quorum did not recover after restoring all voters: last read error=%v context=%v", recoveryErr, ctx.Err())
 }
 
 func TestStepJournalQuorumLossDefersAcceptedRun(t *testing.T) {

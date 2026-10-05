@@ -154,6 +154,57 @@ func TestSignalRetriesAWaitRunCASConflict(t *testing.T) {
 		t.Fatalf("external effect counts prefix=%d suffix=%d; want exactly 1/1", prefixEffects.Load(), suffixEffects.Load())
 	}
 
+	for _, conflictCount := range []int32{1, 3} {
+		prefixBase, suffixBase := prefixEffects.Load(), suffixEffects.Load()
+		admission, err = runtime.Admit(ctx, Submission{
+			Tenant: tenant, RequestKey: fmt.Sprintf("signal-cas-retry-%s-%d", testID, conflictCount),
+			Workflow: "signal-cas-retry", Input: json.RawMessage(`{"value":80}`),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := runtime.processOne(ctx, owner); !errors.Is(err, ErrNoWork) {
+			t.Fatalf("%d-conflict retry run process error=%v, want suspended work yield", conflictCount, err)
+		}
+		retryWaitID := WaitIDFor(admission.RunID, "approval")
+		barrier.eventID = waitTransition("signal", tenant+"\x00"+retryWaitID+"\x00cas-signal")
+		barrier.before = func() error {
+			data, revision, readErr := directStore.ReadState(ctx, partition, admission.RunID)
+			if readErr != nil {
+				return readErr
+			}
+			if revision == 0 {
+				return errors.New("run projection disappeared before injected conflict")
+			}
+			bumpID := revisionBumps.Add(1)
+			_, commitErr := directStore.CommitFencedState(ctx, owner, admission.RunID, revision,
+				fmt.Sprintf("test-revision-bump-%s-%d", retryWaitID, bumpID), "test.signal_revision_bump", data, data)
+			return commitErr
+		}
+		retryPayload := json.RawMessage(fmt.Sprintf(`{"value":%d}`, 80+conflictCount))
+		triggerBase := barrier.triggerCount.Load()
+		eventCommitBase := barrier.eventCommitCount.Load()
+		barrier.arm(conflictCount)
+		retried, retryErr := runtime.DeliverSignal(ctx, tenant, retryWaitID, "cas-signal", "synthetic-principal", retryPayload, true)
+		if retryErr != nil || !retried.Accepted || retried.Duplicate || retried.Late {
+			t.Fatalf("signal after %d run-only CAS conflicts=%+v err=%v; want newly accepted signal", conflictCount, retried, retryErr)
+		}
+		if got := barrier.triggerCount.Load() - triggerBase; got != conflictCount {
+			t.Fatalf("%d-conflict retry injected %d real run-revision conflicts", conflictCount, got)
+		}
+		if got := barrier.eventCommitCount.Load() - eventCommitBase; got != 1 {
+			t.Fatalf("%d-conflict retry committed signal transition events=%d, want exactly 1", conflictCount, got)
+		}
+		retryOutput := fmt.Sprintf(`{"value":%d}`, 81+conflictCount)
+		completed, err = runtime.processOne(ctx, owner)
+		if err != nil || completed.State != "completed" || string(completed.Output) != retryOutput {
+			t.Fatalf("run after %d-conflict retry=%+v err=%v, want output %s", conflictCount, completed, err, retryOutput)
+		}
+		if prefixEffects.Load()-prefixBase != 1 || suffixEffects.Load()-suffixBase != 1 {
+			t.Fatalf("%d-conflict retry external effect deltas prefix=%d suffix=%d; want exactly 1/1", conflictCount, prefixEffects.Load()-prefixBase, suffixEffects.Load()-suffixBase)
+		}
+	}
+
 	for index, collision := range []struct {
 		name      string
 		principal string
@@ -204,8 +255,8 @@ func TestSignalRetriesAWaitRunCASConflict(t *testing.T) {
 		if !errors.Is(conflictErr, ErrRequestConflict) || conflicting.Accepted || conflicting.Late || conflicting.Duplicate {
 			t.Fatalf("same-ID %s race result=%+v err=%v; want request conflict without acknowledgement", collision.name, conflicting, conflictErr)
 		}
-		if got := barrier.triggerCount.Load(); got != int32(5+index) {
-			t.Fatalf("barrier injections=%d after %s race, want %d", got, collision.name, 5+index)
+		if got := barrier.triggerCount.Load(); got != int32(9+index) {
+			t.Fatalf("barrier injections=%d after %s race, want %d", got, collision.name, 9+index)
 		}
 		wait, err = runtime.GetWait(ctx, tenant, collisionWaitID)
 		if err != nil || wait.State != "signaled" || wait.Principal != collision.principal || string(wait.Payload) != string(collision.payload) {
@@ -219,8 +270,8 @@ func TestSignalRetriesAWaitRunCASConflict(t *testing.T) {
 			t.Fatalf("exact %s competitor retry=%+v err=%v; want duplicate", collision.name, duplicate, duplicateErr)
 		}
 	}
-	if prefixEffects.Load() != 3 || suffixEffects.Load() != 3 {
-		t.Fatalf("aggregate real-backend effect counts prefix=%d suffix=%d; want exactly 3/3", prefixEffects.Load(), suffixEffects.Load())
+	if prefixEffects.Load() != 5 || suffixEffects.Load() != 5 {
+		t.Fatalf("aggregate real-backend effect counts prefix=%d suffix=%d; want exactly 5/5", prefixEffects.Load(), suffixEffects.Load())
 	}
 }
 
