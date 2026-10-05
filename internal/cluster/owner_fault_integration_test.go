@@ -172,7 +172,17 @@ type ownerFaultFixture struct {
 			Skip    int    `json:"skip"`
 			After   bool   `json:"after"`
 		} `json:"hook"`
+		SuccessorHold *struct {
+			Pattern string `json:"pattern"`
+			Skip    int    `json:"skip"`
+			After   bool   `json:"after"`
+		} `json:"successorHold"`
 		Expected struct {
+			DuringSuccessorRun *struct {
+				State            string `json:"state"`
+				OwnedBySuccessor bool   `json:"ownedBySuccessor"`
+				ActiveRuns       int    `json:"activeRuns"`
+			} `json:"duringSuccessorRun"`
 			State                string         `json:"state"`
 			Output               string         `json:"output"`
 			Effects              map[string]int `json:"effects"`
@@ -386,7 +396,10 @@ func TestOwnerFaultsAroundEveryStepTransition(t *testing.T) {
 					dir := t.TempDir()
 					ledger := effectLedger(filepath.Join(dir, "ledger"))
 					store := integrationDistributedStore(t)
-					successorRuntime, err := ownerFaultRuntime(store, ledger, nil)
+					// The successor runs on its own client so a stage can hold it
+					// mid-run at a chosen transition.
+					successorClient := &hookedClient{Client: integrationClient(t)}
+					successorRuntime, err := ownerFaultRuntime(integrationStoreFor(t, successorClient), ledger, nil)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -458,12 +471,58 @@ func TestOwnerFaultsAroundEveryStepTransition(t *testing.T) {
 					if successor.Token <= stale.Token {
 						t.Fatalf("fence did not advance: stale=%d successor=%d", stale.Token, successor.Token)
 					}
-					record, err := successorRuntime.processOne(ctx, successor)
-					if err != nil {
-						t.Fatalf("successor processOne: %v", err)
+					var record RunRecord
+					var killed bool
+					if hold := stage.SuccessorHold; hold != nil {
+						// Hold the successor inside its own run, then let the
+						// stale owner resume and attempt its remaining
+						// transitions against a run the successor still owns.
+						held, release := make(chan struct{}), make(chan struct{})
+						successorClient.arm(hold.Pattern, hold.Skip, hold.After, func() {
+							close(held)
+							<-release
+						})
+						successorDone := make(chan error, 1)
+						go func() {
+							var processErr error
+							record, processErr = successorRuntime.processOne(ctx, successor)
+							successorDone <- processErr
+						}()
+						select {
+						case <-held:
+						case err := <-successorDone:
+							t.Fatalf("successor finished before reaching its hold: %v", err)
+						case <-ctx.Done():
+							t.Fatal("successor did not reach its hold")
+						}
+						helper.resume(t)
+						killed = helper.wait(t)
+						during, err := successorRuntime.GetRun(ctx, tenant, admission.RunID)
+						if err != nil {
+							t.Fatal(err)
+						}
+						activeDuring, err := store.ListActiveRunIDs(ctx, partition, ownerFaultLimits.PartitionAdmissions)
+						if err != nil {
+							t.Fatal(err)
+						}
+						ownedBySuccessor := during.OwnerID == successor.ID && during.Fence == successor.Token
+						t.Logf("%s/%s while successor held: state=%s ownedBySuccessor=%v active=%d", fault, stage.Name, during.State, ownedBySuccessor, len(activeDuring))
+						want := stage.Expected.DuringSuccessorRun
+						if want == nil || during.State != want.State || ownedBySuccessor != want.OwnedBySuccessor || len(activeDuring) != want.ActiveRuns {
+							t.Errorf("while successor held: state=%s ownedBySuccessor=%v active=%v; fixture %+v", during.State, ownedBySuccessor, activeDuring, want)
+						}
+						close(release)
+						if err := <-successorDone; err != nil {
+							t.Fatalf("successor processOne after stale owner resumed: %v", err)
+						}
+					} else {
+						record, err = successorRuntime.processOne(ctx, successor)
+						if err != nil {
+							t.Fatalf("successor processOne: %v", err)
+						}
+						helper.resume(t)
+						killed = helper.wait(t)
 					}
-					helper.resume(t)
-					killed := helper.wait(t)
 					staleResult := "unknown"
 					if fault == "kill" {
 						if killed {

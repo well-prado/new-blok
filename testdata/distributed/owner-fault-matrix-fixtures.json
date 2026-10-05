@@ -13,73 +13,203 @@
     {
       "name": "before-claim",
       "transition": "T4 run claim",
-      "hook": {"pattern": "/events/claim-", "skip": 0, "after": false},
+      "hook": {
+        "pattern": "/events/claim-",
+        "skip": 0,
+        "after": false
+      },
       "expected": {
-        "state": "completed", "output": "{\"value\":42}",
-        "effects": {"kill": 1, "stop": 1, "partition": 1},
-        "pureInvocations": {"kill": 1, "stop": 1, "partition": 1},
-        "effectDispatches": 1, "pureDispatches": 1, "successorPureAttempt": 1
+        "state": "completed",
+        "output": "{\"value\":42}",
+        "effects": {
+          "kill": 1,
+          "stop": 1,
+          "partition": 1
+        },
+        "pureInvocations": {
+          "kill": 1,
+          "stop": 1,
+          "partition": 1
+        },
+        "effectDispatches": 1,
+        "pureDispatches": 1,
+        "successorPureAttempt": 1
       }
     },
     {
       "name": "after-pure-dispatch",
       "transition": "T7 dispatch intent of a pure step",
-      "hook": {"pattern": "/events/dispatch-", "skip": 0, "after": true},
+      "hook": {
+        "pattern": "/events/dispatch-",
+        "skip": 0,
+        "after": true
+      },
       "expected": {
-        "state": "completed", "output": "{\"value\":42}",
-        "effects": {"kill": 1, "stop": 1, "partition": 1},
-        "pureInvocations": {"kill": 1, "stop": 2, "partition": 2},
-        "effectDispatches": 1, "pureDispatches": 2, "successorPureAttempt": 2
+        "state": "completed",
+        "output": "{\"value\":42}",
+        "effects": {
+          "kill": 1,
+          "stop": 1,
+          "partition": 1
+        },
+        "pureInvocations": {
+          "kill": 1,
+          "stop": 2,
+          "partition": 2
+        },
+        "effectDispatches": 1,
+        "pureDispatches": 2,
+        "successorPureAttempt": 2
       }
     },
     {
       "name": "after-effect-dispatch",
       "transition": "T7 dispatch intent of an effectful step",
-      "hook": {"pattern": "/events/dispatch-", "skip": 1, "after": true},
+      "hook": {
+        "pattern": "/events/dispatch-",
+        "skip": 1,
+        "after": true
+      },
       "expected": {
-        "state": "uncertain", "output": "",
-        "effects": {"kill": 0, "stop": 1, "partition": 1},
-        "pureInvocations": {"kill": 1, "stop": 1, "partition": 1},
-        "effectDispatches": 1, "pureDispatches": 1, "successorPureAttempt": 0
+        "state": "uncertain",
+        "output": "",
+        "effects": {
+          "kill": 0,
+          "stop": 1,
+          "partition": 1
+        },
+        "pureInvocations": {
+          "kill": 1,
+          "stop": 1,
+          "partition": 1
+        },
+        "effectDispatches": 1,
+        "pureDispatches": 1,
+        "successorPureAttempt": 0
       }
     },
     {
       "name": "in-effect",
       "transition": "T8 external effect performed, result not yet committed",
-      "hook": {"pattern": "", "skip": 0, "after": false},
+      "hook": {
+        "pattern": "",
+        "skip": 0,
+        "after": false
+      },
       "expected": {
-        "state": "uncertain", "output": "",
-        "effects": {"kill": 1, "stop": 1, "partition": 1},
-        "pureInvocations": {"kill": 1, "stop": 1, "partition": 1},
-        "effectDispatches": 1, "pureDispatches": 1, "successorPureAttempt": 0
+        "state": "uncertain",
+        "output": "",
+        "effects": {
+          "kill": 1,
+          "stop": 1,
+          "partition": 1
+        },
+        "pureInvocations": {
+          "kill": 1,
+          "stop": 1,
+          "partition": 1
+        },
+        "effectDispatches": 1,
+        "pureDispatches": 1,
+        "successorPureAttempt": 0
       }
     },
     {
       "name": "after-effect-commit",
       "transition": "T9 effect result committed, run not finished",
-      "hook": {"pattern": "/events/committed-", "skip": 1, "after": true},
+      "hook": {
+        "pattern": "/events/committed-",
+        "skip": 1,
+        "after": true
+      },
       "expected": {
-        "state": "completed", "output": "{\"value\":42}",
-        "effects": {"kill": 1, "stop": 1, "partition": 1},
-        "pureInvocations": {"kill": 1, "stop": 1, "partition": 1},
-        "effectDispatches": 1, "pureDispatches": 1, "successorPureAttempt": 0
+        "state": "completed",
+        "output": "{\"value\":42}",
+        "effects": {
+          "kill": 1,
+          "stop": 1,
+          "partition": 1
+        },
+        "pureInvocations": {
+          "kill": 1,
+          "stop": 1,
+          "partition": 1
+        },
+        "effectDispatches": 1,
+        "pureDispatches": 1,
+        "successorPureAttempt": 0
       }
     },
     {
       "name": "before-finish",
       "transition": "T15 terminal state and slot release",
-      "hook": {"pattern": "/events/finish-", "skip": 0, "after": false},
+      "hook": {
+        "pattern": "/events/finish-",
+        "skip": 0,
+        "after": false
+      },
       "expected": {
-        "state": "completed", "output": "{\"value\":42}",
-        "effects": {"kill": 1, "stop": 1, "partition": 1},
-        "pureInvocations": {"kill": 1, "stop": 1, "partition": 1},
-        "effectDispatches": 1, "pureDispatches": 1, "successorPureAttempt": 0
+        "state": "completed",
+        "output": "{\"value\":42}",
+        "effects": {
+          "kill": 1,
+          "stop": 1,
+          "partition": 1
+        },
+        "pureInvocations": {
+          "kill": 1,
+          "stop": 1,
+          "partition": 1
+        },
+        "effectDispatches": 1,
+        "pureDispatches": 1,
+        "successorPureAttempt": 0
+      }
+    },
+    {
+      "name": "stale-finish-during-successor-run",
+      "transition": "T15 stale owner resumes after its effect commit and attempts finish while the successor is still running the run",
+      "hook": {
+        "pattern": "/events/committed-",
+        "skip": 1,
+        "after": true
+      },
+      "successorHold": {
+        "pattern": "/events/finish-",
+        "skip": 0,
+        "after": false
+      },
+      "expected": {
+        "duringSuccessorRun": {
+          "state": "running",
+          "ownedBySuccessor": true,
+          "activeRuns": 1
+        },
+        "state": "completed",
+        "output": "{\"value\":42}",
+        "effects": {
+          "kill": 1,
+          "stop": 1,
+          "partition": 1
+        },
+        "pureInvocations": {
+          "kill": 1,
+          "stop": 1,
+          "partition": 1
+        },
+        "effectDispatches": 1,
+        "pureDispatches": 1,
+        "successorPureAttempt": 0
       }
     }
   ],
   "invariants": {
     "activeRunsAfterSuccessor": 0,
-    "staleOwnerResult": {"kill": "killed", "stop": "ownership_lost", "partition": "ownership_lost"},
+    "staleOwnerResult": {
+      "kill": "killed",
+      "stop": "ownership_lost",
+      "partition": "ownership_lost"
+    },
     "staleFenceEventsAfterTakeover": 0,
     "terminalEvents": 1
   }
