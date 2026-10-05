@@ -15,6 +15,7 @@ import (
 
 	"github.com/well-prado/new-blok/contract/audit"
 	"github.com/well-prado/new-blok/internal/journal"
+	"github.com/well-prado/new-blok/store/sqlite"
 )
 
 // A reconciliation belongs to the tenant that decided it (#286). Only that
@@ -252,22 +253,38 @@ func (r *rig) operationRun(key string) string {
 	return runID
 }
 
+// reopen opens the rig's database again, as the next process would: the
+// schema transaction runs, and with it the tenant backfill.
+func (r *rig) reopen() *rig {
+	r.t.Helper()
+	next := openRig(r.t, r.path, rigOptions{})
+	next.clock = r.clock
+	return next
+}
+
 // TestReconciliationWithNoKnownTenantBelongsToTheSystemTenant: a row from
-// before #286 recorded no tenant, and with no audit record either (it
-// predates audit) nothing says which tenant decided it. It belongs to the
-// system tenant "", the tenant compaction files its record under: a
-// tenant-scoped re-delivery, the deciding tenant's included, is refused and
-// writes nothing; a system re-delivery returns it and backfills under "".
+// before #286 stored no tenant, and with no audit record either (it
+// predates audit) nothing says which tenant decided it. Opening the journal
+// gives it the system tenant "", the tenant compaction files its record
+// under. From then on a tenant-scoped re-delivery, the deciding tenant's
+// included, is refused, terminally, and writes nothing; a system re-delivery
+// returns it and backfills its record under "".
 func TestReconciliationWithNoKnownTenantBelongsToTheSystemTenant(t *testing.T) {
-	r := newRig(t, rigOptions{})
-	op, original := r.decideUnder(tenantA(r.ctx), "UNKNOWN")
-	_, settled := r.settledEffect("settled")
-	r.exec(`UPDATE journal_reconciliations SET tenant = NULL`)
-	r.dropReconciliationRecords()
-	for _, ctx := range []context.Context{tenantA(r.ctx), tenantB(r.ctx)} {
-		got, err := r.redeliverAs(ctx, op.Key)
-		control, controlErr := r.redeliverAs(ctx, settled.Key)
-		requireIndistinguishable(t, got, err, control, controlErr)
+	first := newRig(t, rigOptions{})
+	op, original := first.decideUnder(tenantA(first.ctx), "UNKNOWN")
+	_, settled := first.settledEffect("settled")
+	first.exec(`UPDATE journal_reconciliations SET tenant = NULL`)
+	first.dropReconciliationRecords()
+	r := first.reopen()
+	if n := r.count(`SELECT COUNT(*) FROM journal_reconciliations WHERE tenant = ''`); n != 1 {
+		t.Fatalf("rows given the system tenant on open=%d, want 1", n)
+	}
+	for range 2 {
+		for _, ctx := range []context.Context{tenantA(r.ctx), tenantB(r.ctx)} {
+			got, err := r.redeliverAs(ctx, op.Key)
+			control, controlErr := r.redeliverAs(ctx, settled.Key)
+			requireIndistinguishable(t, got, err, control, controlErr)
+		}
 	}
 	if n := r.count(`SELECT COUNT(*) FROM audit_records_v1`); n != 0 {
 		t.Fatalf("refused re-deliveries wrote %d records", n)
@@ -282,6 +299,76 @@ func TestReconciliationWithNoKnownTenantBelongsToTheSystemTenant(t *testing.T) {
 		t.Fatalf("backfill records system=%d a=%d b=%d, want it under the system tenant", r.records(""), r.records("tenant-a"), r.records("tenant-b"))
 	}
 	r.mustVerify(1)
+}
+
+// TestPruningTheRecordDoesNotChangeWhoOwnsTheReconciliation: a row from
+// before #286 takes its tenant from its audit record when the journal is
+// opened, once. That record can be pruned while the run is kept; the
+// deciding tenant must still own the decision afterwards, and the system
+// tenant must not inherit it.
+func TestPruningTheRecordDoesNotChangeWhoOwnsTheReconciliation(t *testing.T) {
+	first := newRig(t, rigOptions{})
+	op, original := first.decideUnder(tenantA(first.ctx), "PRUNED")
+	_, settled := first.settledEffect("settled")
+	first.exec(`UPDATE journal_reconciliations SET tenant = NULL`)
+	r := first.reopen()
+	want := original
+	want.Duplicate = true
+	if again, err := r.redeliverAs(tenantA(r.ctx), op.Key); err != nil || !reflect.DeepEqual(again, want) {
+		t.Fatalf("own re-delivery before prune=%+v err=%v", again, err)
+	}
+	if err := r.journal.CompleteRun(r.ctx, r.operationRun(op.Key), []byte(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	r.clock = r.clock.Add(48 * time.Hour)
+	if report, err := r.audit.Prune(r.ctx, r.clock, r.journal); err != nil || report.Removed != 1 {
+		t.Fatalf("prune=%+v err=%v", report, err)
+	}
+	// A restart after the prune must not re-derive the owner either.
+	r = r.reopen()
+	if again, err := r.redeliverAs(tenantA(r.ctx), op.Key); err != nil || !reflect.DeepEqual(again, want) {
+		t.Fatalf("own re-delivery after its record was pruned=%+v err=%v, want the original", again, err)
+	}
+	for _, ctx := range []context.Context{r.ctx, tenantB(r.ctx)} {
+		got, err := r.redeliverAs(ctx, op.Key)
+		control, controlErr := r.redeliverAs(ctx, settled.Key)
+		requireIndistinguishable(t, got, err, control, controlErr)
+	}
+	// The owner's re-delivery wrote the pruned record again (re-delivery
+	// backfills any missing record, as before #286); it is under the
+	// deciding tenant, never the system tenant's.
+	if r.records("tenant-a") != 1 || r.records("") != 0 || r.records("tenant-b") != 0 {
+		t.Fatalf("records after prune a=%d system=%d b=%d", r.records("tenant-a"), r.records(""), r.records("tenant-b"))
+	}
+	r.reopen().mustVerify(1)
+}
+
+// TestRowWithoutATenantIsOwnedByNobodyUntilTheNextOpen: an older binary
+// (#291) can still open a migrated journal and insert a reconciliation
+// without a tenant. Until the journal is opened again, nobody owns it: every
+// re-delivery, the deciding and the system tenant's included, is answered
+// as for a never-reconciled operation and writes nothing, so ownership is
+// never derived from audit at re-delivery time. The next open fixes it from
+// its record.
+func TestRowWithoutATenantIsOwnedByNobodyUntilTheNextOpen(t *testing.T) {
+	r := newRig(t, rigOptions{})
+	op, original := r.decideUnder(tenantA(r.ctx), "OLDER")
+	_, settled := r.settledEffect("settled")
+	r.exec(`UPDATE journal_reconciliations SET tenant = NULL`)
+	for _, ctx := range []context.Context{tenantA(r.ctx), r.ctx, tenantB(r.ctx)} {
+		got, err := r.redeliverAs(ctx, op.Key)
+		control, controlErr := r.redeliverAs(ctx, settled.Key)
+		requireIndistinguishable(t, got, err, control, controlErr)
+	}
+	if n := r.count(`SELECT COUNT(*) FROM journal_reconciliations WHERE tenant IS NULL`); n != 1 || r.records("tenant-a") != 1 {
+		t.Fatalf("a refused re-delivery wrote: unowned rows=%d records=%d", n, r.records("tenant-a"))
+	}
+	next := r.reopen()
+	want := original
+	want.Duplicate = true
+	if again, err := next.redeliverAs(tenantA(next.ctx), op.Key); err != nil || !reflect.DeepEqual(again, want) {
+		t.Fatalf("own re-delivery after the next open=%+v err=%v", again, err)
+	}
 }
 
 // tenantFixture is a journal written by origin/main at 99a9228, after #281
@@ -327,48 +414,91 @@ func (r *rig) keyWithEvidence(label string) string {
 }
 
 // TestPreColumnReconciliationsAreAnsweredOnlyToTheirRecordedTenant opens a
-// journal origin/main wrote. Its reconciliations gain an empty tenant on
-// open; each is then answered only to the tenant its audit record carries,
-// the one that decided it. Reopening changes nothing, and Verify passes.
+// journal origin/main wrote. Opening gives each reconciliation the tenant
+// its verified audit record carries, the one that decided it, once; each is
+// then answered only to that tenant, also after its record is pruned.
+// Reopening changes nothing, and Verify passes.
 func TestPreColumnReconciliationsAreAnsweredOnlyToTheirRecordedTenant(t *testing.T) {
 	path := tenantFixtureDatabase(t)
 	r := openRig(t, path, rigOptions{})
-	if n := r.count(`SELECT COUNT(*) FROM journal_reconciliations WHERE tenant IS NULL`); n != 2 {
-		t.Fatalf("pre-column reconciliations without a tenant=%d, want 2", n)
+	keyA, keySystem := r.keyWithEvidence("A"), r.keyWithEvidence("SYSTEM")
+	if r.count(`SELECT COUNT(*) FROM journal_reconciliations WHERE tenant IS NULL`) != 0 ||
+		r.count(`SELECT COUNT(*) FROM journal_reconciliations WHERE operation_key = ? AND tenant = 'tenant-a'`, keyA) != 1 ||
+		r.count(`SELECT COUNT(*) FROM journal_reconciliations WHERE operation_key = ? AND tenant = ''`, keySystem) != 1 {
+		t.Fatal("opening did not give each pre-column reconciliation its record's tenant")
 	}
 	r.mustVerify(2)
-	keyA, keySystem := r.keyWithEvidence("A"), r.keyWithEvidence("SYSTEM")
-	_, settled := r.settledEffect("settled")
-	for _, c := range []struct {
-		key   string
-		owner context.Context
-		label string
-		other []context.Context
-	}{
-		{keyA, tenantA(r.ctx), "A", []context.Context{tenantB(r.ctx), r.ctx}},
-		{keySystem, r.ctx, "SYSTEM", []context.Context{tenantA(r.ctx), tenantB(r.ctx)}},
-	} {
-		for _, ctx := range c.other {
-			got, err := r.redeliverAs(ctx, c.key)
-			control, controlErr := r.redeliverAs(ctx, settled.Key)
-			requireIndistinguishable(t, got, err, control, controlErr)
-		}
-		own, err := r.redeliverAs(c.owner, c.key)
-		if err != nil || !own.Duplicate || own.Erased || own.Actor != "operator:bob" || !strings.Contains(own.Evidence, tenantMarker+c.label+"-EVIDENCE") || !strings.Contains(string(own.Result), tenantMarker+c.label+"-RESULT") {
-			t.Fatalf("%s own re-delivery=%+v err=%v", c.label, own, err)
-		}
-	}
 	migrated := r.snapshot()
 	if again := openRig(t, path, rigOptions{}).snapshot(); again != migrated {
 		t.Fatal("reopening a migrated journal changed it")
 	}
+	_, settled := r.settledEffect("settled")
+	answers := func(stage string) {
+		t.Helper()
+		for _, c := range []struct {
+			key   string
+			owner context.Context
+			label string
+			other []context.Context
+		}{
+			{keyA, tenantA(r.ctx), "A", []context.Context{tenantB(r.ctx), r.ctx}},
+			{keySystem, r.ctx, "SYSTEM", []context.Context{tenantA(r.ctx), tenantB(r.ctx)}},
+		} {
+			for _, ctx := range c.other {
+				got, err := r.redeliverAs(ctx, c.key)
+				control, controlErr := r.redeliverAs(ctx, settled.Key)
+				requireIndistinguishable(t, got, err, control, controlErr)
+			}
+			own, err := r.redeliverAs(c.owner, c.key)
+			if err != nil || !own.Duplicate || own.Erased || own.Actor != "operator:bob" || !strings.Contains(own.Evidence, tenantMarker+c.label+"-EVIDENCE") || !strings.Contains(string(own.Result), tenantMarker+c.label+"-RESULT") {
+				t.Fatalf("%s: %s own re-delivery=%+v err=%v", stage, c.label, own, err)
+			}
+		}
+	}
+	answers("migrated")
+	r.clock = r.clock.Add(48 * time.Hour)
+	if report, err := r.audit.Prune(r.ctx, r.clock, r.journal); err != nil || report.Removed != 2 {
+		t.Fatalf("prune=%+v err=%v", report, err)
+	}
+	answers("records pruned")
+	if r.records("tenant-a") != 1 || r.records("") != 1 || r.records("tenant-b") != 0 {
+		t.Fatalf("records after prune a=%d system=%d b=%d", r.records("tenant-a"), r.records(""), r.records("tenant-b"))
+	}
 	r.mustVerify(2)
+}
 
-	// The tenant is read from the verified record, never from a column
-	// alone: a record whose tenant column was altered fails verification,
-	// and the re-delivery is refused with it instead of answering.
-	r.exec(`UPDATE audit_records_v1 SET tenant = 'tenant-b' WHERE id = 'reconcile:` + keyA + `'`)
-	if got, err := r.redeliverAs(tenantB(r.ctx), keyA); !errors.Is(err, audit.ErrCorrupt) || !reflect.DeepEqual(got, journal.Reconciliation{}) {
-		t.Fatalf("re-delivery against a tampered record=%+v err=%v, want ErrCorrupt and nothing", got, err)
+// TestTamperedRecordDoesNotLendItsTenant: the tenant is taken from the
+// verified record, never from a column alone. A record whose tenant column
+// was altered before the upgrade fails verification, so the row keeps no
+// tenant and is owned by nobody: neither the altered tenant nor the deciding
+// one is answered, and Verify reports the record.
+func TestTamperedRecordDoesNotLendItsTenant(t *testing.T) {
+	path := tenantFixtureDatabase(t)
+	db, err := (sqlite.Backend{}).Open(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WithTx(context.Background(), func(tx *sql.Tx) error {
+		_, err := tx.Exec(`UPDATE audit_records_v1 SET tenant = 'tenant-b' WHERE tenant = 'tenant-a'`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	r := openRig(t, path, rigOptions{})
+	keyA := r.keyWithEvidence("A")
+	if n := r.count(`SELECT COUNT(*) FROM journal_reconciliations WHERE operation_key = ? AND tenant IS NULL`, keyA); n != 1 {
+		t.Fatalf("a row took its tenant from a record that fails verification")
+	}
+	_, settled := r.settledEffect("settled")
+	for _, ctx := range []context.Context{tenantB(r.ctx), tenantA(r.ctx), r.ctx} {
+		got, err := r.redeliverAs(ctx, keyA)
+		control, controlErr := r.redeliverAs(ctx, settled.Key)
+		requireIndistinguishable(t, got, err, control, controlErr)
+	}
+	if _, err := r.audit.Verify(r.ctx, r.journal); !errors.Is(err, audit.ErrCorrupt) {
+		t.Fatalf("verify=%v, want ErrCorrupt", err)
 	}
 }

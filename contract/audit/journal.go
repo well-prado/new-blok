@@ -190,13 +190,14 @@ func (j *Journal) Recorded(ctx context.Context, tx *sql.Tx, id string) (bool, er
 	return found > 0, nil
 }
 
-// RecordTenant reports, inside tx, the tenant of the record with id. The
-// record is verified first (digest, shape, indexed columns), and one that
-// fails is ErrCorrupt, so an owner deciding who may see a decision never
-// trusts an altered tenant. An owner uses it for a decision that predates
-// its own tenant column: the record the decision wrote names its tenant.
-func (j *Journal) RecordTenant(ctx context.Context, tx *sql.Tx, id string) (tenant string, found bool, err error) {
-	if j == nil || tx == nil {
+// StoredTenant reports, inside tx, the tenant of the stored record with
+// id. The record is verified first (digest, shape, indexed columns), and one
+// that fails is ErrCorrupt, so an owner never adopts an altered tenant. It
+// needs no composed Journal, so an owner can call it while migrating; the
+// audit tables must exist. An owner uses it to fix, once, the tenant of a
+// decision that predates its own tenant column.
+func StoredTenant(ctx context.Context, tx *sql.Tx, id string) (tenant string, found bool, err error) {
+	if tx == nil {
 		return "", false, ErrRequired
 	}
 	_, record, err := scanVerified(tx.QueryRowContext(ctx, `SELECT seq, id, kind, tenant, run_id, record, digest FROM audit_records_v1 WHERE id = ?`, id))

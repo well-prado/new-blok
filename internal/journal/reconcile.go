@@ -139,16 +139,13 @@ func (j *Journal) reconcileOnce(ctx context.Context, operationKey, actor, eviden
 		}
 		foreign := false
 		if err == nil {
-			owner, err := j.reconciliationTenant(ctx, tx, existing.OperationKey, existingTenant)
-			if err != nil {
-				return err
-			}
+			owner, owned := reconciliationTenant(existingTenant)
 			// A reconciliation is answered only to the tenant that decided
 			// it (#286). Any other caller's operation is looked up below as
 			// if it had none, so it learns exactly what it would of an
 			// operation that settled without one: not its evidence, not its
 			// result, not even that it was reconciled.
-			foreign = owner != caller
+			foreign = !owned || owner != caller
 			if !foreign && erasedAt.Valid {
 				// The run was compacted: the decision is still a duplicate,
 				// but there is no content left to return, and an audit
@@ -206,25 +203,67 @@ func (j *Journal) reconcileOnce(ctx context.Context, operationKey, actor, eviden
 }
 
 // reconciliationTenant is the tenant a reconciliation belongs to (#286):
-// the one stored with it, which every reconciliation since #286 has. A row
-// from before carries none (NULL); its audit record, which the original
-// decision wrote under its own tenant, says which, and is read verified, so
-// a record that fails verification refuses the re-delivery (ErrCorrupt)
-// rather than answer it. A row with neither (it predates audit too) belongs
-// to the system tenant "", the tenant its backfilled record takes. Rows are
-// not rewritten: the tenant is derived each time.
-func (j *Journal) reconciliationTenant(ctx context.Context, tx *sql.Tx, operationKey string, stored sql.NullString) (string, error) {
-	if stored.Valid {
-		return stored.String, nil
+// the one stored with it. Every row has one: every reconciliation since
+// #286 stores it, and opening a journal fixes it, once, for a row from
+// before (backfillReconciliationTenants), so ownership never depends on
+// audit retention. A row still without one (an older binary wrote it after
+// the migration, or its audit record failed verification when the journal
+// was opened) belongs to nobody until the next open fixes it: every
+// re-delivery is answered as for a never-reconciled operation.
+func reconciliationTenant(stored sql.NullString) (tenant string, owned bool) {
+	return stored.String, stored.Valid
+}
+
+// backfillReconciliationTenants runs in the schema transaction on every
+// open. It gives each reconciliation without a tenant the tenant of its
+// verified audit record, which the original decision wrote under its own
+// tenant, or the system tenant "" when it has no record (it predates
+// audit, or audit was never composed on this database). It is written
+// once and never re-derived, so pruning the record later cannot change who
+// owns the decision. A record that fails verification is not trusted: the
+// row stays without a tenant, owned by nobody, and Verify reports the
+// record (ErrCorrupt). Rows that already have a tenant are not touched, so
+// reopening changes nothing.
+func backfillReconciliationTenants(ctx context.Context, tx *sql.Tx) error {
+	rows, err := tx.QueryContext(ctx, `SELECT operation_key FROM journal_reconciliations WHERE tenant IS NULL ORDER BY operation_key`)
+	if err != nil {
+		return err
 	}
-	if j.audit == nil {
-		return "", nil
+	var keys []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			rows.Close()
+			return err
+		}
+		keys = append(keys, key)
 	}
-	tenant, found, err := j.audit.RecordTenant(ctx, tx, "reconcile:"+operationKey)
-	if err != nil || !found {
-		return "", err
+	if err := rows.Close(); err != nil || len(keys) == 0 {
+		return err
 	}
-	return tenant, nil
+	audited, err := tableExists(ctx, tx, "audit_records_v1")
+	if err != nil {
+		return err
+	}
+	for _, key := range keys {
+		tenant := ""
+		if audited {
+			stored, found, err := audit.StoredTenant(ctx, tx, "reconcile:"+key)
+			if errors.Is(err, audit.ErrCorrupt) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if found {
+				tenant = stored
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE journal_reconciliations SET tenant = ? WHERE operation_key = ? AND tenant IS NULL`, tenant, key); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // reconciliationRecord binds evidence and result by digest only: the

@@ -226,9 +226,12 @@ func New(ctx context.Context, database store.Database, config Config) (*Journal,
 				return err
 			}
 			// A reconciliation records the tenant that decided it (#286).
-			// Rows from before keep NULL: their tenant is unknown, and
-			// reconciliationTenant derives it from their audit record.
-			return ensureColumn(ctx, tx, "journal_reconciliations", "tenant", `TEXT`)
+			// The column is added once; every open then fixes the tenant of
+			// any row without one, from its verified audit record or "".
+			if err := ensureColumn(ctx, tx, "journal_reconciliations", "tenant", `TEXT`); err != nil {
+				return err
+			}
+			return backfillReconciliationTenants(ctx, tx)
 		})
 	}); err != nil {
 		return nil, err
