@@ -61,7 +61,8 @@ needs, and returns saturation that names the write domain it waited on
 the first would let a handler that joins another store's saturation ahead of
 its own hide the self-submit. A match means the claim itself was the
 contention, so deferring would only repeat the wait: the job fails as
-`worker.ErrNestedSubmission`, is not retried, and dead-letters as `nested
+`worker.ErrNestedSubmission`, is not retried (even when joined with a
+retryable `HandlerError`, #225), and dead-letters as `nested
 submission to claimed store; use worker.Tx for atomic writes`. Saturation
 naming a different domain, or no domain, is backpressure and still defers.
 The comparison needs the claiming queue's own domain: a queue opened on a
