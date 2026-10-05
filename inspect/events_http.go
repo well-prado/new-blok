@@ -198,7 +198,7 @@ func (h *eventHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reque
 			snapshot = &page
 		}
 	}
-	session := &eventSession{writer: writer, control: control, timeout: h.cfg.WriteTimeout, fields: fields, seen: cursor}
+	session := &eventSession{writer: writer, control: control, timeout: h.cfg.WriteTimeout, seen: cursor}
 	var planned []plannedFrame
 	if replay.Gap != nil {
 		gap, _ := json.Marshal(replay.Gap)
@@ -358,7 +358,6 @@ type eventSession struct {
 	writer  http.ResponseWriter
 	control *http.ResponseController
 	timeout time.Duration
-	fields  map[inspection.Field]bool
 	// seen is the cursor of the last frame this reader has passed, written
 	// or withheld by policy.
 	seen string
