@@ -40,7 +40,11 @@ var allowedImports = map[string]bool{
 //     except as the callee that roots the one chain;
 //   - any reflect selector but reflect.DeepEqual, so a method cannot be
 //     reached by a computed name;
-//   - any import outside allowedImports, and dot or blank imports.
+//   - any import outside allowedImports, and dot or blank imports;
+//   - an import path imported twice in a file, or under two local names
+//     across the package, and reflect or the engine imported under any
+//     name but its default. Each allowed package is imported once,
+//     unaliased; every local name is still tracked, as defense in depth.
 //
 // Out of scope: unsafe or reflect used from another package of the module
 // on Program's unexported fields (this package's own unsafe import is
@@ -63,6 +67,9 @@ func TestSourceRunsTheEngineOnlyUnobserved(t *testing.T) {
 	}
 	fset := token.NewFileSet()
 	runs, news, checked := 0, 0, 0
+	// localNames is every local name each import path takes, across the
+	// package: one path, one name.
+	localNames := map[string]map[string]bool{}
 	for _, name := range files {
 		if strings.HasSuffix(name, "_test.go") {
 			continue
@@ -72,23 +79,35 @@ func TestSourceRunsTheEngineOnlyUnobserved(t *testing.T) {
 			t.Fatal(err)
 		}
 		checked++
-		engineName, reflectName := "", ""
+		// Every local name the engine and reflect take in this file. The
+		// rules below require one, the default; tracking all of them keeps
+		// a second name from hiding the first.
+		engineNames, reflectNames := map[string]bool{}, map[string]bool{}
+		imported := map[string]int{}
 		for _, spec := range file.Imports {
 			path, _ := strconv.Unquote(spec.Path.Value)
 			if !allowedImports[path] {
 				t.Errorf("%s imports %s; this package may not observe, journal or persist a run", name, path)
 			}
-			if path == enginePath {
-				engineName = "engine"
-				if spec.Name != nil {
-					engineName = spec.Name.Name
-				}
+			if imported[path]++; imported[path] > 1 {
+				t.Errorf("%s imports %s more than once; each allowed package is imported once", name, path)
 			}
-			if path == "reflect" {
-				reflectName = "reflect"
-				if spec.Name != nil {
-					reflectName = spec.Name.Name
-				}
+			local := defaultName(path)
+			if spec.Name != nil {
+				local = spec.Name.Name
+			}
+			if localNames[path] == nil {
+				localNames[path] = map[string]bool{}
+			}
+			localNames[path][local] = true
+			switch path {
+			case enginePath:
+				engineNames[local] = true
+			case "reflect":
+				reflectNames[local] = true
+			}
+			if (path == enginePath || path == "reflect") && spec.Name != nil {
+				t.Errorf("%s imports %s as %q; it must be imported unaliased", name, path, spec.Name.Name)
 			}
 			if spec.Name != nil && (spec.Name.Name == "." || spec.Name.Name == "_") {
 				t.Errorf("%s imports %s as %q", name, path, spec.Name.Name)
@@ -108,13 +127,13 @@ func TestSourceRunsTheEngineOnlyUnobserved(t *testing.T) {
 				if !ok {
 					return true
 				}
-				if isEngineNew(call, engineName) {
+				if isEngineNew(call, engineNames) {
 					news++
 					if !inRun {
 						t.Errorf("%s: engine.New outside (*Program).Run", fset.Position(call.Pos()))
 					}
 				}
-				if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Run" && rootedAtEngineNew(sel.X, engineName) {
+				if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Run" && rootedAtEngineNew(sel.X, engineNames) {
 					runs++
 					chainNew[chainRoot(sel.X)] = true
 					if !inRun {
@@ -136,7 +155,7 @@ func TestSourceRunsTheEngineOnlyUnobserved(t *testing.T) {
 				if forbidden[x.Sel.Name] {
 					t.Errorf("%s: uses engine method %s; a catalog program runs only through plain Run", fset.Position(x.Pos()), x.Sel.Name)
 				}
-				if id, ok := x.X.(*ast.Ident); ok && engineName != "" && id.Name == engineName {
+				if id, ok := x.X.(*ast.Ident); ok && engineNames[id.Name] {
 					switch {
 					case x.Sel.Name != "New":
 						t.Errorf("%s: uses engine.%s; only engine.New is allowed", fset.Position(x.Pos()), x.Sel.Name)
@@ -148,7 +167,7 @@ func TestSourceRunsTheEngineOnlyUnobserved(t *testing.T) {
 				}
 				// reflect can call any engine method by a computed name, so
 				// only reflect.DeepEqual (Equal) is allowed.
-				if id, ok := x.X.(*ast.Ident); ok && reflectName != "" && id.Name == reflectName && x.Sel.Name != "DeepEqual" {
+				if id, ok := x.X.(*ast.Ident); ok && reflectNames[id.Name] && x.Sel.Name != "DeepEqual" {
 					t.Errorf("%s: uses reflect.%s; only reflect.DeepEqual is allowed", fset.Position(x.Pos()), x.Sel.Name)
 				}
 			}
@@ -157,6 +176,11 @@ func TestSourceRunsTheEngineOnlyUnobserved(t *testing.T) {
 	}
 	if checked == 0 {
 		t.Fatal("no source files checked")
+	}
+	for path, names := range localNames {
+		if len(names) > 1 {
+			t.Errorf("%s is imported under %d local names %v; each import path takes one name across the package", path, len(names), names)
+		}
 	}
 	if news != 1 || runs != 1 {
 		t.Errorf("found %d engine.New calls and %d engine.New(...)…Run(...) chains; want exactly one of each, in (*Program).Run", news, runs)
@@ -182,25 +206,31 @@ func chainRoot(expr ast.Expr) *ast.SelectorExpr {
 	return chainRoot(sel.X)
 }
 
-func isEngineNew(call *ast.CallExpr, engineName string) bool {
+// defaultName is the name an unaliased import of path binds. Every allowed
+// package's name is the last element of its path.
+func defaultName(path string) string {
+	return path[strings.LastIndex(path, "/")+1:]
+}
+
+func isEngineNew(call *ast.CallExpr, engineNames map[string]bool) bool {
 	sel, ok := call.Fun.(*ast.SelectorExpr)
 	if !ok || sel.Sel.Name != "New" {
 		return false
 	}
 	id, ok := sel.X.(*ast.Ident)
-	return ok && engineName != "" && id.Name == engineName
+	return ok && engineNames[id.Name]
 }
 
 // rootedAtEngineNew reports whether expr is engine.New(...) followed only
 // by WithMaxSteps(...) calls.
-func rootedAtEngineNew(expr ast.Expr, engineName string) bool {
+func rootedAtEngineNew(expr ast.Expr, engineNames map[string]bool) bool {
 	call, ok := expr.(*ast.CallExpr)
 	if !ok {
 		return false
 	}
-	if isEngineNew(call, engineName) {
+	if isEngineNew(call, engineNames) {
 		return true
 	}
 	sel, ok := call.Fun.(*ast.SelectorExpr)
-	return ok && sel.Sel.Name == "WithMaxSteps" && rootedAtEngineNew(sel.X, engineName)
+	return ok && sel.Sel.Name == "WithMaxSteps" && rootedAtEngineNew(sel.X, engineNames)
 }

@@ -514,6 +514,11 @@ It reads the package's syntax, not its types, and it is red on:
 - any import outside the set `Run` needs, so `contract/inspection`,
   `internal/journal`, the event hub and `unsafe` are refused, as are dot
   and blank imports;
+- each allowed package imported more than once, unaliased: a path
+  imported twice in one file, a path taking two local names across the
+  package, or `reflect` or the engine imported under any name but its
+  default. The test still tracks every local name a path takes, so a
+  second name cannot hide uses under the first;
 - any selector naming an engine method other than `WithMaxSteps` and `Run`
   (`WithObserver`, `RunObserved`, `RunObservedPending`, `RunJournaled`,
   `EmitRunTerminal`, `RunControl`, or one added later), whether called or
@@ -576,6 +581,15 @@ and called `MethodByName("With"+"Observer")` and
 `MethodByName("Run"+"Observed")`, splitting the names so no forbidden
 string appears. The leak reproduced. The test is now red on it, through
 both the `engine.New` reference rule and the `reflect` rule.
+
+The third review imported `reflect` and the engine a second time, as `rx`
+and `eng`. It built the counted chain on `eng.New` and pointed `Equal` at
+`rx.DeepEqual`, then ran the round-2 attack under the plain names. The test
+had tracked only the last local name per path, so it passed while
+`Catalog.Invoke` leaked. It is now red on that edit through the
+import-once, one-name and unaliased rules. Because every name is tracked,
+the round-2 `reflect` and `engine.New` findings fire as well. An alias
+alone (`eng` for the engine) is red too.
 
 Out of scope, because a syntax check cannot hold them:
 
