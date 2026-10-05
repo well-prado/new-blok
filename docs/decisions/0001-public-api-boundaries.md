@@ -503,9 +503,16 @@ catalog dispatch.** It is now enforced by the package structure, not by
 review. The lowered program and its literals live in the unexported fields of
 `agent/internal/catalogprogram.Program`, which package `agent` cannot read.
 The type exposes `Literals` (copies of the values dispatch hands the calls),
-`Equal` and `GoString` (for tests and diagnostics), and one `Run`, which
+`Equal` and `GoString` (for tests and diagnostics; `GoString` prints the
+whole `catalogprogram.Program`, literals included), and one `Run`, which
 builds the dispatch nodes, substitutes every literal and runs the engine.
-`Run` takes no observer, journal or engine, so none can be attached.
+`Run` takes no observer, journal or engine, so a caller cannot attach one.
+Inside the package, a source test holds the same line: it allows only
+`engine.New`, `WithMaxSteps` and `Run` from the engine, forbids every other
+engine method by name (including in strings, against reflection), allows
+only the imports `Run` needs (so `contract/inspection`, `internal/journal`
+and the event hub are refused), and requires exactly one
+`engine.New(...).WithMaxSteps(...).Run(...)` chain, in `(*Program).Run`.
 `catalogprogram.Lower` is the only caller of the lowering with
 `Options.Literals`. Package `agent` no longer imports `internal/engine` or
 `internal/lowering`, so it cannot build an engine or lower a literal itself.
@@ -535,9 +542,27 @@ On origin/main it compiles and shows the hazard. Now it fails to compile on
 `catalogprogram.Program`. The same file walks every value package `agent`
 can reach for a `contract.InternalProgram`, and checks the import boundary.
 `agent/internal/catalogprogram` pins its surface and allows only `flow` and
-itself to import the lowering. Limits: a determined in-module caller could
-still use `reflect` or `unsafe`, or edit `catalogprogram` itself; the
-surface test makes the second visible in review.
+itself to import the lowering. `source_guard_test.go` is red on the
+review's second escape, which keeps the surface and makes `Run` switch to
+`WithObserver(o).RunObserved` when the context carries an observer. Before
+that test, a probe through `Catalog.Invoke` logged the commit step observed
+with `{"quantity":2,"sku":"SECRET"}` while `go test ./agent/...` stayed
+green. It is also red on importing the journal, on `RunJournaled`, and on
+holding the engine in a variable.
+
+The step bound `Run` passes, `MaxCalls+1`, can never cut a catalog run
+short: registration and `Invoke` already refuse a workflow with more calls
+than the budget, and a program has at most one instruction per call plus
+the output. What the bound does is lift the engine's 10000-step default
+for a workflow at the 10000-call ceiling, whose program has 10001
+instructions. Without the bound, that workflow registers and then always
+fails. Both directions are tested.
+
+Limits: the source test reads syntax, not types. In-module code can still
+reach the program through `reflect` on unexported fields or through
+`unsafe`, and an edit to `catalogprogram` can weaken the source test
+itself. Either one is a visible change to a guarded file, not a silent
+one; it is not impossible.
 
 The initial portable contract is a bounded, JSON-compatible value subset with
 explicit semantics for missing, null, optional fields, objects, arrays, string,

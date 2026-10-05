@@ -3,6 +3,8 @@ package catalogprogram
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -16,6 +18,7 @@ import (
 	"testing"
 
 	"github.com/well-prado/new-blok/contract"
+	"github.com/well-prado/new-blok/internal/engine"
 )
 
 func literalProgram(t *testing.T) *Program {
@@ -79,8 +82,13 @@ func TestLiteralsAreCopiesAndProgramIsComparable(t *testing.T) {
 	if !p.Equal(want) {
 		t.Fatalf("program %#v; want %#v", p, want)
 	}
-	if !strings.Contains(p.GoString(), `ID:"commit"`) {
-		t.Fatalf("GoString %s", p.GoString())
+	// GoString names the type and shows the literals, which the program
+	// alone does not hold.
+	if g := p.GoString(); !strings.HasPrefix(g, "catalogprogram.Program{program:contract.InternalProgram{") || !strings.Contains(g, `ID:"commit"`) || !strings.HasSuffix(g, `, literals:map[string]string{"commit":"{\"sku\":\"tea\",\"quantity\":1}"}}`) {
+		t.Fatalf("GoString %s", g)
+	}
+	if g := fmt.Sprintf("%#v", p); g != p.GoString() {
+		t.Fatalf("%%#v %s; want GoString", g)
 	}
 	if none, err := Lower("conf/workflow", "1.0.0", []Instruction{{Kind: "call", ID: "reserve", Node: "conf/reserve", Input: "$input"}}, "$step.reserve"); err != nil || none.Literals() != nil {
 		t.Fatalf("no-literal program: %v %v", none, err)
@@ -198,5 +206,37 @@ func TestOnlyFlowAndCatalogProgramImportTheLowering(t *testing.T) {
 		if !allowed[dir] {
 			t.Errorf("%s imports internal/lowering; a literal-bearing program must stay behind catalogprogram.Program", dir)
 		}
+	}
+}
+
+// Run applies maxSteps to the engine in both directions: below the engine
+// default it refuses a program longer than the bound before any dispatch,
+// and above it, it admits a program the default would refuse.
+func TestRunAppliesMaxSteps(t *testing.T) {
+	p := literalProgram(t) // three calls and the output instruction
+	dispatched := 0
+	dispatch := func(context.Context, string, []byte) (any, error) { dispatched++; return map[string]any{}, nil }
+	none := func(string) []string { return nil }
+	_, err := p.Run(context.Background(), map[string]any{}, 3, none, dispatch)
+	var engineErr *engine.Error
+	if !errors.As(err, &engineErr) || engineErr.Code != "step_budget_exceeded" || dispatched != 0 {
+		t.Fatalf("maxSteps 3 on a 4-instruction program: err=%v dispatched=%d", err, dispatched)
+	}
+	if _, err := p.Run(context.Background(), map[string]any{}, 4, none, dispatch); err != nil || dispatched != 3 {
+		t.Fatalf("maxSteps 4: err=%v dispatched=%d", err, dispatched)
+	}
+
+	const calls = 10000 // the registration and tool.Budget MaxCalls ceiling
+	instructions := make([]Instruction, calls)
+	for i := range instructions {
+		instructions[i] = Instruction{Kind: "call", ID: "c" + strconv.Itoa(i), Node: "conf/commit", Input: "$input"}
+	}
+	long, err := Lower("conf/long", "1.0.0", instructions, "$step.c0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatched = 0
+	if _, err := long.Run(context.Background(), map[string]any{}, calls+1, none, dispatch); err != nil || dispatched != calls {
+		t.Fatalf("10000 calls with maxSteps 10001: err=%v dispatched=%d", err, dispatched)
 	}
 }

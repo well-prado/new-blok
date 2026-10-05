@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"go/parser"
 	"go/token"
@@ -13,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/well-prado/new-blok/contract"
+	"github.com/well-prado/new-blok/flow"
 )
 
 // #260: a workflow tool's lowered program has no literal form. A call that
@@ -166,5 +168,36 @@ func TestCatalogDoesNotImportTheEngineOrTheLowering(t *testing.T) {
 	}
 	if checked == 0 {
 		t.Fatal("no package agent source files checked")
+	}
+}
+
+// The catalog passes the engine MaxCalls+1 steps. Registration and Invoke
+// already refuse a workflow with more calls than the budget, so the bound
+// can never cut a catalog run short; what it does is lift the engine's
+// 10000-step default for a workflow at the 10000-call ceiling, whose lowered
+// program has 10001 instructions with the output. Without it that workflow
+// registers and then always fails with step_budget_exceeded.
+func TestWorkflowAtTheCallCeilingRuns(t *testing.T) {
+	r := &recorder{}
+	n := newConfNodes(r)
+	c := confCatalog(t, n)
+	const calls = 10000
+	wf := flow.MustDefine(confSpec, func(b *flow.Builder, in flow.Ref[object]) flow.Ref[object] {
+		var last flow.Ref[object]
+		for i := range calls {
+			last = flow.Call(b, "c"+strconv.Itoa(i), n.commit, in)
+		}
+		return last
+	})
+	if err := RegisterWorkflow(c, wf, []byte(confOrderSchema), []byte(confCommitSchema), confManifest(), metadata()); err != nil {
+		t.Fatalf("register %d calls: %v", calls, err)
+	}
+	budget := confBudget()
+	budget.MaxCalls = calls
+	if _, err := c.Invoke(context.Background(), confPrincipal(), confSpec.Name, confSpec.Version, []byte(`{"sku":"coffee","quantity":2}`), budget); err != nil {
+		t.Fatalf("invoke %d calls with MaxCalls %d: %v", calls, calls, err)
+	}
+	if got := len(r.inputs["conf/commit"]); got != calls {
+		t.Fatalf("dispatched %d calls; want %d", got, calls)
 	}
 }

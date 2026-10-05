@@ -65,8 +65,19 @@ func (p *Program) Equal(want contract.InternalProgram) bool {
 	return reflect.DeepEqual(p.program, want)
 }
 
-// GoString describes the stored program for diagnostics.
-func (p *Program) GoString() string { return fmt.Sprintf("%#v", p.program) }
+// GoString describes the whole Program for diagnostics: the lowered program
+// and, because the program alone does not show what a literal call
+// receives, the literals as text.
+func (p *Program) GoString() string {
+	var literals map[string]string
+	if p.literals != nil {
+		literals = make(map[string]string, len(p.literals))
+		for id, literal := range p.literals {
+			literals[id] = string(literal)
+		}
+	}
+	return fmt.Sprintf("catalogprogram.Program{program:%#v, literals:%#v}", p.program, literals)
+}
 
 // Dispatch admits and runs one call: id is the call's instruction id and
 // input the bytes the call is handed, which for a literal call is the
@@ -79,6 +90,9 @@ type Dispatch func(ctx context.Context, id string, input []byte) (any, error)
 // longer safe to retry (#190). The engine runs with maxSteps and no observer
 // or journal: Run accepts neither, because an engine event or journal entry
 // for a literal call would carry the workflow input, not the literal.
+// source_guard_test.go keeps it that way: it allows only engine.New,
+// WithMaxSteps and Run, forbids importing anything that observes or
+// journals, and requires this to be the package's one engine run.
 func (p *Program) Run(ctx context.Context, input any, maxSteps int, effects func(id string) []string, dispatch Dispatch) (any, error) {
 	nodes := map[string]node.Any{}
 	// Unique engine keys per instruction preserve literals and versions.
