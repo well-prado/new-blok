@@ -132,7 +132,13 @@ their first read. Journal `withTx` therefore begins with an empty
 `UPDATE journal_runs SET run_id = run_id WHERE 0`: it obtains the write
 reservation without changing rows, invoking row triggers, or replaying the
 callback. Schema initialization is the exception: its first statement is
-`CREATE TABLE`, before `journal_runs` exists. `Records.Execute` uses the same
+`CREATE TABLE`, before `journal_runs` exists. Adding a column to an
+existing journal reads the schema before it alters it, so concurrent
+openers of a journal that needs one race: without help, all but one fail
+`store.ErrBusy` at once (50 of 60 opens in a six-handle probe). `journal.New`
+therefore reruns the idempotent schema transaction while it fails busy,
+through the same `internal/migration.Retry` the worker queue uses (#233,
+#235). `Records.Execute` uses the same
 empty-update rule on `provider_records`; its constructor starts with DDL.
 
 All journal mutation paths follow this rule: admission, replay, effect intent,
