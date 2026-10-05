@@ -38,6 +38,7 @@ const (
 	DefaultQueueDepth              = 32
 	DefaultLateWindow              = 2 * time.Second
 	DefaultRecoveredPerPrincipal   = 16
+	DefaultIdleTimeout             = 10 * time.Minute
 
 	MaxRunsLimit       = 1 << 14
 	MaxEventsPerRun    = 1 << 14
@@ -46,6 +47,7 @@ const (
 	MaxSubscribersCap  = 1 << 12
 	MaxQueueDepth      = 1024
 	MaxLateWindow      = 30 * time.Second
+	MaxIdleTimeout     = 2 * time.Hour
 	// MaxRetainedBytes bounds MaxRuns × RunBytes.
 	MaxRetainedBytes = 1 << 30
 	// MaxQueuedBytes bounds MaxSubscribers × (QueueDepth × MaxEventBytes +
@@ -135,6 +137,15 @@ type Config struct {
 	// observation (a worker log delivered off the result path) is still
 	// accepted and delivered. A later one is dropped and marked.
 	LateWindow time.Duration
+	// IdleTimeout is how long an unfinished run may go without a
+	// publication or a follower before a recovered read may recycle it
+	// (#263). Below it, a recovered run never displaces a live run; past
+	// it, an unfollowed unfinished run (one suspended, or one whose
+	// execution in this process stopped without a terminal transition) is
+	// as recyclable as a closed one, so a saturated hub holding only idle
+	// runs cannot keep durable reads out indefinitely. A publisher that
+	// later resumes a recycled run re-creates it behind an "evicted" gap.
+	IdleTimeout time.Duration
 	// Clock is for tests.
 	Clock func() time.Time
 }
@@ -173,6 +184,12 @@ func (c Config) withDefaults() (Config, error) {
 	if c.LateWindow == 0 {
 		c.LateWindow = DefaultLateWindow
 	}
+	if c.IdleTimeout < 0 || c.IdleTimeout > MaxIdleTimeout {
+		return c, fmt.Errorf("observe/event: IdleTimeout must be within [0, %s]", MaxIdleTimeout)
+	}
+	if c.IdleTimeout == 0 {
+		c.IdleTimeout = DefaultIdleTimeout
+	}
 	if c.MaxEventBytes+frameOverhead > c.RunBytes {
 		return c, errors.New("observe/event: MaxEventBytes plus frame overhead exceeds RunBytes")
 	}
@@ -210,6 +227,10 @@ type Stats struct {
 	// Reowned counts recovered runs whose attached owner differed from the
 	// trusted publisher; the publisher won (see Publish).
 	Reowned uint64
+	// IdleRecycled counts unfinished runs a recovered read recycled after
+	// IdleTimeout without a publication or a follower (also counted in
+	// EvictedRuns).
+	IdleRecycled uint64
 }
 
 // Frame is one immutable, already-projected observation. Its bytes are
@@ -269,7 +290,10 @@ type run struct {
 	attachedBy string
 	// reownedFrom is the incarnation a publisher reclaimed this run from.
 	reownedFrom uint64
-	element     *list.Element
+	// active is the last publication, subscription or departure of a
+	// follower; IdleTimeout is measured from it.
+	active  time.Time
+	element *list.Element
 }
 
 // Hub is safe for concurrent use. Its lock is held only for bounded,
@@ -498,6 +522,7 @@ func (h *Hub) appendLocked(item *run, frame *Frame) {
 }
 
 func (h *Hub) touchLocked(item *run) {
+	item.active = h.cfg.Clock()
 	if item.element != nil {
 		h.lru.MoveToBack(item.element)
 	}
@@ -506,12 +531,21 @@ func (h *Hub) touchLocked(item *run) {
 func (h *Hub) createLocked(runID, owner string, now time.Time, recovered bool) (*run, error) {
 	if len(h.runs) >= h.cfg.MaxRuns {
 		var victim *run
+		idle := false
 		for element := h.lru.Front(); element != nil; element = element.Next() {
 			candidate := element.Value.(*run)
-			// A recovered run may displace only another recovered run or a
-			// closed one, never a run that is still live.
-			if len(candidate.subs) == 0 && (!recovered || candidate.recovered || h.closedLocked(candidate, now)) {
+			if len(candidate.subs) != 0 {
+				continue
+			}
+			// A recovered run may displace only another recovered run, a
+			// closed one, or one idle past IdleTimeout, never a run that is
+			// still live.
+			if !recovered || candidate.recovered || h.closedLocked(candidate, now) {
 				victim = candidate
+				break
+			}
+			if h.idleLocked(candidate, now) {
+				victim, idle = candidate, true
 				break
 			}
 		}
@@ -520,9 +554,12 @@ func (h *Hub) createLocked(runID, owner string, now time.Time, recovered bool) (
 		}
 		h.removeLocked(victim, "evicted")
 		h.stats.EvictedRuns++
+		if idle {
+			h.stats.IdleRecycled++
+		}
 	}
 	h.nextInc++
-	item := &run{id: runID, owner: owner, inc: h.nextInc, next: 1, subs: map[*Subscriber]struct{}{}}
+	item := &run{id: runID, owner: owner, inc: h.nextInc, next: 1, subs: map[*Subscriber]struct{}{}, active: now}
 	item.element = h.lru.PushBack(item)
 	h.runs[runID] = item
 	return item, nil
@@ -538,6 +575,12 @@ func (h *Hub) releaseAttachLocked(item *run) {
 		delete(h.recoveredBy, item.attachedBy)
 	}
 	item.attachedBy = ""
+}
+
+// idleLocked reports an unfinished run without a publication, a new
+// follower or a departing one for IdleTimeout.
+func (h *Hub) idleLocked(item *run, now time.Time) bool {
+	return !item.finished && !now.Before(item.active.Add(h.cfg.IdleTimeout))
 }
 
 // closedLocked reports a run that is finished and past its late window.
@@ -564,6 +607,7 @@ func (h *Hub) detachLocked(item *run, sub *Subscriber, reason string) {
 	}
 	delete(item.subs, sub)
 	h.subscribers--
+	item.active = h.cfg.Clock()
 	sub.close(reason)
 }
 
@@ -616,6 +660,43 @@ func (h *Hub) AttachRecovered(runID, owner, reader string, terminal bool) error 
 		item.finished, item.finishedAt = true, time.Time{}
 	}
 	return nil
+}
+
+// Recovered reports whether sub still follows a recovered attachment: the
+// run it subscribed to is retained, in the same incarnation, and no trusted
+// publisher has claimed it. Only such a run has nothing that would ever end
+// it, so only its followers need to watch the durable source (#263).
+func (h *Hub) Recovered(sub *Subscriber) bool {
+	if sub == nil {
+		return false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	current := h.runs[sub.runID]
+	return current != nil && current.inc == sub.inc && current.recovered
+}
+
+// FinishRecovered closes the recovered attachment sub follows, because its
+// durable source reports the run terminal; a later reader then gets the
+// reconstruction and an end instead of following. Like AttachRecovered for a
+// terminal run, it is closed at once: the late window belongs to the process
+// that saw the terminal transition. It reports false, and changes nothing,
+// when the run is no longer that recovered attachment (a publisher claimed
+// it, or it was recycled).
+func (h *Hub) FinishRecovered(sub *Subscriber) bool {
+	if sub == nil {
+		return false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	current := h.runs[sub.runID]
+	if current == nil || current.inc != sub.inc || !current.recovered {
+		return false
+	}
+	if !current.finished {
+		current.finished, current.finishedAt = true, time.Time{}
+	}
+	return true
 }
 
 // Gap is a loss a reader must be told about before its replay.
