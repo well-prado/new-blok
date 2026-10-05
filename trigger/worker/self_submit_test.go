@@ -432,3 +432,77 @@ func TestHandlerJoinedSaturationIsClassifiedByEveryDomain(t *testing.T) {
 		})
 	}
 }
+
+// TestNestedSubmissionJoinedWithRetryableErrorIsNotRetried: a handler that
+// joins its nested submission with a retryable HandlerError still fails the
+// job once. Retrying would submit to its own claimed store on every attempt
+// (#225). Both diagnoses are covered: up front from the handler's context,
+// and after one busy wait through a wrapper that hides the write domain. A
+// retryable HandlerError on its own is still retried.
+func TestNestedSubmissionJoinedWithRetryableErrorIsNotRetried(t *testing.T) {
+	wait := 250 * time.Millisecond
+	for _, scenario := range []struct {
+		name     string
+		nested   bool
+		detected func(store.Database) store.Database
+		submit   func(handlerCtx context.Context) context.Context
+	}{
+		{"context-diagnosed", true, func(db store.Database) store.Database { return db }, func(ctx context.Context) context.Context { return ctx }},
+		{"busy-wait-diagnosed", true, func(db store.Database) store.Database { return shortBusyDatabase{Database: db, timeout: wait} }, func(context.Context) context.Context { return context.Background() }},
+		{"retryable-alone", false, nil, nil},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			ctx := context.Background()
+			database := openSQLite(t, filepath.Join(t.TempDir(), "jobs.db"))
+			queue, err := New(ctx, database, time.Now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var self *Queue
+			if scenario.nested {
+				if self, err = New(ctx, scenario.detected(database), time.Now); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := queue.Enqueue(ctx, EnqueueRequest{RequestKey: "job", Kind: "job", Payload: []byte(`{}`), MaxAttempts: 3}); err != nil {
+				t.Fatal(err)
+			}
+			var nestedErr error
+			processed, err := processBounded(queue, func(handlerCtx context.Context, _ Tx, _ Job) error {
+				retry := &HandlerError{Retryable: true, Message: "provider timeout"}
+				if !scenario.nested {
+					return retry
+				}
+				_, nestedErr = self.Submit(scenario.submit(handlerCtx), trigger.Submission{Key: "inner", Kind: "inner", Payload: []byte(`{}`)})
+				return errors.Join(retry, nestedErr)
+			})
+			if err != nil || !processed {
+				t.Fatalf("processed=%v err=%v", processed, err)
+			}
+			switch scenario.name {
+			case "context-diagnosed":
+				if !errors.Is(nestedErr, ErrNestedSubmission) {
+					t.Fatalf("submission=%v; want ErrNestedSubmission from the context check", nestedErr)
+				}
+			case "busy-wait-diagnosed":
+				if !errors.Is(nestedErr, trigger.ErrSaturated) || errors.Is(nestedErr, ErrNestedSubmission) {
+					t.Fatalf("submission=%v; want saturation after a busy wait, diagnosed only by ProcessOnce", nestedErr)
+				}
+			}
+			job, err := queue.Get(ctx, "job")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !scenario.nested {
+				if job.State != StatePending || job.Attempt != 1 || job.Error != "provider timeout" {
+					t.Fatalf("retryable job=%+v; want pending for another attempt", job)
+				}
+				return
+			}
+			expected := nestedStoreExpected(t, "same-store")
+			if job.State != expected.State || job.Attempt != expected.Attempt || job.Deferrals != expected.Deferrals || job.Error != expected.JobError {
+				t.Fatalf("job=%+v; want state=%s attempt=%d deferrals=%d error=%q", job, expected.State, expected.Attempt, expected.Deferrals, expected.JobError)
+			}
+		})
+	}
+}

@@ -813,7 +813,14 @@ func (q *Queue) withTx(ctx context.Context, fn func(*sql.Tx) error) error {
 }
 func (q *Queue) now() int64     { return q.clock().UTC().UnixNano() }
 func digest(data []byte) string { sum := sha256.Sum256(data); return fmt.Sprintf("%x", sum[:]) }
+
+// retryable reports whether a failed job gets another attempt. A nested
+// submission never does, even when joined with a retryable HandlerError:
+// every attempt would submit to its own claimed store again (#225).
 func retryable(err error) bool {
+	if errors.Is(err, ErrNestedSubmission) {
+		return false
+	}
 	var target *HandlerError
 	return errors.As(err, &target) && target.Retryable
 }
