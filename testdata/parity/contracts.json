@@ -60,6 +60,31 @@
       }
     },
     {
+      "id": "order-reserve-commit-success",
+      "operation": "reserve-commit",
+      "request": { "requestKey": "order-reserve", "sku": "coffee", "quantity": 2 },
+      "expected": {
+        "output": { "status": 200, "body": { "requestKey": "order-reserve", "reserved": true } },
+        "providerCalls": 2,
+        "committedEffects": 2
+      }
+    },
+    {
+      "id": "order-cancel-in-flight",
+      "operation": "reserve-commit",
+      "request": { "requestKey": "order-cancel", "sku": "coffee", "quantity": 2 },
+      "expected": {
+        "cancellation": {
+          "trigger": "caller disconnects the HTTP request while the reserve provider call is in flight",
+          "reserveCalls": 1,
+          "reserveAbortedByCaller": 1,
+          "commitCalls": 0,
+          "committedEffects": 0,
+          "processServesAfterCancel": true
+        }
+      }
+    },
+    {
       "id": "webhook-duplicate",
       "operation": "webhook",
       "request": { "requestKey": "webhook-108", "eventId": "evt-108", "type": "order.created", "kind": "order.created", "orderId": "order-108" },
@@ -83,6 +108,67 @@
       }
     }
   ],
+  "migratedWorkflows": {
+    "triggerValue": "published Blok 2.x resolves a root `@trigger` reference to ctx.request, the request envelope {body, headers, query, params, method, url}; the converted workflow receives that same value as its input",
+    "request": { "requestKey": "migrated-quote", "sku": "coffee", "quantity": 2 },
+    "cases": [
+      {
+        "id": "converted-envelope-quote",
+        "source": { "schemaVersion": "2", "name": "migrated quote", "version": "1.0.0", "trigger": { "http": {} }, "steps": [ { "id": "load", "use": "catalog-request", "inputs": { "$ref": { "step": "@trigger", "path": [] } } }, { "id": "total", "use": "price", "inputs": { "$ref": { "step": "load", "path": ["body"] } } } ] },
+        "expected": { "supported": true, "output": { "sku": "coffee", "totalCents": 3000, "display": "3000 USD" }, "providerCalls": 1, "committedEffects": 1 }
+      },
+      {
+        "id": "trigger-body-projection-runs-old-but-is-not-converted",
+        "source": { "schemaVersion": "2", "name": "projected quote", "version": "1.0.0", "trigger": { "http": {} }, "steps": [ { "id": "load", "use": "catalog", "inputs": { "$ref": { "step": "@trigger", "path": ["body"] } } }, { "id": "total", "use": "price", "inputs": { "$ref": { "step": "load", "path": ["body"] } } } ] },
+        "expected": { "supported": false, "code": "unsupported_trigger_projection", "path": "steps[0].inputs", "oldOutput": { "sku": "coffee", "totalCents": 3000, "display": "3000 USD" }, "providerCalls": 1, "committedEffects": 1 }
+      }
+    ]
+  },
+  "durableRecovery": {
+    "trigger": "the producer process is SIGKILLed after durable acceptance of two submissions with the same job id; a fresh consumer process recovers the work",
+    "providerFailsFirstAttempt": true,
+    "expectedBody": { "state": "completed", "totalCents": 3000 },
+    "old": {
+      "adapter": "published PgBossAdapter, pg-boss 10.4.2 standard queue",
+      "storedJobsAfterDuplicateSubmission": 2,
+      "completed": 2,
+      "failed": 1,
+      "providerCalls": 3,
+      "committedEffects": 1
+    },
+    "new": {
+      "adapter": "trigger/worker.Queue on SQLite WAL synchronous=FULL",
+      "storedJobsAfterDuplicateSubmission": 1,
+      "completed": 1,
+      "failed": 1,
+      "attempts": 2,
+      "providerCalls": 2,
+      "committedEffects": 1
+    },
+    "duplicateSubmissionSemanticsMatch": false,
+    "note": "PgBossAdapter maps jobId to pg-boss singletonKey, which a standard pg-boss 10 queue does not deduplicate; both stored jobs execute and only the provider idempotency key keeps the business effect single. The new queue deduplicates the request key at admission."
+  },
+  "midExecutionKill": {
+    "trigger": "the consumer process is SIGKILLed while its provider call is in flight; a fresh consumer must redeliver the accepted job from durable storage",
+    "expectedBody": { "state": "completed", "totalCents": 3000 },
+    "old": {
+      "adapter": "published PgBossAdapter, pg-boss 10.4.2 standard queue, per-job expireInSeconds=5",
+      "redelivery": "pg-boss maintenance expires the orphaned active job and retries it; maintenance runs every 120 s by default and PgBossAdapter 2.5.0 exposes no option to change it",
+      "completedByFreshConsumer": 1,
+      "providerCalls": 2,
+      "abortedByKill": 1,
+      "committedEffects": 1
+    },
+    "new": {
+      "adapter": "trigger/worker.Queue on SQLite WAL synchronous=FULL",
+      "redelivery": "the claim, handler writes and acknowledgment share one SQLite transaction, so the kill rolls the claim back too; the fresh consumer claims the job immediately and the killed attempt leaves no durable attempt count",
+      "completedByFreshConsumer": 1,
+      "attempts": 1,
+      "providerCalls": 2,
+      "abortedByKill": 1,
+      "committedEffects": 1
+    }
+  },
   "recovery": {
     "new": { "api": "trigger/worker.Queue", "expected": "accepted job remains durable and is processed after process restart" },
     "old": { "api": "trigger/worker.InMemoryAdapter", "expected": "job is lost after process restart; adapter explicitly has no persistence" },

@@ -37,6 +37,7 @@ type contracts struct {
 }
 
 func TestWorkerRecoveryUsesPublishedOldAndNativeQueueAPIs(t *testing.T) {
+	requireOldEngine(t)
 	oldResult := runOldWorkerAdapterReset(t, map[string]any{"jobId": "recovery-108", "orderId": "order-108"})
 	var old struct {
 		Engine        string `json:"engine"`
@@ -119,19 +120,28 @@ type workload struct {
 		MaxAttempts int `json:"maxAttempts"`
 	} `json:"retry,omitempty"`
 	Expected struct {
-		Output           json.RawMessage `json:"output"`
-		ErrorCode        string          `json:"errorCode"`
-		NormalizedOutput json.RawMessage `json:"normalizedOutput"`
-		ProviderCalls    int             `json:"providerCalls"`
-		CommittedEffects int             `json:"committedEffects"`
-		OldRunner        *expectedRun    `json:"oldRunner"`
-		NewNativeEngine  *expectedRun    `json:"newNativeEngine"`
+		Output           json.RawMessage       `json:"output"`
+		ErrorCode        string                `json:"errorCode"`
+		NormalizedOutput json.RawMessage       `json:"normalizedOutput"`
+		ProviderCalls    int                   `json:"providerCalls"`
+		CommittedEffects int                   `json:"committedEffects"`
+		OldRunner        *expectedRun          `json:"oldRunner"`
+		NewNativeEngine  *expectedRun          `json:"newNativeEngine"`
+		Cancellation     *expectedCancellation `json:"cancellation"`
 		NewWorkerQueue   *struct {
 			Output           json.RawMessage `json:"output"`
 			ProviderCalls    int             `json:"providerCalls"`
 			CommittedEffects int             `json:"committedEffects"`
 		} `json:"newWorkerQueue"`
 	} `json:"expected"`
+}
+
+type expectedCancellation struct {
+	ReserveCalls             int  `json:"reserveCalls"`
+	ReserveAbortedByCaller   int  `json:"reserveAbortedByCaller"`
+	CommitCalls              int  `json:"commitCalls"`
+	CommittedEffects         int  `json:"committedEffects"`
+	ProcessServesAfterCancel bool `json:"processServesAfterCancel"`
 }
 
 type expectedRun struct {
@@ -164,8 +174,17 @@ type providerLedger struct {
 	effects int
 	seen    map[string]bool
 	attempt map[string]int
-	gates   map[string]*providerGate
+	// aborted counts provider calls whose caller disconnected mid-call.
+	aborted     map[string]int
+	holdKeys    map[string]bool
+	gates       map[string]*providerGate
+	holdEntered chan string
 }
+
+// reserveHoldFallback bounds how long /reserve waits for its caller to abort
+// before committing, so an engine that ignores cancellation fails visibly
+// instead of hanging the suite.
+const reserveHoldFallback = 10 * time.Second
 
 type providerGate struct {
 	entered chan struct{}
@@ -196,6 +215,7 @@ func (l *ledgerServer) attemptsFor(operation, key string) int {
 }
 
 func TestExecutableOldAndNewEngineWorkloads(t *testing.T) {
+	requireOldEngine(t)
 	fixturePath := filepath.Join("..", "..", "testdata", "parity", "contracts.json")
 	data, err := os.ReadFile(fixturePath)
 	if err != nil {
@@ -256,6 +276,7 @@ func TestExecutableOldAndNewEngineWorkloads(t *testing.T) {
 }
 
 func TestOldWebhookTriggerDuplicateDelivery(t *testing.T) {
+	requireOldEngine(t)
 	tc := findWorkload(t, "webhook-duplicate")
 	oldProvider := newProvider(t)
 	raw := runOldWebhookTrigger(t, oldProvider.URL, tc)
@@ -288,6 +309,7 @@ func TestOldWebhookTriggerDuplicateDelivery(t *testing.T) {
 }
 
 func TestWorkerTriggerRetryUsesRealPublishedTriggerAndInMemoryAdapter(t *testing.T) {
+	requireOldEngine(t)
 	tc := findWorkload(t, "job-retry")
 	provider := newProvider(t)
 	raw := runOldWorkerTriggerRetry(t, provider.URL, tc)
@@ -319,6 +341,7 @@ func TestWorkerTriggerRetryUsesRealPublishedTriggerAndInMemoryAdapter(t *testing
 }
 
 func TestSSETriggerEmitsExpectedEventThroughRealAdapters(t *testing.T) {
+	requireOldEngine(t)
 	tc := findWorkload(t, "stream-event-and-disconnect")
 	oldRaw := runOldSSETrigger(t, tc)
 	var old struct {
@@ -982,6 +1005,16 @@ func schemasForOperation(operation string) ([]byte, []byte) {
 		inputRequired = append(inputRequired, "jobId", "sku", "quantity")
 		outputProperties = map[string]any{"jobId": stringField(), "state": stringField(), "totalCents": integerField()}
 		outputRequired = []string{"jobId", "state", "totalCents"}
+	case "reserve":
+		inputProperties["sku"], inputProperties["quantity"] = stringField(), integerField()
+		inputRequired = append(inputRequired, "sku", "quantity")
+		outputProperties = map[string]any{"requestKey": stringField(), "reserved": map[string]any{"type": "boolean"}}
+		outputRequired = []string{"requestKey", "reserved"}
+	case "commit":
+		inputProperties["reserved"] = map[string]any{"type": "boolean"}
+		inputRequired = append(inputRequired, "reserved")
+		outputProperties = map[string]any{"requestKey": stringField(), "reserved": map[string]any{"type": "boolean"}}
+		outputRequired = []string{"requestKey", "reserved"}
 	default:
 		outputProperties = map[string]any{}
 	}
@@ -996,7 +1029,7 @@ func schemasForOperation(operation string) ([]byte, []byte) {
 
 func newProvider(t *testing.T) *ledgerServer {
 	t.Helper()
-	ledger := &providerLedger{seen: map[string]bool{}, attempt: map[string]int{}, gates: map[string]*providerGate{}}
+	ledger := &providerLedger{seen: map[string]bool{}, attempt: map[string]int{}, aborted: map[string]int{}, holdKeys: map[string]bool{}, gates: map[string]*providerGate{}, holdEntered: make(chan string, 1)}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1013,6 +1046,41 @@ func newProvider(t *testing.T) *ledgerServer {
 		ledger.calls++
 		ledger.attempt[operation+"\x00"+key]++
 		attempt := ledger.attempt[operation+"\x00"+key]
+		if operation == "reserve" || operation == "job-hold" {
+			// A held call stays open until the caller aborts (a cancelled
+			// request or a killed process). Only a caller that never aborts
+			// reaches the fallback, which commits an effect so a missing
+			// abort is visible in the ledger. job-hold holds only its first
+			// attempt, so a redelivered job can complete.
+			held := ledger.holdKeys[key] && (operation == "reserve" || attempt == 1)
+			ledger.mu.Unlock()
+			if held {
+				select {
+				case ledger.holdEntered <- key:
+				default:
+				}
+				select {
+				case <-request.Context().Done():
+					ledger.mu.Lock()
+					ledger.aborted[operation]++
+					ledger.mu.Unlock()
+					return
+				case <-time.After(reserveHoldFallback):
+				}
+			}
+			ledger.mu.Lock()
+			if !ledger.seen[key] {
+				ledger.effects++
+				ledger.seen[key] = true
+			}
+			ledger.mu.Unlock()
+			if operation == "job-hold" {
+				writeProviderJSON(w, http.StatusOK, map[string]any{"jobId": payload["jobId"], "state": "completed", "totalCents": 3000})
+				return
+			}
+			writeProviderJSON(w, http.StatusOK, map[string]any{"requestKey": key, "reserved": true})
+			return
+		}
 		if operation == "job-retry" && attempt == 1 {
 			ledger.mu.Unlock()
 			writeProviderJSON(w, http.StatusServiceUnavailable, map[string]any{"code": "temporary_provider_error", "message": "synthetic first-attempt failure"})

@@ -28,9 +28,16 @@ if (input.mode === "durable-worker-produce") {
 	const adapter = new PgBossAdapter({ connectionString, schema: input.schema });
 	await adapter.connect();
 	const postgresVersion = await readPostgresVersion(connectionString);
-	const jobId = await adapter.addJob(input.queue, input.payload, { jobId: input.payload.requestKey, retries: 2 });
-	const duplicateJobId = await adapter.addJob(input.queue, input.payload, { jobId: input.payload.requestKey, retries: 2 });
-	process.stdout.write(`ACCEPTED ${JSON.stringify({ jobId, duplicateJobId, postgresVersion })}\n`);
+	// expireSeconds bounds how long a job claimed by a killed consumer stays
+	// active before pg-boss maintenance may retry it.
+	const sendOptions = { jobId: input.payload.requestKey, retries: 2, ...(input.expireSeconds ? { timeout: input.expireSeconds * 1000 } : {}) };
+	const jobId = await adapter.addJob(input.queue, input.payload, sendOptions);
+	const duplicateJobId = input.duplicate === false ? null : await adapter.addJob(input.queue, input.payload, sendOptions);
+	// PgBossAdapter.addJob falls back to the caller's jobId or a fresh UUID
+	// when pg-boss returns no id, so its return value cannot prove a durable
+	// row. Count the committed rows for this queue directly.
+	const storedJobs = await countStoredJobs(connectionString, input.schema, input.queue);
+	process.stdout.write(`ACCEPTED ${JSON.stringify({ jobId, duplicateJobId, storedJobs, postgresVersion })}\n`);
 	await new Promise(() => {});
 } else if (input.mode === "durable-worker-consume") {
 	console.log = () => {};
@@ -50,7 +57,7 @@ if (input.mode === "durable-worker-produce") {
 		input: z.object({ requestKey: z.string(), jobId: z.string(), sku: z.string(), quantity: z.number().int() }),
 		output: z.object({ status: z.number().int(), body: z.object({ jobId: z.string(), state: z.string(), totalCents: z.number().int() }) }),
 		async execute(ctx, request) {
-			const result = await fetch(`${providerURL}/job-retry`, {
+			const result = await fetch(`${providerURL}/${input.operation ?? "job-retry"}`, {
 				method: "POST",
 				headers: { "content-type": "application/json", "idempotency-key": request.requestKey },
 				body: JSON.stringify(request),
@@ -74,12 +81,12 @@ if (input.mode === "durable-worker-produce") {
 	class DurableParityWorker extends WorkerTrigger {
 		adapter = new PgBossAdapter({ connectionString, schema: input.schema });
 		nodes = { [workerNode.name]: workerNode };
-		workflows = { "parity-durable-worker": application._config };
+		workflows = { "parity-durable-worker": application };
 	}
 	const worker = new DurableParityWorker();
 	await worker.listen();
 	process.stdout.write("READY worker\n");
-	const deadline = Date.now() + 45000;
+	const deadline = Date.now() + (input.deadlineSeconds ?? 45) * 1000;
 	let stats;
 	let firstCompletionAt = 0;
 	let recoveredOutput;
@@ -93,8 +100,89 @@ if (input.mode === "durable-worker-produce") {
 		}
 	} while (Date.now() < deadline && stats.failed < 3 && (stats.completed === 0 || stats.active !== 0 || stats.waiting !== 0 || Date.now() - firstCompletionAt < 3000));
 	await worker.stop();
-	if (stats.completed !== 1) throw new Error(`durable old worker did not complete: ${JSON.stringify(stats)}`);
+	if (stats.completed < 1) throw new Error(`durable old worker did not complete: ${JSON.stringify(stats)}`);
 	process.stdout.write(`SETTLED ${JSON.stringify({ stats, response: recoveredOutput?.response })}\n`);
+} else if (input.mode === "json-workflow") {
+	// Executes a Blok schema-version-2 JSON workflow source exactly as given,
+	// through the published Configuration normalizer and Runner. The same
+	// source is converted by migration.Convert on the new side.
+	console.log = () => {};
+	console.info = () => {};
+	console.warn = () => {};
+	console.error = () => {};
+	const providerURL = process.env.BLOK_PARITY_PROVIDER_URL;
+	if (!providerURL) throw new Error("JSON workflow probe requires the local provider");
+	async function quoteAtProvider(signal, request) {
+		const response = await fetch(`${providerURL}/quote`, {
+			method: "POST",
+			headers: { "content-type": "application/json", "idempotency-key": request.requestKey },
+			body: JSON.stringify(request),
+			signal,
+		});
+		const body = await response.json();
+		if (!response.ok) {
+			const failure = new Error(body.message ?? `provider status ${response.status}`);
+			failure.code = body.code ?? "provider_error";
+			throw failure;
+		}
+		return { status: response.status, body };
+	}
+	const catalog = defineNode({
+		name: "catalog",
+		description: "Quotes a SKU at the shared synthetic provider",
+		input: z.object(requestShape.quote),
+		output: z.object({ status: z.number().int(), body: z.object(outputShape.quote) }),
+		async execute(ctx, request) {
+			return quoteAtProvider(ctx.signal, request);
+		},
+	});
+	const price = defineNode({
+		name: "price",
+		description: "Formats a provider quote for display; no effects",
+		input: z.object(outputShape.quote),
+		output: z.object({ sku: z.string(), totalCents: z.number().int(), display: z.string() }),
+		async execute(_ctx, quote) {
+			return { sku: quote.sku, totalCents: quote.totalCents, display: `${quote.totalCents} ${quote.currency}` };
+		},
+	});
+	// Published Blok 2.x roots a `@trigger` reference at ctx.request, the
+	// whole request envelope; this node takes that envelope and quotes its body.
+	const catalogRequest = defineNode({
+		name: "catalog-request",
+		description: "Quotes the SKU in a request envelope's body at the shared synthetic provider",
+		input: z.object({ body: z.object(requestShape.quote), headers: z.record(z.string(), z.unknown()), query: z.record(z.string(), z.unknown()), params: z.record(z.string(), z.unknown()), method: z.string(), url: z.string() }),
+		output: z.object({ status: z.number().int(), body: z.object(outputShape.quote) }),
+		async execute(ctx, request) {
+			return quoteAtProvider(ctx.signal, request.body);
+		},
+	});
+	const nodes = { [catalog.name]: catalog, [catalogRequest.name]: catalogRequest, [price.name]: price };
+	const config = new Configuration();
+	await config.init(input.workflow.name, { nodes: { getNode: (name) => nodes[name] ?? null } }, input.workflow);
+	const state = {};
+	const context = {
+		id: `parity-json-${input.payload.requestKey}`,
+		workflow_name: input.workflow.name,
+		workflow_path: "/parity/json",
+		request: { body: input.payload, headers: {}, query: {}, params: {}, method: "POST", url: "/parity/json" },
+		response: { data: null, error: null, success: true, contentType: "application/json" },
+		error: { message: [] },
+		logger: { log() {}, info() {}, warn() {}, error() {} },
+		config: config.nodes,
+		vars: state,
+		state,
+		env: process.env,
+		eventLogger: { log() {}, info() {}, warn() {}, error() {} },
+		_PRIVATE_: {},
+	};
+	let result;
+	try {
+		await new Runner(config.steps).run(context);
+		result = { ok: context.response.success, response: context.response.data, error: context.response.success ? null : { name: "Error", code: null, message: context.response.error?.message ?? null } };
+	} catch (error) {
+		result = { ok: false, response: null, error: { name: error?.name ?? "Error", code: error?.code ?? null, message: error?.message ?? String(error) } };
+	}
+	process.stdout.write(`${JSON.stringify({ engine: "blok-runner", version: "2.5.0", mode: "json-workflow", ...result })}\n`);
 } else if (input.mode === "persistent-app-server") {
 	const providerURL = process.env.BLOK_PARITY_PROVIDER_URL;
 	if (!providerURL) throw new Error("persistent old application requires the shared loopback provider");
@@ -102,7 +190,7 @@ if (input.mode === "durable-worker-produce") {
 		name: "parity-persistent-provider",
 		description: "Calls the shared local synthetic provider fixture",
 		input: z.object({ requestKey: z.string(), sku: z.string(), quantity: z.number().int() }),
-		output: z.object({ status: z.number().int(), body: z.object({ requestKey: z.string(), sku: z.string(), quantity: z.number().int(), totalCents: z.number().int() }) }),
+		output: z.object({ status: z.number().int(), body: z.object(outputShape.quote) }),
 		async execute(ctx, request) {
 			const response = await fetch(`${providerURL}/quote`, {
 				method: "POST",
@@ -121,40 +209,109 @@ if (input.mode === "durable-worker-produce") {
 	await config.init("parity-persistent-quote", {
 		nodes: { getNode: (name) => name === providerNode.name ? providerNode : null },
 	}, application._config);
+	// Two-step reserve -> commit workflow for the in-flight cancellation
+	// workload. The provider holds /reserve open until its caller aborts, so a
+	// committed effect or any /commit call proves cancellation did not reach
+	// the in-flight provider call or the following step.
+	const reserveShape = { requestKey: z.string(), sku: z.string(), quantity: z.number().int() };
+	const reserveNode = defineNode({
+		name: "parity-persistent-reserve",
+		description: "Holds a provider reservation open until the caller completes or aborts",
+		input: z.object(reserveShape),
+		output: z.object({ status: z.number().int(), body: z.object({ requestKey: z.string(), reserved: z.boolean() }) }),
+		async execute(ctx, request) {
+			const response = await fetch(`${providerURL}/reserve`, {
+				method: "POST",
+				headers: { "content-type": "application/json", "idempotency-key": request.requestKey },
+				body: JSON.stringify(request),
+				signal: ctx.signal,
+			});
+			return { status: response.status, body: await response.json() };
+		},
+	});
+	const commitNode = defineNode({
+		name: "parity-persistent-commit",
+		description: "Commits the reserved order effect at the provider",
+		input: z.object({ requestKey: z.string(), reserved: z.boolean() }),
+		output: z.object({ status: z.number().int(), body: z.object({ requestKey: z.string(), reserved: z.boolean() }) }),
+		async execute(ctx, request) {
+			const response = await fetch(`${providerURL}/commit`, {
+				method: "POST",
+				headers: { "content-type": "application/json", "idempotency-key": `${request.requestKey}-commit` },
+				body: JSON.stringify(request),
+				signal: ctx.signal,
+			});
+			return { status: response.status, body: await response.json() };
+		},
+	});
+	const reserveCommit = await workflow("parity-persistent-reserve-commit", {
+		version: "1.0.0",
+		trigger: http.post("/parity/reserve-commit"),
+	}, (req) => {
+		const reservation = step("reserve", reserveNode, req.body);
+		step("commit", commitNode, reservation.body);
+	});
+	const reserveConfig = new Configuration();
+	const reserveNodes = { [reserveNode.name]: reserveNode, [commitNode.name]: commitNode };
+	await reserveConfig.init("parity-persistent-reserve-commit", {
+		nodes: { getNode: (name) => reserveNodes[name] ?? null },
+	}, reserveCommit._config);
+	const routes = {
+		"/quote": { config, application, path: "/parity/quote" },
+		"/reserve-commit": { config: reserveConfig, application: reserveCommit, path: "/parity/reserve-commit" },
+	};
 	const server = createServer(async (request, response) => {
 		if (request.method === "GET" && request.url === "/health") {
 			response.writeHead(200, { "content-type": "application/json" }).end('{"ready":true}');
 			return;
 		}
-		if (request.method !== "POST" || request.url !== "/quote") {
+		const route = request.method === "POST" ? routes[request.url] : undefined;
+		if (!route) {
 			response.writeHead(404).end();
 			return;
 		}
+		// A caller that disconnects before the response is written aborts the
+		// run through the Runner's documented ctx.signal.
+		const controller = new AbortController();
+		response.on("close", () => {
+			if (!response.writableEnded) controller.abort();
+		});
+		let outcome = null;
 		try {
 			const body = await readJSONBody(request, 1 << 20);
 			const state = {};
 			const context = {
 				id: `parity-${body.requestKey}`,
-				workflow_name: application._config.name,
-				workflow_path: "/parity/quote",
+				workflow_name: route.application._config.name,
+				workflow_path: route.path,
 				request: { body, headers: request.headers, query: {}, params: {}, method: "POST", url: request.url },
 				response: { data: null, error: null, success: true, contentType: "application/json" },
 				error: { message: [] },
 				logger: { log() {}, info() {}, warn() {}, error() {} },
-				config: config.nodes,
+				config: route.config.nodes,
 				vars: state,
 				state,
 				env: process.env,
 				eventLogger: { log() {}, info() {}, warn() {}, error() {} },
+				signal: controller.signal,
 				_PRIVATE_: {},
 			};
-			await new Runner(config.steps).run(context);
+			await new Runner(route.config.steps).run(context);
+			outcome = { success: context.response.success, errorName: null, error: context.response.error?.message ?? null };
 			const status = context.response.success ? 200 : 422;
 			response.writeHead(status, { "content-type": "application/json" });
 			response.end(JSON.stringify({ ok: context.response.success, response: context.response.data, error: context.response.error?.message ?? null }));
 		} catch (error) {
-			response.writeHead(400, { "content-type": "application/json" });
-			response.end(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }));
+			outcome = { success: false, errorName: error instanceof Error ? error.name : "Error", error: error instanceof Error ? error.message : String(error) };
+			if (!response.headersSent && !controller.signal.aborted) {
+				response.writeHead(400, { "content-type": "application/json" });
+				response.end(JSON.stringify({ ok: false, error: outcome.error }));
+			}
+		} finally {
+			if (controller.signal.aborted) {
+				process.stdout.write(`CANCELLED ${JSON.stringify({ route: request.url, signalAborted: true, ...outcome })}\n`);
+				if (!response.writableEnded) response.destroy();
+			}
 		}
 	});
 	server.listen(0, "127.0.0.1", () => {
@@ -459,6 +616,19 @@ async function readJSONBody(request, limit) {
 		chunks.push(chunk);
 	}
 	return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
+
+async function countStoredJobs(connectionString, schema, queue) {
+	if (!/^[a-z0-9_]+$/.test(schema)) throw new Error("unexpected pg-boss schema name");
+	const { Client } = await import("pg");
+	const client = new Client({ connectionString });
+	await client.connect();
+	try {
+		const result = await client.query(`SELECT count(*)::int AS count FROM "${schema}".job WHERE name = $1`, [queue]);
+		return result.rows[0].count;
+	} finally {
+		await client.end();
+	}
 }
 
 async function readPostgresVersion(connectionString) {

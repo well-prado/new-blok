@@ -52,6 +52,7 @@ func TestLimitedHarnessPerformanceDistributions(t *testing.T) {
 	if os.Getenv("BLOK_PARITY_LIMITED_PERF") != "1" {
 		t.Skip("set BLOK_PARITY_LIMITED_PERF=1 to reproduce the historical limited harness samples")
 	}
+	requireOldEngine(t)
 	quote := findWorkload(t, "quote-success")
 	provider := newProvider(t)
 	var distributions []latencyDistribution

@@ -18,7 +18,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/well-prado/new-blok/contract"
+	runtimecontract "github.com/well-prado/new-blok/contract/runtime"
 	"github.com/well-prado/new-blok/flow"
+	"github.com/well-prado/new-blok/internal/compile"
 	"github.com/well-prado/new-blok/internal/engine"
 	"github.com/well-prado/new-blok/node"
 	"github.com/well-prado/new-blok/store/sqlite"
@@ -47,8 +50,46 @@ func TestNativePersistentAppProcess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runner := engine.New(map[string]node.Any{definition.Descriptor().Name: definition.Any()})
+	reserve := persistentOperationNode(t, providerURL, "parity-persistent-reserve", "reserve")
+	commit := persistentOperationNode(t, providerURL, "parity-persistent-commit", "commit")
+	reserveProgram, err := compileReserveCommit(reserve, commit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := engine.New(map[string]node.Any{
+		definition.Descriptor().Name: definition.Any(),
+		reserve.Descriptor().Name:    reserve.Any(),
+		commit.Descriptor().Name:     commit.Any(),
+	})
+	var stdout sync.Mutex
 	mux := http.NewServeMux()
+	// A caller that disconnects cancels request.Context(), which the engine
+	// passes to every node call. The outcome line mirrors the old app's.
+	mux.HandleFunc("POST /reserve-commit", func(w http.ResponseWriter, request *http.Request) {
+		defer request.Body.Close()
+		var input map[string]any
+		if err := json.NewDecoder(http.MaxBytesReader(w, request.Body, 1<<20)).Decode(&input); err != nil {
+			writePersistentJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid request"})
+			return
+		}
+		result, err := runner.Run(request.Context(), reserveProgram, input)
+		if request.Context().Err() != nil {
+			message := ""
+			if err != nil {
+				message = err.Error()
+			}
+			outcome, _ := json.Marshal(map[string]any{"route": "/reserve-commit", "contextCanceled": errors.Is(err, context.Canceled), "success": err == nil, "error": message})
+			stdout.Lock()
+			fmt.Fprintf(os.Stdout, "CANCELLED %s\n", outcome)
+			stdout.Unlock()
+			return
+		}
+		if err != nil {
+			writePersistentJSON(w, http.StatusUnprocessableEntity, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writePersistentJSON(w, http.StatusOK, map[string]any{"ok": true, "response": result.Output})
+	})
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		writePersistentJSON(w, http.StatusOK, map[string]bool{"ready": true})
 	})
@@ -72,7 +113,9 @@ func TestNativePersistentAppProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer listener.Close()
+	stdout.Lock()
 	fmt.Fprintf(os.Stdout, "READY http://%s\n", listener.Addr().String())
+	stdout.Unlock()
 	server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		t.Fatal(err)
@@ -92,6 +135,12 @@ func TestNativePersistentWorkerProcess(t *testing.T) {
 	providerURL := os.Getenv("BLOK_PARITY_PROVIDER_URL")
 	requestKey := os.Getenv("BLOK_PARITY_REQUEST_KEY")
 	jobID := os.Getenv("BLOK_PARITY_JOB_ID")
+	// The provider operation the consumer calls: job-retry fails its first
+	// attempt; job-hold holds its first attempt open until the caller dies.
+	operation := os.Getenv("BLOK_PARITY_OPERATION")
+	if operation == "" {
+		operation = "job-retry"
+	}
 	if databasePath == "" || providerURL == "" || requestKey == "" || jobID == "" {
 		t.Fatal("durable native worker requires database, local provider, request key, and job id")
 	}
@@ -146,7 +195,7 @@ func TestNativePersistentWorkerProcess(t *testing.T) {
 			if err != nil {
 				return nil, err
 			}
-			request, err := http.NewRequestWithContext(callCtx, http.MethodPost, providerURL+"/job-retry", bytes.NewReader(body))
+			request, err := http.NewRequestWithContext(callCtx, http.MethodPost, providerURL+"/"+operation, bytes.NewReader(body))
 			if err != nil {
 				return nil, err
 			}
@@ -229,8 +278,20 @@ func TestNativePersistentWorkerProcess(t *testing.T) {
 	t.Fatal("timed out waiting for durable native job settlement")
 }
 
+// persistentHTTPClient keeps loopback connections alive across concurrent
+// requests. Go's default transport retains only two idle connections per
+// host, so four load workers would churn ephemeral ports until the host runs
+// out of them; the published Node runtime's fetch pool reuses connections.
+func persistentHTTPClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns = 256
+	transport.MaxIdleConnsPerHost = 64
+	return &http.Client{Transport: transport, Timeout: 30 * time.Second}
+}
+
 func persistentProviderNode(t *testing.T, providerURL string) node.Definition[map[string]any, map[string]any] {
 	t.Helper()
+	client := persistentHTTPClient()
 	inputSchema, outputSchema := schemasForOperation("quote")
 	definition, err := node.Define[map[string]any, map[string]any](
 		"parity-persistent-provider",
@@ -248,7 +309,7 @@ func persistentProviderNode(t *testing.T, providerURL string) node.Definition[ma
 			if key, ok := input["requestKey"].(string); ok {
 				request.Header.Set("idempotency-key", key)
 			}
-			response, err := http.DefaultClient.Do(request)
+			response, err := client.Do(request)
 			if err != nil {
 				return nil, err
 			}
@@ -267,6 +328,84 @@ func persistentProviderNode(t *testing.T, providerURL string) node.Definition[ma
 			return map[string]any{"status": response.StatusCode, "body": body}, nil
 		},
 		node.Description("Shared loopback provider call in a persistent parity application"),
+		node.Schemas(inputSchema, outputSchema),
+		node.Effects("network"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return definition
+}
+
+// compileReserveCommit builds the two-step program through the canonical
+// document compiler, with commit reading reserve's `body` by an explicit
+// reference. flow.Definition.Lower is not used here: it currently drops call
+// input references (#244), so a lowered commit would silently receive the
+// workflow input instead of the reservation.
+func compileReserveCommit(reserve, commit node.Definition[map[string]any, map[string]any]) (contract.InternalProgram, error) {
+	reserveDescriptor, commitDescriptor := reserve.Descriptor(), commit.Descriptor()
+	document := contract.Document{
+		Version: contract.CurrentVersion,
+		Workflow: contract.Workflow{
+			ID:           "parity-persistent-reserve-commit",
+			Name:         "parity-persistent-reserve-commit",
+			Version:      "1.0.0",
+			Digest:       runtimecontract.CanonicalDigest([]byte("issue108-reserve-commit-v1")),
+			InputSchema:  reserveDescriptor.InputSchema,
+			OutputSchema: commitDescriptor.OutputSchema,
+			Instructions: []contract.Instruction{
+				{ID: "reserve", Kind: "call", Node: reserveDescriptor.Name},
+				{ID: "commit", Kind: "call", Node: commitDescriptor.Name, References: []contract.Reference{{Step: "reserve", Path: []string{"body"}}}},
+				{ID: "output", Kind: "output", References: []contract.Reference{{Step: "commit"}}},
+			},
+		},
+	}
+	for _, descriptor := range []node.Descriptor{reserveDescriptor, commitDescriptor} {
+		document.Nodes = append(document.Nodes, contract.NodeDescriptor{ID: descriptor.Name, Version: descriptor.Version, Digest: runtimecontract.CanonicalDigest(descriptor.InputSchema), InputSchema: descriptor.InputSchema, OutputSchema: descriptor.OutputSchema})
+	}
+	compiled, err := compile.Compile(document)
+	return compiled.Program, err
+}
+
+// persistentOperationNode calls one provider operation and returns
+// {status, body}; it mirrors the old app's reserve/commit nodes.
+func persistentOperationNode(t *testing.T, providerURL, name, operation string) node.Definition[map[string]any, map[string]any] {
+	t.Helper()
+	client := persistentHTTPClient()
+	inputSchema, outputSchema := schemasForOperation(operation)
+	definition, err := node.Define[map[string]any, map[string]any](
+		name,
+		"1.0.0",
+		func(ctx context.Context, input map[string]any) (map[string]any, error) {
+			encoded, err := json.Marshal(input)
+			if err != nil {
+				return nil, err
+			}
+			request, err := http.NewRequestWithContext(ctx, http.MethodPost, providerURL+"/"+operation, bytes.NewReader(encoded))
+			if err != nil {
+				return nil, err
+			}
+			request.Header.Set("Content-Type", "application/json")
+			key, _ := input["requestKey"].(string)
+			if operation == "commit" {
+				key += "-commit"
+			}
+			request.Header.Set("idempotency-key", key)
+			response, err := client.Do(request)
+			if err != nil {
+				return nil, err
+			}
+			defer response.Body.Close()
+			var body map[string]any
+			if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+				return nil, err
+			}
+			if response.StatusCode >= http.StatusBadRequest {
+				return nil, &node.DomainError{Code: "provider_error", Class: "provider", Err: fmt.Errorf("synthetic provider status %d", response.StatusCode)}
+			}
+			return map[string]any{"status": response.StatusCode, "body": body}, nil
+		},
+		node.Description("Shared loopback provider "+operation+" call in a persistent parity application"),
 		node.Schemas(inputSchema, outputSchema),
 		node.Effects("network"),
 	)
@@ -503,10 +642,10 @@ func startOldWorkerProcess(t *testing.T, input map[string]any, providerURL, post
 	return process
 }
 
-func startNativeWorkerProcess(t *testing.T, role, databasePath, providerURL, requestKey, jobID string) *persistentAppProcess {
+func startNativeWorkerProcess(t *testing.T, role, databasePath, providerURL, requestKey, jobID string, extraEnv ...string) *persistentAppProcess {
 	t.Helper()
 	command := exec.Command(os.Args[0], "-test.run=^TestNativePersistentWorkerProcess$")
-	command.Env = append(os.Environ(),
+	command.Env = append(append(os.Environ(), extraEnv...),
 		"BLOK_PARITY_NATIVE_WORKER_ROLE="+role,
 		"BLOK_PARITY_NATIVE_WORKER_DB="+databasePath,
 		"BLOK_PARITY_PROVIDER_URL="+providerURL,
