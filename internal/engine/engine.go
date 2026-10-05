@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"log/slog"
 	"reflect"
-	"strings"
 	"time"
 
 	"github.com/well-prado/new-blok/contract"
@@ -658,50 +657,21 @@ func resolveReference(state map[string]any, reference contract.Reference) (any, 
 	if !ok {
 		return nil, fmt.Errorf("step %q has no committed output", reference.Step)
 	}
-	for _, path := range reference.Path {
+	if len(reference.Path) == 0 {
+		return current, nil
+	}
+	// The walk keeps reflect values between segments: encoding/json picks
+	// a pointer-receiver marshaler only for addressable values, so losing
+	// addressability midway would change what a key resolves to.
+	resolved := reflect.ValueOf(&current).Elem()
+	for _, name := range reference.Path {
 		var err error
-		current, err = field(current, path)
+		resolved, err = field(resolved, name)
 		if err != nil {
 			return nil, err
 		}
 	}
-	return current, nil
-}
-
-func field(input any, name string) (any, error) {
-	if input == nil {
-		return nil, fmt.Errorf("cannot read %q from null", name)
-	}
-	value := reflect.ValueOf(input)
-	for value.Kind() == reflect.Pointer || value.Kind() == reflect.Interface {
-		if value.IsNil() {
-			return nil, fmt.Errorf("cannot read %q from null", name)
-		}
-		value = value.Elem()
-	}
-	if value.Kind() == reflect.Map {
-		key := reflect.ValueOf(name)
-		found := value.MapIndex(key)
-		if found.IsValid() {
-			return found.Interface(), nil
-		}
-		return nil, fmt.Errorf("field %q is missing", name)
-	}
-	if value.Kind() != reflect.Struct {
-		return nil, fmt.Errorf("cannot read %q from %s", name, value.Type())
-	}
-	typ := value.Type()
-	for index := 0; index < typ.NumField(); index++ {
-		fieldType := typ.Field(index)
-		jsonName := strings.Split(fieldType.Tag.Get("json"), ",")[0]
-		if jsonName == "" {
-			jsonName = fieldType.Name
-		}
-		if jsonName == name || fieldType.Name == name {
-			return value.Field(index).Interface(), nil
-		}
-	}
-	return nil, fmt.Errorf("field %q is missing", name)
+	return resolved.Interface(), nil
 }
 
 func validateSchema(raw []byte, value any) error {
