@@ -347,7 +347,17 @@ func New(ctx context.Context, database store.Database, clock func() time.Time) (
 		if err := ensureColumn(ctx, tx, "deferrals", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 			return err
 		}
-		return ensureColumn(ctx, tx, "principal_json", "TEXT NOT NULL DEFAULT ''")
+		if err := ensureColumn(ctx, tx, "principal_json", "TEXT NOT NULL DEFAULT ''"); err != nil {
+			return err
+		}
+		// enqueue_seq orders jobs that share a created_at by when they were
+		// enqueued (#217). Jobs from before the column existed keep 0 and
+		// fall back to job_id among themselves.
+		if err := ensureColumn(ctx, tx, "enqueue_seq", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS worker_jobs_enqueue_seq ON worker_jobs (enqueue_seq)`)
+		return err
 	}); err != nil {
 		return nil, fmt.Errorf("worker: schema: %w", err)
 	}
@@ -370,7 +380,8 @@ func createJobs(ctx context.Context, tx *sql.Tx) error {
 		lease_until INTEGER,
 		error_text TEXT NOT NULL DEFAULT '',
 		created_at INTEGER NOT NULL,
-		updated_at INTEGER NOT NULL
+		updated_at INTEGER NOT NULL,
+		enqueue_seq INTEGER NOT NULL DEFAULT 0
 	)`)
 	return err
 }
@@ -460,9 +471,13 @@ func (q *Queue) Enqueue(ctx context.Context, request EnqueueRequest) (EnqueueRes
 	jobID := "job:" + digest([]byte(request.RequestKey))[:32]
 	var result EnqueueResult
 	err = q.withTx(store.Writer(ctx), func(tx *sql.Tx) error {
+		// enqueue_seq is one past the highest so far, read under this
+		// transaction's write lock, so it follows commit order. It is stored
+		// rather than taken from SQLite's rowid, which SQLite documents VACUUM
+		// may renumber for tables without an INTEGER PRIMARY KEY.
 		res, err := tx.ExecContext(ctx, `INSERT INTO worker_jobs
-			(job_id, request_key, kind, payload_json, payload_digest, max_attempts, principal_json, state, available_at, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(request_key) DO NOTHING`,
+			(job_id, request_key, kind, payload_json, payload_digest, max_attempts, principal_json, state, available_at, created_at, updated_at, enqueue_seq)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(enqueue_seq), 0) + 1 FROM worker_jobs)) ON CONFLICT(request_key) DO NOTHING`,
 			jobID, request.RequestKey, request.Kind, []byte(request.Payload), payloadDigest, request.MaxAttempts, principal, StatePending, q.now(), q.now(), q.now())
 		if err != nil {
 			return err
@@ -782,7 +797,9 @@ func (q *Queue) Get(ctx context.Context, requestKey string) (Job, error) {
 	return job, err
 }
 
-// claim leases the next available job. Its first statement writes: a
+// claim leases the next available job: the oldest created_at first, and
+// among jobs that share one, the first enqueued (#217). Its first statement
+// writes: a
 // transaction that reads before writing cannot wait for a concurrent
 // writer and fails with SQLITE_BUSY once that writer commits; one that
 // writes first waits under the busy timeout (as cron's cursor writes do).
@@ -791,7 +808,7 @@ func (q *Queue) claim(ctx context.Context, tx *sql.Tx) (Job, int64, error) {
 	leaseUntil := time.Unix(0, now).Add(30 * time.Second).UnixNano()
 	job, err := scanJob(tx.QueryRowContext(ctx, `UPDATE worker_jobs SET state = ?, attempt = attempt + 1, lease_until = ?, updated_at = ?
 		WHERE job_id = (SELECT job_id FROM worker_jobs
-			WHERE (state = ? OR (state = ? AND lease_until <= ?)) AND available_at <= ? ORDER BY created_at, job_id LIMIT 1)
+			WHERE (state = ? OR (state = ? AND lease_until <= ?)) AND available_at <= ? ORDER BY created_at, enqueue_seq, job_id LIMIT 1)
 		RETURNING job_id, request_key, kind, payload_json, attempt, max_attempts, deferrals, principal_json, state, error_text`,
 		StateProcessing, leaseUntil, now, StatePending, StateProcessing, now, now))
 	if errors.Is(err, sql.ErrNoRows) {
