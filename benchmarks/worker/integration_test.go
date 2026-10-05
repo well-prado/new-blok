@@ -211,8 +211,10 @@ func observeWorkerCrash(t *testing.T, phase string) faultSample {
 			t.Fatalf("lost worker effect not uncertain: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		// A retried call parks at the same barrier, so it hangs here instead of
-		// returning: more than one request is the signature of a hidden retry.
+		// A retried call parks at the same barrier and never completes; the
+		// Node fetch timeout (2s, nodes.mjs) usually fails it before this
+		// fires. Either way the request count the caller asserts is what exposes
+		// a hidden retry: more than one request means the call was re-sent.
 		requests, effects := p.Counts()
 		t.Fatalf("lost worker call hung (requests/effects %d/%d; requests above 1 means an automatic retry)", requests, effects)
 	}
