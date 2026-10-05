@@ -1,0 +1,30 @@
+Symlinks that escape the root: a node directory linked to an outside directory holding a valid node, a file inside a node linked outside, and a workflow path linked outside. None is followed; following would discover shop/stolen.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"classic","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+
+go 1.27.0
+-- runtimes/go/nodes/quote/quote.go --
+package quote
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/quote", "1.0.0", nil)
+-- @outside/stolen/stolen.go --
+package stolen
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/stolen", "1.0.0", nil)
+-- @outside/secret.go --
+package quote
+
+var Secret = "outside the project"
+-- @links --
+runtimes/go/nodes/stolen -> $OUTSIDE/stolen
+runtimes/go/nodes/quote/secret.go -> $OUTSIDE/secret.go
+workflows -> $OUTSIDE
+runtimes/go/nodes/quote/relative.go -> ../../../../../outside/secret.go
+-- @expect --
+{"diagnostics":[["layout_symlink_escape","runtimes/go/nodes/quote/relative.go"],["layout_symlink_escape","runtimes/go/nodes/quote/secret.go"],["layout_symlink_escape","runtimes/go/nodes/stolen"],["layout_symlink_escape","workflows"]]}

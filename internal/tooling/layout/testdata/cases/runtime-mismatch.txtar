@@ -1,0 +1,27 @@
+Runtime mismatches: node.json naming another runtime, a Go definition under nodejs, and node.json beside a Go node.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+
+go 1.27.0
+-- nodes/nodejs/claims/node.json --
+{"name":"shop/claims","version":"1.0.0","runtime":"python3"}
+-- nodes/nodejs/gofile/gofile.go --
+package gofile
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/gofile", "1.0.0", nil)
+-- nodes/nodejs/gofile/node.json --
+{"name":"shop/gofile","version":"1.0.0"}
+-- nodes/go/both/both.go --
+package both
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/both", "1.0.0", nil)
+-- nodes/go/both/node.json --
+{"name":"shop/both","version":"1.0.0"}
+-- @expect --
+{"diagnostics":[["layout_runtime_mismatch","nodes/go/both/node.json"],["layout_runtime_mismatch","nodes/nodejs/claims/node.json"],["layout_runtime_mismatch","nodes/nodejs/gofile/gofile.go:5"]]}

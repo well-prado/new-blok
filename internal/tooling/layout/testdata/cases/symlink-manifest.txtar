@@ -1,0 +1,9 @@
+blok.json itself is a link to a manifest outside the root: refused, not read.
+-- go.mod --
+module example.com/shop
+-- @outside/blok.json --
+{"name":"shop","layout":"classic"}
+-- @links --
+blok.json -> $OUTSIDE/blok.json
+-- @expect --
+{"diagnostics":[["layout_symlink_escape","blok.json"]]}

@@ -1,0 +1,20 @@
+Symlink cycles never resolve: a self link, a two-link cycle and a directory linked to its parent. Discovery terminates and reports each.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+
+go 1.27.0
+-- nodes/go/quote/quote.go --
+package quote
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/quote", "1.0.0", nil)
+-- @links --
+nodes/go/quote/self -> self
+nodes/go/quote/a -> b
+nodes/go/quote/b -> a
+nodes/go/quote/up -> ..
+-- @expect --
+{"diagnostics":[["layout_symlink_alias","nodes/go/quote/up"],["layout_symlink_loop","nodes/go/quote/a"],["layout_symlink_loop","nodes/go/quote/b"],["layout_symlink_loop","nodes/go/quote/self"]]}

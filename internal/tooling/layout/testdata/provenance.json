@@ -1,0 +1,137 @@
+{
+  "source": "synthetic fixtures authored for E12-T01 (#67); no application, customer or private data",
+  "license": "Apache-2.0",
+  "privateData": false,
+  "expected": {
+    "classic-shop": {
+      "outputRecords": 3,
+      "errorRecords": 0,
+      "effectRecords": 0
+    },
+    "unified-shop": {
+      "outputRecords": 3,
+      "errorRecords": 0,
+      "effectRecords": 0
+    },
+    "import-aliases": {
+      "outputRecords": 3,
+      "errorRecords": 0,
+      "effectRecords": 0
+    },
+    "explicit-workflow-paths": {
+      "outputRecords": 3,
+      "errorRecords": 0,
+      "effectRecords": 0
+    },
+    "duplicate-identity": {
+      "outputRecords": 0,
+      "errorRecords": 1,
+      "effectRecords": 0
+    },
+    "duplicate-identity-across-runtimes": {
+      "outputRecords": 0,
+      "errorRecords": 1,
+      "effectRecords": 0
+    },
+    "duplicate-version": {
+      "outputRecords": 0,
+      "errorRecords": 1,
+      "effectRecords": 0
+    },
+    "duplicate-workflow": {
+      "outputRecords": 0,
+      "errorRecords": 1,
+      "effectRecords": 0
+    },
+    "node-imports-node": {
+      "outputRecords": 0,
+      "errorRecords": 1,
+      "effectRecords": 0
+    },
+    "node-imports-workflow": {
+      "outputRecords": 0,
+      "errorRecords": 1,
+      "effectRecords": 0
+    },
+    "mixed-layout": {
+      "outputRecords": 0,
+      "errorRecords": 1,
+      "effectRecords": 0
+    },
+    "mixed-layout-unified": {
+      "outputRecords": 0,
+      "errorRecords": 1,
+      "effectRecords": 0
+    },
+    "runtime-mismatch": {
+      "outputRecords": 0,
+      "errorRecords": 3,
+      "effectRecords": 0
+    },
+    "descriptor-failures": {
+      "outputRecords": 0,
+      "errorRecords": 6,
+      "effectRecords": 0
+    },
+    "workflow-ownership": {
+      "outputRecords": 0,
+      "errorRecords": 4,
+      "effectRecords": 0
+    },
+    "manifest-invalid": {
+      "outputRecords": 0,
+      "errorRecords": 4,
+      "effectRecords": 0
+    },
+    "manifest-unknown-field": {
+      "outputRecords": 0,
+      "errorRecords": 1,
+      "effectRecords": 0
+    },
+    "manifest-missing": {
+      "outputRecords": 0,
+      "errorRecords": 1,
+      "effectRecords": 0
+    },
+    "structure-failures": {
+      "outputRecords": 0,
+      "errorRecords": 3,
+      "effectRecords": 0
+    },
+    "symlink-escape": {
+      "outputRecords": 0,
+      "errorRecords": 4,
+      "effectRecords": 0
+    },
+    "symlink-loop": {
+      "outputRecords": 0,
+      "errorRecords": 4,
+      "effectRecords": 0
+    },
+    "symlink-dangling": {
+      "outputRecords": 0,
+      "errorRecords": 2,
+      "effectRecords": 0
+    },
+    "symlink-alias": {
+      "outputRecords": 0,
+      "errorRecords": 2,
+      "effectRecords": 0
+    },
+    "symlink-manifest": {
+      "outputRecords": 0,
+      "errorRecords": 1,
+      "effectRecords": 0
+    },
+    "workflow-contains-nodes": {
+      "outputRecords": 0,
+      "errorRecords": 1,
+      "effectRecords": 0
+    },
+    "symlink-bases": {
+      "outputRecords": 0,
+      "errorRecords": 2,
+      "effectRecords": 0
+    }
+  }
+}
