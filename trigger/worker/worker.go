@@ -66,10 +66,15 @@ type Job struct {
 }
 
 const (
-	// LeaseDuration is how long a started attempt keeps its job from other
-	// workers. A worker that dies mid-attempt leaves its lease behind, and
-	// the job is claimed again once it expires (#245).
-	LeaseDuration = 30 * time.Second
+	// DefaultLease is how long a started attempt keeps its job from other
+	// workers unless WithLease says otherwise. A worker that dies mid-attempt
+	// leaves its lease behind, and the job is claimed again once it expires
+	// (#245).
+	DefaultLease = 30 * time.Second
+	// defaultBusyTimeout is assumed for a store that does not report its
+	// busy timeout (store.BusyTimeoutProvider); it is the SQLite backend's
+	// default.
+	defaultBusyTimeout = 5 * time.Second
 	// ClaimAbandoned is the dead-letter code for a job whose attempts were
 	// all started and never finished: every worker that claimed it died or
 	// lost its lease before acknowledging, for example because the handler
@@ -340,19 +345,53 @@ type Queue struct {
 	database    store.Database
 	writeDomain *store.WriteDomain
 	clock       func() time.Time
-	mu          sync.RWMutex
-	schemas     map[string]schema.Schema
+	lease       time.Duration
+	busyTimeout time.Duration
+	// claimTurn is this process's turn to start an attempt on the queue's
+	// write domain, shared by every Queue on that domain (claimTurnFor).
+	claimTurn chan struct{}
+	mu        sync.RWMutex
+	schemas   map[string]schema.Schema
 }
 
-func New(ctx context.Context, database store.Database, clock func() time.Time) (*Queue, error) {
+// Option configures a Queue.
+type Option func(*options)
+
+type options struct{ lease time.Duration }
+
+// WithLease sets how long a started attempt keeps its job from other workers
+// (DefaultLease otherwise). It bounds how long a job waits after its worker
+// dies before it is delivered again. New refuses a lease no longer than twice
+// the store's busy timeout: between starting an attempt and taking it over
+// to run the handler, a worker may wait for its write turn and then for the
+// write lock, each up to the busy timeout, and a lease that ran out meanwhile
+// would lose the attempt to another worker.
+func WithLease(lease time.Duration) Option {
+	return func(o *options) { o.lease = lease }
+}
+
+func New(ctx context.Context, database store.Database, clock func() time.Time, opts ...Option) (*Queue, error) {
 	if database == nil {
 		return nil, errors.New("worker: database is required")
 	}
 	if clock == nil {
 		clock = time.Now
 	}
+	configured := options{lease: DefaultLease}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&configured)
+		}
+	}
+	busyTimeout, ok := store.BusyTimeoutOf(database)
+	if !ok {
+		busyTimeout = defaultBusyTimeout
+	}
+	if configured.lease <= 2*busyTimeout {
+		return nil, fmt.Errorf("worker: lease %v must be longer than twice the store's busy timeout (%v)", configured.lease, busyTimeout)
+	}
 	writeDomain, _ := store.WriteDomainOf(database)
-	queue := &Queue{database: database, writeDomain: writeDomain, clock: clock, schemas: map[string]schema.Schema{}}
+	queue := &Queue{database: database, writeDomain: writeDomain, clock: clock, lease: configured.lease, busyTimeout: busyTimeout, claimTurn: claimTurnFor(writeDomain), schemas: map[string]schema.Schema{}}
 	if err := migration.Retry(ctx, func() error {
 		return queue.withTx(ctx, func(tx *sql.Tx) error {
 			if err := createJobs(ctx, tx); err != nil {
@@ -559,15 +598,79 @@ type claimedWriteDomain struct {
 	active atomic.Bool
 }
 
+// claimTurns holds one claim turn per write domain this process has opened
+// a Queue on, so every Queue on a domain shares it (#245 review). Entries are
+// kept for the life of the process; a domain without identity gets a turn of
+// its own.
+var claimTurns struct {
+	mu    sync.Mutex
+	turns []claimTurn
+}
+
+type claimTurn struct {
+	domain *store.WriteDomain
+	turn   chan struct{}
+}
+
+func claimTurnFor(domain *store.WriteDomain) chan struct{} {
+	if domain == nil {
+		return make(chan struct{}, 1)
+	}
+	claimTurns.mu.Lock()
+	defer claimTurns.mu.Unlock()
+	for _, existing := range claimTurns.turns {
+		if store.SameWriteDomain(existing.domain, domain) {
+			return existing.turn
+		}
+	}
+	turn := make(chan struct{}, 1)
+	claimTurns.turns = append(claimTurns.turns, claimTurn{domain: domain, turn: turn})
+	return turn
+}
+
+// takeClaimTurn waits for this process's turn to start an attempt on the
+// queue's write domain, up to the store's busy timeout, and returns its
+// release. Like the store's own write turn (#214) it is not interrupted by
+// the consumer's context, and it fails as the store would, with
+// store.ErrBusy naming the write domain, so a handler that runs ProcessOnce
+// on the store its own claim holds fails after one busy wait instead of
+// deadlocking (#207).
+func (q *Queue) takeClaimTurn() (func(), error) {
+	release := func() { <-q.claimTurn }
+	select {
+	case q.claimTurn <- struct{}{}:
+		return release, nil
+	default:
+	}
+	timer := time.NewTimer(q.busyTimeout)
+	defer timer.Stop()
+	select {
+	case q.claimTurn <- struct{}{}:
+		return release, nil
+	case <-timer.C:
+		return nil, store.WithWriteDomain(fmt.Errorf("worker: claim: %w: no claim turn within %v", store.ErrBusy, q.busyTimeout), q.writeDomain)
+	}
+}
+
 // ProcessOnce claims and processes one job, in two write transactions.
 //
-// The first starts the attempt: it leases the job for LeaseDuration and
-// counts the attempt, and commits. A worker process that dies after this
-// point (SIGKILL, OOM, a crash) leaves the lease and the counted attempt
-// behind, so a handler that kills its process every time still spends the
-// job's attempts and dead-letters it as ClaimAbandoned instead of being
-// redelivered forever (#245). The job is claimed again once the lease
+// The first starts the attempt: it leases the job (DefaultLease, or
+// WithLease) and counts the attempt, and commits. A worker process that dies
+// after this point (SIGKILL, OOM, a crash) leaves the lease and the counted
+// attempt behind, so a handler that kills its process every time still
+// spends the job's attempts and dead-letters it as ClaimAbandoned instead of
+// being redelivered forever (#245). The job is claimed again once the lease
 // expires.
+//
+// Within one process, one worker at a time per write domain holds a started
+// attempt: ProcessOnce takes the domain's claim turn before it starts one
+// and keeps it until the attempt's outcome is committed. Another worker
+// could not run its handler meanwhile anyway (the handler holds the write
+// lock), and an attempt it started while waiting would be charged if the
+// running handler crashed the process. A worker that cannot take the turn
+// within the store's busy timeout fails with store.ErrBusy and starts
+// nothing. Workers in other processes on the same database do not share the
+// turn.
 //
 // The second takes that lease over and runs the handler. The handler's
 // writes and the job's acknowledgment are in this one transaction, so a crash
@@ -576,13 +679,13 @@ type claimedWriteDomain struct {
 // unknown external effects without an idempotency key or reconciliation path.
 //
 // Only the claim statement and the handler observe ctx. The claim holds
-// nothing while it waits for its turn in the store's writer queue (#214) or
-// for the write lock, so a consumer canceled meanwhile is reported as
-// ErrConsumerLost. Neither wait is interrupted by ctx (the transactions
-// deliberately are not canceled with it), so that report can take up to the
-// busy timeout, or twice that when a writer on another handle then holds the
-// lock. A consumer lost after the attempt started gives the attempt back and
-// charges a deferral instead.
+// nothing while it waits for the claim turn, for its turn in the store's
+// writer queue (#214) or for the write lock, so a consumer canceled meanwhile
+// is reported as ErrConsumerLost. None of these waits is interrupted by ctx
+// (the transactions deliberately are not canceled with it), so that report
+// can take up to the busy timeout for each. A consumer lost after the
+// attempt started gives the attempt back: before the handler runs, without
+// a deferral; while it runs, charging a deferral instead.
 // Everything after the claim runs on a context ctx cannot cancel, so losing
 // the consumer rolls the handler's transaction back synchronously before
 // ProcessOnce returns instead of leaving database/sql to abort it in the
@@ -601,12 +704,22 @@ func (q *Queue) ProcessOnce(ctx context.Context, handler Handler) (bool, error) 
 		return false, fmt.Errorf("%w: %w", ErrConsumerLost, err)
 	}
 	txCtx := context.WithoutCancel(ctx)
+	release, err := q.takeClaimTurn()
+	if err != nil {
+		if ctx.Err() != nil {
+			// The consumer was lost while this worker waited for its claim
+			// turn: it claimed nothing, so the job is untouched.
+			err = fmt.Errorf("%w: %w", ErrConsumerLost, errors.Join(ctx.Err(), err))
+		}
+		return false, fmt.Errorf("worker: process: %w", err)
+	}
+	defer release()
 	var job Job
 	var lease int64
 	abandoned := false
 	// The claim writes first (#176), so it takes its turn in the store's
 	// writer queue (#214).
-	err := q.withTx(store.Writer(txCtx), func(tx *sql.Tx) error {
+	err = q.withTx(store.Writer(txCtx), func(tx *sql.Tx) error {
 		var err error
 		job, lease, err = q.claim(ctx, tx)
 		if errors.Is(err, ErrNotFound) {
@@ -671,6 +784,12 @@ func (q *Queue) handle(ctx, txCtx context.Context, handler Handler, job Job, lea
 			return err
 		} else if taken == 0 {
 			return errLeaseExpired
+		}
+		if err := ctx.Err(); err != nil {
+			// The consumer was lost before the handler started: it does not
+			// run on a context that is already canceled, and the attempt is
+			// given back.
+			return fmt.Errorf("%w: %w", ErrConsumerLost, err)
 		}
 		// Every statement after the claim goes through the claim's
 		// fail-closed transaction: once SQLite has ended it, nothing more
@@ -769,7 +888,8 @@ func (q *Queue) handle(ctx, txCtx context.Context, handler Handler, job Job, lea
 		return false, fmt.Errorf("worker: process: %w: the attempt's lease expired before its handler started", ErrClaimLost)
 	case !ran:
 		// The handler never ran (the transaction could not take the lease
-		// over): the attempt is given back and the job released at once.
+		// over, or the consumer was lost first): the attempt is given back
+		// and the job released at once.
 		if ctx.Err() != nil && !errors.Is(err, ErrConsumerLost) {
 			err = fmt.Errorf("%w: %w", ErrConsumerLost, errors.Join(ctx.Err(), err))
 		}
@@ -912,7 +1032,7 @@ func (q *Queue) Get(ctx context.Context, requestKey string) (Job, error) {
 // writes first waits under the busy timeout (as cron's cursor writes do).
 func (q *Queue) claim(ctx context.Context, tx *sql.Tx) (Job, int64, error) {
 	now := q.now()
-	leaseUntil := time.Unix(0, now).Add(LeaseDuration).UnixNano()
+	leaseUntil := time.Unix(0, now).Add(q.lease).UnixNano()
 	job, err := scanJob(tx.QueryRowContext(ctx, `UPDATE worker_jobs SET state = ?, attempt = attempt + 1, lease_until = ?, updated_at = ?
 		WHERE job_id = (SELECT job_id FROM worker_jobs
 			WHERE (state = ? OR (state = ? AND lease_until <= ?)) AND available_at <= ? ORDER BY created_at, enqueue_seq, job_id LIMIT 1)

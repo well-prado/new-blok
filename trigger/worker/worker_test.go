@@ -219,7 +219,7 @@ func TestProcessKillRollsBackBusinessWriteAndAcknowledgment(t *testing.T) {
 	defer database.Close()
 	// The killed worker started an attempt and leased the job; a worker
 	// restarted after that lease expires claims it again (#245).
-	queue, err = New(context.Background(), database, func() time.Time { return time.Now().Add(LeaseDuration + time.Second) })
+	queue, err = New(context.Background(), database, func() time.Time { return time.Now().Add(DefaultLease + time.Second) })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -390,13 +390,24 @@ func TestCrashLoopingJobDeadLettersWithinMaxAttempts(t *testing.T) {
 	}
 }
 
-// handlerTxDatabase runs before just ahead of ProcessOnce's handler
-// transaction (the one after the claim that starts the attempt). An error
-// from before is returned in place of that transaction, which never begins.
+// handlerTxDatabase runs a hook just ahead of one transaction: by default
+// ProcessOnce's handler transaction, the second after arm (the first is the
+// claim that starts the attempt). An error from the hook is returned in place
+// of that transaction, which never begins. It forwards the write domain and
+// busy timeout of the database it wraps.
 type handlerTxDatabase struct {
 	store.Database
+	mu           sync.Mutex
 	before       func(context.Context, store.Database) error
+	at           int
 	transactions int
+}
+
+// arm runs before ahead of the at-th transaction from now.
+func (database *handlerTxDatabase) arm(at int, before func(context.Context, store.Database) error) {
+	database.mu.Lock()
+	defer database.mu.Unlock()
+	database.before, database.at, database.transactions = before, at, 0
 }
 
 func (database *handlerTxDatabase) WriteDomain() *store.WriteDomain {
@@ -404,14 +415,25 @@ func (database *handlerTxDatabase) WriteDomain() *store.WriteDomain {
 	return domain
 }
 
+func (database *handlerTxDatabase) BusyTimeout() time.Duration {
+	if provider, ok := database.Database.(interface{ BusyTimeout() time.Duration }); ok {
+		return provider.BusyTimeout()
+	}
+	return 0
+}
+
 func (database *handlerTxDatabase) WithTx(ctx context.Context, fn func(*sql.Tx) error) error {
+	database.mu.Lock()
 	database.transactions++
 	before := database.before
-	if database.transactions != 2 || before == nil {
-		return database.Database.WithTx(ctx, fn)
+	if database.transactions != database.at {
+		before = nil
 	}
-	if err := before(ctx, database.Database); err != nil {
-		return err
+	database.mu.Unlock()
+	if before != nil {
+		if err := before(ctx, database.Database); err != nil {
+			return err
+		}
 	}
 	return database.Database.WithTx(ctx, fn)
 }
@@ -435,8 +457,7 @@ func TestStartedAttemptIsGivenBackWhenItsHandlerNeverRuns(t *testing.T) {
 	if _, err := queue.Enqueue(ctx, EnqueueRequest{RequestKey: "given-back", Kind: "test", Payload: []byte(`{}`), MaxAttempts: 1}); err != nil {
 		t.Fatal(err)
 	}
-	database.transactions = 0
-	database.before = func(context.Context, store.Database) error { return store.ErrBusy }
+	database.arm(2, func(context.Context, store.Database) error { return store.ErrBusy })
 	ran := 0
 	processed, err := queue.ProcessOnce(ctx, func(context.Context, Tx, Job) error { ran++; return nil })
 	if processed || !errors.Is(err, store.ErrBusy) || ran != 0 {
@@ -445,7 +466,7 @@ func TestStartedAttemptIsGivenBackWhenItsHandlerNeverRuns(t *testing.T) {
 	if job, err := queue.Get(ctx, "given-back"); err != nil || job.State != StatePending || job.Attempt != 0 {
 		t.Fatalf("job=%+v err=%v; want pending with its attempt given back", job, err)
 	}
-	database.before = nil
+	database.arm(0, nil)
 	if processed, err := queue.ProcessOnce(ctx, func(context.Context, Tx, Job) error { ran++; return nil }); err != nil || !processed || ran != 1 {
 		t.Fatalf("redelivery processed=%v err=%v ran=%d; want the job's one attempt to run at once", processed, err, ran)
 	}
@@ -473,15 +494,14 @@ func TestExpiredLeaseIsNotTakenOver(t *testing.T) {
 	if _, err := queue.Enqueue(ctx, EnqueueRequest{RequestKey: "expired", Kind: "test", Payload: []byte(`{}`), MaxAttempts: 3}); err != nil {
 		t.Fatal(err)
 	}
-	database.transactions = 0
 	// Another worker's claim, after the lease expired: a new lease and the
 	// next attempt.
-	database.before = func(ctx context.Context, other store.Database) error {
+	database.arm(2, func(ctx context.Context, other store.Database) error {
 		return other.WithTx(ctx, func(tx *sql.Tx) error {
 			_, err := tx.ExecContext(ctx, `UPDATE worker_jobs SET attempt = attempt + 1, lease_until = lease_until + ? WHERE request_key = 'expired'`, int64(time.Hour))
 			return err
 		})
-	}
+	})
 	ran := 0
 	processed, err := queue.ProcessOnce(ctx, func(context.Context, Tx, Job) error { ran++; return nil })
 	if processed || !errors.Is(err, ErrClaimLost) || ran != 0 {
@@ -489,6 +509,512 @@ func TestExpiredLeaseIsNotTakenOver(t *testing.T) {
 	}
 	if job, err := queue.Get(ctx, "expired"); err != nil || job.State != StateProcessing || job.Attempt != 2 {
 		t.Fatalf("job=%+v err=%v; want it left to the other worker's claim", job, err)
+	}
+}
+
+// rawJob reads a job's row straight from the database, outside any queue.
+func rawJob(t *testing.T, database store.Database, requestKey string) (state string, attempt, deferrals int) {
+	t.Helper()
+	if err := database.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return tx.QueryRowContext(context.Background(), `SELECT state, attempt, deferrals FROM worker_jobs WHERE request_key = ?`, requestKey).Scan(&state, &attempt, &deferrals)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return state, attempt, deferrals
+}
+
+// waitProcessing polls until at least want jobs are processing, or gives up
+// after limit. It reports whether they were.
+func waitProcessing(database store.Database, want int, limit time.Duration) bool {
+	deadline := time.Now().Add(limit)
+	for time.Now().Before(deadline) {
+		processing := 0
+		if err := database.WithTx(context.Background(), func(tx *sql.Tx) error {
+			return tx.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM worker_jobs WHERE state = ?`, StateProcessing).Scan(&processing)
+		}); err == nil && processing >= want {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return false
+}
+
+// TestSlowHandlerDoesNotStrandAJobStartedBesideIt: worker A's handler takes
+// longer than the busy timeout, and worker B, on another Queue over the same
+// store in this process, tries to start a job between A's start and A's
+// handler. B must not start an attempt it cannot finish: an attempt started
+// there waited out the busy timeout behind A's handler, failed to give the
+// attempt back for the same reason, and left the job leased with an attempt
+// charged (#245 review). B fails busy and its job is untouched, as when
+// a claim waited behind a handler before #245.
+func TestSlowHandlerDoesNotStrandAJobStartedBesideIt(t *testing.T) {
+	ctx := context.Background()
+	sqliteDB, err := (sqlite.Backend{BusyTimeout: 100 * time.Millisecond}).Open(ctx, filepath.Join(t.TempDir(), "beside.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqliteDB.Close()
+	aDB, bDB := &handlerTxDatabase{Database: sqliteDB}, &handlerTxDatabase{Database: sqliteDB}
+	a, err := New(ctx, aDB, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := New(ctx, bDB, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"slow", "beside"} {
+		if _, err := a.Enqueue(ctx, EnqueueRequest{RequestKey: key, Kind: "test", Payload: []byte(`{}`)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entered := make(chan struct{})
+	bDone := make(chan error, 1)
+	// B's handler transaction, if B gets that far, waits until A's slow
+	// handler holds the write lock.
+	bDB.arm(2, func(context.Context, store.Database) error {
+		select {
+		case <-entered:
+		case <-time.After(2 * time.Second):
+		}
+		return nil
+	})
+	// Between A's start and A's handler, B tries to start the other job.
+	aDB.arm(2, func(context.Context, store.Database) error {
+		go func() {
+			_, err := b.ProcessOnce(ctx, func(context.Context, Tx, Job) error { return nil })
+			bDone <- err
+		}()
+		waitProcessing(sqliteDB, 2, time.Second)
+		return nil
+	})
+	processed, err := a.ProcessOnce(ctx, func(_ context.Context, _ Tx, job Job) error {
+		close(entered)
+		time.Sleep(350 * time.Millisecond)
+		return nil
+	})
+	if err != nil || !processed {
+		t.Fatalf("A processed=%v err=%v", processed, err)
+	}
+	bErr := <-bDone
+	if !errors.Is(bErr, store.ErrBusy) {
+		t.Fatalf("B returned %v; want store.ErrBusy", bErr)
+	}
+	if state, attempt, _ := rawJob(t, sqliteDB, "slow"); state != StateCompleted || attempt != 1 {
+		t.Fatalf("A's job is %s at attempt %d; want completed at 1", state, attempt)
+	}
+	if state, attempt, deferrals := rawJob(t, sqliteDB, "beside"); state != StatePending || attempt != 0 || deferrals != 0 {
+		t.Fatalf("B's job is %s at attempt %d with %d deferrals; want it untouched (pending, 0, 0)", state, attempt, deferrals)
+	}
+}
+
+// TestConsumerLostBeforeTheHandlerStartsGivesTheAttemptBack: the consumer
+// is canceled after the claim that starts the attempt and before the
+// handler's transaction. The handler must not run on a context already
+// canceled; the attempt is given back without charging a deferral, and the
+// job is available again at once (#245 review).
+func TestConsumerLostBeforeTheHandlerStartsGivesTheAttemptBack(t *testing.T) {
+	ctx := context.Background()
+	sqliteDB, err := (sqlite.Backend{}).Open(ctx, filepath.Join(t.TempDir(), "canceled.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqliteDB.Close()
+	database := &handlerTxDatabase{Database: sqliteDB}
+	queue, err := New(ctx, database, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queue.Enqueue(ctx, EnqueueRequest{RequestKey: "canceled", Kind: "test", Payload: []byte(`{}`), MaxAttempts: 1}); err != nil {
+		t.Fatal(err)
+	}
+	consumer, cancel := context.WithCancel(ctx)
+	defer cancel()
+	database.arm(2, func(context.Context, store.Database) error { cancel(); return nil })
+	ran := 0
+	processed, err := queue.ProcessOnce(consumer, func(context.Context, Tx, Job) error { ran++; return nil })
+	if processed || !errors.Is(err, ErrConsumerLost) || ran != 0 {
+		t.Fatalf("processed=%v err=%v ran=%d; want ErrConsumerLost and no handler run", processed, err, ran)
+	}
+	if state, attempt, deferrals := rawJob(t, sqliteDB, "canceled"); state != StatePending || attempt != 0 || deferrals != 0 {
+		t.Fatalf("job is %s at attempt %d with %d deferrals; want pending, attempt given back, no deferral", state, attempt, deferrals)
+	}
+	database.arm(0, nil)
+	if processed, err := queue.ProcessOnce(ctx, func(context.Context, Tx, Job) error { ran++; return nil }); err != nil || !processed || ran != 1 {
+		t.Fatalf("redelivery processed=%v err=%v ran=%d; want the job's one attempt to run at once", processed, err, ran)
+	}
+}
+
+// TestCrashLoopingJobDoesNotChargeABystander: two workers in one process,
+// as an application running several workers does. Worker A runs a poison job
+// whose handler kills the process; worker B, on another Queue over the same
+// store, tries to start an innocent job while A is between its start and its
+// handler. The crash must not charge the innocent job: B must not have
+// started an attempt that the poison job's crash then abandons. After the
+// poison job dead-letters, the innocent job completes on its first attempt
+// (#245 review).
+func TestCrashLoopingJobDoesNotChargeABystander(t *testing.T) {
+	if os.Getenv("NEWBLOK_WORKER_BYSTANDER_CHILD") == "1" {
+		runBystanderChild()
+		return
+	}
+	const maxAttempts, restarts = 3, 8
+	directory := t.TempDir()
+	databasePath := filepath.Join(directory, "worker.db")
+	entriesPath := filepath.Join(directory, "handler-entries")
+	database, err := (sqlite.Backend{}).Open(context.Background(), databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	queue, err := New(context.Background(), database, nil)
+	if err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	for _, key := range []string{"poison", "innocent"} {
+		if _, err := queue.Enqueue(context.Background(), EnqueueRequest{RequestKey: key, Kind: "crash", Payload: []byte(`{}`), MaxAttempts: maxAttempts}); err != nil {
+			database.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	runs := func(key string) int {
+		data, err := os.ReadFile(entriesPath)
+		if errors.Is(err, os.ErrNotExist) {
+			return 0
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		for _, line := range strings.Split(string(data), "\n") {
+			if line == key {
+				n++
+			}
+		}
+		return n
+	}
+	inspect := func(key string) (string, int, string) {
+		t.Helper()
+		database, err := (sqlite.Backend{}).Open(context.Background(), databasePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer database.Close()
+		queue, err := New(context.Background(), database, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		job, err := queue.Get(context.Background(), key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return job.State, job.Attempt, job.Error
+	}
+	var evolution []string
+	for restart := 1; restart <= restarts; restart++ {
+		command := exec.Command(os.Args[0], "-test.run=^TestCrashLoopingJobDoesNotChargeABystander$")
+		command.Env = append(os.Environ(), "NEWBLOK_WORKER_BYSTANDER_CHILD=1", "NEWBLOK_WORKER_PATH="+databasePath, "NEWBLOK_WORKER_ENTRIES="+entriesPath, fmt.Sprintf("NEWBLOK_WORKER_CLOCK_OFFSET=%dh", restart))
+		output, runErr := command.CombinedOutput()
+		exit := "exit 0"
+		var exitErr *exec.ExitError
+		if errors.As(runErr, &exitErr) {
+			exit = exitErr.ProcessState.String()
+		} else if runErr != nil {
+			t.Fatalf("restart %d: %v", restart, runErr)
+		}
+		poisonState, poisonAttempt, poisonError := inspect("poison")
+		innocentState, innocentAttempt, innocentError := inspect("innocent")
+		evolution = append(evolution, fmt.Sprintf("restart %d: %s; poison %s/%d %q runs=%d; innocent %s/%d %q runs=%d", restart, exit, poisonState, poisonAttempt, poisonError, runs("poison"), innocentState, innocentAttempt, innocentError, runs("innocent")))
+		if exit != "exit 0" && runs("poison") != restart {
+			t.Fatalf("restart %d ended (%s) without the poison handler killing it: %s\n%s", restart, exit, output, strings.Join(evolution, "\n"))
+		}
+		if poisonState == StateDead && (innocentState == StateCompleted || innocentState == StateDead) {
+			break
+		}
+	}
+	t.Logf("evolution:\n%s", strings.Join(evolution, "\n"))
+	poisonState, poisonAttempt, _ := inspect("poison")
+	innocentState, innocentAttempt, _ := inspect("innocent")
+	if poisonState != StateDead || poisonAttempt != maxAttempts || runs("poison") != maxAttempts {
+		t.Fatalf("poison job %s at attempt %d after %d runs; want dead at %d after %d:\n%s", poisonState, poisonAttempt, runs("poison"), maxAttempts, maxAttempts, strings.Join(evolution, "\n"))
+	}
+	if innocentState != StateCompleted || innocentAttempt != 1 || runs("innocent") != 1 {
+		t.Fatalf("innocent job %s at attempt %d after %d runs; want completed on its first attempt, never charged for the poison job's crashes:\n%s", innocentState, innocentAttempt, runs("innocent"), strings.Join(evolution, "\n"))
+	}
+}
+
+// runBystanderChild runs worker A, which claims the oldest job, and, between
+// A's start and A's handler, worker B on another Queue over the same store.
+// The poison job's handler kills the process once B's handler transaction,
+// if B started one, is queued behind it.
+func runBystanderChild() {
+	offset, err := time.ParseDuration(os.Getenv("NEWBLOK_WORKER_CLOCK_OFFSET"))
+	if err != nil {
+		panic(err)
+	}
+	database, err := (sqlite.Backend{}).Open(context.Background(), os.Getenv("NEWBLOK_WORKER_PATH"))
+	if err != nil {
+		panic(err)
+	}
+	clock := func() time.Time { return time.Now().Add(offset) }
+	aDB, bDB := &handlerTxDatabase{Database: database}, &handlerTxDatabase{Database: database}
+	a, err := New(context.Background(), aDB, clock)
+	if err != nil {
+		panic(err)
+	}
+	b, err := New(context.Background(), bDB, clock)
+	if err != nil {
+		panic(err)
+	}
+	entered := make(chan struct{})
+	var enter sync.Once
+	var entries sync.Mutex
+	handler := func(ctx context.Context, _ Tx, job Job) error {
+		entries.Lock()
+		file, err := os.OpenFile(os.Getenv("NEWBLOK_WORKER_ENTRIES"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+		if err == nil {
+			_, err = file.WriteString(job.RequestKey + "\n")
+			if err == nil {
+				err = file.Sync()
+			}
+			_ = file.Close()
+		}
+		entries.Unlock()
+		if err != nil {
+			return err
+		}
+		if job.RequestKey != "poison" {
+			return nil
+		}
+		enter.Do(func() { close(entered) })
+		// Let a handler transaction B started queue behind this one.
+		time.Sleep(50 * time.Millisecond)
+		self, err := os.FindProcess(os.Getpid())
+		if err != nil {
+			return err
+		}
+		_ = self.Kill()
+		select {}
+	}
+	bDB.arm(2, func(context.Context, store.Database) error {
+		select {
+		case <-entered:
+		case <-time.After(2 * time.Second):
+		}
+		return nil
+	})
+	bDone := make(chan struct{})
+	started := false
+	aDB.arm(2, func(context.Context, store.Database) error {
+		started = true
+		go func() {
+			defer close(bDone)
+			_, _ = b.ProcessOnce(context.Background(), handler)
+		}()
+		waitProcessing(database, 2, time.Second)
+		return nil
+	})
+	if _, err := a.ProcessOnce(context.Background(), handler); err != nil {
+		panic(err)
+	}
+	if started {
+		<-bDone
+	}
+	_ = database.Close()
+	os.Exit(0)
+}
+
+// TestAttemptAccountingLeavesAnotherClaimAlone: the accounting that follows
+// a rolled-back handler transaction (charging a lost claim, deferring a lost
+// consumer, giving back an attempt whose handler never ran) is its own
+// transaction, matched on the lease its attempt started with. If that lease
+// expired and another worker has claimed the job since, the accounting must
+// leave that worker's claim alone (#245 review).
+func TestAttemptAccountingLeavesAnotherClaimAlone(t *testing.T) {
+	for name, account := range map[string]func(*Queue, context.Context, Job, int64) error{
+		"charge lost claim": (*Queue).chargeLostClaim,
+		"defer lost":        (*Queue).deferLost,
+		"release":           (*Queue).release,
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			database, err := (sqlite.Backend{}).Open(ctx, filepath.Join(t.TempDir(), "accounting.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			now := time.Unix(1_700_000_000, 0)
+			queue, err := New(ctx, database, func() time.Time { return now })
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := queue.Enqueue(ctx, EnqueueRequest{RequestKey: "accounted", Kind: "test", Payload: []byte(`{}`), MaxAttempts: 3}); err != nil {
+				t.Fatal(err)
+			}
+			var job Job
+			var lease int64
+			if err := database.WithTx(store.Writer(ctx), func(tx *sql.Tx) error {
+				var err error
+				job, lease, err = queue.claim(ctx, tx)
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			// The lease expired and another worker claimed the job: its own
+			// lease and the next attempt.
+			taken := lease + int64(time.Hour)
+			if err := database.WithTx(ctx, func(tx *sql.Tx) error {
+				_, err := tx.ExecContext(ctx, `UPDATE worker_jobs SET attempt = attempt + 1, lease_until = ? WHERE request_key = 'accounted'`, taken)
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			read := func() (string, int, int, int64, string) {
+				var state, message string
+				var attempt, deferrals int
+				var until sql.NullInt64
+				if err := database.WithTx(ctx, func(tx *sql.Tx) error {
+					return tx.QueryRowContext(ctx, `SELECT state, attempt, deferrals, lease_until, error_text FROM worker_jobs WHERE request_key = 'accounted'`).Scan(&state, &attempt, &deferrals, &until, &message)
+				}); err != nil {
+					t.Fatal(err)
+				}
+				return state, attempt, deferrals, until.Int64, message
+			}
+			if err := account(queue, ctx, job, lease); err != nil {
+				t.Fatal(err)
+			}
+			if state, attempt, deferrals, until, message := read(); state != StateProcessing || attempt != 2 || deferrals != 0 || until != taken || message != "" {
+				t.Fatalf("stale accounting changed the other worker's claim: %s attempt=%d deferrals=%d lease=%d error=%q", state, attempt, deferrals, until, message)
+			}
+			// The same accounting on the current lease does change the job, so
+			// the check above is not vacuous.
+			if err := database.WithTx(ctx, func(tx *sql.Tx) error {
+				var err error
+				job, err = scanJob(tx.QueryRowContext(ctx, `SELECT job_id, request_key, kind, payload_json, attempt, max_attempts, deferrals, principal_json, state, error_text FROM worker_jobs WHERE request_key = 'accounted'`))
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := account(queue, ctx, job, taken); err != nil {
+				t.Fatal(err)
+			}
+			if state, _, _, _, _ := read(); state == StateProcessing {
+				t.Fatal("accounting on the current lease left the job processing")
+			}
+		})
+	}
+}
+
+// TestAttemptTransactionsWriteFirst: another handle on the same file holds
+// the write lock as the claim that starts an attempt begins, and again as
+// the handler's transaction begins. Each must write first: a SQLite
+// transaction that reads before its first write cannot wait for the lock
+// and fails busy at once (#176, ADR 0003). Writing first, each waits the
+// other writer out and the job completes (#245 review).
+func TestAttemptTransactionsWriteFirst(t *testing.T) {
+	for _, phase := range []struct {
+		name string
+		at   int
+	}{{"start", 1}, {"handle", 2}} {
+		t.Run(phase.name, func(t *testing.T) {
+			ctx := context.Background()
+			path := filepath.Join(t.TempDir(), "write-first.db")
+			sqliteDB, err := (sqlite.Backend{}).Open(ctx, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sqliteDB.Close()
+			other, err := (sqlite.Backend{}).Open(ctx, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer other.Close()
+			database := &handlerTxDatabase{Database: sqliteDB}
+			queue, err := New(ctx, database, time.Now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := queue.Enqueue(ctx, EnqueueRequest{RequestKey: "write-first", Kind: "test", Payload: []byte(`{}`)}); err != nil {
+				t.Fatal(err)
+			}
+			held := make(chan error, 1)
+			database.arm(phase.at, func(context.Context, store.Database) error {
+				holding := make(chan struct{})
+				go func() {
+					held <- other.WithTx(context.Background(), func(tx *sql.Tx) error {
+						if _, err := tx.ExecContext(context.Background(), `UPDATE worker_jobs SET updated_at = updated_at`); err != nil {
+							return err
+						}
+						close(holding)
+						time.Sleep(200 * time.Millisecond)
+						return nil
+					})
+				}()
+				<-holding
+				return nil
+			})
+			ran := 0
+			processed, err := queue.ProcessOnce(ctx, func(context.Context, Tx, Job) error { ran++; return nil })
+			if err := <-held; err != nil {
+				t.Fatal(err)
+			}
+			if err != nil || !processed || ran != 1 {
+				t.Fatalf("processed=%v err=%v ran=%d; want the %s transaction to wait for the other writer and the job to complete", processed, err, ran, phase.name)
+			}
+			if state, attempt, _ := rawJob(t, sqliteDB, "write-first"); state != StateCompleted || attempt != 1 {
+				t.Fatalf("job %s at attempt %d; want completed at 1", state, attempt)
+			}
+		})
+	}
+}
+
+// TestLeaseIsConfigurableAndLongerThanTwoBusyTimeouts: WithLease sets the
+// lease a started attempt takes, and New refuses a lease no longer than twice
+// the store's busy timeout, including the default lease on a store whose busy
+// timeout is long (#245 review).
+func TestLeaseIsConfigurableAndLongerThanTwoBusyTimeouts(t *testing.T) {
+	ctx := context.Background()
+	open := func(busy time.Duration) store.Database {
+		database, err := (sqlite.Backend{BusyTimeout: busy}).Open(ctx, filepath.Join(t.TempDir(), "lease.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = database.Close() })
+		return database
+	}
+	if _, err := New(ctx, open(time.Second), nil, WithLease(2*time.Second)); err == nil {
+		t.Fatal("New accepted a lease of exactly twice the busy timeout")
+	}
+	if _, err := New(ctx, open(20*time.Second), nil); err == nil {
+		t.Fatal("New accepted the default 30 s lease on a store whose busy timeout is 20 s")
+	}
+	if _, err := New(ctx, open(5*time.Second), nil); err != nil {
+		t.Fatalf("New refused the default lease on the default busy timeout: %v", err)
+	}
+	sqliteDB := open(time.Second)
+	database := &handlerTxDatabase{Database: sqliteDB}
+	now := time.Unix(1_700_000_000, 0)
+	queue, err := New(ctx, database, func() time.Time { return now }, WithLease(3*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queue.Enqueue(ctx, EnqueueRequest{RequestKey: "leased", Kind: "test", Payload: []byte(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	var until int64
+	database.arm(2, func(ctx context.Context, underlying store.Database) error {
+		return underlying.WithTx(ctx, func(tx *sql.Tx) error {
+			return tx.QueryRowContext(ctx, `SELECT lease_until FROM worker_jobs WHERE request_key = 'leased'`).Scan(&until)
+		})
+	})
+	if processed, err := queue.ProcessOnce(ctx, func(context.Context, Tx, Job) error { return nil }); err != nil || !processed {
+		t.Fatalf("processed=%v err=%v", processed, err)
+	}
+	if want := now.Add(3 * time.Second).UnixNano(); until != want {
+		t.Fatalf("the started attempt's lease ends at %d; want now + 3 s = %d", until, want)
 	}
 }
 
@@ -930,12 +1456,13 @@ func TestClaimPredicateAndOrder(t *testing.T) {
 	}
 }
 
-// TestCanceledClaimWaitReportsConsumerLost: a worker waiting for the write
-// lock held by another worker's handler, whose consumer is canceled
-// meanwhile, reports ErrConsumerLost (not SQLITE_BUSY) within the busy
-// timeout, and leaves the job untouched. Its transaction is not canceled
-// with the consumer, so the wait for its write turn runs out the busy
-// timeout before it can report.
+// TestCanceledClaimWaitReportsConsumerLost: a worker waiting behind another
+// worker's handler, whose consumer is canceled meanwhile, reports
+// ErrConsumerLost (not SQLITE_BUSY) within the busy timeout, and leaves the
+// job untouched. Since #245 it waits for the write domain's claim turn,
+// which the other worker holds until its attempt's outcome commits; like
+// the write turn before it, that wait is not canceled with the consumer, so
+// it runs out the busy timeout before it can report.
 func TestCanceledClaimWaitReportsConsumerLost(t *testing.T) {
 	ctx := context.Background()
 	database, err := (sqlite.Backend{}).Open(ctx, filepath.Join(t.TempDir(), "cancel.db"))

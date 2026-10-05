@@ -16,9 +16,8 @@ import (
 	"github.com/well-prado/new-blok/trigger"
 )
 
-// defaultBusyTimeout mirrors the SQLite backend's busy timeout. A nested
-// submission the queue cannot diagnose up front waits this long once.
-const defaultBusyTimeout = 5 * time.Second
+// A nested submission the queue cannot diagnose up front waits the SQLite
+// backend's busy timeout (defaultBusyTimeout) once.
 
 // hangBound fails a nested submission that never returns (#207) instead of
 // letting it run into the package's test timeout.

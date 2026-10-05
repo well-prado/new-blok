@@ -134,8 +134,9 @@ against a job with `MaxAttempts` 3, and the job stayed `pending` at attempt
 `ProcessOnce` now uses two write transactions, both write-first (#176) and
 marked `store.Writer` (#214):
 
-1. **Start.** The claim leases the job for `worker.LeaseDuration` (30 s),
-   counts the attempt, and commits. Nothing else is written.
+1. **Start.** The claim leases the job for the queue's lease
+   (`worker.DefaultLease`, 30 s, or `worker.WithLease`), counts the attempt,
+   and commits. Nothing else is written.
 2. **Handle.** A second transaction takes the lease over (its first
    statement rewrites the lease to a value only this transaction holds,
    and fails if another worker has claimed the job since), runs the
@@ -153,21 +154,68 @@ job with error `claim_abandoned` (`worker.ClaimAbandoned`) at attempt
 `dead`, after exactly `MaxAttempts` handler runs, with no handler write
 committed; a worker restarted before the lease expires claims nothing.
 
+**One started attempt per write domain in a process.** A started attempt is
+charged if the process dies before its outcome commits, so an attempt must
+not be started that the process cannot run at once. A first version let
+several workers in one process start attempts while one handler held the
+write lock. The review reproduced the cost: a poison job's crashes
+dead-lettered an innocent job started beside it, as `claim_abandoned`
+at attempt 3, without its handler ever running. A worker whose handle
+transaction then waited out the busy timeout behind a slow handler also
+failed to give its attempt back for the same reason, and left its job leased
+for 30 s with an attempt charged.
+
+`ProcessOnce` therefore takes its write domain's claim turn before it starts
+an attempt, and holds it until the attempt's outcome, including any
+accounting transaction, has committed or rolled back. Every `Queue` the
+process opens on the same write domain shares the turn
+(`store.SameWriteDomain`). The cost is near zero: the turn holder's handler
+holds the write lock, so another worker could not have run its own handler
+meanwhile anyway. The wait for the turn is bounded by the store's busy timeout
+(`store.BusyTimeoutProvider`, 5 s when the store does not report one). It
+is not interrupted by the consumer's context, like the store's own write
+turn (#214). It fails as the store would, with `store.ErrBusy` naming the
+write domain, so the worker starts nothing and its job is untouched, as when
+a claim waited behind a handler before #245. A handler that calls
+`ProcessOnce` on the store its own claim holds therefore fails after one busy
+wait instead of deadlocking (#207). Workers in other processes on the same
+database file do not share the turn (see Limits).
+
 How each ending treats the started attempt:
 
 | Ending | Attempt | Job |
 | --- | --- | --- |
 | Handler succeeds, fails, or is saturated | as before (saturation and nested submission unchanged, #188/#207/#225) | committed with the handler's outcome |
 | Consumer lost while the handler runs (graceful cancel) | given back | deferred, one deferral charged, as before |
-| Handle transaction fails before the handler runs (for example busy) | given back | released at once, like a busy claim before #245 |
+| Consumer lost after the start and before the handler runs | given back | released at once, no deferral charged; the handler does not run |
+| Handle transaction fails before the handler runs (for example busy, from a writer outside the process) | given back by a separate transaction; if that also fails, it stays counted | released at once; if the give-back failed, redelivered when the lease expires |
 | Lease taken by another worker before the handler starts | stays counted | left to that worker; `ProcessOnce` returns `worker.ErrClaimLost` |
 | Claim lost under the handler (#180), or the handle transaction fails to commit | stays counted | retried after a backoff, or dead (`claim transaction ended`) |
 | Process dies | stays counted | redelivered when the lease expires, or dead (`claim_abandoned`) once attempts are spent |
 
 The accounting after a rolled-back handle transaction (give back, defer,
-charge) is its own transaction, matched on the start's lease. If the process
-dies before it commits, the job keeps the counted attempt and is redelivered
-when the lease expires; it is never acknowledged.
+charge) is its own write-first transaction, matched on the start's lease, so
+it leaves alone a job another worker has claimed since that lease expired.
+If the process dies before it commits, the job keeps the counted attempt and
+is redelivered when the lease expires; it is never acknowledged.
+
+**The lease.** `worker.New` takes options; `worker.WithLease` sets the lease,
+and `worker.DefaultLease` is 30 s. `New` refuses a lease that is not longer
+than twice the store's busy timeout, including the default on a store
+configured with a busy timeout of 15 s or more. Between the start and the
+handler, a worker may wait for its turn in the store's writer queue and then
+for the write lock (a writer on another handle or in another process), each up
+to the busy timeout. A lease that ran out meanwhile would be claimed by another
+worker, and the attempt lost (one of the "Lease taken" endings above). The
+lease is not renewed while the handler runs, and need not be: the handler
+holds the write lock, so no other worker can claim its job until its
+outcome commits, however long it runs. What the lease bounds is how long a
+job waits after its worker dies. 30 s is six times the default 5 s busy
+timeout, three times the worst legitimate gap of two busy timeouts. It is
+also the lease the claim already wrote before #245, and the default
+visibility timeout of comparable queues. A shorter lease recovers faster
+after a crash but leaves less margin over a long busy timeout; it must still
+be more than twice the busy timeout.
 
 `worker.Queue` implements the port. It persists the principal established by the
 trusted producer (`EnqueueRequest.Principal`, `Job.Principal`) and makes it part
@@ -274,7 +322,11 @@ is never parsed before verification.
 | Worker handler returns saturation naming its own claim's domain, alone or joined with other failures in any order | behavioral | The job fails as `worker.ErrNestedSubmission` after one busy wait instead of being deferred to `deferral_budget_exhausted` |
 | SQLite `:memory:` uses the memdb VFS instead of shared cache | behavioral | Same shared database per process; writer conflicts are `store.ErrBusy` within the busy timeout instead of an unbounded wait |
 | `principal_json` column | schema | added by `worker.New` |
-| A started attempt is committed before its handler runs (#245): `worker.LeaseDuration`, `worker.ClaimAbandoned` | behavioral, additive | No schema change or migration: the start reuses `state`, `attempt` and `lease_until`. A job whose worker died mid-handler is redelivered when its 30 s lease expires instead of at once, counts that attempt, and dead-letters as `claim_abandoned` once its attempts are spent. A handle transaction that rolls back after the handler ran now counts its attempt. Workers from before #245 on the same store still claim only pending jobs and expired leases, so they skip a live lease, but their own crashed attempts stay uncounted |
+| A started attempt is committed before its handler runs (#245): `worker.DefaultLease`, `worker.WithLease`, `worker.ClaimAbandoned` | behavioral, additive | No schema change or migration: the start reuses `state`, `attempt` and `lease_until`. A job whose worker died mid-handler is redelivered when its lease expires instead of at once, counts that attempt, and dead-letters as `claim_abandoned` once its attempts are spent. A handle transaction that rolls back after the handler ran now counts its attempt |
+| `worker.New(ctx, database, clock, opts ...Option)` | additive (source-compatible) | Existing three-argument calls compile unchanged. `New` now fails on a store whose busy timeout is 15 s or more unless `WithLease` sets a lease longer than twice it |
+| One started attempt per write domain per process (claim turn) | behavioral | A worker that cannot take the turn within the busy timeout fails with `store.ErrBusy` naming the write domain and starts nothing, where it used to wait for the write lock with the same timeout and outcome |
+| `store.BusyTimeoutProvider` / `store.BusyTimeoutOf`; SQLite reports its busy timeout | additive | Stores and wrappers may expose it; without it the worker assumes 5 s |
+| Workers from before #245 on the same store (mixed versions) | compatibility limit | No migration is needed and both claim only pending jobs and expired leases, so an old worker skips a new worker's live lease. An old worker's own crashed attempts stay uncounted. An old worker that claims a job whose attempts new workers' crashes have spent does not dead-letter it at the claim, as new workers do: it runs the handler once more, at attempt `MaxAttempts`+1, and dead-letters it only if that attempt fails. Run one version per store |
 | Jobs tied on `created_at` are claimed in enqueue order; `enqueue_seq` column and index | behavioral, schema | added by `worker.New`; existing jobs keep 0 and stay in `job_id` order among themselves |
 | New package `trigger/webhook` | additive | none |
 
@@ -302,23 +354,32 @@ is never parsed before verification.
   provider integration yet (E10).
 - The deduplication record lives as long as the job row; retention is the
   queue's (E07).
-- Each job now commits two write transactions instead of one. Draining 200
-  instant jobs with 4 workers (`TestMeasureClaimContention`, 5 samples, two
-  interleaved runs per arm, macOS arm64 on a host shared with other load)
-  took 22–28 ms on `origin/main` and 29–32 ms with #245, with 0 busy errors
-  on both. macOS `fsync` does not flush the drive cache; on a host where it
-  does, the second commit costs one more durable flush per job.
-- Recovery after a crash waits for the lease: up to 30 s, where it was
-  immediate. The parity mid-execution kill sample
+- Each job now commits two write transactions instead of one. The #245
+  review measured worker throughput on trivial jobs about 20 % lower:
+  5.5–7.1 k jobs/s on `origin/main` against 4.9–5.7 k jobs/s with #245,
+  on macOS with WAL and `synchronous=FULL`. The author's own interleaved
+  runs of `TestMeasureClaimContention` (4 workers, 200 instant jobs, 5
+  samples per round) on the same shared macOS arm64 host were 22–28 ms
+  against 29–32 ms before the claim turn was added. With it, at a load
+  average of about 13, they spread 51–192 ms against 55–458 ms, too noisy to
+  resolve the difference. All runs had 0 busy errors. macOS `fsync` does not
+  flush the drive cache. On Linux, where `synchronous=FULL` flushes it, the
+  second commit is one more durable flush per job, so the cost there is
+  likely higher; it has not been measured.
+- Recovery after a crash waits for the lease: by default up to 30 s, where it
+  was immediate. The parity mid-execution kill sample
   (`testdata/parity/raw/mid-execution-kill.json`) went from 11 ms to
-  30.04 s kill-to-completion, recovering as attempt 2. The lease is not configurable and is not renewed; a handler
-  holds the write lock, so no other worker can claim its job while it
-  runs, however long the handler takes.
-- An attempt counts from its start, so a crash charges every job whose
-  attempt the dying process had started and not finished: not only the job
-  whose handler crashed it, but also jobs of other workers in that process
-  that had started and were waiting for the write lock behind it. Enough
-  such crashes can dead-letter a job whose own handler never failed.
-  One attempt is also lost when the lease expires before the handle
-  transaction gets the write lock, which needs a writer-queue wait longer
-  than 30 s; the default busy timeout is 5 s.
+  30.04 s kill-to-completion, recovering as attempt 2.
+- The claim turn serializes started attempts only within one process.
+  Workers in other processes on the same database file can still start an
+  attempt while a handler here holds the write lock. A crash of either
+  process then charges the attempt the dead process had started, even if
+  its handler never ran. Enough such crashes can dead-letter a job whose own
+  handler never failed. Within a process, only the job whose handler was
+  running is charged.
+- One attempt is lost when the lease expires before the handle transaction
+  takes it over. `New`'s lease bound makes that possible only if the
+  writer-queue and lock waits between the two transactions together exceed
+  the lease, which each busy-timeout bound rules out, or the queue's clock
+  steps forward by more than the lease meanwhile. The claim turn entries live for the life of the process, one
+  per write domain opened.
