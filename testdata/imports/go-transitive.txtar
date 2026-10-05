@@ -1,0 +1,40 @@
+Transitive evasion: node a imports only a shared helper, and the helper
+imports node b. Discovery sees no direct node import; the ownership graph
+follows the helper and fails a, naming the chain. Node b, which nobody
+evades through, stays verified.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"classic","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+-- internal/helpers/helpers.go --
+package helpers
+
+import "example.com/shop/internal/helpers/deep"
+
+var _ = deep.B
+-- internal/helpers/deep/deep.go --
+package deep
+
+import b "example.com/shop/runtimes/go/nodes/b"
+
+var B = b.Node
+-- runtimes/go/nodes/a/a.go --
+package a
+
+import (
+	"github.com/well-prado/new-blok/node"
+
+	"example.com/shop/internal/helpers"
+)
+
+var _ = helpers.X
+
+var Node = node.MustDefine("shop/a", "1.0.0", nil)
+-- runtimes/go/nodes/b/b.go --
+package b
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/b", "1.0.0", nil)
+-- @expect --
+{"nodes":[["runtimes/go/nodes/a","violation"],["runtimes/go/nodes/b","verified"]],"diagnostics":[["ownership_transitive_node_import","runtimes/go/nodes/a/a.go:6"]]}

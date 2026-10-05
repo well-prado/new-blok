@@ -1,0 +1,24 @@
+A Node.js node reaching a workflow path fails. A JSX file has no checked
+grammar and leaves its node unverified, and a runtime with no adapter
+(python) is never verified.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+-- workflows/checkout/steps.ts --
+export const steps = ["quote"];
+-- nodes/nodejs/a/node.json --
+{"name":"shop/a","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/a/index.ts --
+import { steps } from "../../../workflows/checkout/steps.js";
+export const a = steps;
+-- nodes/nodejs/b/node.json --
+{"name":"shop/b","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/b/view.tsx --
+export const View = () => <p>it's {"text"}</p>;
+-- nodes/python/p/node.json --
+{"name":"shop/p","version":"1.0.0","runtime":"python"}
+-- nodes/python/p/main.py --
+import json
+-- @expect --
+{"nodes":[["nodes/nodejs/a","violation"],["nodes/nodejs/b","unverified"],["nodes/python/p","unverified"]],"diagnostics":[["ownership_node_imports_workflow","nodes/nodejs/a/index.ts:1"],["ownership_runtime_unsupported","nodes/python/p"],["ownership_source_unsupported","nodes/nodejs/b/view.tsx"]]}

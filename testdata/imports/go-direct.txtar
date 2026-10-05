@@ -1,0 +1,25 @@
+A Go node imports another node's package directly. Layout discovery
+(ADR 0023) already refuses a direct module-path import, so the check
+reports discovery's diagnostic.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+-- nodes/go/a/a.go --
+package a
+
+import (
+	"github.com/well-prado/new-blok/node"
+
+	_ "example.com/shop/nodes/go/b"
+)
+
+var Node = node.MustDefine("shop/a", "1.0.0", nil)
+-- nodes/go/b/b.go --
+package b
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/b", "1.0.0", nil)
+-- @expect --
+{"layout":[["layout_node_imports_node","nodes/go/a/a.go"]]}

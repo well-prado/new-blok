@@ -1,0 +1,33 @@
+Links are never followed (ADR 0023). A shared directory link into node b
+is reported and, because its target is inside b, fails node a as a node
+import. An installed package that is a link into node b fails node c the
+same way. A dangling link leaves node d unverified.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+-- nodes/nodejs/a/node.json --
+{"name":"shop/a","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/a/index.ts --
+import { b } from "../../../shared/billing/index.js";
+export const a = b;
+-- nodes/nodejs/b/node.json --
+{"name":"shop/b","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/b/index.ts --
+export const b = 1;
+-- nodes/nodejs/c/node.json --
+{"name":"shop/c","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/c/index.ts --
+import { b } from "billing";
+export const c = b;
+-- nodes/nodejs/d/node.json --
+{"name":"shop/d","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/d/index.ts --
+import { gone } from "../../../shared/gone.js";
+export const d = gone;
+-- @links --
+shared/billing -> ../nodes/nodejs/b
+node_modules/billing -> ../nodes/nodejs/b
+shared/gone.ts -> nowhere.ts
+-- @expect --
+{"nodes":[["nodes/nodejs/a","violation"],["nodes/nodejs/b","verified"],["nodes/nodejs/c","violation"],["nodes/nodejs/d","unverified"]],"diagnostics":[["layout_symlink_alias","node_modules/billing"],["layout_symlink_alias","shared/billing"],["layout_symlink_dangling","shared/gone.ts"],["ownership_node_imports_node","nodes/nodejs/a/index.ts:1"],["ownership_node_imports_node","nodes/nodejs/c/index.ts:1"]]}
