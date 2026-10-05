@@ -77,8 +77,9 @@ nodes race. A standby worker retries partition acquisition at a bounded
 interval. A worker whose processing fails (for example because its
 registered artifact does not match an accepted run) releases its exact
 partition fence at once, so a healthy worker can take over without waiting
-for lease expiry, and backs off exponentially up to the owner TTL before it
-tries to acquire again. Such a run still blocks a partition for as long as
+for lease expiry, and backs off exponentially before it tries to acquire
+again: 250 ms doubling per consecutive failure, capped at the smaller of
+16 s and the owner TTL. Such a run still blocks a partition for as long as
 every worker that acquires it fails the same way; mismatched artifacts are an
 operator error the runtime reports but does not repair.
 
