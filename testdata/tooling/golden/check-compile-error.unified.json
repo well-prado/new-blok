@@ -1,0 +1,47 @@
+{
+  "version": "blok-cli/v1",
+  "command": "check",
+  "status": "failed",
+  "exitCode": 1,
+  "project": {
+    "name": "shop",
+    "module": "example.com/shop",
+    "runtime": "go",
+    "layout": "unified",
+    "triggers": [
+      "http"
+    ]
+  },
+  "checks": [
+    {
+      "name": "project",
+      "state": "passed"
+    },
+    {
+      "name": "node-imports",
+      "state": "passed"
+    },
+    {
+      "name": "bindings",
+      "state": "passed"
+    },
+    {
+      "name": "workflow-steps",
+      "state": "passed"
+    },
+    {
+      "name": "go-vet",
+      "state": "failed"
+    }
+  ],
+  "diagnostics": [
+    {
+      "code": "go_compile_error",
+      "source": "workflows/quotes/quotes.go:18:37",
+      "expected": "Go code that type-checks",
+      "actual": "quote.OutputFields(result).TotalCentz undefined (type quote.OutputRef has no field or method TotalCentz)",
+      "remediation": "fix the Go compile error at this position",
+      "message": "the Go code does not compile"
+    }
+  ]
+}

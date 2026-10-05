@@ -35,6 +35,14 @@
       "evidence": ["unknown-instruction-diagnostic", "malformed-binding-diagnostic"]
     },
     {
+      "id": "cli-check-test-inspect-report",
+      "question": "What do blok check, blok test and blok inspect report, how do they exit, and what may they run?",
+      "owner": "E11-T02",
+      "status": "implemented",
+      "decision": "One versioned blok-cli/v1 report per run, produced by internal/tooling/devtool and only encoded by the CLI, carrying unchanged #28 diagnostics with project-relative file:line:col sources and no timings; exit 0 clean, 1 findings, 2 usage, 3 tool unavailable, 4 output not written, 130 interrupted with the partial report flushed and the go process group stopped; check and inspect never execute application code (go vet compiles, runs nothing), test runs the application's real tests through go test; inspect is a static, field-allowlisted projection (schemas opt-in) through observe/redact, and project discovery is a ProjectSource seam that E12-T01 (#67) fills (ADR 0023).",
+      "evidence": ["cli-fixture-cases-both-layouts", "cli-golden-json-stable-twice", "cli-golden-human-streams", "cli-json-equals-api", "cli-check-test-agree", "cli-repair-one-diagnostic", "cli-interrupt-sigint-ctrl-c-sigterm", "cli-writer-failure", "cli-missing-toolchain", "cli-field-policy-redaction", "cli-discovery-confined"]
+    },
+    {
       "id": "go-authoring-api",
       "question": "Which typed Go authoring forms and ownership rules are supported?",
       "owner": "E03-T01",

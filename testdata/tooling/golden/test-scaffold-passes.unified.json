@@ -1,0 +1,66 @@
+{
+  "version": "blok-cli/v1",
+  "command": "test",
+  "status": "passed",
+  "exitCode": 0,
+  "project": {
+    "name": "shop",
+    "module": "example.com/shop",
+    "runtime": "go",
+    "layout": "unified",
+    "triggers": [
+      "http"
+    ]
+  },
+  "tests": {
+    "packages": [
+      {
+        "importPath": "example.com/shop/cmd/shop",
+        "dir": "cmd/shop",
+        "status": "no-tests"
+      },
+      {
+        "importPath": "example.com/shop/internal/app",
+        "dir": "internal/app",
+        "status": "pass",
+        "tests": [
+          {
+            "name": "TestQuoteOverHTTP",
+            "status": "pass"
+          },
+          {
+            "name": "TestQuoteOverHTTP/malformed_json",
+            "status": "pass"
+          },
+          {
+            "name": "TestQuoteOverHTTP/quantity_out_of_range",
+            "status": "pass"
+          },
+          {
+            "name": "TestQuoteOverHTTP/quote",
+            "status": "pass"
+          },
+          {
+            "name": "TestQuoteOverHTTP/unknown_sku",
+            "status": "pass"
+          }
+        ]
+      },
+      {
+        "importPath": "example.com/shop/nodes/go/quote",
+        "dir": "nodes/go/quote",
+        "status": "no-tests"
+      },
+      {
+        "importPath": "example.com/shop/workflows/quotes",
+        "dir": "workflows/quotes",
+        "status": "no-tests"
+      }
+    ],
+    "passed": 5,
+    "failed": 0,
+    "skipped": 0,
+    "incomplete": 0
+  },
+  "diagnostics": []
+}

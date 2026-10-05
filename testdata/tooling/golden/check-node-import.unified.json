@@ -1,0 +1,48 @@
+{
+  "version": "blok-cli/v1",
+  "command": "check",
+  "status": "failed",
+  "exitCode": 1,
+  "project": {
+    "name": "shop",
+    "module": "example.com/shop",
+    "runtime": "go",
+    "layout": "unified",
+    "triggers": [
+      "http"
+    ]
+  },
+  "checks": [
+    {
+      "name": "project",
+      "state": "passed"
+    },
+    {
+      "name": "node-imports",
+      "state": "failed"
+    },
+    {
+      "name": "bindings",
+      "state": "passed"
+    },
+    {
+      "name": "workflow-steps",
+      "state": "passed"
+    },
+    {
+      "name": "go-vet",
+      "state": "passed"
+    }
+  ],
+  "diagnostics": [
+    {
+      "code": "node_import_forbidden",
+      "source": "nodes/go/tax/tax.go:3:8",
+      "field": "import",
+      "expected": "no import of another node's package",
+      "actual": "example.com/shop/nodes/go/quote",
+      "remediation": "move the shared code into a package outside nodes/ that both nodes may import, or compose the two nodes in a workflow",
+      "message": "a node cannot import another node; workflows own composition"
+    }
+  ]
+}

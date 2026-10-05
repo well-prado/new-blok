@@ -1,0 +1,179 @@
+{
+  "schemaVersion": 1,
+  "roadmap": "E11-T02",
+  "description": "blok check, test and inspect run against real scaffolded applications (module example.com/shop) after these edits. Placeholders: {module} is the module path, {node} the quote node's directory in the layout, {nodes} the directory holding the layout's Go nodes. outputRecords counts passed checks (check), passed tests (test) or catalog entries (inspect); errorRecords counts diagnostics; effectRecords counts project files the command created, changed or removed.",
+  "cases": [
+    {
+      "id": "check-scaffold-passes",
+      "command": "check",
+      "layouts": ["classic", "unified"],
+      "golden": true,
+      "expected": {"exitCode": 0, "status": "passed", "outputRecords": 5, "errorRecords": 0, "effectRecords": 0, "diagnostics": []}
+    },
+    {
+      "id": "check-compile-error",
+      "command": "check",
+      "layouts": ["classic", "unified"],
+      "golden": true,
+      "edits": [{"file": "workflows/quotes/quotes.go", "replace": ["TotalCents()", "TotalCentz()"]}],
+      "expected": {"exitCode": 1, "status": "failed", "outputRecords": 4, "errorRecords": 1, "effectRecords": 0, "diagnostics": [{"code": "go_compile_error", "source": "workflows/quotes/quotes.go:18:37"}]}
+    },
+    {
+      "id": "check-stale-bindings",
+      "command": "check",
+      "layouts": ["classic", "unified"],
+      "edits": [{"file": "{node}/types.go", "append": "\n// Extra is a type the committed bindings do not know yet.\ntype Extra struct {\n\tNote string `json:\"note\"`\n}\n"}],
+      "expected": {"exitCode": 1, "status": "failed", "outputRecords": 4, "errorRecords": 1, "effectRecords": 0, "diagnostics": [{"code": "bindings_stale", "source": "{node}/bindings_gen.go"}]}
+    },
+    {
+      "id": "check-node-import",
+      "command": "check",
+      "layouts": ["classic", "unified"],
+      "golden": true,
+      "edits": [{"file": "{nodes}/tax/tax.go", "write": "package tax\n\nimport \"{module}/{node}\"\n\n// Rate reads the quote node's input type, which another node may not import.\nfunc Rate(input quote.Input) int { return input.Quantity }\n"}],
+      "expected": {"exitCode": 1, "status": "failed", "outputRecords": 4, "errorRecords": 1, "effectRecords": 0, "diagnostics": [{"code": "node_import_forbidden", "source": "{nodes}/tax/tax.go:3:8"}]}
+    },
+    {
+      "id": "check-step-duplicate",
+      "command": "check",
+      "layouts": ["classic"],
+      "edits": [{"file": "workflows/quotes/quotes.go", "replace": ["\t\treturn quote.OutputFields(result).TotalCents()", "\t\t_ = flow.Call(builder, \"calculate\", calculate, input)\n\t\treturn quote.OutputFields(result).TotalCents()"]}],
+      "expected": {"exitCode": 1, "status": "failed", "outputRecords": 4, "errorRecords": 1, "effectRecords": 0, "diagnostics": [{"code": "workflow_step_id_duplicate", "source": "workflows/quotes/quotes.go:18:7", "step": "calculate"}]}
+    },
+    {
+      "id": "check-step-invalid-id",
+      "command": "check",
+      "layouts": ["classic"],
+      "edits": [{"file": "workflows/quotes/quotes.go", "replace": ["\"calculate\"", "\"Calculate\""]}],
+      "expected": {"exitCode": 1, "status": "failed", "outputRecords": 4, "errorRecords": 1, "effectRecords": 0, "diagnostics": [{"code": "workflow_step_id_invalid", "source": "workflows/quotes/quotes.go:17:13", "step": "Calculate"}]}
+    },
+    {
+      "id": "check-step-reserved",
+      "command": "check",
+      "layouts": ["unified"],
+      "edits": [{"file": "workflows/quotes/quotes.go", "replace": ["\"calculate\"", "\"output\""]}],
+      "expected": {"exitCode": 1, "status": "failed", "outputRecords": 4, "errorRecords": 1, "effectRecords": 0, "diagnostics": [{"code": "workflow_step_id_reserved", "source": "workflows/quotes/quotes.go:17:13", "step": "output"}]}
+    },
+    {
+      "id": "check-vet-finding",
+      "command": "check",
+      "layouts": ["classic"],
+      "edits": [
+        {"file": "internal/app/app.go", "replace": ["\t\"encoding/json\"\n", "\t\"encoding/json\"\n\t\"fmt\"\n"]},
+        {"file": "internal/app/app.go", "append": "\n// Label formats a quote label. Its verb does not match its argument.\nfunc Label(sku string) string { return fmt.Sprintf(\"%d\", sku) }\n"}
+      ],
+      "expected": {"exitCode": 1, "status": "failed", "outputRecords": 4, "errorRecords": 1, "effectRecords": 0, "diagnostics": [{"code": "go_vet_finding", "sourcePrefix": "internal/app/app.go:67:", "field": "printf"}]}
+    },
+    {
+      "id": "check-module-mismatch",
+      "command": "check",
+      "layouts": ["classic"],
+      "edits": [{"file": "blok.json", "replace": ["\"module\": \"example.com/shop\"", "\"module\": \"example.com/other\""]}],
+      "expected": {"exitCode": 1, "status": "failed", "outputRecords": 4, "errorRecords": 1, "effectRecords": 0, "diagnostics": [{"code": "project_module_mismatch", "source": "blok.json", "field": "module"}]}
+    },
+    {
+      "id": "check-layout-unsupported",
+      "command": "check",
+      "layouts": ["classic"],
+      "edits": [{"file": "blok.json", "replace": ["\"layout\": \"classic\"", "\"layout\": \"flat\""]}],
+      "expected": {"exitCode": 1, "status": "failed", "outputRecords": 4, "errorRecords": 1, "effectRecords": 0, "diagnostics": [{"code": "project_layout_unsupported", "source": "blok.json", "field": "layout"}]}
+    },
+    {
+      "id": "check-manifest-missing",
+      "command": "check",
+      "layouts": ["classic"],
+      "edits": [{"file": "blok.json", "delete": true}],
+      "expected": {"exitCode": 1, "status": "failed", "outputRecords": 3, "errorRecords": 1, "effectRecords": 0, "diagnostics": [{"code": "project_manifest_missing", "source": "blok.json"}]}
+    },
+    {
+      "id": "check-go-mod-missing",
+      "command": "check",
+      "layouts": ["classic"],
+      "edits": [{"file": "go.mod", "delete": true}],
+      "expected": {"exitCode": 1, "status": "failed", "outputRecords": 0, "errorRecords": 1, "effectRecords": 0, "diagnostics": [{"code": "project_go_mod_missing", "source": "go.mod"}]}
+    },
+    {
+      "id": "test-scaffold-passes",
+      "command": "test",
+      "layouts": ["classic", "unified"],
+      "golden": true,
+      "expected": {"exitCode": 0, "status": "passed", "outputRecords": 5, "errorRecords": 0, "effectRecords": 0, "diagnostics": []}
+    },
+    {
+      "id": "test-failing-assertion",
+      "command": "test",
+      "layouts": ["classic"],
+      "golden": true,
+      "edits": [{"file": "internal/app/app_test.go", "replace": ["\"totalCents\":3000", "\"totalCents\":3001"]}],
+      "expected": {"exitCode": 1, "status": "failed", "outputRecords": 3, "errorRecords": 1, "effectRecords": 0, "diagnostics": [{"code": "test_failed", "source": "internal/app/app_test.go:42"}]}
+    },
+    {
+      "id": "test-compile-error",
+      "command": "test",
+      "layouts": ["unified"],
+      "edits": [{"file": "workflows/quotes/quotes.go", "replace": ["TotalCents()", "TotalCentz()"]}],
+      "expected": {"exitCode": 1, "status": "failed", "outputRecords": 0, "errorRecords": 1, "effectRecords": 0, "diagnostics": [{"code": "go_compile_error", "source": "workflows/quotes/quotes.go:18:37"}]}
+    },
+    {
+      "id": "test-step-duplicate",
+      "command": "test",
+      "layouts": ["classic"],
+      "edits": [{"file": "workflows/quotes/quotes.go", "replace": ["\t\treturn quote.OutputFields(result).TotalCents()", "\t\t_ = flow.Call(builder, \"calculate\", calculate, input)\n\t\treturn quote.OutputFields(result).TotalCents()"]}],
+      "expected": {"exitCode": 1, "status": "failed", "outputRecords": 0, "errorRecords": 1, "effectRecords": 0, "diagnostics": [{"code": "test_failed", "source": "internal/app/app_test.go:16"}]}
+    },
+    {
+      "id": "test-no-tests",
+      "command": "test",
+      "layouts": ["classic"],
+      "edits": [{"file": "internal/app/app_test.go", "delete": true}],
+      "expected": {"exitCode": 1, "status": "failed", "outputRecords": 0, "errorRecords": 1, "effectRecords": 0, "diagnostics": [{"code": "no_tests_ran"}]}
+    },
+    {
+      "id": "test-package-panic",
+      "command": "test",
+      "layouts": ["classic"],
+      "edits": [{"file": "internal/app/main_test.go", "write": "package app\n\nimport \"testing\"\n\nfunc TestMain(m *testing.M) { panic(\"fixture: the test binary cannot start\") }\n"}],
+      "expected": {"exitCode": 1, "status": "failed", "outputRecords": 0, "errorRecords": 1, "effectRecords": 0, "diagnostics": [{"code": "test_package_failed", "source": "internal/app"}]}
+    },
+    {
+      "id": "test-skip",
+      "command": "test",
+      "layouts": ["unified"],
+      "edits": [{"file": "internal/app/skip_test.go", "write": "package app\n\nimport \"testing\"\n\nfunc TestLater(t *testing.T) { t.Skip(\"fixture: not yet\") }\n"}],
+      "expected": {"exitCode": 0, "status": "passed", "outputRecords": 5, "errorRecords": 0, "effectRecords": 0, "diagnostics": []}
+    },
+    {
+      "id": "inspect-scaffold",
+      "command": "inspect",
+      "layouts": ["classic", "unified"],
+      "golden": true,
+      "expected": {"exitCode": 0, "status": "passed", "outputRecords": 3, "errorRecords": 0, "effectRecords": 0, "diagnostics": []}
+    },
+    {
+      "id": "inspect-redaction-and-references",
+      "command": "inspect",
+      "fields": "nodes,descriptions,sources,tests,examples,schemas",
+      "layouts": ["classic"],
+      "golden": true,
+      "edits": [
+        {"file": "{node}/audit.go", "write": "package quote\n\nimport (\n\t\"context\"\n\n\t\"github.com/well-prado/new-blok/node\"\n)\n\nvar auditSchema = []byte(`{\"type\":\"object\",\"properties\":{\"password\":{\"type\":\"string\",\"default\":\"hunter2-fixture\"}}}`)\n\n// Audit's description and schema carry credential-shaped values.\nvar Audit = node.MustDefine(\"app/audit\", \"1.0.0\", func(_ context.Context, input Input) (Input, error) { return input, nil }, node.Description(\"calls the ledger with Authorization: Bearer fixture-token-0123456789abcdef\"), node.Schemas(auditSchema, auditSchema), node.Effects(\"ledger.write\"))\n"},
+        {"file": "{node}/audit_test.go", "write": "package quote\n\nimport (\n\t\"fmt\"\n\t\"testing\"\n)\n\nfunc TestAuditDescriptor(t *testing.T) {\n\tif Audit.Descriptor().Name != \"app/audit\" {\n\t\tt.Fatal(Audit.Descriptor().Name)\n\t}\n}\n\nfunc ExampleAudit() {\n\tfmt.Println(Audit.Descriptor().Name)\n\t// Output: app/audit\n}\n"}
+      ],
+      "expected": {"exitCode": 0, "status": "passed", "outputRecords": 2, "errorRecords": 0, "effectRecords": 0, "redacted": 3, "diagnostics": []}
+    },
+    {
+      "id": "inspect-dynamic-identity",
+      "command": "inspect",
+      "layouts": ["unified"],
+      "edits": [{"file": "{node}/dynamic.go", "write": "package quote\n\nimport (\n\t\"context\"\n\n\t\"github.com/well-prado/new-blok/node\"\n)\n\nvar dynamicName = \"app/\" + \"dynamic\"\n\n// Dynamic's identity is computed, so inspect cannot read it without running code.\nvar Dynamic = node.MustDefine(dynamicName, \"1.0.0\", func(_ context.Context, input Input) (Input, error) { return input, nil })\n"}],
+      "expected": {"exitCode": 0, "status": "passed", "outputRecords": 3, "errorRecords": 0, "effectRecords": 0, "unresolved": [{"kind": "node", "source": "{node}/dynamic.go:12:15"}], "diagnostics": []}
+    },
+    {
+      "id": "inspect-parse-error",
+      "command": "inspect",
+      "layouts": ["classic"],
+      "edits": [{"file": "internal/app/broken.go", "write": "package app\n\nfunc broken( {\n"}],
+      "expected": {"exitCode": 1, "status": "failed", "outputRecords": 3, "errorRecords": 1, "effectRecords": 0, "diagnostics": [{"code": "source_parse_error", "sourcePrefix": "internal/app/broken.go:3:"}]}
+    }
+  ]
+}

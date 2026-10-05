@@ -1,0 +1,7 @@
+project example.com/shop (classic layout)
+check project         passed
+check node-imports    passed
+check bindings        passed
+check workflow-steps  passed
+check go-vet          passed
+blok check: passed
