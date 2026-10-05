@@ -77,6 +77,28 @@
       "redacted": 1
     },
     {
+      "name": "json-in-string-escaped-key",
+      "kind": "value",
+      "input": {
+        "payload": "{\"pass\\u0077ord\":\"SYNTHETIC-0023\"}"
+      },
+      "expected": {
+        "payload": "[redacted]"
+      },
+      "redacted": 1
+    },
+    {
+      "name": "json-in-string-key-only-known-structurally",
+      "kind": "value",
+      "input": {
+        "payload": "{\"session_cookie\": \"SYNTHETIC-0024\"}"
+      },
+      "expected": {
+        "payload": "[redacted]"
+      },
+      "redacted": 1
+    },
+    {
       "name": "url-encoded",
       "kind": "value",
       "input": {

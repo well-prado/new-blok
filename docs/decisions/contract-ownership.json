@@ -177,6 +177,14 @@
       "status": "implemented",
       "decision": "The engine allocates W3C trace context for observed runs under an explicit app TracePolicy and hands it to nodes, worker calls (optional proto fields inside protocol 1.1) and child runs through the stdlib-only contract/observe port; the OpenTelemetry bridge is the separate observe/otel Go module, an inspection.Observer that declares itself payload-free, exports independently selected signals with a fixed label vocabulary, tenant allowlist and series bound, and drops and counts on queue saturation or exporter failure without ever blocking or failing a run (ADR 0020).",
       "evidence": ["telemetry-no-exporter-footprint", "telemetry-real-otlp-fixture-cases", "telemetry-actual-collector-outage", "telemetry-cardinality-bound", "telemetry-queue-saturation", "telemetry-node-child-lineage", "telemetry-gates-authoritative", "telemetry-mode-latency-rss"]
+    },
+    {
+      "id": "sensitive-data-and-reliable-audit",
+      "question": "How are secrets kept out of framework-owned channels, and how is mandatory audit kept reliable, access-controlled, retained and restored separately from optional telemetry?",
+      "owner": "E16-T02",
+      "status": "implemented",
+      "decision": "contract/audit records approval, reconciliation and deployment decisions (actor, outcome, digests, opaque scope names; no content or secret values) in the decision's own store transaction, so an audit failure refuses the decision and applies nothing; an optional mirror receives copies only after commit; reads are tenant-authorized and digest-verified; retention spares active runs, legal holds and the legal minimum; audit is backed up and restored with durable state. observe/redact is the single redaction boundary (keys, credential text, bounded JSON-in-string/percent/base64 decoding) for inspection, worker logs, telemetry attributes, catalog listings and audit records, covering framework-owned channels only (ADR 0021).",
+      "evidence": ["audit-decision-fixture-cases", "audit-unavailable-before-approval-reconcile-deployment", "audit-optional-mirror-drop", "audit-retention-active-hold-minimum", "audit-run-compaction-legal-hold", "audit-restore-with-durable-state", "audit-tenant-read-denial", "audit-record-secret-refusal", "redaction-encoded-content-fixtures", "inspection-secret-fixtures-real-engine", "inspection-two-principal-two-tenant-denial", "inspection-field-policy-authorized-reader", "telemetry-allowlisted-attributes-opaque", "worker-log-shared-redaction", "catalog-listing-opaque"]
     }
   ]
 }
