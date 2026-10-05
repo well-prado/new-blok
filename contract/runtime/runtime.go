@@ -196,7 +196,8 @@ type Call struct {
 	Capabilities   []Capability `json:"capabilities,omitempty"`
 	// OnLog receives best-effort logs asynchronously on a bounded per-connection
 	// dispatcher. It must return promptly; blocking it drops later logs but
-	// cannot block result-frame processing or change call outcomes.
+	// cannot block result-frame processing or change call outcomes. A log may
+	// be delivered after Call has returned that call's result (#226).
 	OnLog func(Log) `json:"-"`
 }
 

@@ -887,10 +887,10 @@ func fixtureErrorName(err error) string {
 	}
 }
 
-// TestLogArrivingAfterItsStepCompletedIsRecorded: a worker's log reaches
-// inspection asynchronously (contract/runtime Call.OnLog), so it can arrive
-// after its step, and its run, completed. It is still recorded with that
-// step, not dropped (#226).
+// TestLogArrivingAfterItsStepCompletedIsRecorded pins existing behaviour that
+// #226 relies on: a worker's log reaches inspection asynchronously
+// (contract/runtime Call.OnLog), so it can arrive after its step, and its
+// run, completed. It is still recorded with that step, not dropped.
 func TestLogArrivingAfterItsStepCompletedIsRecorded(t *testing.T) {
 	recorder := inspect.NewRecorder()
 	at := time.Date(2026, 10, 4, 0, 0, 0, 0, time.UTC)

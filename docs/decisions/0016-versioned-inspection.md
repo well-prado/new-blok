@@ -119,6 +119,15 @@ credentials/customer payloads and put sensitive values only in structured
 attributes. There is no concrete-trigger integration or universal API server
 in this decision.
 
+A worker log is delivered off the call's result path (`Call.OnLog`), so it
+may reach inspection after its step, and its run, have completed. That can
+happen even without queue pressure: the result can simply win the race. A
+log that arrives late is still attributed to its step and appears in later
+projections, so a reader that needs a step's logs reads after its completion
+rather than at it (#226). A consumer that stops at a run's terminal event,
+such as a live stream (#77), can miss such logs unless it keeps reading for
+a bound after that event.
+
 ## Evidence
 
 Executable scenarios run the real Go engine and real Node worker; compare an
