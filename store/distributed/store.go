@@ -25,6 +25,10 @@ var (
 	// ErrAdmissionConflict reports that the request's admission identity is
 	// already committed with a different payload. It is definite, not retryable.
 	ErrAdmissionConflict = errors.New("distributed store: request identity conflicts with committed admission")
+	// ErrAdmissionSlotTaken reports that a slot chosen from an earlier read
+	// was consumed by a concurrent admission. It says nothing about whether
+	// other slots remain free; callers re-read capacity before rejecting.
+	ErrAdmissionSlotTaken = errors.New("distributed store: chosen admission slot was taken concurrently")
 )
 
 const MaxPayloadBytes = 512 << 10
@@ -344,7 +348,8 @@ func (s *Store) FreeAdmissionSlots(ctx context.Context, partition, tenant string
 
 // CommitAdmission durably accepts a run and consumes one global and one
 // tenant slot atomically. It is idempotent by event ID; the caller reconciles
-// ErrAlreadyWritten by reading and comparing the event's full payload.
+// ErrAlreadyWritten by reading and comparing the event's full payload, and
+// treats ErrAdmissionSlotTaken as contention, not as exhausted capacity.
 func (s *Store) CommitAdmission(ctx context.Context, partition, tenant, globalSlot, tenantSlot, runID string, state, payload []byte) error {
 	if !validName(partition) || !validName(tenant) || !validName(globalSlot) || !validName(tenantSlot) || !validName(runID) || len(state) > MaxPayloadBytes || len(payload) > MaxPayloadBytes || !json.Valid(state) || !json.Valid(payload) {
 		return errors.New("distributed store: valid admission identity, JSON values and payload bounds are required")
@@ -388,7 +393,7 @@ func (s *Store) CommitAdmission(ctx context.Context, partition, tenant, globalSl
 		}
 		return ErrAdmissionConflict
 	}
-	return ErrAdmissionFull
+	return ErrAdmissionSlotTaken
 }
 
 // ReleaseAdmissionSlots frees the run's capacity in the same fenced

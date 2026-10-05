@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"math/rand/v2"
 	"sort"
 	"strconv"
 	"sync"
@@ -48,6 +49,10 @@ const MaxInputBytes = distributed.MaxPayloadBytes - 4096
 // acquireRetryInterval bounds how often a worker retries acquiring a partition
 // that another owner holds or that storage could not grant.
 const acquireRetryInterval = 250 * time.Millisecond
+
+// maxAdmissionAttempts bounds how often one admission re-reads capacity after
+// losing its chosen slot to a concurrent admission.
+const maxAdmissionAttempts = 32
 
 const (
 	maxPartitions          = 256
@@ -154,8 +159,7 @@ func (r *Runtime) Admit(ctx context.Context, request Submission) (Admission, err
 		return Admission{}, fmt.Errorf("%w: workflow is not registered", ErrInvalid)
 	}
 	partition := r.Partition(request.Tenant)
-	identity := sha256.Sum256([]byte(request.Tenant + "\x00" + request.RequestKey))
-	runID := "run-" + hex.EncodeToString(identity[:16])
+	runID := admissionRunID(request.Tenant, request.RequestKey)
 	decodedInput, err := workflow.DecodeInput(request.Input)
 	if err != nil {
 		return Admission{}, fmt.Errorf("%w: workflow input is invalid: %v", ErrInvalid, err)
@@ -173,7 +177,10 @@ func (r *Runtime) Admit(ctx context.Context, request Submission) (Admission, err
 		}
 		return Admission{RunID: runID, Accepted: false, State: record.State}, nil
 	}
-	for attempt := 0; attempt < 4; attempt++ {
+	// Each attempt starts from one linearizable read of both the partition's
+	// and the tenant's free slots. Only that read can establish exhaustion;
+	// losing a slot to a concurrent admission is contention and is retried.
+	for attempt := 0; attempt < maxAdmissionAttempts; attempt++ {
 		globalSlots, tenantSlots, err := r.store.FreeAdmissionSlots(ctx, partition, request.Tenant, r.limits.PartitionAdmissions, r.limits.TenantAdmissions)
 		if err != nil {
 			return Admission{}, fmt.Errorf("%w: %v", ErrUnavailable, err)
@@ -189,9 +196,17 @@ func (r *Runtime) Admit(ctx context.Context, request Submission) (Admission, err
 				}
 				return Admission{RunID: runID, Accepted: false, State: existing.State}, nil
 			}
-			return Admission{}, distributed.ErrAdmissionFull
+			scope := "partition"
+			if len(globalSlots) > 0 {
+				scope = "tenant"
+			}
+			return Admission{}, &CapacityError{Partition: partition, Tenant: request.Tenant, Scope: scope, PartitionLimit: r.limits.PartitionAdmissions, TenantLimit: r.limits.TenantAdmissions, FreePartitionSlots: len(globalSlots), FreeTenantSlots: len(tenantSlots)}
 		}
-		run := RunRecord{RunID: runID, Tenant: request.Tenant, RequestKey: request.RequestKey, Workflow: request.Workflow, ArtifactDigest: workflow.Program.Digest, InputDigest: inputDigest, Input: append(json.RawMessage(nil), canonicalInput...), State: "accepted", GlobalSlot: globalSlots[0], TenantSlot: tenantSlots[0]}
+		// Concurrent ingress nodes see the same free set; a random choice
+		// spreads them over it instead of all racing for the lowest slot.
+		globalSlot := globalSlots[rand.IntN(len(globalSlots))]
+		tenantSlot := tenantSlots[rand.IntN(len(tenantSlots))]
+		run := RunRecord{RunID: runID, Tenant: request.Tenant, RequestKey: request.RequestKey, Workflow: request.Workflow, ArtifactDigest: workflow.Program.Digest, InputDigest: inputDigest, Input: append(json.RawMessage(nil), canonicalInput...), State: "accepted", GlobalSlot: globalSlot, TenantSlot: tenantSlot}
 		encoded, _ := json.Marshal(run)
 		// Capacity slot choices are transaction-local allocation details. Keep
 		// them out of the stable admission event identity so concurrent ingress
@@ -222,8 +237,11 @@ func (r *Runtime) Admit(ctx context.Context, request Submission) (Admission, err
 			}
 			return Admission{RunID: runID, Accepted: false, State: existing.State}, nil
 		}
-		if !errors.Is(err, distributed.ErrAdmissionFull) {
+		if !errors.Is(err, distributed.ErrAdmissionSlotTaken) {
 			return Admission{}, fmt.Errorf("%w: %v", ErrUnavailable, err)
+		}
+		if waitErr := waitContext(ctx, time.Duration(rand.IntN(4*(attempt+1)))*time.Millisecond); waitErr != nil {
+			return Admission{}, fmt.Errorf("%w: admission contention: %v", ErrUnavailable, waitErr)
 		}
 	}
 	if existing, _, readErr := r.readRun(ctx, partition, runID); readErr != nil {
@@ -234,7 +252,34 @@ func (r *Runtime) Admit(ctx context.Context, request Submission) (Admission, err
 		}
 		return Admission{RunID: runID, Accepted: false, State: existing.State}, nil
 	}
-	return Admission{}, distributed.ErrAdmissionFull
+	// Free slots were observed on every attempt, so capacity is not
+	// exhausted: report bounded contention as retryable unavailability.
+	return Admission{}, fmt.Errorf("%w: admission slot contention exceeded %d attempts", ErrUnavailable, maxAdmissionAttempts)
+}
+
+// CapacityError is a definite admission rejection. It carries the single
+// linearizable capacity read that showed no free partition or tenant slot;
+// Admit never reports exhausted capacity without one.
+type CapacityError struct {
+	Partition          string
+	Tenant             string
+	Scope              string // "partition" or "tenant": which bound was exhausted
+	PartitionLimit     int
+	TenantLimit        int
+	FreePartitionSlots int
+	FreeTenantSlots    int
+}
+
+func (e *CapacityError) Error() string {
+	return fmt.Sprintf("%v: %s %s has no free slot (free partition=%d/%d tenant=%d/%d)", distributed.ErrAdmissionFull, e.Scope, e.Partition, e.FreePartitionSlots, e.PartitionLimit, e.FreeTenantSlots, e.TenantLimit)
+}
+
+func (e *CapacityError) Unwrap() error { return distributed.ErrAdmissionFull }
+
+// admissionRunID is the cluster-wide run identity of a tenant's request key.
+func admissionRunID(tenant, requestKey string) string {
+	identity := sha256.Sum256([]byte(tenant + "\x00" + requestKey))
+	return "run-" + hex.EncodeToString(identity[:16])
 }
 
 func (r *Runtime) readRun(ctx context.Context, partition, runID string) (RunRecord, int64, error) {

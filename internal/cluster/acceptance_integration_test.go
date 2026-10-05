@@ -962,3 +962,94 @@ func TestQuorumLossAtEachRuntimeTransition(t *testing.T) {
 		}
 	})
 }
+
+// TestConcurrentAdmissionWithFreeCapacityIsNeverRejected admits one request
+// from each of several distinct tenants at the same instant, through two
+// ingress clients, into one partition with spare capacity. Capacity is never
+// exhausted, so no request may be told the partition is full.
+func TestConcurrentAdmissionWithFreeCapacityIsNeverRejected(t *testing.T) {
+	var fixture struct {
+		FixtureVersion int    `json:"fixtureVersion"`
+		Synthetic      bool   `json:"synthetic"`
+		Name           string `json:"name"`
+		Limits         struct {
+			Partitions          int `json:"partitions"`
+			PartitionAdmissions int `json:"partitionAdmissions"`
+			TenantAdmissions    int `json:"tenantAdmissions"`
+		} `json:"limits"`
+		Tenants        int `json:"tenants"`
+		IngressClients int `json:"ingressClients"`
+		Rounds         int `json:"rounds"`
+		Expected       struct {
+			Accepted      int `json:"acceptedPerRound"`
+			Full          int `json:"admissionFullPerRound"`
+			Unavailable   int `json:"unavailablePerRound"`
+			Active        int `json:"activeRunsPerRound"`
+			DistinctSlots int `json:"distinctGlobalSlotsPerRound"`
+		} `json:"expected"`
+	}
+	readDistributedFixture(t, "admission-contention-fixtures.json", &fixture)
+	limits := Limits{Partitions: fixture.Limits.Partitions, PartitionAdmissions: fixture.Limits.PartitionAdmissions, TenantAdmissions: fixture.Limits.TenantAdmissions, OwnerTTL: 2 * time.Second}
+	for round := 0; round < fixture.Rounds; round++ {
+		t.Run(fmt.Sprintf("round-%d", round), func(t *testing.T) {
+			ledger := effectLedger(filepath.Join(t.TempDir(), "ledger"))
+			direct := integrationDistributedStore(t)
+			ingress := make([]*Runtime, fixture.IngressClients)
+			for index := range ingress {
+				ingress[index] = newCountedEffectRuntime(t, integrationDistributedStore(t), ledger, limits)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := ingress[0].Check(ctx); err != nil {
+				t.Fatal(err)
+			}
+			const partition = "p-0000"
+			tenants := tenantsInPartition(ingress[0], partition, "contention-tenant", fixture.Tenants)
+			start := make(chan struct{})
+			outcomes := make([]string, len(tenants))
+			var group sync.WaitGroup
+			for index, tenant := range tenants {
+				group.Add(1)
+				go func(index int, tenant string) {
+					defer group.Done()
+					<-start
+					admission, err := ingress[index%len(ingress)].Admit(ctx, Submission{Tenant: tenant, RequestKey: "contended", Workflow: "acceptance-effect", Input: json.RawMessage(fmt.Sprintf(`{"value":%d}`, index))})
+					switch {
+					case errors.Is(err, distributed.ErrAdmissionFull):
+						outcomes[index] = "admission_full"
+					case errors.Is(err, ErrUnavailable):
+						outcomes[index] = "unavailable"
+					case err != nil:
+						outcomes[index] = "error: " + err.Error()
+					case admission.Accepted:
+						outcomes[index] = "accepted"
+					default:
+						outcomes[index] = "duplicate"
+					}
+				}(index, tenant)
+			}
+			close(start)
+			group.Wait()
+			counts := map[string]int{}
+			for _, outcome := range outcomes {
+				counts[outcome]++
+			}
+			active, err := direct.ListActiveRunIDs(ctx, partition, limits.PartitionAdmissions)
+			if err != nil {
+				t.Fatal(err)
+			}
+			slots := map[string]bool{}
+			for _, tenant := range tenants {
+				runID := admissionRunID(tenant, "contended")
+				record, err := ingress[0].GetRun(ctx, tenant, runID)
+				if err == nil {
+					slots[record.GlobalSlot] = true
+				}
+			}
+			t.Logf("concurrent distinct-tenant admission: outcomes=%v active=%d distinct slots=%d", counts, len(active), len(slots))
+			if counts["accepted"] != fixture.Expected.Accepted || counts["admission_full"] != fixture.Expected.Full || counts["unavailable"] != fixture.Expected.Unavailable || len(active) != fixture.Expected.Active || len(slots) != fixture.Expected.DistinctSlots {
+				t.Fatalf("outcomes=%v active=%d slots=%d; fixture accepted=%d full=%d unavailable=%d active=%d slots=%d", counts, len(active), len(slots), fixture.Expected.Accepted, fixture.Expected.Full, fixture.Expected.Unavailable, fixture.Expected.Active, fixture.Expected.DistinctSlots)
+			}
+		})
+	}
+}

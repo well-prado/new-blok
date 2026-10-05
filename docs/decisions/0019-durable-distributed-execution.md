@@ -62,7 +62,11 @@ Every transition below was exercised against a real three-voter etcd cluster
 | Finish | The run keeps its slots and non-terminal state | Terminal state and slot release commit together or not at all; a later owner finishes without re-invoking committed steps |
 
 Capacity exhaustion is a definite rejection (`ErrAdmissionFull`, HTTP 429 +
-`Retry-After`). A request key already committed with a different input is a
+`Retry-After`), reported only from one linearizable read that shows no free
+partition or tenant slot (`CapacityError` carries that read). Losing a chosen
+slot to a concurrent admission is contention: admission picks a random free
+slot, re-reads and retries, and after a bounded number of attempts with free
+slots still visible reports retryable unavailability (HTTP 503), never 429. A request key already committed with a different input is a
 definite conflict (`ErrRequestConflict`, HTTP 409), including when two ingress
 nodes race. A standby worker retries partition acquisition at a bounded
 interval.

@@ -151,15 +151,18 @@ type sustainedLoadFixture struct {
 		TenantAdmissions    int `json:"tenantAdmissions"`
 		OwnerTTLMillis      int `json:"ownerTTLMillis"`
 	} `json:"limits"`
-	Workers               int `json:"workers"`
-	IngressClients        int `json:"ingressClients"`
-	IngressSeconds        int `json:"ingressSeconds"`
-	KillWorkerAtSeconds   int `json:"killWorkerAtSeconds"`
-	NoisyTenantSubmitters int `json:"noisyTenantSubmitters"`
-	SteadyTenants         int `json:"steadyTenants"`
-	BackgroundTenants     int `json:"backgroundTenants"`
-	EffectMillis          int `json:"effectMillis"`
-	DrainTimeoutSeconds   int `json:"drainTimeoutSeconds"`
+	Workers               int    `json:"workers"`
+	IngressClients        int    `json:"ingressClients"`
+	IngressSeconds        int    `json:"ingressSeconds"`
+	KillWorkerAtSeconds   int    `json:"killWorkerAtSeconds"`
+	NoisyTenantSubmitters int    `json:"noisyTenantSubmitters"`
+	SteadyTenants         int    `json:"steadyTenants"`
+	BackgroundTenants     int    `json:"backgroundTenants"`
+	BurstPartition        string `json:"burstPartition"`
+	BurstTenants          int    `json:"burstTenants"`
+	BurstEveryMillis      int    `json:"burstEveryMillis"`
+	EffectMillis          int    `json:"effectMillis"`
+	DrainTimeoutSeconds   int    `json:"drainTimeoutSeconds"`
 	Expected              struct {
 		FailedRuns                     int     `json:"failedRuns"`
 		NonTerminalRuns                int     `json:"nonTerminalRuns"`
@@ -167,6 +170,7 @@ type sustainedLoadFixture struct {
 		CompletedWithoutExactlyOne     int     `json:"completedRunsWithoutExactlyOneEffect"`
 		EffectsWithoutAcceptedRun      int     `json:"effectsWithoutAcceptedRun"`
 		UnexpectedIngressErrors        int     `json:"unexpectedIngressErrors"`
+		SpuriousAdmissionFull          int     `json:"spuriousAdmissionFull"`
 		KilledWorkerOwnedFairness      bool    `json:"killedWorkerOwnedFairnessPartition"`
 		MinCompletedRuns               int     `json:"minCompletedRuns"`
 		MinSteadyToNoisyCompletionRate float64 `json:"minSteadyToNoisyCompletionRatio"`
@@ -240,18 +244,20 @@ func TestSustainedLoadFailoverWithWorkerKill(t *testing.T) {
 	}
 
 	const fairnessPartition = "p-0000"
+	burstPartition := fixture.BurstPartition
 	contended := tenantsInPartition(ingress[0], fairnessPartition, "load-tenant", 1+fixture.SteadyTenants)
 	noisy, steady := contended[0], contended[1:]
 	background := make([]string, 0, fixture.BackgroundTenants)
 	for candidate := 0; len(background) < fixture.BackgroundTenants; candidate++ {
 		tenant := fmt.Sprintf("background-%03d", candidate)
-		if ingress[0].Partition(tenant) != fairnessPartition {
+		if partition := ingress[0].Partition(tenant); partition != fairnessPartition && partition != burstPartition {
 			background = append(background, tenant)
 		}
 	}
 	var mu sync.Mutex
 	accepted := make([]acceptedLoadRun, 0, 1024)
 	full := map[string]int{}
+	spuriousFull := make([]string, 0)
 	unexpected := make([]string, 0)
 	deadline := time.Now().Add(time.Duration(fixture.IngressSeconds) * time.Second)
 	var submitters sync.WaitGroup
@@ -268,6 +274,12 @@ func TestSustainedLoadFailoverWithWorkerKill(t *testing.T) {
 			case err == nil && admission.Accepted:
 				accepted = append(accepted, acceptedLoadRun{tenant: tenant, key: key, runID: admission.RunID})
 			case errors.Is(err, distributed.ErrAdmissionFull):
+				// A legitimate rejection carries the capacity read that showed
+				// its partition or tenant bound exhausted.
+				var capacity *CapacityError
+				if !errors.As(err, &capacity) || capacity.FreePartitionSlots > 0 && capacity.FreeTenantSlots > 0 || capacity.Tenant != tenant {
+					spuriousFull = append(spuriousFull, fmt.Sprintf("%s: %v", key, err))
+				}
 				full[tenant]++
 			default:
 				unexpected = append(unexpected, fmt.Sprintf("%s: admission=%+v err=%v", key, admission, err))
@@ -278,6 +290,51 @@ func TestSustainedLoadFailoverWithWorkerKill(t *testing.T) {
 			}
 		}
 	}
+	// Bursts of distinct, single-use tenants arrive at the same instant on a
+	// partition that otherwise has spare capacity: the shape in which
+	// concurrent ingress nodes contend for the same free slots.
+	burstOutcomes := map[string]int{}
+	submitters.Add(1)
+	go func() {
+		defer submitters.Done()
+		for burst := 0; time.Now().Before(deadline); burst++ {
+			tenants := tenantsInPartition(ingress[0], burstPartition, fmt.Sprintf("burst-%03d", burst), fixture.BurstTenants)
+			start := make(chan struct{})
+			var group sync.WaitGroup
+			for index, tenant := range tenants {
+				group.Add(1)
+				go func(index int, tenant string) {
+					defer group.Done()
+					<-start
+					key := fmt.Sprintf("%s/%d", tenant, 0)
+					input, _ := json.Marshal(loadInput{Tenant: tenant, Sequence: 0})
+					admission, err := ingress[index%len(ingress)].Admit(ctx, Submission{Tenant: tenant, RequestKey: key, Workflow: "sustained-load", Input: input})
+					mu.Lock()
+					defer mu.Unlock()
+					switch {
+					case err == nil && admission.Accepted:
+						accepted = append(accepted, acceptedLoadRun{tenant: tenant, key: key, runID: admission.RunID})
+						burstOutcomes["accepted"]++
+					case errors.Is(err, distributed.ErrAdmissionFull):
+						var capacity *CapacityError
+						if !errors.As(err, &capacity) || capacity.FreePartitionSlots > 0 && capacity.FreeTenantSlots > 0 || capacity.Tenant != tenant {
+							spuriousFull = append(spuriousFull, fmt.Sprintf("%s: %v", key, err))
+						}
+						full[tenant]++
+						burstOutcomes["admission_full"]++
+					default:
+						unexpected = append(unexpected, fmt.Sprintf("%s: admission=%+v err=%v", key, admission, err))
+						burstOutcomes["unexpected"]++
+					}
+				}(index, tenant)
+			}
+			close(start)
+			group.Wait()
+			if err := waitContext(ctx, time.Duration(fixture.BurstEveryMillis)*time.Millisecond); err != nil {
+				return
+			}
+		}
+	}()
 	for submitter := 0; submitter < fixture.NoisyTenantSubmitters; submitter++ {
 		submitters.Add(1)
 		go submit(noisy, submitter)
@@ -288,9 +345,20 @@ func TestSustainedLoadFailoverWithWorkerKill(t *testing.T) {
 	}
 
 	time.Sleep(time.Duration(fixture.KillWorkerAtSeconds) * time.Second)
-	owner, err := store.CurrentOwner(ctx, fairnessPartition)
-	if err != nil {
-		t.Fatalf("fairness partition has no owner under load: %v", err)
+	// Ownership of the contended partition can be between owners at this
+	// instant on a loaded host; wait for the current owner, bounded.
+	var owner distributed.Owner
+	var err error
+	ownerDeadline := time.Now().Add(15 * time.Second)
+	for {
+		owner, err = store.CurrentOwner(ctx, fairnessPartition)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, distributed.ErrOwnershipLost) || time.Now().After(ownerDeadline) {
+			t.Fatalf("fairness partition has no owner under load: %v", err)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 	var victim *worker
 	for _, candidate := range workers {
@@ -410,9 +478,13 @@ func TestSustainedLoadFailoverWithWorkerKill(t *testing.T) {
 		contendedCompletions[tenant], contendedFull[tenant] = completedByTenant[tenant], full[tenant]
 	}
 	sort.Strings(unexpected)
-	t.Logf("sustained load: workers=%d ingress=%d accepted=%d states=%v effects=%d (completed=%d + uncertain-with-effect=%d) admission-full=%d unexpected=%d takeover-after-kill=%s killed=%s",
-		fixture.Workers, fixture.IngressClients, len(accepted), states, totalEffects, states["completed"], uncertainWithEffect, sumCounts(full), len(unexpected), takeover.Round(time.Millisecond), victim.id)
+	t.Logf("sustained load: workers=%d ingress=%d accepted=%d states=%v effects=%d (completed=%d + uncertain-with-effect=%d) admission-full=%d (spurious %d) unexpected=%d takeover-after-kill=%s killed=%s",
+		fixture.Workers, fixture.IngressClients, len(accepted), states, totalEffects, states["completed"], uncertainWithEffect, sumCounts(full), len(spuriousFull), len(unexpected), takeover.Round(time.Millisecond), victim.id)
+	t.Logf("burst partition %s: %d distinct tenants per burst every %dms: outcomes=%v", burstPartition, fixture.BurstTenants, fixture.BurstEveryMillis, burstOutcomes)
 	t.Logf("contended partition %s: completions=%v admission-full=%v steady/noisy ratio=%.2f", fairnessPartition, contendedCompletions, contendedFull, ratio)
+	if len(spuriousFull) != fixture.Expected.SpuriousAdmissionFull {
+		t.Errorf("admission_full without an exhausted-capacity read=%d (first: %v), fixture %d", len(spuriousFull), spuriousFull[:min(3, len(spuriousFull))], fixture.Expected.SpuriousAdmissionFull)
+	}
 	if len(unexpected) != fixture.Expected.UnexpectedIngressErrors {
 		t.Errorf("unexpected ingress errors=%d (first: %v), fixture %d", len(unexpected), unexpected[:min(3, len(unexpected))], fixture.Expected.UnexpectedIngressErrors)
 	}
