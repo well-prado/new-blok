@@ -97,12 +97,17 @@ const compactionCandidates = `SELECT job_id, request_key, kind, payload_digest, 
 // Pending and processing jobs are never touched. Neither is a job the
 // queue's legal hold keeps (WithRetentionHold; a hold that panics keeps the
 // job) or one that finished less than the queue's minimum retention ago
-// (WithMinRetention; each cutoff is clamped to now minus it). The hold runs
-// inside the write transaction: keep it fast and free of side effects.
+// (WithMinRetention; each cutoff is clamped to now minus it).
 //
-// Work is done in write transactions of at most Retention.Batch rows each,
-// marked store.Writer and writing first (#176, #214), so other writers get
-// their turn between batches however large the backlog. Then, as journal
+// Compact reads up to Retention.Batch candidates in a read transaction and
+// asks the hold about each one outside any write transaction, so a slow
+// hold (a lookup in a legal-hold service) delays only Compact, never another
+// writer, and a job the hold has not released is not erased. It then erases
+// the released ones in write transactions marked store.Writer and writing
+// first (#176, #214), each bounded by the batch and by a tenth of the
+// store's busy timeout, and deletes a row only if it is still the finished
+// job that was read. Other writers get their turn between transactions
+// however large the backlog or slow the hold. Then, as journal
 // compaction does (ADR 0021 §7), the store's log is purged whenever an
 // erasure, this pass's or an earlier blocked one, still owes a purge. On an
 // error the batches already committed stay committed and the report counts
@@ -130,32 +135,50 @@ func (q *Queue) Compact(ctx context.Context, retention Retention) (CompactionRep
 			if err := ctx.Err(); err != nil {
 				return report, fmt.Errorf("worker: compact: %w", err)
 			}
-			var compacted, held, seen int
-			err := q.withTx(store.Writer(ctx), func(tx *sql.Tx) error {
-				var err error
-				var at int64
-				var id string
-				at, id, compacted, held, seen, err = q.compactBatch(ctx, tx, pass.state, cutoff, lastAt, lastID, batch)
-				if err != nil {
-					return err
-				}
-				// The erasure and the record that its purge is owed commit
-				// together, so a crash or a blocked purge never loses the debt.
-				if purgeable && compacted > 0 {
-					if _, err := tx.ExecContext(ctx, `UPDATE worker_meta SET value = value + 1 WHERE name = ?`, metaErasureGeneration); err != nil {
-						return err
-					}
-				}
-				lastAt, lastID = at, id
-				return nil
-			})
+			// Read a batch and ask the hold about it outside the write lock:
+			// however slow the hold, no writer waits for it.
+			candidates, err := q.readCandidates(ctx, pass.state, cutoff, lastAt, lastID, batch)
 			if err != nil {
 				return report, fmt.Errorf("worker: compact: %w", err)
 			}
-			report.Batches++
-			report.Compacted += compacted
-			report.Held += held
-			if seen < batch {
+			if len(candidates) == 0 {
+				break
+			}
+			for i := range candidates {
+				candidates[i].keep = q.held(candidates[i].retained())
+			}
+			// Then erase what the hold released, in write transactions bounded
+			// by the batch and by time (writeBudget).
+			for start := 0; start < len(candidates); {
+				if allKept(candidates[start:]) {
+					report.Held += len(candidates) - start
+					break
+				}
+				var done, compacted, held int
+				err := q.withTx(store.Writer(ctx), func(tx *sql.Tx) error {
+					var err error
+					done, compacted, held, err = q.erase(ctx, tx, candidates[start:])
+					if err != nil {
+						return err
+					}
+					// The erasure and the record that its purge is owed commit
+					// together, so a crash or a blocked purge never loses the debt.
+					if purgeable && compacted > 0 {
+						_, err = tx.ExecContext(ctx, `UPDATE worker_meta SET value = value + 1 WHERE name = ?`, metaErasureGeneration)
+					}
+					return err
+				})
+				if err != nil {
+					return report, fmt.Errorf("worker: compact: %w", err)
+				}
+				report.Batches++
+				report.Compacted += compacted
+				report.Held += held
+				start += done
+			}
+			last := candidates[len(candidates)-1]
+			lastAt, lastID = last.finishedAt, last.id
+			if len(candidates) < batch {
 				break
 			}
 		}
@@ -228,67 +251,110 @@ func (q *Queue) retentionCutoff(cutoff time.Time) int64 {
 	return cutoff.UTC().UnixNano()
 }
 
-// compactBatch erases at most limit finished jobs of state after the cursor,
-// and returns the cursor past the last one it read. Its first statement
-// writes (#176): it makes sure the erasure counter exists, which takes the
-// write lock before anything is read.
-func (q *Queue) compactBatch(ctx context.Context, tx *sql.Tx, state string, cutoff, lastAt int64, lastID string, limit int) (int64, string, int, int, int, error) {
-	if _, err := tx.ExecContext(ctx, `INSERT INTO worker_meta (name, value) VALUES (?, 0) ON CONFLICT(name) DO NOTHING`, metaErasureGeneration); err != nil {
-		return lastAt, lastID, 0, 0, 0, err
+// candidate is a finished job Compact read, and the hold's verdict on it.
+type candidate struct {
+	id, key, kind, payloadDigest, principal, state string
+	attempt, maxAttempts                           int
+	createdAt, finishedAt                          int64
+	keep                                           bool
+}
+
+func (c candidate) retained() RetainedJob {
+	job := RetainedJob{ID: c.id, RequestKey: c.key, Kind: c.kind, State: c.state, FinishedAt: time.Unix(0, c.finishedAt).UTC()}
+	if c.principal != "" {
+		// A principal that does not decode is still handed to the hold
+		// without it; the hold sees the rest of the job.
+		_ = json.Unmarshal([]byte(c.principal), &job.Principal)
 	}
-	rows, err := tx.QueryContext(ctx, compactionCandidates, state, cutoff, lastAt, lastAt, lastID, limit)
-	if err != nil {
-		return lastAt, lastID, 0, 0, 0, err
+	return job
+}
+
+func allKept(candidates []candidate) bool {
+	for _, c := range candidates {
+		if !c.keep {
+			return false
+		}
 	}
-	type candidate struct {
-		id, key, kind, payloadDigest, principal, state string
-		attempt, maxAttempts                           int
-		createdAt, finishedAt                          int64
-	}
+	return true
+}
+
+// readCandidates reads at most limit finished jobs of state after the
+// cursor, in a read transaction of its own.
+func (q *Queue) readCandidates(ctx context.Context, state string, cutoff, lastAt int64, lastID string, limit int) ([]candidate, error) {
 	var batch []candidate
-	for rows.Next() {
-		var c candidate
-		if err := rows.Scan(&c.id, &c.key, &c.kind, &c.payloadDigest, &c.principal, &c.state, &c.attempt, &c.maxAttempts, &c.createdAt, &c.finishedAt); err != nil {
-			rows.Close()
-			return lastAt, lastID, 0, 0, 0, err
+	err := q.withTx(ctx, func(tx *sql.Tx) error {
+		batch = nil
+		rows, err := tx.QueryContext(ctx, compactionCandidates, state, cutoff, lastAt, lastAt, lastID, limit)
+		if err != nil {
+			return err
 		}
-		batch = append(batch, c)
+		defer rows.Close()
+		for rows.Next() {
+			var c candidate
+			if err := rows.Scan(&c.id, &c.key, &c.kind, &c.payloadDigest, &c.principal, &c.state, &c.attempt, &c.maxAttempts, &c.createdAt, &c.finishedAt); err != nil {
+				return err
+			}
+			batch = append(batch, c)
+		}
+		return rows.Err()
+	})
+	return batch, err
+}
+
+// compactWriteShare bounds one compaction write transaction to this
+// fraction of the store's busy timeout (writeBudget), so a writer queued
+// behind it never waits anywhere near the timeout for it.
+const compactWriteShare = 10
+
+// writeBudget is how long one compaction write transaction keeps erasing
+// before it commits and lets the next writer in. It always erases at least
+// one job, so compaction makes progress.
+func (q *Queue) writeBudget() time.Duration { return q.busyTimeout / compactWriteShare }
+
+// erase erases, in order, the candidates the hold released and counts the
+// ones it kept, until it runs out of candidates or of its writeBudget, and
+// reports how many it went through. Its first statement writes (#176): it
+// makes sure the erasure counter exists. Each row is deleted only if it is
+// still the finished job that was read, so a job erased meanwhile by
+// another Compact, or changed since, is left alone.
+func (q *Queue) erase(ctx context.Context, tx *sql.Tx, candidates []candidate) (done, compacted, held int, err error) {
+	started := time.Now()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO worker_meta (name, value) VALUES (?, 0) ON CONFLICT(name) DO NOTHING`, metaErasureGeneration); err != nil {
+		return 0, 0, 0, err
 	}
-	if err := rows.Close(); err != nil {
-		return lastAt, lastID, 0, 0, 0, err
-	}
-	if err := rows.Err(); err != nil {
-		return lastAt, lastID, 0, 0, 0, err
-	}
-	compacted, held := 0, 0
 	now := q.now()
-	for _, c := range batch {
-		lastAt, lastID = c.finishedAt, c.id
-		retained := RetainedJob{ID: c.id, RequestKey: c.key, Kind: c.kind, State: c.state, FinishedAt: time.Unix(0, c.finishedAt).UTC()}
-		if c.principal != "" {
-			// A principal that does not decode is still handed to the
-			// hold without it; the hold sees the rest of the job.
-			_ = json.Unmarshal([]byte(c.principal), &retained.Principal)
+	for i, c := range candidates {
+		if i > 0 && time.Since(started) >= q.writeBudget() {
+			return i, compacted, held, nil
 		}
-		if q.held(retained) {
+		if c.keep {
 			held++
 			continue
 		}
+		if q.compactRowHook != nil {
+			q.compactRowHook()
+		}
+		result, err := tx.ExecContext(ctx, `DELETE FROM worker_jobs WHERE job_id = ? AND state = ? AND updated_at = ?`, c.id, c.state, c.finishedAt)
+		if err != nil {
+			return 0, 0, 0, err
+		}
+		if gone, err := result.RowsAffected(); err != nil {
+			return 0, 0, 0, err
+		} else if gone == 0 {
+			continue
+		}
 		// A tombstone already there for the key can only be an older job's,
-		// whose key a worker from before #290 accepted again: the job being
-		// erased now is the key's latest identity.
+		// whose key a worker from before #290 accepted again: the job erased
+		// now is the key's latest identity.
 		if _, err := tx.ExecContext(ctx, `INSERT INTO worker_compacted (request_digest, job_id, kind, identity_digest, state, attempt, max_attempts, created_at, finished_at, compacted_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(request_digest) DO UPDATE SET job_id = excluded.job_id, kind = excluded.kind, identity_digest = excluded.identity_digest,
 				state = excluded.state, attempt = excluded.attempt, max_attempts = excluded.max_attempts, created_at = excluded.created_at, finished_at = excluded.finished_at, compacted_at = excluded.compacted_at`,
 			digest([]byte(c.key)), c.id, c.kind, identityDigest(c.kind, c.payloadDigest, c.principal), c.state, c.attempt, c.maxAttempts, c.createdAt, c.finishedAt, now); err != nil {
-			return lastAt, lastID, 0, 0, 0, err
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM worker_jobs WHERE job_id = ? AND state = ?`, c.id, c.state); err != nil {
-			return lastAt, lastID, 0, 0, 0, err
+			return 0, 0, 0, err
 		}
 		compacted++
 	}
-	return lastAt, lastID, compacted, held, len(batch), nil
+	return len(candidates), compacted, held, nil
 }
 
 // identityDigest is what a tombstone keeps of a job's request identity: its

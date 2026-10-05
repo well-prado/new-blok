@@ -353,11 +353,31 @@ cutoff to `now − minimum`, so no job younger than it is erased whatever
 cutoff is passed; `New` refuses a negative minimum. Held jobs are counted
 in `CompactionReport.Held` and stay eligible on every later pass.
 
+The hold is asked outside any write transaction (#313 review). A hold is
+typically a lookup in a legal-hold service, and the first version asked it
+inside the batch's write transaction: with a 25 ms hold and the default
+batch of 256 the review measured the write lock held for 6.7 s, and a
+concurrent `Enqueue` failed `admission_saturated … no write turn within
+5s`. Now each batch is read in a read transaction, the hold is asked about
+every candidate with no lock held, and only then does a write transaction
+erase the ones it released. A slow hold delays only `Compact`; a job whose
+verdict has not come back is simply not erased yet, and a panic still keeps
+it. The write transaction deletes a row only if it is still the finished
+job that was read (same id, state and finish time), so a job erased in the
+meantime by another `Compact` is skipped. A hold placed in the service
+after its verdict was given and before the erasure commits is not seen; the
+window is one batch, and the same race exists for any hold decided before
+the delete.
+
 **Bounded batches.** `Compact` works in write transactions of at most
 `Retention.Batch` rows (`worker.DefaultCompactBatch` = 256 when zero,
-refused above `worker.MaxCompactBatch` = 4096), each marked `store.Writer`
-(#214) and writing first: its first statement makes sure the erasure
-counter row exists. Candidates are read with a keyset cursor on
+refused above `worker.MaxCompactBatch` = 4096) and of at most a tenth of
+the store's busy timeout (500 ms by default): a transaction that has run
+that long commits after its current row and the rest of the batch goes in
+the next one, so it always erases at least one job and no writer queued
+behind it waits anywhere near the busy timeout. Rows bound the work, time
+bounds the lock. Each is marked `store.Writer` (#214) and writes first:
+its first statement makes sure the erasure counter row exists. Candidates are read with a keyset cursor on
 (`updated_at`, `job_id`) through a new partial index,
 `worker_jobs_finished ON worker_jobs (state, updated_at, job_id) WHERE
 state IN ('completed','dead')`, so each batch costs its own rows and never
@@ -365,10 +385,15 @@ rescans the history before it, and a held job never stalls the cursor. The
 write lock is released between batches, so other writers, claims and
 submissions take their turns in the store's writer queue. Tombstone expiry
 is batched the same way through an index on `finished_at`. Measured on the
-author's macOS arm64 host under a load average of about 6 to 20: compacting
-200,000 completed jobs with the default batch took 782 transactions and
-11–24 s in three runs; the median transaction (including its wait for the
-writer turn and its durable commit) held 12–23 ms, the longest 68–492 ms.
+author's macOS arm64 host under a load average of about 5 to 16, with the
+hold outside the lock: compacting 200,000 completed jobs with the default
+batch took 782 write transactions and 13–14 s in three runs; the median
+write transaction (including its wait for the writer turn and its durable
+commit) took 13–15 ms, the longest 35–91 ms. With a 30 ms hold, and with a
+300 ms hold (longer than the busy timeout on its own), an `Enqueue` loop
+beside the compaction on a store with a 200 ms busy timeout never failed
+and waited at most about 15 ms (`TestSlowHoldNeverBlocksWriters`); with the
+hold inside the transaction the same test fails `admission_saturated`.
 Unfinished jobs are not in the index, so claims do not maintain it; every
 job that finishes adds one entry. Twelve interleaved runs of 2,000 trivial
 jobs on the same host gave median enqueue rates of about 13.6 k/s on
@@ -519,8 +544,8 @@ is never parsed before verification.
 - Tombstone digests are pseudonymous, not anonymous: anyone holding the
   database can confirm a guessed low-entropy request key, or a guessed
   exact payload and principal, by hashing it. The kind, attempt counts and
-  times are kept in clear. The hold runs inside the write transaction, so a
-  slow hold holds every writer.
+  times are kept in clear. A hold slower than its callers expect slows only
+  `Compact`, which then takes as long as the hold needs.
 - Erasure reaches the database file and its log, not copies: a backup taken
   before `Compact` still holds the content, and content deleted before
   secure deletion was on stays in free space until `store.Purger.PurgeFree`

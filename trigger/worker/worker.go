@@ -379,6 +379,9 @@ type Queue struct {
 	// finished jobs (WithRetentionHold, WithMinRetention).
 	hold         func(RetainedJob) bool
 	minRetention time.Duration
+	// compactRowHook, test-only, runs before each row a compaction write
+	// transaction erases.
+	compactRowHook func()
 }
 
 // Option configures a Queue.
