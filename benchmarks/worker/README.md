@@ -16,7 +16,10 @@ key, unknown SKU, business rejection, explicit transient rejection, uncertain
 success-with-response-loss and cancellation against the real selected Node
 process. `TestActualNodeKillBeforeAndAfterProviderEffect` waits for dispatch or
 committed charge, kills that process, checks no receipt/no hidden retry, and runs
-a native order to prove the engine survives. Run both with:
+a native order to prove the engine survives. The provider parks those two requests
+at a barrier (before the effect for `delay`, after commit for `late`) until the test
+releases it, so the kill lands inside the window however slow the machine is; it
+never relies on a sleep winning a race. Run both with:
 
 ```sh
 BLOK_NODE_INTEGRATION_ROOT=<built-repo> go test ./benchmarks/worker -run TestActualNode -v
