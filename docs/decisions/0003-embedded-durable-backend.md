@@ -282,28 +282,57 @@ stays the owner's: `audit.CheckSchema` returns audit's
 | `contract/audit` `Prune` | the journal's run states (`ActiveRuns`) | composed `audit.RunActivity` (the journal) | by `journal.New` |
 | `examples/recipes/shop` `Teardown` | drops `worker_jobs`, `worker_compacted`, `worker_meta` and deletes the `worker` stamp row | bare transaction | none: it removes the worker shape it knows (reported in #321, not changed) |
 
-**Refuse, scoped to the read.** With audit stamped newer than this binary
-understands, `journal.New` refuses with audit's `store.NewerSchemaError`
-when its tenant repair has a row to repair, and gives no row a tenant. It
-refuses rather than skipping the repair, because that is what #291 does
-with a stamp it does not understand, and what a composed `audit.Journal`
-would already have done on the same database; the journal has no channel
-for a non-fatal diagnostic, and a skip reported nowhere is the unchecked
-read this replaces. The check precedes the table probe because a newer
-audit may keep its records outside `audit_records_v1`, and "no audit
-table" would hand every unowned row to the system tenant (shown red, on
-the commit before this change, in the #321 PR). A journal with no row to
-repair reads nothing of audit's and is not refused for audit's stamp, so
-a journal-only binary (`examples/deploy` composes no audit) is not
-stopped by an audit-only upgrade. The same database can therefore open
-today and be refused after a pre-#286 binary writes an untenanted
-reconciliation into it; the refusal names audit and both versions, and
-opening it with a binary that supports that audit version repairs the
-row.
+**Refuse when the repair would read audit.** With audit stamped newer
+than this binary understands, `journal.New` refuses with audit's
+`store.NewerSchemaError` whenever the tenant repair finds a reconciliation
+without a tenant, and gives no row a tenant. The check runs before the
+repair reads any audit record, and before it asks whether
+`audit_records_v1` exists: a newer audit may keep its records elsewhere,
+and "no audit table" would hand every such row to the system tenant. The
+#321 PR shows both, red on the commit before this change and red under a
+mutant that reads the record first and checks the stamp only before
+writing.
+
+It refuses rather than skipping the repair because #291 refuses every
+stamp it does not understand, and a composed `audit.Journal` would already
+refuse the same database. The journal also has no channel for a non-fatal
+diagnostic, and a skip reported nowhere is the unchecked read this
+replaces.
+
+When the refusal applies. A row without a tenant is one of these:
+
+- one a binary from before #286 wrote, which an open by a binary that
+  supports the stamped audit version repairs from its record;
+- one from before #286 whose record was pruned before the upgrade, or
+  whose record fails verification. The repair leaves these without a
+  tenant by design (owned by nobody, ADR 0021) and tries them again on
+  every open.
+
+So a database with a row of the second kind refuses every journal-only
+open under a newer audit stamp, for as long as the row exists, although
+the binary that supports that audit version opens it and leaves the row
+unowned. Before #321 these opens succeeded. A database with no row
+without a tenant reads nothing of audit's and is never refused for
+audit's stamp, so a journal-only binary (`examples/deploy` composes no
+audit) on such a database is not stopped by an audit-only upgrade.
+
+This release keeps the wider refusal rather than narrowing it. To tell a
+row the repair already gave up on from one an older binary wrote since,
+the journal would have to record "repair attempted, unrepairable"
+itself: a new journal-owned marker, so a schema change and a version
+bump. It would also stop retrying a row whose record fails verification,
+which changes #286's behaviour. Hitting the refusal takes both residue
+from before #286 and a binary older than the database's audit schema.
+No audit version 2 exists yet, and ADR 0006 already says one version per
+store. The refusal names audit and both versions. The remedy is the one
+#291 gives for any downgrade below a raised version: run a binary that
+supports that audit version, or restore a backup taken before the
+upgrade. If a future audit version makes this reachable, the marker is
+the change to make with it.
 
 | Change | Class | Migration |
 | --- | --- | --- |
-| `journal.New` refuses with `store.NewerSchemaError{Component: "audit"}` when its tenant repair has rows to repair and audit is stamped newer than supported (#321) | behavioral | None for a database this release's audit understands. Otherwise open it with a binary that supports that audit version, which repairs the rows, or restore a backup taken before the upgrade |
+| `journal.New` refuses with `store.NewerSchemaError{Component: "audit"}` when the tenant repair finds a reconciliation without a tenant (from before #286: unrepaired, or with a pruned or unverifiable record) and audit is stamped newer than supported (#321) | behavioral (breaking for downgrades) | None for a database this release's audit understands. Otherwise run a binary that supports that audit version (it repairs what it can and leaves the rest unowned), or restore a backup taken before the upgrade |
 | `audit.CheckSchema` | additive | None |
 
 ## Alternatives considered

@@ -234,3 +234,120 @@ func TestNewerAuditSchemaWithNothingToRepairStillOpens(t *testing.T) {
 		t.Fatalf("tenants=%v", got)
 	}
 }
+
+// requireAuditRefusal opens a journal-only binary over database and wants
+// audit's refusal for an audit-2 stamp, with the reconciliation's row left
+// without a tenant.
+func requireAuditRefusal(t *testing.T, database store.Database) {
+	t.Helper()
+	refused, err := New(context.Background(), database, Config{})
+	var newer *store.NewerSchemaError
+	tenants := reconciliationTenants(t, database)
+	if refused != nil || !errors.As(err, &newer) || *newer != (store.NewerSchemaError{Component: "audit", Version: 2, Supported: 1}) {
+		t.Fatalf("want NewerSchemaError{audit 2, supported 1}, got journal=%v err=%v (reconciliation tenants now %q)", refused != nil, err, tenants)
+	}
+	if len(tenants) != 1 || tenants[0] != "<null>" {
+		t.Fatalf("a refused open changed who owns the reconciliation: tenants=%q", tenants)
+	}
+}
+
+// tripwireAuditRecords rebuilds audit_records_v1 so that reading any
+// record's content fails: record becomes a virtual column computed from
+// text that is not JSON, so every SELECT that returns it errors, while
+// the table, its ids and its other columns stay as they were. A repair
+// that reads the record before it checks the stamp then fails with
+// audit's ErrUnavailable instead of the stamp's refusal.
+func tripwireAuditRecords(t *testing.T, database store.Database) {
+	t.Helper()
+	execAll(t, database,
+		`ALTER TABLE audit_records_v1 RENAME TO audit_records_untripped`,
+		`CREATE TABLE audit_records_v1 (
+			seq INTEGER PRIMARY KEY AUTOINCREMENT,
+			id TEXT NOT NULL UNIQUE,
+			kind TEXT NOT NULL,
+			tenant TEXT NOT NULL,
+			tenant_seq INTEGER NOT NULL,
+			run_id TEXT NOT NULL,
+			recorded_at INTEGER NOT NULL,
+			trip TEXT NOT NULL DEFAULT 'not json',
+			digest TEXT NOT NULL)`,
+		`INSERT INTO audit_records_v1 (seq, id, kind, tenant, tenant_seq, run_id, recorded_at, digest)
+			SELECT seq, id, kind, tenant, tenant_seq, run_id, recorded_at, digest FROM audit_records_untripped`,
+		`DROP TABLE audit_records_untripped`,
+		`ALTER TABLE audit_records_v1 ADD COLUMN record BLOB GENERATED ALWAYS AS (json_extract(trip, '$')) VIRTUAL`,
+	)
+}
+
+// TestNewerAuditSchemaIsCheckedBeforeAnyAuditRecordIsRead (#321): "never
+// reads audit rows" made observable. The record of the row to repair is a
+// tripwire: reading it fails. Under an audit-2 stamp the open must be
+// refused for the stamp, which it can only be if no record was read
+// first; with stamp 1 restored the same open trips, so the wire is live.
+func TestNewerAuditSchemaIsCheckedBeforeAnyAuditRecordIsRead(t *testing.T) {
+	database := untenantedReconciliation(t)
+	tripwireAuditRecords(t, database)
+	execAll(t, database, `UPDATE blok_schema_versions SET version = 2 WHERE component = 'audit'`)
+	requireAuditRefusal(t, database)
+
+	execAll(t, database, `UPDATE blok_schema_versions SET version = 1 WHERE component = 'audit'`)
+	opened, err := New(context.Background(), database, Config{})
+	if opened != nil || !errors.Is(err, audit.ErrUnavailable) {
+		t.Fatalf("the tripwire is not live: reading the record under an understood stamp gave journal=%v err=%v, want audit.ErrUnavailable", opened != nil, err)
+	}
+	t.Logf("tripwire live under stamp 1: %v", err)
+}
+
+// TestUnrepairableRowsKeepAJournalOnlyOpenRefusedUnderANewerAudit pins a
+// cost of #321's refusal. A row from before #286 whose record was pruned
+// before the upgrade, or whose record fails verification, is left without
+// a tenant on purpose (#286) and stays that way: every open tries it again.
+// Under an audit stamp newer than this binary supports, each of those opens
+// would have to read audit to try, so every journal-only open is refused,
+// for as long as the row exists, even though an understood stamp opens it
+// fine and leaves the row unowned. Before #321 such opens succeeded.
+func TestUnrepairableRowsKeepAJournalOnlyOpenRefusedUnderANewerAudit(t *testing.T) {
+	ctx := context.Background()
+	for _, shape := range []struct {
+		name   string
+		damage func(t *testing.T, database store.Database, key string)
+	}{
+		{name: "record pruned", damage: func(t *testing.T, database store.Database, key string) {
+			id := "reconcile:" + key
+			if err := database.WithTx(ctx, func(tx *sql.Tx) error {
+				if _, err := tx.Exec(`DELETE FROM audit_records_v1 WHERE id = ?`, id); err != nil {
+					return err
+				}
+				_, err := tx.Exec(`INSERT INTO audit_pruned_v1 (id_digest, kind, pruned_at) VALUES (?, ?, 1)`, audit.Digest([]byte(id)), string(audit.KindReconciliation))
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "record fails verification", damage: func(t *testing.T, database store.Database, _ string) {
+			execAll(t, database, `UPDATE audit_records_v1 SET tenant = 'tenant-b' WHERE tenant = 'tenant-a'`)
+		}},
+	} {
+		t.Run(shape.name, func(t *testing.T) {
+			database := untenantedReconciliation(t)
+			var key string
+			if err := database.WithTx(ctx, func(tx *sql.Tx) error {
+				return tx.QueryRow(`SELECT operation_key FROM journal_reconciliations`).Scan(&key)
+			}); err != nil {
+				t.Fatal(err)
+			}
+			shape.damage(t, database, key)
+			// An understood stamp opens it, and the repair leaves the row
+			// unowned, as #286 intends.
+			if _, err := New(ctx, database, Config{}); err != nil {
+				t.Fatalf("audit-1 open: %v", err)
+			}
+			if got := reconciliationTenants(t, database); len(got) != 1 || got[0] != "<null>" {
+				t.Fatalf("an unrepairable row was given a tenant: %q", got)
+			}
+			execAll(t, database, `UPDATE blok_schema_versions SET version = 2 WHERE component = 'audit'`)
+			for range 3 {
+				requireAuditRefusal(t, database)
+			}
+		})
+	}
+}

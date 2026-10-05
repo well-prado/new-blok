@@ -234,8 +234,11 @@ func reconciliationTenant(stored sql.NullString) (tenant string, owned bool) {
 // with audit's *store.NewerSchemaError, and no row is given a tenant. The
 // check precedes even asking whether audit_records_v1 exists, because a
 // newer audit may keep its records elsewhere, and "no audit table" would
-// then hand every row to the system tenant. A journal with no row to
-// repair reads nothing of audit's and is not refused for it.
+// then hand every row to the system tenant. A journal with no row without
+// a tenant reads nothing of audit's and is not refused for it. A row the
+// repair leaves unowned (its record pruned or unverifiable) is tried again
+// on every open, so under a newer audit every open is refused while it
+// exists (ADR 0003, #321).
 func backfillReconciliationTenants(ctx context.Context, tx *sql.Tx) error {
 	rows, err := tx.QueryContext(ctx, `SELECT operation_key FROM journal_reconciliations WHERE tenant IS NULL ORDER BY operation_key`)
 	if err != nil {
