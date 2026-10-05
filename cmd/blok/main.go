@@ -89,17 +89,18 @@ func runNew(args []string, out io.Writer, in io.Reader) error {
 		if directory, err = prompt(reader, out, "Target directory", directory); err != nil {
 			return err
 		}
-		// Offer the defaults new would apply, so Enter accepts them.
+		// Offer the defaults new would apply, so Enter accepts them; the
+		// module default follows the name chosen just before it.
 		if name == "" {
 			name = scaffold.DefaultName(directory)
+		}
+		if name, err = prompt(reader, out, "Executable name", name); err != nil {
+			return err
 		}
 		if module == "" {
 			module = scaffold.DefaultModule(name)
 		}
 		if module, err = prompt(reader, out, "Module path", module); err != nil {
-			return err
-		}
-		if name, err = prompt(reader, out, "Executable name", name); err != nil {
 			return err
 		}
 		if runtime, err = prompt(reader, out, "Runtime", runtime); err != nil {
@@ -140,7 +141,7 @@ func runNew(args []string, out io.Writer, in io.Reader) error {
 	if output, err := tidy.CombinedOutput(); err != nil {
 		hint := ""
 		if framework == "" {
-			hint = fmt.Sprintf("; the starter requires %s %s, the version this blok was built from — if that commit is not published, rerun with --framework <version or framework checkout>", scaffold.FrameworkModule, selected.Version)
+			hint = fmt.Sprintf("; the starter requires %s %s, the version this blok was built from — if that commit is not published, remove %s and rerun with --framework <version or framework checkout>, or point its go.mod at one", scaffold.FrameworkModule, selected.Version, directory)
 		}
 		return fmt.Errorf("new: go mod tidy failed in %s (the files were created; fix the cause and rerun it)%s: %v\n%s", directory, hint, err, bytes.TrimSpace(output))
 	}

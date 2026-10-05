@@ -159,7 +159,7 @@ func TestFreshApplicationBuildsServesAndRegenerates(t *testing.T) {
 func TestInteractiveAnswersMatchFlags(t *testing.T) {
 	root := repoRoot(t)
 	interactive := filepath.Join(t.TempDir(), "piped")
-	answers := strings.Join([]string{interactive, "example.com/piped", "piped", "go", "unified", "http"}, "\n") + "\n"
+	answers := strings.Join([]string{interactive, "piped", "example.com/piped", "go", "unified", "http"}, "\n") + "\n"
 	var out bytes.Buffer
 	if err := runWithIO([]string{"new", "--interactive", "--skip-tidy", "--framework", root}, &out, strings.NewReader(answers)); err != nil {
 		t.Fatalf("interactive: %v\n%s", err, out.String())
@@ -200,7 +200,7 @@ func readTree(t *testing.T, root string) map[string][]byte {
 // TestInteractiveCancellation: ending input at the first prompt or a later
 // one cancels, and nothing is created.
 func TestInteractiveCancellation(t *testing.T) {
-	for name, input := range map[string]string{"first prompt": "", "later prompt": "%s\nexample.com/later\n"} {
+	for name, input := range map[string]string{"first prompt": "", "later prompt": "%s\nlater\n"} {
 		t.Run(name, func(t *testing.T) {
 			directory := filepath.Join(t.TempDir(), "later")
 			var out bytes.Buffer
@@ -368,20 +368,25 @@ func TestUnusualFrameworkPathsBuild(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds a fresh application")
 	}
-	parent := filepath.Join(t.TempDir(), "Área de Trabalho (Blök), [1]")
-	if err := os.MkdirAll(parent, 0o755); err != nil {
-		t.Fatal(err)
+	// The bracket-and-comma path has no space, which the old quoting
+	// needed before it quoted anything.
+	for name, path := range map[string]string{"brackets": "x(1),[a]", "accents and spaces": "Área de Trabalho (Blök), [1]/new blok"} {
+		t.Run(name, func(t *testing.T) {
+			framework := filepath.Join(t.TempDir(), filepath.FromSlash(path))
+			if err := os.MkdirAll(filepath.Dir(framework), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(repoRoot(t), framework); err != nil {
+				t.Skipf("cannot link the framework: %v", err)
+			}
+			directory := filepath.Join(t.TempDir(), "odd")
+			var out bytes.Buffer
+			if err := run([]string{"new", directory, "--non-interactive", "--framework", framework}, &out); err != nil {
+				t.Fatalf("new: %v\n%s", err, out.String())
+			}
+			goTool(t, directory, "build", "./...")
+		})
 	}
-	framework := filepath.Join(parent, "new blok")
-	if err := os.Symlink(repoRoot(t), framework); err != nil {
-		t.Skipf("cannot link the framework: %v", err)
-	}
-	directory := filepath.Join(t.TempDir(), "odd")
-	var out bytes.Buffer
-	if err := run([]string{"new", directory, "--non-interactive", "--framework", framework}, &out); err != nil {
-		t.Fatalf("new: %v\n%s", err, out.String())
-	}
-	goTool(t, directory, "build", "./...")
 }
 
 // TestInteractiveDefaultsAndUnterminatedLastAnswer: Enter accepts each
@@ -407,5 +412,19 @@ func TestInteractiveDefaultsAndUnterminatedLastAnswer(t *testing.T) {
 	unterminated := filepath.Join(t.TempDir(), "eof")
 	if err := runWithIO([]string{"new", "--interactive", "--skip-tidy", "--framework", root}, &out, strings.NewReader(unterminated+"\n\n\n\n\nhttp")); err != nil {
 		t.Fatalf("unterminated last answer: %v", err)
+	}
+}
+
+// TestInteractiveModuleFollowsTheChosenName: the module default offered
+// after the name prompt derives from the name chosen there.
+func TestInteractiveModuleFollowsTheChosenName(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "folder")
+	var out bytes.Buffer
+	if err := runWithIO([]string{"new", "--interactive", "--skip-tidy", "--framework", repoRoot(t)}, &out, strings.NewReader(directory+"\nshop\n\n\n\n\n")); err != nil {
+		t.Fatal(err)
+	}
+	mod, err := os.ReadFile(filepath.Join(directory, "go.mod"))
+	if err != nil || !strings.HasPrefix(string(mod), "module example.com/shop\n") {
+		t.Fatalf("go.mod=%q err=%v; want module example.com/shop", mod, err)
 	}
 }
