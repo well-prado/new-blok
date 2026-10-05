@@ -620,3 +620,32 @@ func TestQueueWritesAreMarkedAndReadsAreNot(t *testing.T) {
 		t.Fatalf("Get/Settled marks=%v; want two unmarked reads", got)
 	}
 }
+
+// TestClaimAccountingWritesAreMarked: charging a lost claim and deferring a
+// lost consumer write first and take turns in the store's writer queue
+// (#214), like the claim itself.
+func TestClaimAccountingWritesAreMarked(t *testing.T) {
+	ctx := context.Background()
+	marks := &writerMarks{Database: openSQLite(t, filepath.Join(t.TempDir(), "accounting.db"))}
+	queue, err := New(ctx, marks, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queue.Enqueue(ctx, EnqueueRequest{RequestKey: "job", Kind: "job", Payload: []byte(`{}`), MaxAttempts: 3}); err != nil {
+		t.Fatal(err)
+	}
+	job, err := queue.Get(ctx, "job")
+	if err != nil {
+		t.Fatal(err)
+	}
+	marks.take()
+	if err := queue.chargeLostClaim(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.deferLost(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	if got := marks.take(); len(got) != 2 || !got[0] || !got[1] {
+		t.Fatalf("chargeLostClaim/deferLost marks=%v; want two marked writers", got)
+	}
+}

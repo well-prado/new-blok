@@ -33,7 +33,8 @@ func (d *markRecorder) take() []bool {
 }
 
 // TestTransitionsAreMarkedWritersAndReadsAreNot: journal transitions write
-// first and take turns in the store's writer queue; its reads do not (#214).
+// first and take turns in the store's writer queue; its reads and schema
+// creation do not (#214).
 func TestTransitionsAreMarkedWritersAndReadsAreNot(t *testing.T) {
 	ctx := context.Background()
 	db, err := (sqlite.Backend{}).Open(ctx, filepath.Join(t.TempDir(), "journal.db"))
@@ -46,8 +47,10 @@ func TestTransitionsAreMarkedWritersAndReadsAreNot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := marks.take(); len(got) == 0 || !got[0] {
-		t.Fatalf("schema marks=%v; want a marked writer", got)
+	// Schema creation only reads when the tables exist, so it is not
+	// queued: a journal opened inside a held turn must not wait for it.
+	if got := marks.take(); len(got) != 1 || got[0] {
+		t.Fatalf("schema marks=%v; want one unmarked transaction", got)
 	}
 	run, err := j.Admit(ctx, AdmissionRequest{RequestKey: "request", Workflow: "synthetic", ArtifactDigest: "artifact", Input: []byte(`{}`)})
 	if err != nil {

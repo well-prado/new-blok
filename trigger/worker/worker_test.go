@@ -706,6 +706,10 @@ func TestCanceledClaimWaitReportsConsumerLost(t *testing.T) {
 	if !errors.Is(err, ErrConsumerLost) || elapsed > 7*time.Second {
 		t.Fatalf("a canceled worker waited %v for the lock and returned %v", elapsed, err)
 	}
+	// The report keeps what the wait itself ended with.
+	if !errors.Is(err, store.ErrBusy) {
+		t.Fatalf("the consumer-lost report %v dropped the busy wait it replaced", err)
+	}
 	if err := <-first; err != nil {
 		t.Fatal(err)
 	}

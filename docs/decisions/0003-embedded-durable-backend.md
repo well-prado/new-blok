@@ -171,7 +171,8 @@ slowed.
 The framework's own writers therefore take turns.
 - **Marked writers:** a transaction whose context is marked `store.Writer` is
   queued per `sqlite` handle, first come first served, before it begins.
-- **Who marks:** every journal transition, the worker's submission, claim and
+- **Who marks:** every journal transition (not schema creation, which only
+  reads when the journal is reopened), the worker's submission, claim and
   claim-accounting writes, provider records, cron cursor writes and approval
   records. All of these write first (#176, #179, above), so holding the turn
   from begin to commit is holding the write lock.
@@ -210,7 +211,10 @@ busy timeout, and the job was dead-lettered as a nested submission.
 - **Opting in:** mark only a callback that writes first and does no slow work,
   since it holds the turn as long as it holds the lock.
 - **Unenforced:** the mark is not enforced. An unmarked framework write would
-  silently lose its ordering, so tests assert the marks on each writer path.
+  silently lose its ordering, so tests assert the marks on each writer path:
+  journal transitions, worker Enqueue, claim, `chargeLostClaim` and
+  `deferLost`, provider `Execute`, cron `Add` and tick flush, approval
+  `Record`.
 - **Two waits:** a marked writer that then meets an unmarked or out-of-handle
   writer in SQLite waits up to the busy timeout again there. Its total wait
   can therefore reach twice the timeout.

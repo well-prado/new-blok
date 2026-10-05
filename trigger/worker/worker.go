@@ -535,9 +535,12 @@ type claimedWriteDomain struct {
 // effects without an idempotency key or reconciliation path.
 //
 // Only the claim statement and the handler observe ctx. The claim holds
-// nothing while it waits for the store's write lock, so a consumer canceled
-// meanwhile is reported as ErrConsumerLost; the SQLite driver does not
-// interrupt a busy wait, so that report can take up to the busy timeout.
+// nothing while it waits for its turn in the store's writer queue (#214) or
+// for the write lock, so a consumer canceled meanwhile is reported as
+// ErrConsumerLost. Neither wait is interrupted by ctx (the claim's
+// transaction deliberately is not canceled with it), so that report can
+// take up to the busy timeout, or twice that when a writer on another
+// handle then holds the lock.
 // Everything after the claim runs on a context ctx cannot cancel, so losing
 // the consumer rolls the claim back synchronously before ProcessOnce returns
 // instead of leaving database/sql to abort it in the background while the
