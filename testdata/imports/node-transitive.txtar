@@ -1,0 +1,28 @@
+Transitive evasion through shared helpers: node a imports a shared util
+(ESM) that re-exports a deeper helper, which requires node b (CommonJS).
+The diagnostic names the node file the chain starts from; node b and the
+shared helpers themselves are not nodes and are not failed for importing
+a node.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+-- shared/util.ts --
+export { deep } from "./deep.cjs";
+-- shared/deep.cjs --
+const b = require("../nodes/nodejs/b/index.js");
+exports.deep = b;
+-- nodes/nodejs/a/node.json --
+{"name":"shop/a","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/a/index.ts --
+import { local } from "./local.js";
+import { deep } from "../../../shared/util.js";
+export const a = [local, deep];
+-- nodes/nodejs/a/local.ts --
+export const local = 1;
+-- nodes/nodejs/b/node.json --
+{"name":"shop/b","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/b/index.js --
+module.exports = 1;
+-- @expect --
+{"nodes":[["nodes/nodejs/a","violation"],["nodes/nodejs/b","verified"]],"diagnostics":[["ownership_transitive_node_import","nodes/nodejs/a/index.ts:2"]]}

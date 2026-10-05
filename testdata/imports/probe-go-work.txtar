@@ -1,0 +1,34 @@
+Review probe (PR #314, Review R): a go.work redirects example.com/bmod to
+node b's nested module. The check does not resolve workspaces, so a
+present go.work leaves every Go node unverified instead of reporting a
+wrong verified.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+-- go.work --
+go 1.24
+
+use (
+	.
+	./nodes/go/b
+)
+-- nodes/go/b/b.go --
+package b
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/b", "1.0.0", nil)
+-- nodes/go/b/go.mod --
+module example.com/bmod
+-- nodes/go/go-nested-mod-gowork/go_nested_mod_gowork.go --
+package go_nested_mod_gowork
+
+import (
+	"github.com/well-prado/new-blok/node"
+	_ "example.com/bmod"
+)
+
+var Node = node.MustDefine("probe/go-nested-mod-gowork", "1.0.0", nil)
+-- @expect --
+{"diagnostics":[["ownership_unsupported_form","go.work"]],"nodes":[["nodes/go/b","unverified"],["nodes/go/go-nested-mod-gowork","unverified"]]}

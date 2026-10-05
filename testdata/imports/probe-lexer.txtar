@@ -1,0 +1,80 @@
+Review probes (PR #314, Review R): forms that hid an import from the lexer
+while the node was reported verified, plus lexer controls. A "/" whose
+goal (regular expression or division) needs a parser, after a function or
+class expression "}", a labelled block or a contextual keyword used as an
+identifier, makes the file unverified; a property named like a keyword
+(o.if) is decided and the import is found. A hashbang holding a quote, a
+byte order mark before a hashbang, escapes and nested templates still find
+the import. A file importing itself is a cycle.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+-- nodes/nodejs/b/index.js --
+module.exports = 1;
+-- nodes/nodejs/b/node.json --
+{"name":"shop/b","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/bom-shebang/index.js --
+﻿#!/usr/bin/env node
+require("../b/index.js");
+-- nodes/nodejs/bom-shebang/node.json --
+{"name":"probe/bom-shebang","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/classexpr-div/index.js --
+const C = class {} / 1; require("..\u002fb\u002findex.js"); const y = 1 / 1;
+-- nodes/nodejs/classexpr-div/node.json --
+{"name":"probe/classexpr-div","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/control-direct/index.js --
+require("../b/index.js");
+-- nodes/nodejs/control-direct/node.json --
+{"name":"probe/control-direct","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/fnexpr-div/index.js --
+const x = function () {} / 1; require("..\u002fb\u002findex.js"); const y = 1 / 1;
+-- nodes/nodejs/fnexpr-div/node.json --
+{"name":"probe/fnexpr-div","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/ident-of-div/index.js --
+var of = 4;
+var x = of / 2; require("..\u002fb\u002findex.js"); var y = 1 / 1;
+-- nodes/nodejs/ident-of-div/node.json --
+{"name":"probe/ident-of-div","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/label-block-regex/index.js --
+L: {} /'/; require("../b/index.js"); /'/;
+-- nodes/nodejs/label-block-regex/node.json --
+{"name":"probe/label-block-regex","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/member-if-div/index.js --
+const o = { if(v) { return v; } };
+const x = o.if(4) / 2; require("..\u002fb\u002findex.js"); const y = 1 / 1;
+-- nodes/nodejs/member-if-div/node.json --
+{"name":"probe/member-if-div","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/nested-tpl/index.js --
+const s = `${ `${ { a: `}` }.a }` }`; require("../b/index.js");
+-- nodes/nodejs/nested-tpl/node.json --
+{"name":"probe/nested-tpl","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/self-cycle/index.js --
+require("./index.js");
+-- nodes/nodejs/self-cycle/node.json --
+{"name":"probe/self-cycle","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/shebang/index.js --
+#!/usr/bin/env node --title='x
+require("../b/index.js");
+-- nodes/nodejs/shebang/node.json --
+{"name":"probe/shebang","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/template-import/index.mjs --
+await import(`../b/index.js`);
+-- nodes/nodejs/template-import/node.json --
+{"name":"probe/template-import","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/tpl-comment/index.js --
+const s = `/* ${ `x` } */`; require("../b/index.js");
+-- nodes/nodejs/tpl-comment/node.json --
+{"name":"probe/tpl-comment","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/ts-generic-div/index.ts --
+declare function f<T>(x: T): number;
+const x = f<number>(1) / 2; require("..\u002fb\u002findex.js"); const y = 1 / 1;
+export {};
+-- nodes/nodejs/ts-generic-div/node.json --
+{"name":"probe/ts-generic-div","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/unicode-escape-require/index.js --
+\u0072equire("../b/index.js");
+-- nodes/nodejs/unicode-escape-require/node.json --
+{"name":"probe/unicode-escape-require","version":"1.0.0","runtime":"nodejs"}
+-- @expect --
+{"diagnostics":[["ownership_ambiguous_syntax","nodes/nodejs/classexpr-div/index.js:1"],["ownership_ambiguous_syntax","nodes/nodejs/fnexpr-div/index.js:1"],["ownership_ambiguous_syntax","nodes/nodejs/ident-of-div/index.js:2"],["ownership_ambiguous_syntax","nodes/nodejs/label-block-regex/index.js:1"],["ownership_import_cycle","nodes/nodejs/self-cycle/index.js"],["ownership_node_imports_node","nodes/nodejs/bom-shebang/index.js:2"],["ownership_node_imports_node","nodes/nodejs/control-direct/index.js:1"],["ownership_node_imports_node","nodes/nodejs/member-if-div/index.js:2"],["ownership_node_imports_node","nodes/nodejs/nested-tpl/index.js:1"],["ownership_node_imports_node","nodes/nodejs/shebang/index.js:2"],["ownership_node_imports_node","nodes/nodejs/template-import/index.mjs:1"],["ownership_node_imports_node","nodes/nodejs/tpl-comment/index.js:1"],["ownership_node_imports_node","nodes/nodejs/ts-generic-div/index.ts:2"],["ownership_node_imports_node","nodes/nodejs/unicode-escape-require/index.js:1"]],"nodes":[["nodes/nodejs/b","verified"],["nodes/nodejs/bom-shebang","violation"],["nodes/nodejs/classexpr-div","unverified"],["nodes/nodejs/control-direct","violation"],["nodes/nodejs/fnexpr-div","unverified"],["nodes/nodejs/ident-of-div","unverified"],["nodes/nodejs/label-block-regex","unverified"],["nodes/nodejs/member-if-div","violation"],["nodes/nodejs/nested-tpl","violation"],["nodes/nodejs/self-cycle","violation"],["nodes/nodejs/shebang","violation"],["nodes/nodejs/template-import","violation"],["nodes/nodejs/tpl-comment","violation"],["nodes/nodejs/ts-generic-div","violation"],["nodes/nodejs/unicode-escape-require","violation"]]}

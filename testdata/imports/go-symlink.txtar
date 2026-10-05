@@ -1,0 +1,39 @@
+Links are never followed (ADR 0023). A shared path that is a link to node
+b is reported as a link and, because its lexical target is inside node b,
+as a node import; a dangling link is reported and leaves the node
+unverified.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+-- nodes/go/a/a.go --
+package a
+
+import (
+	"github.com/well-prado/new-blok/node"
+
+	_ "example.com/shop/internal/billing"
+)
+
+var Node = node.MustDefine("shop/a", "1.0.0", nil)
+-- nodes/go/b/b.go --
+package b
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/b", "1.0.0", nil)
+-- nodes/go/c/c.go --
+package c
+
+import (
+	"github.com/well-prado/new-blok/node"
+
+	_ "example.com/shop/internal/gone"
+)
+
+var Node = node.MustDefine("shop/c", "1.0.0", nil)
+-- @links --
+internal/billing -> ../nodes/go/b
+internal/gone -> ../nowhere
+-- @expect --
+{"nodes":[["nodes/go/a","violation"],["nodes/go/b","verified"],["nodes/go/c","unverified"]],"diagnostics":[["layout_symlink_alias","internal/billing"],["layout_symlink_dangling","internal/gone"],["ownership_node_imports_node","nodes/go/a/a.go:6"]]}

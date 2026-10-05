@@ -1,0 +1,29 @@
+Import paths must match on-disk names exactly. On a case-insensitive file
+system example.com/shop/Internal/money would resolve and on a
+case-sensitive one it would not; the check reports it on every machine.
+A mis-cased path into node b is also a node import.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+-- internal/money/money.go --
+package money
+-- nodes/go/a/a.go --
+package a
+
+import (
+	"github.com/well-prado/new-blok/node"
+
+	_ "example.com/shop/Internal/money"
+	_ "example.com/shop/Nodes/go/b"
+)
+
+var Node = node.MustDefine("shop/a", "1.0.0", nil)
+-- nodes/go/b/b.go --
+package b
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/b", "1.0.0", nil)
+-- @expect --
+{"nodes":[["nodes/go/a","violation"],["nodes/go/b","verified"]],"diagnostics":[["ownership_import_case_mismatch","nodes/go/a/a.go:6"],["ownership_import_case_mismatch","nodes/go/a/a.go:7"],["ownership_node_imports_node","nodes/go/a/a.go:7"]]}

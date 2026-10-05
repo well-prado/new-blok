@@ -1,0 +1,88 @@
+Review probes (PR #314, Review R): routes to Node's loader, to native
+bindings or to evaluation that were reported verified. Every member route
+to a require function, any module.<name> but exports, any eval, Function or
+Reflect name or property, a computed property of the global object, the
+Function constructor reached through constructor.constructor, the AsyncFunction
+constructor, the CommonJS wrapper's arguments, the global
+object passed as a value (Reflect.get(globalThis, …)), native
+bindings, AMD define and the worker, child-process and cluster modules
+are unverified. A static require.resolve of another node is a violation.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+-- nodes/nodejs/amd-define/index.js --
+define(["../b/index.js"], function (b) { return b; });
+-- nodes/nodejs/amd-define/node.json --
+{"name":"probe/amd-define","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/async-function-constructor/index.js --
+const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
+new AsyncFunction("return 1")();
+-- nodes/nodejs/async-function-constructor/node.json --
+{"name":"probe/async-function-constructor","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/b/index.js --
+module.exports = 1;
+-- nodes/nodejs/b/node.json --
+{"name":"shop/b","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/wrapper-arguments/index.js --
+module.exports = arguments[1]("../b/index.js");
+-- nodes/nodejs/wrapper-arguments/node.json --
+{"name":"probe/wrapper-arguments","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/child-process-fork/index.js --
+require('child_process').fork("../b/index.js");
+-- nodes/nodejs/child-process-fork/node.json --
+{"name":"probe/child-process-fork","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/constructor-constructor/index.js --
+(() => 1).constructor.constructor("return 1")();
+-- nodes/nodejs/constructor-constructor/node.json --
+{"name":"probe/constructor-constructor","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/global-computed/index.js --
+globalThis["ev" + "al"]("1");
+-- nodes/nodejs/global-computed/node.json --
+{"name":"probe/global-computed","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/globalthis-eval/index.js --
+globalThis.eval("process.mainModule.require('x')");
+-- nodes/nodejs/globalthis-eval/node.json --
+{"name":"probe/globalthis-eval","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/globalthis-function/index.js --
+globalThis.Function("return 1")();
+-- nodes/nodejs/globalthis-function/node.json --
+{"name":"probe/globalthis-function","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/indirect-eval/index.js --
+(0, eval)("1");
+-- nodes/nodejs/indirect-eval/node.json --
+{"name":"probe/indirect-eval","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/module-constructor-proto/index.js --
+module.exports = module.constructor.prototype.require.call(module, "../b/index.js");
+-- nodes/nodejs/module-constructor-proto/node.json --
+{"name":"probe/module-constructor-proto","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/module-optional-require/index.js --
+module.exports = module?.require("../b/index.js");
+-- nodes/nodejs/module-optional-require/node.json --
+{"name":"probe/module-optional-require","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/new-url-worker/index.js --
+const { Worker } = require('worker_threads'); const W = Worker; new W(new URL("../b/index.js", import.meta.url));
+-- nodes/nodejs/new-url-worker/node.json --
+{"name":"probe/new-url-worker","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/process-binding/index.js --
+process.binding('fs');
+-- nodes/nodejs/process-binding/node.json --
+{"name":"probe/process-binding","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/reflect-construct/index.js --
+Reflect.construct(Function, ["return 1"])();
+-- nodes/nodejs/reflect-construct/node.json --
+{"name":"probe/reflect-construct","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/reflect-get-global/index.js --
+Reflect.get(globalThis, "ev" + "al")("1");
+-- nodes/nodejs/reflect-get-global/node.json --
+{"name":"probe/reflect-get-global","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/require-main-require/index.js --
+module.exports = require.main.require("../b/index.js");
+-- nodes/nodejs/require-main-require/node.json --
+{"name":"probe/require-main-require","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/require-resolve-only/index.js --
+require.resolve("../b/index.js");
+-- nodes/nodejs/require-resolve-only/node.json --
+{"name":"probe/require-resolve-only","version":"1.0.0","runtime":"nodejs"}
+-- @expect --
+{"diagnostics":[["ownership_node_imports_node","nodes/nodejs/require-resolve-only/index.js:1"],["ownership_unsupported_form","nodes/nodejs/amd-define/index.js:1"],["ownership_unsupported_form","nodes/nodejs/async-function-constructor/index.js:1"],["ownership_unsupported_form","nodes/nodejs/async-function-constructor/index.js:1"],["ownership_unsupported_form","nodes/nodejs/child-process-fork/index.js:1"],["ownership_unsupported_form","nodes/nodejs/constructor-constructor/index.js:1"],["ownership_unsupported_form","nodes/nodejs/global-computed/index.js:1"],["ownership_unsupported_form","nodes/nodejs/global-computed/index.js:1"],["ownership_unsupported_form","nodes/nodejs/globalthis-eval/index.js:1"],["ownership_unsupported_form","nodes/nodejs/globalthis-eval/index.js:1"],["ownership_unsupported_form","nodes/nodejs/globalthis-function/index.js:1"],["ownership_unsupported_form","nodes/nodejs/globalthis-function/index.js:1"],["ownership_unsupported_form","nodes/nodejs/indirect-eval/index.js:1"],["ownership_unsupported_form","nodes/nodejs/module-constructor-proto/index.js:1"],["ownership_unsupported_form","nodes/nodejs/module-constructor-proto/index.js:1"],["ownership_unsupported_form","nodes/nodejs/module-constructor-proto/index.js:1"],["ownership_unsupported_form","nodes/nodejs/module-constructor-proto/index.js:1"],["ownership_unsupported_form","nodes/nodejs/module-optional-require/index.js:1"],["ownership_unsupported_form","nodes/nodejs/module-optional-require/index.js:1"],["ownership_unsupported_form","nodes/nodejs/new-url-worker/index.js:1"],["ownership_unsupported_form","nodes/nodejs/new-url-worker/index.js:1"],["ownership_unsupported_form","nodes/nodejs/process-binding/index.js:1"],["ownership_unsupported_form","nodes/nodejs/process-binding/index.js:1"],["ownership_unsupported_form","nodes/nodejs/reflect-construct/index.js:1"],["ownership_unsupported_form","nodes/nodejs/reflect-construct/index.js:1"],["ownership_unsupported_form","nodes/nodejs/reflect-get-global/index.js:1"],["ownership_unsupported_form","nodes/nodejs/reflect-get-global/index.js:1"],["ownership_unsupported_form","nodes/nodejs/require-main-require/index.js:1"],["ownership_unsupported_form","nodes/nodejs/require-main-require/index.js:1"],["ownership_unsupported_form","nodes/nodejs/wrapper-arguments/index.js:1"]],"nodes":[["nodes/nodejs/amd-define","unverified"],["nodes/nodejs/async-function-constructor","unverified"],["nodes/nodejs/b","verified"],["nodes/nodejs/child-process-fork","unverified"],["nodes/nodejs/constructor-constructor","unverified"],["nodes/nodejs/global-computed","unverified"],["nodes/nodejs/globalthis-eval","unverified"],["nodes/nodejs/globalthis-function","unverified"],["nodes/nodejs/indirect-eval","unverified"],["nodes/nodejs/module-constructor-proto","unverified"],["nodes/nodejs/module-optional-require","unverified"],["nodes/nodejs/new-url-worker","unverified"],["nodes/nodejs/process-binding","unverified"],["nodes/nodejs/reflect-construct","unverified"],["nodes/nodejs/reflect-get-global","unverified"],["nodes/nodejs/require-main-require","unverified"],["nodes/nodejs/require-resolve-only","violation"],["nodes/nodejs/wrapper-arguments","unverified"]]}

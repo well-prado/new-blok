@@ -1,0 +1,110 @@
+Review probes (PR #314, Review R), Go: a linked .go file is compiled by
+go build but was skipped; cgo (#include in the preamble) and assembly
+(.s #include) reach files no import names. All are unverified. A
+//go:embed of shared data stays verified; a package embedding another
+node's file is a node import. The transitive control still fails.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- embedroot.go --
+package shop
+
+import _ "embed"
+
+//go:embed nodes/go/b/b.h
+var Header string
+-- go.mod --
+module example.com/shop
+-- nodes/go/b/b.go --
+package b
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/b", "1.0.0", nil)
+-- nodes/go/b/b.h --
+int x;
+-- nodes/go/go-asm-sfile/go_asm_sfile.go --
+package go_asm_sfile
+
+import (
+	"github.com/well-prado/new-blok/node"
+	_ "example.com/shop/shared/asm"
+)
+
+var Node = node.MustDefine("probe/go-asm-sfile", "1.0.0", nil)
+-- nodes/go/go-cgo-include/go_cgo_include.go --
+package go_cgo_include
+
+import (
+	"github.com/well-prado/new-blok/node"
+	_ "example.com/shop/shared/cgo"
+)
+
+var Node = node.MustDefine("probe/go-cgo-include", "1.0.0", nil)
+-- nodes/go/go-control-transitive/go_control_transitive.go --
+package go_control_transitive
+
+import (
+	"github.com/well-prado/new-blok/node"
+	_ "example.com/shop/shared/control"
+)
+
+var Node = node.MustDefine("probe/go-control-transitive", "1.0.0", nil)
+-- nodes/go/go-embed-node/go_embed_node.go --
+package go_embed_node
+
+import (
+	"github.com/well-prado/new-blok/node"
+	_ "example.com/shop"
+)
+
+var Node = node.MustDefine("probe/go-embed-node", "1.0.0", nil)
+-- nodes/go/go-embed/go_embed.go --
+package go_embed
+
+import (
+	"github.com/well-prado/new-blok/node"
+	_ "example.com/shop/shared/embedded"
+)
+
+var Node = node.MustDefine("probe/go-embed", "1.0.0", nil)
+-- nodes/go/go-symlinked-file/go_symlinked_file.go --
+package go_symlinked_file
+
+import (
+	"github.com/well-prado/new-blok/node"
+	_ "example.com/shop/shared/linked"
+)
+
+var Node = node.MustDefine("probe/go-symlinked-file", "1.0.0", nil)
+-- shared/asm/s.go --
+package asm
+-- shared/asm/s.s --
+#include "../../nodes/go/b/b.h"
+-- shared/cgo/s.go --
+package cgo
+
+// #include "../../nodes/go/b/b.h"
+import "C"
+-- shared/control/s.go --
+package control
+
+import _ "example.com/shop/nodes/go/b"
+-- shared/embedded/b.go.tmpl --
+x
+-- shared/embedded/s.go --
+package embedded
+
+import _ "embed"
+
+//go:embed b.go.tmpl
+var S string
+-- shared/linked/real/evil.go.txt --
+package linked
+
+import _ "example.com/shop/nodes/go/b"
+-- shared/linked/s.go --
+package linked
+-- @links --
+shared/linked/evil.go -> real/evil.go.txt
+-- @expect --
+{"diagnostics":[["layout_symlink_alias","shared/linked/evil.go"],["ownership_transitive_node_import","nodes/go/go-control-transitive/go_control_transitive.go:5"],["ownership_transitive_node_import","nodes/go/go-embed-node/go_embed_node.go:5"],["ownership_unsupported_form","shared/asm/s.s"],["ownership_unsupported_form","shared/cgo/s.go:4"]],"nodes":[["nodes/go/b","verified"],["nodes/go/go-asm-sfile","unverified"],["nodes/go/go-cgo-include","unverified"],["nodes/go/go-control-transitive","violation"],["nodes/go/go-embed","verified"],["nodes/go/go-embed-node","violation"],["nodes/go/go-symlinked-file","unverified"]]}

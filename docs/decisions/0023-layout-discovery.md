@@ -363,7 +363,9 @@ Focused suites: `go test -count=1 ./internal/tooling/... ./internal/scaffold
   the hard-link count is not checked.
 - Case folding is `strings.ToLower`; Unicode normalization (NFC/NFD) is not
   folded.
-- Only Go import graphs are checked; foreign-runtime imports are E12-T02.
+- Only direct Go imports are checked here. Transitive, aliased and
+  foreign-runtime (Node.js) import graphs are checked by
+  `internal/tooling/ownership` (E12-T02, [ADR 0025](0025-node-independence-import-graphs.md)).
   Imports in build-constrained files are checked like any other.
 - Discovery is a snapshot; a tree changing during discovery can produce a
   stale result, though `os.Root` still prevents reads outside the root and

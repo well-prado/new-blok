@@ -1,0 +1,35 @@
+Unresolved graph regions and cycles are reported. Node a imports a
+missing file, an undeclared package that is not installed, a package
+subpath its exports do not expose, and a file in a shared directory whose
+syntax cannot be read. Node b's own files import each other in a cycle.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+-- packages/lib/package.json --
+{"name":"@shop/lib","exports":{".":"./index.js"}}
+-- packages/lib/index.js --
+export const lib = 1;
+-- package.json --
+{"private":true,"workspaces":["packages/lib"]}
+-- shared/broken.ts --
+export const broken = "unterminated;
+-- nodes/nodejs/a/node.json --
+{"name":"shop/a","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/a/index.ts --
+import { missing } from "./missing.js";
+import pad from "left-pad";
+import { hidden } from "@shop/lib/internal.js";
+import { broken } from "../../../shared/broken.js";
+export const a = [missing, pad, hidden, broken];
+-- nodes/nodejs/b/node.json --
+{"name":"shop/b","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/b/index.ts --
+import { y } from "./y.js";
+export const x = 1;
+export const b = y;
+-- nodes/nodejs/b/y.ts --
+import { x } from "./index.js";
+export const y = x;
+-- @expect --
+{"nodes":[["nodes/nodejs/a","unverified"],["nodes/nodejs/b","violation"]],"diagnostics":[["ownership_import_cycle","nodes/nodejs/b/index.ts"],["ownership_import_unresolved","nodes/nodejs/a/index.ts:1"],["ownership_import_unresolved","nodes/nodejs/a/index.ts:2"],["ownership_import_unresolved","nodes/nodejs/a/index.ts:3"],["ownership_parse_failed","shared/broken.ts:1"]]}

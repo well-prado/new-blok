@@ -1,0 +1,32 @@
+Review probe (PR #314, Review R): vendored module source imports node b.
+The check does not resolve vendored copies, so a present vendor directory
+leaves every Go node unverified.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+-- nodes/go/b/b.go --
+package b
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/b", "1.0.0", nil)
+-- nodes/go/go-vendor/go_vendor.go --
+package go_vendor
+
+import (
+	"github.com/well-prado/new-blok/node"
+	_ "example.com/vend"
+)
+
+var Node = node.MustDefine("probe/go-vendor", "1.0.0", nil)
+-- vendor/example.com/vend/v.go --
+package vend
+
+import _ "example.com/shop/nodes/go/b"
+-- vendor/modules.txt --
+# example.com/vend v1.0.0
+## explicit
+example.com/vend
+-- @expect --
+{"diagnostics":[["ownership_unsupported_form","vendor"]],"nodes":[["nodes/go/b","unverified"],["nodes/go/go-vendor","unverified"]]}
