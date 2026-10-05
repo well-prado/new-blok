@@ -1488,6 +1488,17 @@
    "reason": "out_of_stock"
   },
   {
+   "name": "domain not-found error",
+   "credential": "alice",
+   "request": {
+    "sku": "coffee",
+    "quantity": 2
+   },
+   "behavior": "domain:not_found:not_found",
+   "code": "NOT_FOUND",
+   "reason": "not_found"
+  },
+  {
    "name": "domain error of another class",
    "credential": "alice",
    "request": {
@@ -1547,8 +1558,8 @@
   "startupAccepted": 2,
   "startupRefused": 16,
   "callsOK": 1,
-  "callsRefused": 14,
-  "dispatches": 7,
+  "callsRefused": 15,
+  "dispatches": 8,
   "effects": 1
  }
 }

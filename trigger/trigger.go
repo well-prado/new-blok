@@ -202,6 +202,13 @@ type Submitter interface {
 	Submit(context.Context, Submission) (accepted bool, err error)
 }
 
+// ClassNotFound is the class of a domain error for a record the caller
+// cannot see, whether it is missing or belongs to someone else (#306). It
+// equals node.ClassNotFound. In-band adapters answer it as their protocol's
+// not-found (HTTP 404, gRPC NotFound) with the error's code; the others
+// report the code as for any classified error. It never invites a retry.
+const ClassNotFound = "not_found"
+
 // Classified is implemented by errors that carry a stable public code and
 // class. Adapters map these without importing engine packages.
 type Classified interface {

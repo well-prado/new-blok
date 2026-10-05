@@ -235,6 +235,73 @@ not applicable with a reason, never as passed. Failures are
   `conformance.RunTrigger` (aliased and dot imports are recognized; a bare
   reference does not count).
 
+### The not-found class (#306)
+
+A record the caller may not see has to be answered without saying why: a
+record that does not exist and one that belongs to another principal must
+look the same. Before #306 the only way to say that was class `validation`
+with code `not_found`, which HTTP answers 400 ("you sent a bad request")
+and gRPC `InvalidArgument`. Clients, caches and retry logic branch on that
+status, so they took the wrong path.
+
+`node.ClassNotFound` and `trigger.ClassNotFound` are the class
+`not_found`. Two constants carry the one wire string because `trigger`
+does not import `node` (adapters map classified errors without the
+authoring packages); a test pins that they agree. The class sits beside the
+existing ones (`validation`, `admission`, `cancellation`, `configuration`,
+`persistence`, `uncertain`, ...) and means "this record is not visible to
+you". It does not mean "the input is malformed" (that stays `validation`),
+and it is not an admission or configuration refusal.
+
+**Indistinguishability.** The framework guarantees that a not-found answer
+carries the status its adapter gives the class and the error's stable code,
+and nothing else: never the error's text or its wrapped cause, and no
+header, detail or field that depends on them. A node returns the same
+error, code and class, for "does not exist" and "is not yours"; the two are
+then byte-identical on every adapter apart from the per-request id HTTP adds
+to every error body. The code is the node's, so an entity code such as
+`order_not_found` is kept; `not_found` is the recommended one. A code that
+is not a stable identifier falls back to the adapter's generic error, as for
+every class.
+
+| Adapter | Not-found from the workflow | Why |
+| --- | --- | --- |
+| HTTP | 404, `{"error":<code>,"requestId":…}`, no `Retry-After` | HTTP's not-found. The router's own 404 for an unknown route keeps its `{"error":"not found"}` body; route existence is public |
+| gRPC | `NotFound`, message and `ErrorInfo` reason `<code>` | gRPC's not-found ([ADR 0013](0013-grpc-bindings.md)) |
+| WebSocket | reply `{"id":…,"error":<code>}`; an `OnConnect` refusal closes 1008 with the code | the reply protocol has no status. There is no not-found close code, and the adapter does not invent one in the private 4000–4999 range |
+| MCP | `isError` tool result `{"code":<code>}` | MCP reports a tool's own failure in the result. JSON-RPC errors are for protocol failures, and the spec's -32002 is for `resources/read`, not `tools/call` |
+| SSE | final `failed` event `{"code":<code>}` | the start answers the committed submission before the workflow runs; its status cannot carry the outcome |
+| Webhook (and pub/sub, cron, worker) | the provider already got 202; the job ends dead after its one attempt with the code as its error | the event is acknowledged when committed; the workflow's outcome is the job's |
+
+A `Submitter` (webhook, SSE) that itself returns a not-found error is not a
+sentinel those adapters map: it is answered 500 `internal`, as any other
+unexpected admission failure, and a provider redelivers.
+
+**Retry semantics.** The class is terminal and never invites a retry. HTTP
+answers a 4xx without `Retry-After`, never the 5xx that clients and proxies
+retry; `NotFound` is not in the transient set gRPC retry policies list. The
+worker retries only a `HandlerError` the handler marks retryable, so the
+class does not make a job retryable. The in-band runner writes `FailRun`
+with the code and class, never `MarkRunUncertain`. The distributed runtime
+leaves a run replayable only for a non-overflow `persistence` failure or a
+context error, so a not-found run ends failed. One existing rule still
+applies: in a journaled (distributed) run, a failure of a node that declares
+effects is `effect_outcome_uncertain`, whatever its class, because the
+engine cannot take the node's word that nothing happened (ADR 0003). A
+lookup that should answer not-found there must not declare effects.
+
+**Telemetry and redaction.** The class reaches inspection events, the
+journal, the OTel span and the `blok.error.class` label of `blok.steps`
+unchanged as `not_found`. It is a valid bounded label, `redact.Sensitive`
+does not match it, and the inspection projection (#80) keeps it. No metric
+vocabulary changes: `blok.error.class` was already an open, series-bounded
+label (ADR 0022).
+
+**Remote nodes.** The runtime protocol's `ErrorClass` enum has no
+not-found value, so a node running in an external runtime cannot return
+this class yet: its failure arrives as one of the enum's classes. Adding the
+value is a wire change of its own.
+
 ## Compatibility
 
 | Change | Class | Migration |
@@ -259,6 +326,9 @@ not applicable with a reason, never as passed. Failures are
 | A drain timeout cancels admitted work, waits up to `AbortGrace`, then closes the dependencies (#177) | behavioral (fix) | work that outlived `DrainTimeout` used to run on into closed dependencies. Handlers should observe their context |
 | HTTP's draining 503 carries `Retry-After` | additive | none |
 | `Deployment.Run` closes request-less connections when drain begins (#194) | behavioral (fix) | a connection opened but not yet carrying a request is closed instead of answered. Its request was never admitted. A drain that used to report `application_drain_timeout` because of such a connection now ends when the admitted work does |
+| `node.ClassNotFound`, `trigger.ClassNotFound` (#306) | additive | none |
+| HTTP answers class `not_found` 404 with its code (#306) | behavioral | it was a 500 `internal error` that hid the code. No code in this repository used the class; code `not_found` with class `validation` still answers 400 until it switches class |
+| gRPC answers class `not_found` `NotFound` (#306) | behavioral | it was `FailedPrecondition` with the same reason |
 
 ## Limits
 

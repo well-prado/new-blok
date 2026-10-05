@@ -636,6 +636,8 @@ func statusFor(ctx context.Context, err error, ended time.Time) error {
 	switch class {
 	case "validation":
 		return refusal(codes.InvalidArgument, code)
+	case trigger.ClassNotFound:
+		return refusal(codes.NotFound, code)
 	case "admission":
 		return refusal(codes.ResourceExhausted, code)
 	case "cancellation":
