@@ -66,7 +66,7 @@ var QuoteWorkflow = flow.MustDefine[QuoteInput, Quote](
 )
 ```
 
-Returning a reference declares the output. `Define` also returns an error for tooling. Whole-value wiring works without generation. Field-level composition uses generated typed accessors. A call takes one input reference, so a call cannot yet read two earlier steps at once; the generated argument structs that would combine references, and literal call inputs, have no consumer or program form yet. Today `Lower` carries the workflow input, whole call results and accessor-selected fields of earlier calls into the program, and rejects literal or workflow-input-field call inputs, which have no program form yet ([ADR 0001](decisions/0001-public-api-boundaries.md), #244). Ordinary Go fields cannot hold both `string` and `Ref[string]`. Generation uses Go package/type analysis, never executes arbitrary package initialization, marks generated files and is deterministic.
+Returning a reference declares the output. `Define` also returns an error for tooling. Whole-value wiring works without generation. Field-level composition uses generated typed accessors. A call takes one input reference, so a call cannot yet read two earlier steps at once; the generated argument structs that would combine references, and literal call inputs, have no consumer or program form yet. Today `Lower` carries the workflow input, whole call results and accessor-selected fields of earlier calls into the program, and rejects literal or workflow-input-field call inputs, which have no program form yet ([ADR 0001](decisions/0001-public-api-boundaries.md), #244). `Lower` appends the workflow output instruction under the id `output` (`flow.OutputID`), so no builder accepts that id for a step (#247). Ordinary Go fields cannot hold both `string` and `Ref[string]`. Generation uses Go package/type analysis, never executes arbitrary package initialization, marks generated files and is deterministic.
 
 Unified layout: `nodes/<runtime>/<node>/`; classic layout: `runtimes/<runtime>/nodes/<node>/`. Workflow source remains under a dedicated application workflow directory. Layout does not change node identity. Files inside one node may import each other and approved utility/domain packages, but cannot import another node. CLI migration is transactional and validates ownership/collisions.
 
@@ -84,6 +84,8 @@ generic numeric envelope preserves exact JSON integers; its supplied inner
 schema owns integer range/wire rules. Template expansion preflights the byte
 budget before allocating output. See [ADR 0012](decisions/0012-catalog-null-and-template-bounds.md)
 for the correction, supported array limits and pending Node mirror integration.
+
+Field references select `encoding/json` object keys, so a path resolves identically on a typed node output and on its JSON-decoded form, with work bounded by the selected member; a selected field keeps its Go type. See [ADR 0001](decisions/0001-public-api-boundaries.md#field-references-select-encodingjson-keys-241).
 
 Logical values are immutable. Maps, slices and pointers require isolation between nodes and branches. Typed native fast paths must preserve this rule, and benchmarks include required validation/copies. Portable encodings serve journals and worker boundaries. Stable diagnostics name code, file/line, workflow, step, field, expected/actual and remediation.
 
