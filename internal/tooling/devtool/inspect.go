@@ -162,7 +162,9 @@ func Inspect(ctx context.Context, options InspectOptions) (report Report) {
 	for _, problem := range problems {
 		found.add(problem)
 	}
-	if workspace.Module == "" {
+	// Without a successful discovery there is no catalog to describe:
+	// inspect fails closed rather than describing part of a project.
+	if !workspace.Discovered {
 		return report
 	}
 	parsed, err := parseWorkspace(ctx, workspace)
@@ -175,21 +177,16 @@ func Inspect(ctx context.Context, options InspectOptions) (report Report) {
 	extracted := parsed.extract()
 	projector := &projection{selected: selected}
 	catalog := &Catalog{Fields: fields}
-	runtime := "go"
-	if workspace.Manifest != nil && workspace.Manifest.Runtime != "" {
-		runtime = workspace.Manifest.Runtime
-	}
 	if selected[FieldNodes] {
 		for _, item := range extracted.nodes {
-			source := projector.source(parsed.position(item.pos))
-			if item.id == "" || item.version == "" {
-				catalog.Unresolved = append(catalog.Unresolved, Unresolved{Kind: "node", Source: source, Reason: strings.Join(item.unresolved, "; ")})
-				continue
+			source := projector.source(item.at)
+			if item.pos.IsValid() {
+				source = projector.source(parsed.position(item.pos))
 			}
 			for _, reason := range item.unresolved {
 				catalog.Unresolved = append(catalog.Unresolved, Unresolved{Kind: "node-option", Source: source, Reason: reason})
 			}
-			entry := NodeEntry{ID: projector.text(item.id), Version: projector.text(item.version), Runtime: runtime, Package: item.pkg.Dir, Deterministic: item.deterministic, RemoteBoundary: item.remote, Source: source}
+			entry := NodeEntry{ID: projector.text(item.id), Version: projector.text(item.version), Runtime: item.runtime, Package: item.pkg.Dir, Deterministic: item.deterministic, RemoteBoundary: item.remote, Source: source}
 			entry.Effects = projector.texts(item.effects)
 			entry.RequiredCapabilities = projector.texts(item.capabilities)
 			if selected[FieldDescriptions] {
@@ -209,10 +206,9 @@ func Inspect(ctx context.Context, options InspectOptions) (report Report) {
 	}
 	if selected[FieldWorkflows] {
 		for _, item := range extracted.workflows {
-			source := projector.source(parsed.position(item.pos))
-			if item.name == "" || item.version == "" {
-				catalog.Unresolved = append(catalog.Unresolved, Unresolved{Kind: "workflow", Source: source, Reason: strings.Join(item.unresolved, "; ")})
-				continue
+			source := projector.source(item.at)
+			if item.pos.IsValid() {
+				source = projector.source(parsed.position(item.pos))
 			}
 			for _, reason := range item.unresolved {
 				catalog.Unresolved = append(catalog.Unresolved, Unresolved{Kind: "workflow-step", Source: source, Reason: reason})

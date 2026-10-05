@@ -19,19 +19,61 @@ import (
 	"github.com/well-prado/new-blok/internal/diagnostic"
 )
 
-// emittedCodes finds every diagnostic code literal in this package's
-// non-test source: a Code field in a composite literal, an assignment to a
-// .Code selector, or a comparison against one.
+// layoutCodes are internal/tooling/layout's diagnostic code constants by
+// name, read from its source.
+func layoutCodes(t *testing.T) map[string]string {
+	t.Helper()
+	file, err := parser.ParseFile(token.NewFileSet(), filepath.Join("..", "layout", "diagnostics.go"), nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	codes := map[string]string{}
+	for _, decl := range file.Decls {
+		general, ok := decl.(*ast.GenDecl)
+		if !ok || general.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range general.Specs {
+			value := spec.(*ast.ValueSpec)
+			for index, name := range value.Names {
+				if text, ok := stringLiteral(value.Values[index]); ok && strings.HasPrefix(name.Name, "Code") {
+					codes[name.Name] = text
+				}
+			}
+		}
+	}
+	if len(codes) == 0 {
+		t.Fatal("no layout codes found")
+	}
+	return codes
+}
+
+// emittedCodes finds every diagnostic code this package's non-test source
+// can emit: a Code field in a composite literal, an assignment to a .Code
+// selector, or a comparison against one, as a literal or a layout.Code*
+// constant. Every layout code is also emitted, passed through from
+// discovery.
 func emittedCodes(t *testing.T) map[string]bool {
 	t.Helper()
+	fromLayout := layoutCodes(t)
 	files, err := filepath.Glob("*.go")
 	if err != nil {
 		t.Fatal(err)
 	}
 	codes := map[string]bool{}
+	for _, code := range fromLayout {
+		codes[code] = true
+	}
 	record := func(expr ast.Expr) {
 		if value, ok := stringLiteral(expr); ok {
 			codes[value] = true
+		}
+		if selector, ok := expr.(*ast.SelectorExpr); ok {
+			if value, ok := fromLayout[selector.Sel.Name]; ok {
+				codes[value] = true
+			} else {
+				t.Errorf("code %s.%s is not a layout constant", selector.X, selector.Sel.Name)
+			}
 		}
 	}
 	isCode := func(expr ast.Expr) bool {

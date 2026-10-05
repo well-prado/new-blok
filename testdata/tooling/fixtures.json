@@ -14,7 +14,7 @@
       "expected": {
         "exitCode": 0,
         "status": "passed",
-        "outputRecords": 5,
+        "outputRecords": 4,
         "errorRecords": 0,
         "effectRecords": 0,
         "diagnostics": []
@@ -40,7 +40,7 @@
       "expected": {
         "exitCode": 1,
         "status": "failed",
-        "outputRecords": 4,
+        "outputRecords": 3,
         "errorRecords": 1,
         "effectRecords": 0,
         "diagnostics": [
@@ -67,7 +67,7 @@
       "expected": {
         "exitCode": 1,
         "status": "failed",
-        "outputRecords": 4,
+        "outputRecords": 3,
         "errorRecords": 1,
         "effectRecords": 0,
         "diagnostics": [
@@ -89,19 +89,19 @@
       "edits": [
         {
           "file": "{nodes}/tax/tax.go",
-          "write": "package tax\n\nimport \"{module}/{node}\"\n\n// Rate reads the quote node's input type, which another node may not import.\nfunc Rate(input quote.Input) int { return input.Quantity }\n"
+          "write": "package tax\n\nimport (\n\t\"context\"\n\n\t\"github.com/well-prado/new-blok/node\"\n\t\"{module}/{node}\"\n)\n\n// Rate reads the quote node's input type, which another node may not import.\nvar Rate = node.MustDefine(\"app/tax\", \"1.0.0\", func(_ context.Context, in quote.Input) (int, error) { return in.Quantity, nil })\n"
         }
       ],
       "expected": {
         "exitCode": 1,
         "status": "failed",
-        "outputRecords": 4,
+        "outputRecords": 2,
         "errorRecords": 1,
         "effectRecords": 0,
         "diagnostics": [
           {
-            "code": "node_import_forbidden",
-            "source": "{nodes}/tax/tax.go:3:8"
+            "code": "layout_node_imports_node",
+            "source": "{nodes}/tax/tax.go"
           }
         ]
       }
@@ -124,7 +124,7 @@
       "expected": {
         "exitCode": 1,
         "status": "failed",
-        "outputRecords": 4,
+        "outputRecords": 3,
         "errorRecords": 1,
         "effectRecords": 0,
         "diagnostics": [
@@ -154,7 +154,7 @@
       "expected": {
         "exitCode": 1,
         "status": "failed",
-        "outputRecords": 4,
+        "outputRecords": 3,
         "errorRecords": 1,
         "effectRecords": 0,
         "diagnostics": [
@@ -184,7 +184,7 @@
       "expected": {
         "exitCode": 1,
         "status": "failed",
-        "outputRecords": 4,
+        "outputRecords": 3,
         "errorRecords": 1,
         "effectRecords": 0,
         "diagnostics": [
@@ -218,7 +218,7 @@
       "expected": {
         "exitCode": 1,
         "status": "failed",
-        "outputRecords": 4,
+        "outputRecords": 3,
         "errorRecords": 1,
         "effectRecords": 0,
         "diagnostics": [
@@ -248,12 +248,12 @@
       "expected": {
         "exitCode": 1,
         "status": "failed",
-        "outputRecords": 4,
+        "outputRecords": 2,
         "errorRecords": 1,
         "effectRecords": 0,
         "diagnostics": [
           {
-            "code": "project_module_mismatch",
+            "code": "layout_manifest_invalid",
             "source": "blok.json",
             "field": "module"
           }
@@ -278,12 +278,12 @@
       "expected": {
         "exitCode": 1,
         "status": "failed",
-        "outputRecords": 4,
+        "outputRecords": 1,
         "errorRecords": 1,
         "effectRecords": 0,
         "diagnostics": [
           {
-            "code": "project_layout_unsupported",
+            "code": "layout_manifest_invalid",
             "source": "blok.json",
             "field": "layout"
           }
@@ -305,12 +305,12 @@
       "expected": {
         "exitCode": 1,
         "status": "failed",
-        "outputRecords": 3,
+        "outputRecords": 1,
         "errorRecords": 1,
         "effectRecords": 0,
         "diagnostics": [
           {
-            "code": "project_manifest_missing",
+            "code": "layout_manifest_missing",
             "source": "blok.json"
           }
         ]
@@ -331,12 +331,12 @@
       "expected": {
         "exitCode": 1,
         "status": "failed",
-        "outputRecords": 0,
+        "outputRecords": 1,
         "errorRecords": 1,
         "effectRecords": 0,
         "diagnostics": [
           {
-            "code": "project_go_mod_missing",
+            "code": "layout_module_missing",
             "source": "go.mod"
           }
         ]
@@ -546,12 +546,12 @@
       "golden": true,
       "edits": [
         {
-          "file": "{node}/audit.go",
-          "write": "package quote\n\nimport (\n\t\"context\"\n\n\t\"github.com/well-prado/new-blok/node\"\n)\n\nvar auditSchema = []byte(`{\"type\":\"object\",\"properties\":{\"password\":{\"type\":\"string\",\"default\":\"hunter2-fixture\"}}}`)\n\n// Audit's description and schema carry credential-shaped values.\nvar Audit = node.MustDefine(\"app/audit\", \"1.0.0\", func(_ context.Context, input Input) (Input, error) { return input, nil }, node.Description(\"calls the ledger with Authorization: Bearer fixture-token-0123456789abcdef\"), node.Schemas(auditSchema, auditSchema), node.Effects(\"ledger.write\"))\n"
+          "file": "{nodes}/audit/audit.go",
+          "write": "package audit\n\nimport (\n\t\"context\"\n\n\t\"github.com/well-prado/new-blok/node\"\n)\n\n// Entry is what the audit node records.\ntype Entry struct {\n\tID string `json:\"id\"`\n}\n\nvar auditSchema = []byte(`{\"type\":\"object\",\"properties\":{\"password\":{\"type\":\"string\",\"default\":\"hunter2-fixture\"}}}`)\n\n// Audit's description and schema carry credential-shaped values.\nvar Audit = node.MustDefine(\"app/audit\", \"1.0.0\", func(_ context.Context, input Entry) (Entry, error) { return input, nil }, node.Description(\"calls the ledger with Authorization: Bearer fixture-token-0123456789abcdef\"), node.Schemas(auditSchema, auditSchema), node.Effects(\"ledger.write\"))\n"
         },
         {
-          "file": "{node}/audit_test.go",
-          "write": "package quote\n\nimport (\n\t\"fmt\"\n\t\"testing\"\n)\n\nfunc TestAuditDescriptor(t *testing.T) {\n\tif Audit.Descriptor().Name != \"app/audit\" {\n\t\tt.Fatal(Audit.Descriptor().Name)\n\t}\n}\n\nfunc ExampleAudit() {\n\tfmt.Println(Audit.Descriptor().Name)\n\t// Output: app/audit\n}\n"
+          "file": "{nodes}/audit/audit_test.go",
+          "write": "package audit\n\nimport (\n\t\"fmt\"\n\t\"testing\"\n)\n\nfunc TestAuditDescriptor(t *testing.T) {\n\tif Audit.Descriptor().Name != \"app/audit\" {\n\t\tt.Fatal(Audit.Descriptor().Name)\n\t}\n}\n\nfunc ExampleAudit() {\n\tfmt.Println(Audit.Descriptor().Name)\n\t// Output: app/audit\n}\n"
         }
       ],
       "expected": {
@@ -572,23 +572,22 @@
       ],
       "edits": [
         {
-          "file": "{node}/dynamic.go",
-          "write": "package quote\n\nimport (\n\t\"context\"\n\n\t\"github.com/well-prado/new-blok/node\"\n)\n\nvar dynamicName = \"app/\" + \"dynamic\"\n\n// Dynamic's identity is computed, so inspect cannot read it without running code.\nvar Dynamic = node.MustDefine(dynamicName, \"1.0.0\", func(_ context.Context, input Input) (Input, error) { return input, nil })\n"
+          "file": "{nodes}/dynamic/dynamic.go",
+          "write": "package dynamic\n\nimport (\n\t\"context\"\n\n\t\"github.com/well-prado/new-blok/node\"\n)\n\nvar dynamicName = \"app/\" + \"dynamic\"\n\n// Dynamic's identity is a variable, so discovery cannot know it without running code.\nvar Dynamic = node.MustDefine(dynamicName, \"1.0.0\", func(_ context.Context, input string) (string, error) { return input, nil })\n"
         }
       ],
       "expected": {
-        "exitCode": 0,
-        "status": "passed",
-        "outputRecords": 3,
-        "errorRecords": 0,
+        "exitCode": 1,
+        "status": "failed",
+        "outputRecords": 0,
+        "errorRecords": 1,
         "effectRecords": 0,
-        "unresolved": [
+        "diagnostics": [
           {
-            "kind": "node",
-            "source": "{node}/dynamic.go:12:15"
+            "code": "layout_descriptor_not_static",
+            "source": "{nodes}/dynamic/dynamic.go:12"
           }
-        ],
-        "diagnostics": []
+        ]
       }
     },
     {
@@ -611,7 +610,7 @@
         "effectRecords": 0,
         "diagnostics": [
           {
-            "code": "source_parse_error",
+            "code": "layout_parse_failed",
             "sourcePrefix": "internal/app/broken.go:3:"
           }
         ]
@@ -639,7 +638,7 @@
       "expected": {
         "exitCode": 1,
         "status": "failed",
-        "outputRecords": 4,
+        "outputRecords": 3,
         "errorRecords": 1,
         "effectRecords": 0,
         "diagnostics": [
@@ -666,18 +665,18 @@
       "expected": {
         "exitCode": 1,
         "status": "failed",
-        "outputRecords": 0,
+        "outputRecords": 2,
         "errorRecords": 1,
         "effectRecords": 0,
         "diagnostics": [
           {
-            "code": "project_too_large"
+            "code": "layout_limit_exceeded"
           }
         ]
       }
     },
     {
-      "id": "inspect-source-unreadable",
+      "id": "inspect-source-too-large",
       "command": "inspect",
       "layouts": [
         "classic"
@@ -686,7 +685,7 @@
         {
           "file": "internal/app/huge.go",
           "write": "package app\n",
-          "padTo": 9437184
+          "padTo": 2097152
         }
       ],
       "expected": {
@@ -697,7 +696,7 @@
         "effectRecords": 0,
         "diagnostics": [
           {
-            "code": "source_unreadable",
+            "code": "layout_limit_exceeded",
             "source": "internal/app/huge.go"
           }
         ]
@@ -758,6 +757,35 @@
           {
             "code": "test_failed",
             "source": "internal/app/leak_test.go:7"
+          }
+        ]
+      }
+    },
+    {
+      "id": "check-manifest-unknown-field",
+      "command": "check",
+      "layouts": [
+        "unified"
+      ],
+      "edits": [
+        {
+          "file": "blok.json",
+          "replace": [
+            "\"runtime\": \"go\",",
+            "\"runtime\": \"go\",\n  \"plugins\": [\"auto\"],"
+          ]
+        }
+      ],
+      "expected": {
+        "exitCode": 1,
+        "status": "failed",
+        "outputRecords": 1,
+        "errorRecords": 1,
+        "effectRecords": 0,
+        "diagnostics": [
+          {
+            "code": "layout_manifest_invalid",
+            "source": "blok.json"
           }
         ]
       }

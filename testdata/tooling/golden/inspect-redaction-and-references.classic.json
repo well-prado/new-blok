@@ -26,7 +26,7 @@
         "id": "app/audit",
         "version": "1.0.0",
         "runtime": "go",
-        "package": "runtimes/go/nodes/quote",
+        "package": "runtimes/go/nodes/audit",
         "description": "[redacted: sensitive-looking log message]",
         "deterministic": false,
         "effects": [
@@ -44,21 +44,17 @@
           },
           "type": "object"
         },
-        "source": "runtimes/go/nodes/quote/audit.go:12:13",
+        "source": "runtimes/go/nodes/audit/audit.go:17:13",
         "tests": [
           {
-            "name": "TestQuoteOverHTTP",
-            "source": "internal/app/app_test.go:13:6"
-          },
-          {
             "name": "TestAuditDescriptor",
-            "source": "runtimes/go/nodes/quote/audit_test.go:8:6"
+            "source": "runtimes/go/nodes/audit/audit_test.go:8:6"
           }
         ],
         "examples": [
           {
             "name": "ExampleAudit",
-            "source": "runtimes/go/nodes/quote/audit_test.go:14:6"
+            "source": "runtimes/go/nodes/audit/audit_test.go:14:6"
           }
         ]
       },
@@ -100,16 +96,6 @@
           {
             "name": "TestQuoteOverHTTP",
             "source": "internal/app/app_test.go:13:6"
-          },
-          {
-            "name": "TestAuditDescriptor",
-            "source": "runtimes/go/nodes/quote/audit_test.go:8:6"
-          }
-        ],
-        "examples": [
-          {
-            "name": "ExampleAudit",
-            "source": "runtimes/go/nodes/quote/audit_test.go:14:6"
           }
         ]
       }

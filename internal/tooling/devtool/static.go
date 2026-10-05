@@ -2,10 +2,12 @@ package devtool
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -15,6 +17,7 @@ import (
 	"github.com/well-prado/new-blok/flow"
 	"github.com/well-prado/new-blok/internal/diagnostic"
 	"github.com/well-prado/new-blok/internal/scaffold"
+	"github.com/well-prado/new-blok/internal/tooling/layout"
 )
 
 // Framework packages whose calls and literals the static reader recognises.
@@ -58,7 +61,11 @@ func parseWorkspace(ctx context.Context, workspace Workspace) (*source, error) {
 			}
 			data, err := readBounded(filepath.Join(workspace.Root, filepath.FromSlash(name)), MaxSourceFileBytes)
 			if err != nil {
-				parsed.parseErrors = append(parsed.parseErrors, diagnostic.Diagnostic{Code: "source_unreadable", Source: name, Actual: errorText(err), Expected: "a readable Go file of at most 8 MiB", Remediation: "make the file readable or move it out of the project", Message: "a Go source file could not be read"})
+				code, message := layout.CodeFileUnsupported, "a Go source file could not be read"
+				if errors.Is(err, errFileTooLarge) {
+					code, message = layout.CodeLimitExceeded, "a Go source file exceeds the discovery size bound"
+				}
+				parsed.parseErrors = append(parsed.parseErrors, diagnostic.Diagnostic{Code: code, Source: name, Actual: errorText(err), Expected: "a readable regular file of at most " + strconv.Itoa(MaxSourceFileBytes) + " bytes", Remediation: "make the file a readable regular file within the bound, or move it out of the module", Message: message})
 				continue
 			}
 			file, err := parser.ParseFile(parsed.fset, name, data, parser.SkipObjectResolution)
@@ -70,7 +77,7 @@ func parseWorkspace(ctx context.Context, workspace Workspace) (*source, error) {
 				if before, after, ok := strings.Cut(message, ": "); ok && strings.HasPrefix(before, name) {
 					position, message = before, after
 				}
-				parsed.parseErrors = append(parsed.parseErrors, diagnostic.Diagnostic{Code: "source_parse_error", Source: position, Actual: message, Expected: "valid Go syntax", Remediation: "fix the Go syntax error at this position", Message: "a Go source file does not parse"})
+				parsed.parseErrors = append(parsed.parseErrors, diagnostic.Diagnostic{Code: layout.CodeParseFailed, Source: position, Actual: message, Expected: "valid Go syntax", Remediation: "fix the syntax error; discovery reads source without building it", Message: "a Go source file does not parse"})
 				continue
 			}
 			parsed.files[name] = file
@@ -137,6 +144,9 @@ func stringLiteral(expr ast.Expr) (string, bool) {
 
 // staticNode is a node.Define or node.MustDefine call.
 type staticNode struct {
+	// runtime and at come from layout: the node's runtime and the
+	// file:line (Go) or node.json path declaring it.
+	runtime, at   string
 	pkg           Package
 	file          string
 	pos           token.Pos
@@ -153,6 +163,7 @@ type staticNode struct {
 
 // staticWorkflow is a flow.Define or flow.MustDefine call.
 type staticWorkflow struct {
+	at            string
 	pkg           Package
 	file          string
 	pos           token.Pos
@@ -183,18 +194,34 @@ type staticTest struct {
 }
 
 type extraction struct {
-	nodes     []staticNode
-	workflows []staticWorkflow
-	routes    []staticRoute
+	// nodeCalls and flowCalls are the Define calls by file:line, the form
+	// layout positions its nodes and workflows in.
+	nodeCalls, flowCalls map[string]definedCall
+	nodes                []staticNode
+	workflows            []staticWorkflow
+	routes               []staticRoute
 	// tests and examples by package directory.
 	tests, examples map[string][]staticTest
 	// importers maps an import path to the package directories that import it.
 	importers map[string]map[string]bool
 }
 
-// extract reads every recognised declaration from the parsed workspace.
+// definedCall is a Define call and the name its file imports the framework
+// package by.
+type definedCall struct {
+	call *ast.CallExpr
+	name string
+	pkg  Package
+	file string
+}
+
+// extract describes the nodes and workflows layout discovered, reading the
+// details layout does not carry (options, steps) at the Define call each
+// one's position names, plus HTTP routes and test and example functions
+// from every package. Identity and the set of nodes and workflows are
+// layout's; extract never adds one.
 func (s *source) extract() extraction {
-	result := extraction{tests: map[string][]staticTest{}, examples: map[string][]staticTest{}, importers: map[string]map[string]bool{}}
+	result := extraction{tests: map[string][]staticTest{}, examples: map[string][]staticTest{}, importers: map[string]map[string]bool{}, nodeCalls: map[string]definedCall{}, flowCalls: map[string]definedCall{}}
 	for _, item := range s.workspace.Packages {
 		for _, name := range append(append([]string(nil), item.Files...), item.TestFiles...) {
 			file := s.files[name]
@@ -215,7 +242,44 @@ func (s *source) extract() extraction {
 			s.collectDeclarations(file, item, name, &result)
 		}
 	}
+	packages := map[string]Package{}
+	for _, item := range s.workspace.Packages {
+		packages[item.Dir] = item
+	}
+	for _, node := range s.workspace.Nodes {
+		found := staticNode{runtime: node.Runtime, at: node.Descriptor, pkg: packages[node.Dir], id: node.Name, version: node.Version}
+		if found.pkg.Dir == "" {
+			found.pkg = Package{Dir: node.Dir, ImportPath: s.workspace.Module + "/" + node.Dir}
+		}
+		if defined, ok := result.nodeCalls[node.Descriptor]; ok {
+			detail := s.node(defined.call, defined.name, defined.pkg, defined.file)
+			detail.runtime, detail.at, detail.id, detail.version = node.Runtime, node.Descriptor, node.Name, node.Version
+			found = detail
+		}
+		result.nodes = append(result.nodes, found)
+	}
+	for _, workflow := range s.workspace.Workflows {
+		found := staticWorkflow{at: workflow.Source, name: workflow.Name, version: workflow.Version, pkg: packages[path.Dir(sourceFile(workflow.Source))]}
+		if defined, ok := result.flowCalls[workflow.Source]; ok {
+			detail := s.workflow(defined.call, defined.name, defined.pkg, defined.file)
+			detail.at, detail.name, detail.version = workflow.Source, workflow.Name, workflow.Version
+			found = detail
+		} else {
+			found.unresolved = append(found.unresolved, "the workflow's source does not parse here, so its steps are not read")
+		}
+		result.workflows = append(result.workflows, found)
+	}
 	return result
+}
+
+// sourceFile is the file of a file:line position.
+func sourceFile(position string) string {
+	if index := strings.LastIndex(position, ":"); index > 0 {
+		if _, err := strconv.Atoi(position[index+1:]); err == nil {
+			return position[:index]
+		}
+	}
+	return position
 }
 
 func (s *source) collectTests(file *ast.File, dir string, result *extraction) {
@@ -253,11 +317,16 @@ func (s *source) collectDeclarations(file *ast.File, item Package, name string, 
 	ast.Inspect(file, func(n ast.Node) bool {
 		switch expr := n.(type) {
 		case *ast.CallExpr:
+			at := name + ":" + strconv.Itoa(s.fset.Position(expr.Pos()).Line)
 			if symbol, ok := selects(expr.Fun, nodeName); ok && (symbol == "Define" || symbol == "MustDefine") {
-				result.nodes = append(result.nodes, s.node(expr, nodeName, item, name))
+				if _, taken := result.nodeCalls[at]; !taken {
+					result.nodeCalls[at] = definedCall{call: expr, name: nodeName, pkg: item, file: name}
+				}
 			}
 			if symbol, ok := selects(expr.Fun, flowName); ok && (symbol == "Define" || symbol == "MustDefine") {
-				result.workflows = append(result.workflows, s.workflow(expr, flowName, item, name))
+				if _, taken := result.flowCalls[at]; !taken {
+					result.flowCalls[at] = definedCall{call: expr, name: flowName, pkg: item, file: name}
+				}
 			}
 		case *ast.CompositeLit:
 			if symbol, ok := selects(expr.Type, appName); ok && symbol == "Route" {
@@ -282,13 +351,6 @@ func (s *source) node(call *ast.CallExpr, nodeName string, item Package, file st
 	if len(call.Args) < 3 {
 		found.unresolved = append(found.unresolved, "node.Define needs a name, a version and a handler")
 		return found
-	}
-	var ok bool
-	if found.id, ok = stringLiteral(call.Args[0]); !ok {
-		found.unresolved = append(found.unresolved, "the node name is not a string literal")
-	}
-	if found.version, ok = stringLiteral(call.Args[1]); !ok {
-		found.unresolved = append(found.unresolved, "the node version is not a string literal")
 	}
 	for _, option := range call.Args[3:] {
 		optionCall, ok := option.(*ast.CallExpr)
@@ -393,15 +455,6 @@ func (s *source) workflow(call *ast.CallExpr, flowName string, item Package, fil
 				continue
 			}
 			switch key {
-			case "Name", "Version":
-				text, ok := stringLiteral(value)
-				if !ok {
-					found.unresolved = append(found.unresolved, "the workflow "+strings.ToLower(key)+" is not a string literal")
-				} else if key == "Name" {
-					found.name = text
-				} else {
-					found.version = text
-				}
 			case "Durability":
 				if symbol, ok := selects(value, flowName); ok && symbol == "Memory" {
 					found.durability = string(flow.Memory)

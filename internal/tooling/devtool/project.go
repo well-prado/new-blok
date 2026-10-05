@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"io/fs"
 	"os"
@@ -15,24 +14,32 @@ import (
 	"strings"
 
 	"github.com/well-prado/new-blok/internal/diagnostic"
-	"github.com/well-prado/new-blok/internal/scaffold"
+	"github.com/well-prado/new-blok/internal/tooling/layout"
 )
 
-// Bounds on what project loading reads.
-const (
-	MaxSourceFiles     = 20000
-	MaxSourceFileBytes = 8 << 20
-	maxManifestBytes   = 1 << 20
-)
+// MaxSourceFiles bounds the Go files goPackages lists for routes and test
+// references; past it the listing fails with layout_limit_exceeded.
+const MaxSourceFiles = 20000
 
-// Workspace is what check and inspect know about an application before they
-// look inside its source: its root, module, manifest and Go packages.
+// MaxSourceFileBytes is the per-file read bound, the same as discovery's.
+const MaxSourceFileBytes = layout.MaxFileBytes
+
+// Workspace is what check, test and inspect know about an application
+// before they look inside its source.
 type Workspace struct {
-	// Root is the absolute project directory.
-	Root     string
-	Module   string
-	Manifest *scaffold.Manifest
-	// Packages are sorted by Dir.
+	// Root is the absolute project directory as given.
+	Root   string
+	Module string
+	// Manifest is blok.json, read strictly by internal/tooling/layout; nil
+	// when it is missing or invalid.
+	Manifest *layout.Manifest
+	// Discovered reports that layout discovery succeeded, so Nodes and
+	// Workflows are the project's whole catalog.
+	Discovered bool
+	Nodes      []layout.Node
+	Workflows  []layout.Workflow
+	// Packages are the module's Go package directories, sorted by Dir,
+	// for HTTP routes and test and example references.
 	Packages []Package
 }
 
@@ -45,42 +52,70 @@ type Package struct {
 	TestFiles  []string
 }
 
-// ProjectSource finds a project's packages without executing any of its
-// source. It is the seam E12-T01 (#67) fills: its manifest-based discovery
-// of both layouts replaces DirectorySource, and check and inspect consume
-// whatever it returns unchanged.
+// ProjectSource finds a project without executing any of its source.
 type ProjectSource interface {
 	Load(ctx context.Context, root string) (Workspace, []diagnostic.Diagnostic, error)
 }
 
-// DirectorySource is the interim ProjectSource: blok.json and go.mod at the
-// root, and every Go package directory the go command itself would see under
-// it (vendor, testdata, nested modules and directories starting with "." or
-// "_" are skipped). Symbolic links are never followed, so nothing outside
-// the root is read.
-type DirectorySource struct{}
+// LayoutSource is the project discovery E12-T01 owns (ADR 0023):
+// layout.Discover for the manifest, module, nodes and workflows, and its
+// diagnostics unchanged. When discovery fails it still reads blok.json
+// through the strict layout.LoadManifest and go.mod's module directive, so
+// the checks that need only those can run; it never invents a catalog.
+type LayoutSource struct{}
 
-func (DirectorySource) Load(ctx context.Context, root string) (Workspace, []diagnostic.Diagnostic, error) {
+func (LayoutSource) Load(ctx context.Context, root string) (Workspace, []diagnostic.Diagnostic, error) {
 	absolute, err := filepath.Abs(root)
 	if err != nil {
 		return Workspace{}, nil, err
 	}
 	workspace := Workspace{Root: absolute}
+	if info, err := os.Stat(absolute); err != nil {
+		return workspace, nil, err
+	} else if !info.IsDir() {
+		return workspace, nil, &fs.PathError{Op: "open", Path: absolute, Err: errors.New("not a directory")}
+	}
 	var found []diagnostic.Diagnostic
-	module, problem := readModule(filepath.Join(absolute, "go.mod"))
+	project, err := layout.Discover(absolute)
+	var discovery *layout.Error
+	switch {
+	case err == nil:
+		workspace.Discovered = true
+		manifest := project.Manifest
+		workspace.Manifest, workspace.Module = &manifest, project.Module
+		workspace.Nodes, workspace.Workflows = project.Nodes, project.Workflows
+	case errors.As(err, &discovery):
+		found = append(found, discovery.Diagnostics...)
+		if manifest, err := layout.LoadManifest(absolute); err == nil {
+			workspace.Manifest = &manifest
+		}
+		workspace.Module = moduleOf(filepath.Join(absolute, "go.mod"))
+	default:
+		return workspace, nil, err
+	}
+	if workspace.Module == "" {
+		return workspace, found, nil
+	}
+	packages, problem, err := goPackages(ctx, absolute, workspace.Module)
+	if err != nil {
+		return workspace, found, err
+	}
 	if problem != nil {
 		found = append(found, *problem)
 	}
-	workspace.Module = module
-	manifest, problems := readManifest(absolute, module)
-	found = append(found, problems...)
-	workspace.Manifest = manifest
-	if module == "" {
-		return workspace, found, nil
-	}
+	workspace.Packages = packages
+	return workspace, found, nil
+}
+
+// goPackages lists the module's Go package directories the go command would
+// see (vendor, testdata, nested modules and "."/"_" directories skipped).
+// It never follows a symbolic link: a link is never a regular entry, and
+// WalkDir does not descend into a linked directory, so nothing outside root
+// is read. It is a file listing, not discovery: identities come from layout.
+func goPackages(ctx context.Context, root, module string) ([]Package, *diagnostic.Diagnostic, error) {
 	packages := map[string]*Package{}
 	files := 0
-	err = filepath.WalkDir(absolute, func(name string, entry fs.DirEntry, walkErr error) error {
+	err := filepath.WalkDir(root, func(name string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -88,7 +123,7 @@ func (DirectorySource) Load(ctx context.Context, root string) (Workspace, []diag
 			return err
 		}
 		if entry.IsDir() {
-			if name == absolute {
+			if name == root {
 				return nil
 			}
 			base := entry.Name()
@@ -100,16 +135,13 @@ func (DirectorySource) Load(ctx context.Context, root string) (Workspace, []diag
 			}
 			return nil
 		}
-		// A symbolic link is never a regular entry, and WalkDir does not
-		// descend into a linked directory, so nothing outside root is read.
 		if !entry.Type().IsRegular() || filepath.Ext(name) != ".go" {
 			return nil
 		}
-		files++
-		if files > MaxSourceFiles {
+		if files++; files > MaxSourceFiles {
 			return errTooLarge
 		}
-		relative, err := filepath.Rel(absolute, name)
+		relative, err := filepath.Rel(root, name)
 		if err != nil {
 			return err
 		}
@@ -132,77 +164,42 @@ func (DirectorySource) Load(ctx context.Context, root string) (Workspace, []diag
 		return nil
 	})
 	if errors.Is(err, errTooLarge) {
-		found = append(found, diagnostic.Diagnostic{Code: "project_too_large", Expected: "at most " + strconv.Itoa(MaxSourceFiles) + " Go files", Actual: "more", Remediation: "run blok from the application's own module root", Message: "the project has more Go files than blok reads"})
-		return workspace, found, nil
+		return nil, &diagnostic.Diagnostic{Code: layout.CodeLimitExceeded, Expected: "at most " + strconv.Itoa(MaxSourceFiles) + " Go files", Actual: "more", Remediation: "run blok from the application's own module root, or split the project", Message: "the module has more Go files than blok reads"}, nil
 	}
 	if err != nil {
-		return workspace, found, err
+		return nil, nil, err
 	}
+	result := make([]Package, 0, len(packages))
 	for _, item := range packages {
 		sort.Strings(item.Files)
 		sort.Strings(item.TestFiles)
-		workspace.Packages = append(workspace.Packages, *item)
+		result = append(result, *item)
 	}
-	sort.Slice(workspace.Packages, func(i, j int) bool { return workspace.Packages[i].Dir < workspace.Packages[j].Dir })
-	return workspace, found, nil
+	sort.Slice(result, func(i, j int) bool { return result[i].Dir < result[j].Dir })
+	return result, nil, nil
 }
 
 var errTooLarge = errors.New("too many source files")
 
-// readModule returns go.mod's module path, or the diagnostic explaining why
-// there is none.
-func readModule(name string) (string, *diagnostic.Diagnostic) {
-	data, err := readBounded(name, maxManifestBytes)
+// moduleOf is go.mod's module path, or "" when there is none. It reports
+// nothing: discovery already said why (layout_module_missing).
+func moduleOf(name string) string {
+	data, err := readBounded(name, MaxSourceFileBytes)
 	if err != nil {
-		return "", &diagnostic.Diagnostic{Code: "project_go_mod_missing", Source: "go.mod", Expected: "a go.mod at the project root", Actual: errorText(err), Remediation: "run blok from the application's module root, or create the application with blok new", Message: "the project has no readable go.mod"}
+		return ""
 	}
 	scanner := bufio.NewScanner(bytes.NewReader(data))
-	for line := 1; scanner.Scan(); line++ {
+	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
 		if len(fields) < 2 || fields[0] != "module" {
 			continue
 		}
-		module := fields[1]
-		if unquoted, err := strconv.Unquote(module); err == nil {
-			module = unquoted
+		if unquoted, err := strconv.Unquote(fields[1]); err == nil {
+			return unquoted
 		}
-		return module, nil
+		return fields[1]
 	}
-	return "", &diagnostic.Diagnostic{Code: "project_go_mod_invalid", Source: "go.mod", Expected: "a module directive", Remediation: "add a module directive naming the application's module path", Message: "go.mod declares no module"}
-}
-
-// readManifest reads blok.json. It accepts fields it does not know, so a
-// newer manifest still loads; it rejects what check cannot honour.
-func readManifest(root, module string) (*scaffold.Manifest, []diagnostic.Diagnostic) {
-	data, err := readBounded(filepath.Join(root, "blok.json"), maxManifestBytes)
-	if err != nil {
-		return nil, []diagnostic.Diagnostic{{Code: "project_manifest_missing", Source: "blok.json", Expected: "a blok.json at the project root", Actual: errorText(err), Remediation: "run blok from the application's root, or create the application with blok new", Message: "the project has no readable blok.json"}}
-	}
-	var manifest scaffold.Manifest
-	if err := json.Unmarshal(data, &manifest); err != nil {
-		return nil, []diagnostic.Diagnostic{{Code: "project_manifest_invalid", Source: "blok.json", Expected: "a JSON object", Actual: err.Error(), Remediation: "fix blok.json so it is a valid JSON object", Message: "blok.json is not valid JSON"}}
-	}
-	var found []diagnostic.Diagnostic
-	if module != "" && manifest.Module != module {
-		found = append(found, diagnostic.Diagnostic{Code: "project_module_mismatch", Source: "blok.json", Field: "module", Expected: module, Actual: manifest.Module, Remediation: "set blok.json's module to the module path go.mod declares", Message: "blok.json and go.mod name different modules"})
-	}
-	if manifest.Layout != "classic" && manifest.Layout != "unified" {
-		found = append(found, diagnostic.Diagnostic{Code: "project_layout_unsupported", Source: "blok.json", Field: "layout", Expected: "classic|unified", Actual: manifest.Layout, Remediation: "set blok.json's layout to classic or unified", Message: "blok.json names an unsupported layout"})
-	}
-	if manifest.Types != "" && !confined(manifest.Types) {
-		found = append(found, diagnostic.Diagnostic{Code: "project_manifest_invalid", Source: "blok.json", Field: "types", Expected: "a relative path inside the project", Actual: manifest.Types, Remediation: "point blok.json's types at a Go file inside the project", Message: "blok.json's types path leaves the project"})
-		manifest.Types = ""
-	}
-	return &manifest, found
-}
-
-// confined reports whether a manifest path stays inside the project root.
-func confined(name string) bool {
-	if name == "" || strings.Contains(name, "\\") || path.IsAbs(name) || filepath.IsAbs(name) || filepath.VolumeName(name) != "" {
-		return false
-	}
-	clean := path.Clean(name)
-	return clean != ".." && !strings.HasPrefix(clean, "../")
+	return ""
 }
 
 // readBounded reads a regular file of at most limit bytes without following

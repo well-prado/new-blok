@@ -14,11 +14,7 @@
   },
   "checks": [
     {
-      "name": "project",
-      "state": "passed"
-    },
-    {
-      "name": "node-imports",
+      "name": "layout",
       "state": "passed"
     },
     {

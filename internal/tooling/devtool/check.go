@@ -5,8 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"go/parser"
-	"go/token"
 	"os"
 	"path"
 	"path/filepath"
@@ -16,14 +14,14 @@ import (
 
 	"github.com/well-prado/new-blok/internal/diagnostic"
 	"github.com/well-prado/new-blok/internal/generate"
-	"github.com/well-prado/new-blok/internal/tooling/graphcheck"
 )
 
 // Check names, in the order blok check runs them. The slow toolchain check
 // runs last, so an interrupt during it still reports every static result.
 const (
-	CheckProject       = "project"
-	CheckNodeImports   = "node-imports"
+	// CheckLayout is layout discovery (ADR 0023): the manifest, the module,
+	// node identities and node import independence.
+	CheckLayout        = "layout"
 	CheckBindings      = "bindings"
 	CheckWorkflowSteps = "workflow-steps"
 	CheckGoVet         = "go-vet"
@@ -38,7 +36,7 @@ type Options struct {
 	Root string
 	// Go is the go command; "go" when empty.
 	Go string
-	// Source discovers the project; DirectorySource when nil.
+	// Source discovers the project; LayoutSource when nil.
 	Source ProjectSource
 	// Env is the environment the go command starts from; os.Environ() when
 	// nil. Toolchain, proxy, module-mode and workspace settings in it are
@@ -65,7 +63,7 @@ func (o Options) goBinary() string {
 
 func (o Options) source() ProjectSource {
 	if o.Source == nil {
-		return DirectorySource{}
+		return LayoutSource{}
 	}
 	return o.Source
 }
@@ -78,32 +76,31 @@ func Check(ctx context.Context, options Options) (report Report) {
 	toolFailure := false
 	defer func() { finish(&report, found, ctx, toolFailure) }()
 
-	workspace, projectProblems, err := options.source().Load(ctx, options.Root)
+	workspace, problems, err := options.source().Load(ctx, options.Root)
 	report.Project = workspace.project()
 	if err != nil {
 		if ctx.Err() == nil {
 			found.add(diagnostic.Diagnostic{Code: "project_unreadable", Actual: errorText(err), Expected: "a readable project directory", Remediation: "run blok from a readable application directory", Message: "the project could not be read"})
 		}
-		report.Checks = append(report.Checks, CheckResult{Name: CheckProject, State: stateOf(ctx, true)})
-		report.Checks = append(report.Checks, notReached(ctx, CheckNodeImports, CheckBindings, CheckWorkflowSteps, CheckGoVet)...)
+		report.Checks = append(report.Checks, CheckResult{Name: CheckLayout, State: stateOf(ctx, true)})
+		report.Checks = append(report.Checks, notReached(ctx, CheckBindings, CheckWorkflowSteps, CheckGoVet)...)
 		return report
 	}
-	for _, problem := range projectProblems {
+	for _, problem := range problems {
 		found.add(problem)
 	}
-	report.Checks = append(report.Checks, CheckResult{Name: CheckProject, State: stateOf(ctx, len(projectProblems) > 0)})
+	report.Checks = append(report.Checks, CheckResult{Name: CheckLayout, State: stateOf(ctx, len(problems) > 0)})
+	report.Checks = append(report.Checks, checkBindings(ctx, workspace, found))
+	if workspace.Discovered {
+		parsed, parseErr := parseWorkspace(ctx, workspace)
+		report.Checks = append(report.Checks, checkWorkflowSteps(ctx, parsed, parseErr, found))
+	} else {
+		report.Checks = append(report.Checks, CheckResult{Name: CheckWorkflowSteps, State: CheckSkipped, Reason: "layout discovery failed, so the workflows are unknown"})
+	}
 	if workspace.Module == "" {
-		reason := "the project has no go.mod module"
-		for _, name := range []string{CheckNodeImports, CheckBindings, CheckWorkflowSteps, CheckGoVet} {
-			report.Checks = append(report.Checks, CheckResult{Name: name, State: CheckSkipped, Reason: reason})
-		}
+		report.Checks = append(report.Checks, CheckResult{Name: CheckGoVet, State: CheckSkipped, Reason: "the project has no go.mod module"})
 		return report
 	}
-
-	report.Checks = append(report.Checks, checkNodeImports(ctx, workspace, found))
-	report.Checks = append(report.Checks, checkBindings(ctx, workspace, found))
-	parsed, parseErr := parseWorkspace(ctx, workspace)
-	report.Checks = append(report.Checks, checkWorkflowSteps(ctx, parsed, parseErr, found))
 	vet, vetToolFailure := checkGoVet(ctx, options, workspace, found)
 	toolFailure = vetToolFailure
 	report.Checks = append(report.Checks, vet)
@@ -131,75 +128,16 @@ func notReached(ctx context.Context, names ...string) []CheckResult {
 	return results
 }
 
-// checkNodeImports applies the node-independence rule through graphcheck,
-// the same analysis the framework enforces on itself, and locates each
-// offending import.
-func checkNodeImports(ctx context.Context, workspace Workspace, found *diagnostics) CheckResult {
-	if ctx.Err() != nil {
-		return CheckResult{Name: CheckNodeImports, State: CheckInterrupted}
-	}
-	results, err := graphcheck.Check(workspace.Root)
-	if err != nil {
-		return CheckResult{Name: CheckNodeImports, State: CheckSkipped, Reason: "the import graph could not be read: " + firstLine(relativeText(err.Error(), workspace.Root))}
-	}
-	failed := false
-	for _, result := range results {
-		if result.Code != "node_import_forbidden" {
-			continue
-		}
-		failed = true
-		found.add(diagnostic.Diagnostic{
-			Code:        result.Code,
-			Source:      importPosition(workspace, result.Package, result.Import),
-			Field:       "import",
-			Expected:    "no import of another node's package",
-			Actual:      result.Import,
-			Remediation: "move the shared code into a package outside nodes/ that both nodes may import, or compose the two nodes in a workflow",
-			Message:     result.Message,
-		})
-	}
-	return CheckResult{Name: CheckNodeImports, State: stateOf(ctx, failed)}
-}
-
-// importPosition is where the package at importPath imports imported.
-func importPosition(workspace Workspace, importPath, imported string) string {
-	for _, item := range workspace.Packages {
-		if item.ImportPath != importPath {
-			continue
-		}
-		for _, name := range item.Files {
-			fset := token.NewFileSet()
-			file, err := parser.ParseFile(fset, name, readOrNil(filepath.Join(workspace.Root, filepath.FromSlash(name))), parser.ImportsOnly)
-			if err != nil {
-				continue
-			}
-			for _, spec := range file.Imports {
-				if value, err := strconv.Unquote(spec.Path.Value); err == nil && value == imported {
-					at := fset.Position(spec.Pos())
-					return at.Filename + ":" + strconv.Itoa(at.Line) + ":" + strconv.Itoa(at.Column)
-				}
-			}
-		}
-		return item.Dir
-	}
-	return strings.TrimPrefix(strings.TrimPrefix(importPath, workspace.Module), "/")
-}
-
-func readOrNil(name string) []byte {
-	data, err := readBounded(name, MaxSourceFileBytes)
-	if err != nil {
-		return []byte{}
-	}
-	return data
-}
-
 // checkBindings regenerates the manifest's typed bindings in memory, exactly
 // as blok generate would, and compares them with the committed file.
 func checkBindings(ctx context.Context, workspace Workspace, found *diagnostics) CheckResult {
 	if ctx.Err() != nil {
 		return CheckResult{Name: CheckBindings, State: CheckInterrupted}
 	}
-	if workspace.Manifest == nil || workspace.Manifest.Types == "" {
+	if workspace.Manifest == nil {
+		return CheckResult{Name: CheckBindings, State: CheckSkipped, Reason: "blok.json is missing or invalid"}
+	}
+	if workspace.Manifest.Types == "" {
 		return CheckResult{Name: CheckBindings, State: CheckSkipped, Reason: "blok.json names no types file"}
 	}
 	types := path.Clean(workspace.Manifest.Types)
@@ -366,9 +304,4 @@ func roots(root string) []string {
 		result = append(result, resolved)
 	}
 	return result
-}
-
-func firstLine(text string) string {
-	line, _, _ := strings.Cut(text, "\n")
-	return line
 }

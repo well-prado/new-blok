@@ -1,5 +1,7 @@
 package devtool
 
+import "github.com/well-prado/new-blok/internal/tooling/layout"
+
 // Code is one stable diagnostic code and the commands that emit it.
 type Code struct {
 	Code     string
@@ -7,19 +9,43 @@ type Code struct {
 }
 
 // Codes is the registry of every diagnostic code check, test and inspect
-// emit. A code keeps one meaning for the life of blok-cli/v1 (ADR 0024);
+// emit, including layout's, which they pass through unchanged. A code keeps one meaning for the life of blok-cli/v1 (ADR 0024);
 // each is a #28 diagnostic code. Tests keep this list, the code literals in
 // this package's source and the ADR 0024 table identical.
 var Codes = []Code{
-	{"project_go_mod_missing", all},
-	{"project_go_mod_invalid", all},
-	{"project_manifest_missing", all},
-	{"project_manifest_invalid", all},
-	{"project_module_mismatch", all},
-	{"project_layout_unsupported", all},
-	{"project_too_large", all},
+	// internal/tooling/layout discovery (ADR 0023), reported by every
+	// command unchanged: one code per condition, wherever it is found.
+	{layout.CodeManifestMissing, all},
+	{layout.CodeManifestInvalid, all},
+	{layout.CodeModuleMissing, all},
+	{layout.CodePathOutsideRoot, all},
+	{layout.CodeMixedLayout, all},
+	{layout.CodeInvalidRuntime, all},
+	{layout.CodeFileUnowned, all},
+	{layout.CodeFileUnsupported, all},
+	{layout.CodeParseFailed, all},
+	{layout.CodeDescriptorMissing, all},
+	{layout.CodeDescriptorMultiple, all},
+	{layout.CodeDescriptorNotStatic, all},
+	{layout.CodeDescriptorInvalid, all},
+	{layout.CodeDescriptorMisplaced, all},
+	{layout.CodeDescriptorConstrained, all},
+	{layout.CodePackageMismatch, all},
+	{layout.CodeRuntimeMismatch, all},
+	{layout.CodeDuplicateIdentity, all},
+	{layout.CodeDuplicateVersion, all},
+	{layout.CodePathCollision, all},
+	{layout.CodeOwnershipOverlap, all},
+	{layout.CodeWorkflowPathMissing, all},
+	{layout.CodeNodeImportsNode, all},
+	{layout.CodeNodeImportsWorkflow, all},
+	{layout.CodeSymlinkEscape, all},
+	{layout.CodeSymlinkAlias, all},
+	{layout.CodeSymlinkDangling, all},
+	{layout.CodeSymlinkLoop, all},
+	{layout.CodeLimitExceeded, all},
+	// blok check, test and inspect (ADR 0024).
 	{"project_unreadable", all},
-	{"node_import_forbidden", checkOnly},
 	{"bindings_types_missing", checkOnly},
 	{"bindings_generate_failed", checkOnly},
 	{"bindings_missing", checkOnly},
@@ -40,8 +66,6 @@ var Codes = []Code{
 	{"test_failed", testOnly},
 	{"test_package_failed", testOnly},
 	{"no_tests_ran", testOnly},
-	{"source_unreadable", inspectOnly},
-	{"source_parse_error", inspectOnly},
 	{"interrupted", all},
 }
 
@@ -49,7 +73,6 @@ var (
 	all          = []string{"check", "test", "inspect"}
 	checkOnly    = []string{"check"}
 	testOnly     = []string{"test"}
-	inspectOnly  = []string{"inspect"}
 	checkAndTest = []string{"check", "test"}
 )
 

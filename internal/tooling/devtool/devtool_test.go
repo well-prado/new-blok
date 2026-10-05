@@ -24,6 +24,7 @@ import (
 	"github.com/well-prado/new-blok/internal/diagnostic"
 	"github.com/well-prado/new-blok/internal/generate"
 	"github.com/well-prado/new-blok/internal/scaffold"
+	"github.com/well-prado/new-blok/internal/tooling/layout"
 )
 
 var update = flag.Bool("update", false, "rewrite testdata/tooling/golden")
@@ -467,13 +468,13 @@ func TestRepairWithOneDiagnostic(t *testing.T) {
 			}
 
 			// A forbidden node import: the diagnostic names the import line.
-			applyEdits(t, dir, []fixtureEdit{{File: "{nodes}/tax/tax.go", Write: ptr("package tax\n\nimport \"{module}/{node}\"\n\nfunc Rate(input quote.Input) int { return input.Quantity }\n")}}, names)
+			applyEdits(t, dir, []fixtureEdit{{File: "{nodes}/tax/tax.go", Write: ptr(taxNode("\"{module}/{node}\"", "quote.Input"))}}, names)
 			report = Check(context.Background(), Options{Root: dir})
-			if len(report.Diagnostics) != 1 || report.Diagnostics[0].Code != "node_import_forbidden" {
+			if len(report.Diagnostics) != 1 || report.Diagnostics[0].Code != "layout_node_imports_node" {
 				t.Fatalf("diagnostics=%+v", report.Diagnostics)
 			}
 			file, _, _ := strings.Cut(report.Diagnostics[0].Source, ":")
-			if err := os.WriteFile(filepath.Join(dir, filepath.FromSlash(file)), []byte("package tax\n\n// Input is the tax node's own input.\ntype Input struct{ Quantity int }\n\nfunc Rate(input Input) int { return input.Quantity }\n"), 0o644); err != nil {
+			if err := os.WriteFile(filepath.Join(dir, filepath.FromSlash(file)), []byte(taxNode("", "Input")+"\n// Input is the tax node's own input.\ntype Input struct{ Quantity int }\n"), 0o644); err != nil {
 				t.Fatal(err)
 			}
 			if report := Check(context.Background(), Options{Root: dir}); report.ExitCode != ExitOK {
@@ -484,6 +485,12 @@ func TestRepairWithOneDiagnostic(t *testing.T) {
 }
 
 func ptr(value string) *string { return &value }
+
+// taxNode is a second node, importing extra (another node's package, or
+// nothing) and taking input as its input type.
+func taxNode(extra, input string) string {
+	return "package tax\n\nimport (\n\t\"context\"\n\n\t\"github.com/well-prado/new-blok/node\"\n\t" + extra + "\n)\n\n// Rate is the tax node.\nvar Rate = node.MustDefine(\"app/tax\", \"1.0.0\", func(_ context.Context, in " + input + ") (int, error) { return in.Quantity, nil })\n"
+}
 
 // regenerate is what blok generate writes for a types file.
 func regenerate(t *testing.T, types []byte) []byte {
@@ -662,9 +669,9 @@ func TestFieldPolicy(t *testing.T) {
 	}
 }
 
-// TestDirectorySourceStaysInsideRoot: a symbolic link to code outside the
-// project is never read.
-func TestDirectorySourceStaysInsideRoot(t *testing.T) {
+// TestPackageListingStaysInsideRoot: a symbolic link to code outside the
+// project is never listed, so never read.
+func TestPackageListingStaysInsideRoot(t *testing.T) {
 	outside := t.TempDir()
 	if err := os.WriteFile(filepath.Join(outside, "leak.go"), []byte("package leak\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -679,12 +686,12 @@ func TestDirectorySourceStaysInsideRoot(t *testing.T) {
 	if err := os.Symlink(filepath.Join(outside, "leak.go"), filepath.Join(root, "leak.go")); err != nil {
 		t.Fatal(err)
 	}
-	workspace, _, err := DirectorySource{}.Load(context.Background(), root)
-	if err != nil {
-		t.Fatal(err)
+	packages, problem, err := goPackages(context.Background(), root, "example.com/confined")
+	if err != nil || problem != nil {
+		t.Fatal(err, problem)
 	}
-	if len(workspace.Packages) != 0 {
-		t.Fatalf("read outside the root: %+v", workspace.Packages)
+	if len(packages) != 0 {
+		t.Fatalf("read outside the root: %+v", packages)
 	}
 }
 
@@ -715,10 +722,12 @@ func build(ok bool) {
 			t.Fatal(err)
 		}
 	}
-	workspace, _, err := DirectorySource{}.Load(context.Background(), root)
+	// Layout locates the workflow; the static reader reads its steps.
+	packages, _, err := goPackages(context.Background(), root, "example.com/flows")
 	if err != nil {
 		t.Fatal(err)
 	}
+	workspace := Workspace{Root: root, Module: "example.com/flows", Discovered: true, Packages: packages, Workflows: []layout.Workflow{{Name: "w", Version: "1.0.0", Path: ".", Source: "flows.go:6"}}}
 	parsed, err := parseWorkspace(context.Background(), workspace)
 	if err != nil {
 		t.Fatal(err)

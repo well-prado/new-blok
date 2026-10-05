@@ -4,8 +4,8 @@
 - Date: 2026-10-05
 - Roadmap: E11-T02 ([#65](https://github.com/well-prado/new-blok/issues/65));
   builds on E11-T01 (#64: `blok new`, `blok generate`, `blok.json`), E02-T04
-  (#28: `internal/diagnostic`), the node-independence graph check
-  (`internal/tooling/graphcheck`) and ADR 0021's redaction boundary
+  (#28: `internal/diagnostic`), E12-T01 (#67: `internal/tooling/layout`
+  discovery, ADR 0023) and ADR 0021's redaction boundary
 - Consumers: E11-T03 (#66, dev), E11-T04 (#102, doctor), the read-only
   development MCP (#69) and Studio, through the versioned report only
 - Windows: unverified. The native Windows checklist on #65 is a Windows-track
@@ -39,15 +39,16 @@ blok inspect [--json] [--fields LIST] [directory]
 
 | Command | Reads | Runs |
 | --- | --- | --- |
-| `check` | `go.mod`, `blok.json`, Go source (parsed, never loaded) | `go vet -json ./...`, which type-checks and compiles every package and runs none of them |
-| `test` | `go.mod`, `blok.json` | `go test -json ./...`: the application's own tests, in their own process |
+| `check` | layout discovery (`blok.json`, `go.mod`, node and workflow source), Go source (parsed, never loaded) | `go vet -json ./...`, which type-checks and compiles every package and runs none of them |
+| `test` | layout discovery | `go test -json ./...`: the application's own tests, in their own process |
 
 Neither `check` nor `test` downloads anything or edits the project (next
 section); `inspect` starts no process at all.
-| `inspect` | `go.mod`, `blok.json`, Go source (parsed) | nothing |
+| `inspect` | layout discovery, Go source (parsed) | nothing |
 
-`check` runs, in order: `project` (manifest and module), `node-imports`
-(graphcheck's node-independence rule), `bindings` (the manifest's types file
+`check` runs, in order: `layout` (internal/tooling/layout discovery, ADR
+0023: the strict manifest, the module, node and workflow identities, node
+import independence, ownership and symlink rules), `bindings` (the manifest's types file
 regenerated in memory by the same `generate.Source` `blok generate` uses,
 compared with the committed `bindings_gen.go`), `workflow-steps` (the step-id
 rules `flow.Define` enforces — id grammar, the reserved `output` id,
@@ -89,26 +90,35 @@ is `go_toolchain_too_old` at `go.mod`. The go command's progress lines
 therefore gives the same specific answer on every run, and a project that
 needs nothing from the cache (the starter) passes with an empty one.
 
-### Project discovery is a seam
+### Project discovery is layout's (ADR 0023)
 
-`ProjectSource` is the narrow port both `check` and `inspect` consume:
-`Load(ctx, root) (Workspace, []diagnostic.Diagnostic, error)`, where a
-`Workspace` is the root, module, manifest and Go package file lists.
-`DirectorySource` is the interim implementation: `blok.json` and `go.mod` at
-the root plus every package directory the go command would see (`vendor`,
-`testdata`, nested modules and `.`/`_` directories skipped). It never
-follows a symbolic link, so nothing outside the root is read, and it is
-bounded (20,000 Go files, 8 MiB per file, 1 MiB per manifest).
-**E12-T01 (#67, PR #300, ADR 0023) owns discovery and the manifest.**
-Once it merges, check and inspect consume `internal/tooling/layout`: its
-discovery replaces `DirectorySource` and the static `node.Define` /
-`flow.Define` reader in `devtool/static.go`, `blok.json` is read through
-`layout.LoadManifest` (strict, per ADR 0023: unknown fields are refused),
-and each manifest condition keeps the single code ADR 0023 gives it (for
-example `layout_manifest_invalid`, replacing `project_manifest_invalid`).
-Until then `DirectorySource` reads `blok.json` leniently. This ADR does not
-decide node identity from directories: inspect reports what descriptors
-declare.
+E12-T01 (#67, ADR 0023) owns discovery, and all three commands consume it
+through `ProjectSource` (`Load(ctx, root) (Workspace, []diagnostic.Diagnostic,
+error)`), implemented by `LayoutSource`:
+
+- `layout.Discover` supplies the manifest, the module, every node (its
+  identity from its descriptor, never its directory) and every workflow, or
+  its `*layout.Error`, whose diagnostics the report carries unchanged. Each
+  condition keeps the single code ADR 0023 gives it: an unsupported layout
+  is `layout_manifest_invalid` with field `layout`; a `blok.json` module
+  that differs from `go.mod`'s is `layout_manifest_invalid` with field
+  `module` (discovery compares them, so blok adds no second code); a node
+  importing another node is `layout_node_imports_node`.
+- `blok.json` is **strict, per ADR 0023**: an unknown field, trailing data
+  or a path leaving the root is refused.
+- When discovery fails, the manifest is still read through the strict
+  `layout.LoadManifest` and go.mod's module directive is read, so the checks
+  that need only those (`bindings`, `go-vet`) still run; `workflow-steps` is
+  skipped and `inspect` describes nothing. No partial catalog is invented.
+- The static reader no longer finds nodes or workflows. It reads only what
+  layout does not carry — node options and workflow steps — at the Define
+  call each layout position (`file:line`) names, plus HTTP routes and test
+  and example functions from every package.
+- For routes and test references, `goPackages` lists the module's Go files
+  as the go command would (`vendor`, `testdata`, nested modules and `.`/`_`
+  directories skipped), never following a symbolic link. Past 20,000 files,
+  or past layout's per-file bound, it reports `layout_limit_exceeded`; a
+  file it cannot parse is `layout_parse_failed`.
 
 ### The report (`blok-cli/v1`)
 
@@ -178,12 +188,8 @@ whose `exitCode` is the process exit code. `blok new`, `blok generate` and
 
 | Code | Raised by | Condition |
 | --- | --- | --- |
-| `project_go_mod_missing`, `project_go_mod_invalid` | all | no readable `go.mod`, or no module directive |
-| `project_manifest_missing`, `project_manifest_invalid` | all | no readable `blok.json`, invalid JSON, or a `types` path leaving the project |
-| `project_module_mismatch` | all | `blok.json`'s module differs from `go.mod`'s |
-| `project_layout_unsupported` | all | layout other than `classic` or `unified` |
-| `project_too_large`, `project_unreadable` | all | discovery bounds exceeded, root unreadable |
-| `node_import_forbidden` | check | a node package imports another node (graphcheck's code) |
+| `layout_manifest_missing`, `layout_manifest_invalid`, `layout_module_missing`, `layout_path_outside_root`, `layout_mixed`, `layout_invalid_runtime`, `layout_file_unowned`, `layout_file_unsupported`, `layout_parse_failed`, `layout_descriptor_missing`, `layout_descriptor_multiple`, `layout_descriptor_not_static`, `layout_descriptor_invalid`, `layout_descriptor_misplaced`, `layout_descriptor_constrained`, `layout_package_mismatch`, `layout_runtime_mismatch`, `layout_duplicate_identity`, `layout_duplicate_version`, `layout_path_collision`, `layout_ownership_overlap`, `layout_workflow_path_missing`, `layout_node_imports_node`, `layout_node_imports_workflow`, `layout_symlink_escape`, `layout_symlink_alias`, `layout_symlink_dangling`, `layout_symlink_loop`, `layout_limit_exceeded` | all | layout discovery's codes, passed through unchanged (ADR 0023); blok also raises `layout_parse_failed`, `layout_limit_exceeded` and `layout_file_unsupported` for the other Go files it lists |
+| `project_unreadable` | all | the project directory cannot be opened |
 | `bindings_types_missing`, `bindings_generate_failed`, `bindings_missing`, `bindings_not_generated`, `bindings_stale` | check | generated bindings absent, hand-written or out of date |
 | `workflow_step_id_invalid`, `workflow_step_id_reserved`, `workflow_step_id_duplicate` | check | the step-id rules of `flow.Define` |
 | `go_compile_error` | check, test | a positioned compiler error (identical from `go vet` and `go test`) |
@@ -198,7 +204,6 @@ whose `exitCode` is the process exit code. `blok new`, `blok generate` and
 | `test_failed` | test | a failing leaf test; `source` is the first `file:line` it reported |
 | `test_package_failed` | test | a package failed outside any test (panic, `TestMain`, timeout) |
 | `no_tests_ran` | test | go test passed but ran no test: nothing was verified |
-| `source_unreadable`, `source_parse_error` | inspect | a Go file could not be read or parsed (check leaves syntax to `go vet`) |
 | `interrupted` | all | the command was stopped; results are partial |
 
 ### Inspect: access and redaction policy
@@ -226,10 +231,12 @@ coverage.
   result is canonical JSON with sorted keys). A schema that is not JSON is
   replaced by the marker rather than projected raw. `catalog.redacted`
   counts replacements.
-- **Unresolved.** A declaration whose identity is not a literal, or an
-  option that is not a direct option call, is listed under
-  `catalog.unresolved` with its position and reason. It is never evaluated
-  and never guessed.
+- **Identity and unresolved detail.** Which nodes and workflows exist, and
+  their identities, are layout's: an identity discovery cannot read
+  statically is `layout_descriptor_not_static`, and inspect then describes nothing. A
+  node option that is not a direct option call, or a step id that is not a
+  literal, is listed under `catalog.unresolved` with its position and
+  reason. Nothing is ever evaluated or guessed.
 
 ### Cancellation, and blok dying
 
@@ -269,15 +276,21 @@ is the moment between starting the go command and starting its guard.
   `execute`; `new`, `generate`, `version` and `help` keep their output and
   exit codes.
 - **Unchanged**: `internal/diagnostic` (its #28 shape is reused as is),
-  `internal/tooling/graphcheck`, `internal/generate`, `internal/scaffold`
-  and `blok.json` (read leniently until #67's strict `layout.LoadManifest`
-  replaces the interim reader; see the discovery section).
+  `internal/tooling/graphcheck` (no longer used by blok check, since layout
+  owns the node-import rule), `internal/generate`, `internal/scaffold`
+  and `internal/tooling/layout`, which this change consumes without
+  modifying.
+- **Behavioural, within this unreleased PR**: adopting layout discovery
+  made `blok.json` strict (an unknown field is refused) and replaced this
+  change's earlier `project_*`, `node_import_forbidden` and `source_*`
+  codes with layout's, and the `project` and `node-imports` checks with one
+  `layout` check. None of those shipped.
 - The code registry is `devtool.Codes`; `TestCodeRegistryMatchesSourceAndADR`
   keeps it, the code literals in the source and the table above identical.
 
 ## Evidence
 
-- `testdata/tooling/fixtures.json` predeclares 28 cases (34 runs across the
+- `testdata/tooling/fixtures.json` predeclares 29 cases (35 runs across the
   two layouts) against real applications created by `scaffold.Create` and
   tidied: exit code, status, every diagnostic's code and position, output,
   error and effect counts (effects: project files created, changed or
@@ -328,6 +341,9 @@ is the moment between starting the go command and starting its guard.
 
 ## Limits
 
+- Layout positions some conditions by file only (`layout_node_imports_node`
+  names the importing file, not the import's line); blok reports layout's
+  diagnostic unchanged rather than a second, differently positioned one.
 - Workflow validation in `check` is static and literal-only; lowered-program
   compilation runs in the application's tests. Steps built in helper
   functions are not read (and are counted as unresolved when visible).
