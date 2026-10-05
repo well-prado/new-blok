@@ -1018,6 +1018,117 @@ func TestLeaseIsConfigurableAndLongerThanTwoBusyTimeouts(t *testing.T) {
 	}
 }
 
+// TestPanickingHandlerReleasesTheClaimTurn: a handler panics, and the panic
+// unwinds through ProcessOnce to a caller that recovers it, as a supervisor
+// that keeps its worker alive does. The claim turn must be released on the
+// way out, or every later ProcessOnce on the write domain in this process
+// would wait out the busy timeout for a turn nobody holds (#245 review).
+//
+// The test checks the turn itself rather than running the next job: the
+// panic also leaves the handler's SQLite transaction open, because
+// sqlite's WithTx does not roll back when its callback panics, so every
+// later write to this store fails busy whatever the turn does. That store
+// defect predates #245 (origin/main 078f29a behaves the same) and is
+// reported separately.
+func TestPanickingHandlerReleasesTheClaimTurn(t *testing.T) {
+	ctx := context.Background()
+	database, err := (sqlite.Backend{BusyTimeout: 300 * time.Millisecond}).Open(ctx, filepath.Join(t.TempDir(), "panic.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	queue, err := New(ctx, database, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queue.Enqueue(ctx, EnqueueRequest{RequestKey: "panics", Kind: "test", Payload: []byte(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	ran := false
+	recovered := func() (value any) {
+		defer func() { value = recover() }()
+		_, _ = queue.ProcessOnce(ctx, func(context.Context, Tx, Job) error { ran = true; panic("handler bug") })
+		return nil
+	}()
+	if !ran || recovered != "handler bug" {
+		t.Fatalf("ran=%v recovered=%v; want the handler to run and its panic to reach the caller", ran, recovered)
+	}
+	// Every Queue in the process on this write domain shares the turn; a
+	// fresh one must get it at once.
+	other, err := New(ctx, database, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release, err := other.takeClaimTurn()
+	if err != nil {
+		t.Fatalf("after a handler panic the write domain's claim turn is still held: %v", err)
+	}
+	release()
+}
+
+// TestHandlerProcessingItsOwnQueueFailsAfterOneBusyWait: a handler calls
+// ProcessOnce on the queue whose claim turn it holds. The inner call must
+// fail with store.ErrBusy after the store's busy timeout instead of waiting
+// for the turn forever, and the outer job, whose handler returns that
+// saturation naming its own write domain, fails as a nested submission and
+// is not retried (#207, #225, #245 review). A deadline keeps a regression
+// from hanging the package.
+func TestHandlerProcessingItsOwnQueueFailsAfterOneBusyWait(t *testing.T) {
+	ctx := context.Background()
+	const busy = 300 * time.Millisecond
+	database, err := (sqlite.Backend{BusyTimeout: busy}).Open(ctx, filepath.Join(t.TempDir(), "own-queue.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	queue, err := New(ctx, database, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"outer", "waiting"} {
+		if _, err := queue.Enqueue(ctx, EnqueueRequest{RequestKey: key, Kind: "test", Payload: []byte(`{}`), MaxAttempts: 3}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var inner error
+	var innerElapsed time.Duration
+	innerProcessed := false
+	done := make(chan error, 1)
+	go func() {
+		_, err := queue.ProcessOnce(ctx, func(ctx context.Context, _ Tx, _ Job) error {
+			started := time.Now()
+			innerProcessed, inner = queue.ProcessOnce(ctx, func(context.Context, Tx, Job) error { return nil })
+			innerElapsed = time.Since(started)
+			return inner
+		})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("outer ProcessOnce: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a handler that runs ProcessOnce on its own queue never returned; the claim-turn wait is not bounded by the busy timeout")
+	}
+	if innerProcessed || !errors.Is(inner, store.ErrBusy) {
+		t.Fatalf("inner ProcessOnce processed=%v err=%v; want store.ErrBusy and nothing processed", innerProcessed, inner)
+	}
+	if innerElapsed < busy || innerElapsed > busy+2*time.Second {
+		t.Fatalf("inner ProcessOnce failed after %v; want about the %v busy timeout", innerElapsed, busy)
+	}
+	job, err := queue.Get(ctx, "outer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.State != StateDead || job.Attempt != 1 || job.Error != "nested submission to claimed store; use worker.Tx for atomic writes" {
+		t.Fatalf("outer job=%+v; want dead at attempt 1 as a nested submission", job)
+	}
+	if state, attempt, deferrals := rawJob(t, database, "waiting"); state != StatePending || attempt != 0 || deferrals != 0 {
+		t.Fatalf("the job the inner call would have claimed is %s at attempt %d with %d deferrals; want it untouched", state, attempt, deferrals)
+	}
+}
+
 // runCrashLoopChild processes one job whose handler writes, records that it
 // ran, and kills its own process before the claim can commit.
 func runCrashLoopChild() {
