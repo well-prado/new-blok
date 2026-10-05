@@ -632,3 +632,30 @@ func resolveValue(t *testing.T, source any, path []string) resolved {
 	result, err := engine.New(map[string]node.Any{"test/source": definition.Any()}).Run(context.Background(), program, map[string]any{})
 	return resolved{value: result.Output, err: err}
 }
+
+// refFormatOption carries a format: option, which Go 1.27's encoding/json
+// rejects at encode time.
+type refFormatOption struct {
+	A int64 `json:"a"`
+	B int64 `json:"b,format:units"`
+}
+
+// TestFormatOptionFailsLikeEncodingJSON: encoding/json cannot encode a
+// struct with a format: option, so no field of it — the tagged one or a
+// sibling — resolves. The engine routes it to whole-value encoding and
+// reports that encoding's error instead of reading fields directly (#241
+// review round 4).
+func TestFormatOptionFailsLikeEncodingJSON(t *testing.T) {
+	_, marshalErr := json.Marshal(refFormatOption{A: 1, B: 2})
+	if marshalErr == nil {
+		t.Fatal("encoding/json accepted a format: option; the premise of this test no longer holds")
+	}
+	for _, source := range []any{refFormatOption{A: 1, B: 2}, &refFormatOption{A: 1, B: 2}} {
+		for _, path := range [][]string{{"b"}, {"a"}} {
+			got := resolveThroughEngine(t, source, path)
+			if got.Error == "" || !strings.Contains(got.Error, "format") {
+				t.Fatalf("%T %v resolved to %s; want the format: encoding error (encoding/json: %v)", source, path, got, marshalErr)
+			}
+		}
+	}
+}

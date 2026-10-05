@@ -238,7 +238,7 @@ func TestTaggedEmbeddedFieldTakesPartInDominance(t *testing.T) {
 // leading identifier (",string " still quotes) and parses quoted parts its
 // own way, so a type with such a tag gets no accessors at all (#241).
 func TestNonPlainTagsGetNoAccessors(t *testing.T) {
-	for _, tag := range []string{`n,string `, `'a,string'`, `n,omitempty;`} {
+	for _, tag := range []string{`n,string `, `'a,string'`, `n,omitempty;`, `n,format:units`} {
 		source := []byte("package shop\n\ntype Line struct {\n\tCount int64 `json:" + strconv.Quote(tag) + "`\n\tTotal int64\n}\n")
 		generated, err := Source(source, Options{})
 		if err != nil {
