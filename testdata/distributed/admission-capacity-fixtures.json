@@ -2,7 +2,11 @@
   "fixtureVersion": 1,
   "synthetic": true,
   "name": "bounded-admission-tenant-monopoly",
-  "limits": {"partitions": 8, "partitionAdmissions": 4, "tenantAdmissions": 2},
+  "limits": {
+    "partitions": 8,
+    "partitionAdmissions": 4,
+    "tenantAdmissions": 2
+  },
   "monopolizingTenantConcurrentSubmits": 5,
   "secondTenantConcurrentSubmits": 2,
   "expected": {
@@ -21,6 +25,10 @@
     "externalEffects": 1,
     "httpOverTenantCapStatus": 429,
     "httpRetryAfter": "1",
-    "httpQuorumLossStatus": 503
+    "httpQuorumLossStatus": 503,
+    "httpAcceptedStatus": 202,
+    "httpConflictStatus": 409,
+    "httpSignalQuorumLossStatus": 503,
+    "httpRecoveredAdmission": "accepted"
   }
 }

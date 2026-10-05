@@ -30,11 +30,16 @@ func TestDistributedCompetingOwnersAndExpiredOwnerAreFenced(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	singleErrors := make(map[string]struct{})
 	if err := store.Commit(ctx, owner, "before-expiry", "state", []byte(`{"value":1}`)); err != nil {
-		t.Fatal(err)
+		singleErrors[errorLabel(err)] = struct{}{}
+	}
+	currentOwners := 0
+	if current, err := store.CurrentOwner(ctx, partition); err == nil && current.Token == owner.Token && current.ID == owner.ID {
+		currentOwners++
 	}
 	assertScenarioFixture(t, "single-current-owner", map[string]any{
-		"acquired": 1, "committed": 1, "errors": []string{},
+		"acquired": currentOwners, "committed": committedEvents(t, ctx, store, partition, "before-expiry"), "errors": sortedErrorLabels(singleErrors),
 	})
 
 	var acquired int
@@ -73,19 +78,17 @@ func TestDistributedCompetingOwnersAndExpiredOwnerAreFenced(t *testing.T) {
 	if newOwner.Token <= owner.Token {
 		t.Fatalf("fence did not increase: old=%d new=%d", owner.Token, newOwner.Token)
 	}
-	if err := store.Commit(ctx, owner, "after-takeover", "state", []byte(`{"value":2}`)); !errors.Is(err, ErrOwnershipLost) {
-		t.Fatalf("stale owner commit error = %v, want ErrOwnershipLost", err)
+	staleErrors := make(map[string]struct{})
+	if err := store.Commit(ctx, owner, "after-takeover", "state", []byte(`{"value":2}`)); err != nil {
+		staleErrors[errorLabel(err)] = struct{}{}
 	}
-	if err := store.Commit(ctx, newOwner, "after-takeover", "state", []byte(`{"value":3}`)); err != nil {
+	if err := store.Commit(ctx, newOwner, "after-takeover", "state", []byte(`{"value":3}`)); err != nil && !errors.Is(err, ErrAlreadyWritten) {
 		t.Fatal(err)
 	}
+	oldCommitted, newCommitted := committedByFence(t, ctx, store, partition, "after-takeover", owner, newOwner)
 	assertScenarioFixture(t, "paused-owner-after-expiry-and-takeover", map[string]any{
-		"oldOwnerCommitted": 0, "newOwnerCommitted": 1, "errors": []string{"ownership_lost"},
+		"oldOwnerCommitted": oldCommitted, "newOwnerCommitted": newCommitted, "errors": sortedErrorLabels(staleErrors),
 	})
-	value, err := store.Read(ctx, partition, "after-takeover")
-	if err != nil || !strings.Contains(string(value), `"value":3`) {
-		t.Fatalf("committed value = %s, err=%v", value, err)
-	}
 	_ = client
 }
 
@@ -149,10 +152,57 @@ func TestConcurrentAcquisitionHasExactlyOneFencedWinner(t *testing.T) {
 }
 
 func errorLabel(err error) string {
-	if errors.Is(err, ErrOwnershipLost) {
+	switch {
+	case errors.Is(err, ErrOwnershipLost):
 		return "ownership_lost"
+	case errors.Is(err, ErrIncarnation):
+		return "incarnation_mismatch"
+	case errors.Is(err, ErrBlobUnavailable):
+		return "blob_unavailable"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "acknowledgment_unknown"
+	default:
+		return "unexpected: " + err.Error()
 	}
-	return "unexpected"
+}
+
+// committedEvents counts the committed events with id in partition.
+func committedEvents(t *testing.T, ctx context.Context, store *Store, partition, id string) int {
+	t.Helper()
+	events, err := store.ListEvents(ctx, partition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, event := range events {
+		if event.ID == id {
+			count++
+		}
+	}
+	return count
+}
+
+// committedByFence reports how many committed events with id carry each
+// owner's fence, read back from etcd rather than inferred from return values.
+func committedByFence(t *testing.T, ctx context.Context, store *Store, partition, id string, old, current Owner) (int, int) {
+	t.Helper()
+	events, err := store.ListEvents(ctx, partition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldCount, currentCount := 0, 0
+	for _, event := range events {
+		if event.ID != id {
+			continue
+		}
+		if event.Fence == old.Token && event.Incarnation == old.Incarnation {
+			oldCount++
+		}
+		if event.Fence == current.Token && event.Incarnation == current.Incarnation {
+			currentCount++
+		}
+	}
+	return oldCount, currentCount
 }
 
 func sortedErrorLabels(observed map[string]struct{}) []string {
@@ -197,18 +247,20 @@ func TestReplicaPauseCatchupAndQuorumLoss(t *testing.T) {
 	if err != nil {
 		t.Fatalf("initialize store through remaining voters: %v", err)
 	}
+	voterErrors := make(map[string]struct{})
 	if err := majorityStore.Commit(ctx, owner, "catchup", "state", []byte(`{"n":7}`)); err != nil {
-		t.Fatalf("majority commit with one paused replica: %v", err)
+		voterErrors[errorLabel(err)] = struct{}{}
 	}
+	majorityCommits := committedEvents(t, ctx, majorityStore, partition, "catchup")
 	if output, err := exec.Command("docker", composeArgs("unpause", "etcd3")...).CombinedOutput(); err != nil {
 		t.Fatalf("resume replica: %v: %s", err, output)
 	}
 	paused = false
-	if err := waitRead(ctx, client, endpoints[2], eventKey(partition, "catchup")); err != nil {
-		t.Fatalf("recovered replica did not catch up: %v", err)
-	}
+	catchupCtx, catchupCancel := context.WithTimeout(ctx, 20*time.Second)
+	recovered := waitRead(catchupCtx, client, endpoints[2], eventKey(partition, "catchup")) == nil
+	catchupCancel()
 	assertScenarioFixture(t, "one-voter-paused", map[string]any{
-		"majorityCommit": 1, "recoveredReplicaReadsCommit": true, "errors": []string{},
+		"majorityCommit": majorityCommits, "recoveredReplicaReadsCommit": recovered, "errors": sortedErrorLabels(voterErrors),
 	})
 
 	output, err := exec.Command("docker", composeArgs("pause", "etcd2", "etcd3")...).CombinedOutput()
@@ -225,8 +277,14 @@ func TestReplicaPauseCatchupAndQuorumLoss(t *testing.T) {
 	defer quorumCancel()
 	const operationID = "no-quorum-stable-operation"
 	const operationPayload = `{"n":8}`
-	if err := store.Commit(quorumCtx, owner, operationID, "state", []byte(operationPayload)); err == nil {
-		t.Fatal("commit succeeded after two of three voting members were paused")
+	quorumErrors := make(map[string]struct{})
+	acknowledgment := "acknowledged"
+	if err := store.Commit(quorumCtx, owner, operationID, "state", []byte(operationPayload)); err != nil {
+		quorumErrors[errorLabel(err)] = struct{}{}
+		acknowledgment = "rejected"
+		if errorLabel(err) == "acknowledgment_unknown" {
+			acknowledgment = "unknown"
+		}
 	}
 	if output, err := exec.Command("docker", composeArgs("unpause", "etcd2", "etcd3")...).CombinedOutput(); err != nil {
 		t.Fatalf("restore quorum: %v: %s", err, output)
@@ -235,11 +293,13 @@ func TestReplicaPauseCatchupAndQuorumLoss(t *testing.T) {
 	// A deadline means the acknowledgment is unknown, not that the Raft
 	// proposal definitely failed. Reconcile the stable operation ID first;
 	// retry only when absent, and accept only the same committed payload.
+	reconciled := false
 	for {
 		value, readErr := store.Read(ctx, partition, operationID)
 		if readErr == nil {
 			if value != nil {
 				assertEventPayload(t, value, owner, operationID, "state", operationPayload)
+				reconciled = true
 				break
 			}
 			commitErr := store.Commit(ctx, owner, operationID, "state", []byte(operationPayload))
@@ -260,9 +320,9 @@ func TestReplicaPauseCatchupAndQuorumLoss(t *testing.T) {
 	}
 	assertEventPayload(t, value, owner, operationID, "state", operationPayload)
 	assertScenarioFixture(t, "two-voters-paused", map[string]any{
-		"acknowledgment": "unknown", "reconcileByStableID": true,
-		"committedRecordsAfterRecovery": 1, "externalEffects": 0,
-		"errors": []string{"acknowledgment_unknown"},
+		"acknowledgment": acknowledgment, "reconcileByStableID": reconciled,
+		"committedRecordsAfterRecovery": committedEvents(t, ctx, store, partition, operationID),
+		"errors":                        sortedErrorLabels(quorumErrors),
 	})
 }
 
@@ -331,20 +391,22 @@ func TestNetworkPartitionedVoterAllowsMajorityCommitAndCatchesUp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("initialize store through non-partitioned voters: %v", err)
 	}
+	partitionErrors := make(map[string]struct{})
 	if err := majorityStore.Commit(ctx, owner, "majority-during-partition", "state", []byte(`{"majority":true}`)); err != nil {
-		t.Fatalf("two connected voters failed to commit: %v", err)
+		partitionErrors[errorLabel(err)] = struct{}{}
 	}
+	majorityCommits := committedEvents(t, ctx, majorityStore, partition, "majority-during-partition")
 	if err := restoreNetwork(); err != nil {
 		t.Fatal(err)
 	}
 	if err := waitEndpointAt(ctx, endpoints[2]); err != nil {
 		t.Fatalf("isolated voter did not regain a linearizable quorum: %v", err)
 	}
-	if err := waitRead(ctx, client, endpoints[2], eventKey(partition, "majority-during-partition")); err != nil {
-		t.Fatalf("isolated voter did not recover the majority commit: %v", err)
-	}
+	catchupCtx, catchupCancel := context.WithTimeout(ctx, 20*time.Second)
+	caughtUp := waitRead(catchupCtx, client, endpoints[2], eventKey(partition, "majority-during-partition")) == nil
+	catchupCancel()
 	assertScenarioFixture(t, "one-voter-network-partition", map[string]any{
-		"majorityCommit": 1, "partitionedReplicaCatchesUp": true, "errors": []string{},
+		"majorityCommit": majorityCommits, "partitionedReplicaCatchesUp": caughtUp, "errors": sortedErrorLabels(partitionErrors),
 	})
 }
 
@@ -353,12 +415,14 @@ func TestPausedOwnerProcessCannotCommitAfterTakeover(t *testing.T) {
 	partition := fmt.Sprintf("process-pause-%d", time.Now().UnixNano())
 	ready := filepath.Join(t.TempDir(), "owner-ready")
 	resume := filepath.Join(t.TempDir(), "owner-resume")
-	command := exec.Command(os.Args[0], "-test.run=^TestPausedOwnerHelper$")
+	result := filepath.Join(t.TempDir(), "owner-result")
+	command := exec.Command(os.Args[0], "-test.run=^$")
 	command.Env = append(os.Environ(),
 		"BLOK_DISTRIBUTED_OWNER_HELPER=1",
 		"BLOK_DISTRIBUTED_PARTITION="+partition,
 		"BLOK_DISTRIBUTED_READY="+ready,
 		"BLOK_DISTRIBUTED_RESUME="+resume,
+		"BLOK_DISTRIBUTED_RESULT="+result,
 	)
 	if err := command.Start(); err != nil {
 		t.Fatal(err)
@@ -393,9 +457,6 @@ func TestPausedOwnerProcessCannotCommitAfterTakeover(t *testing.T) {
 	if err := store.Commit(ctx, newOwner, "paused-race", "state", []byte(`{"winner":"new"}`)); err != nil {
 		t.Fatalf("new owner commit: %v", err)
 	}
-	assertScenarioFixture(t, "paused-owner-after-expiry-and-takeover", map[string]any{
-		"oldOwnerCommitted": 0, "newOwnerCommitted": 1, "errors": []string{"ownership_lost"},
-	})
 	if err := os.WriteFile(resume, []byte("resume"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -403,27 +464,53 @@ func TestPausedOwnerProcessCannotCommitAfterTakeover(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := command.Wait(); err != nil {
-		t.Fatalf("resumed stale owner did not observe fencing: %v", err)
+		t.Fatalf("resumed stale owner helper failed: %v", err)
 	}
 	finished = true
-	value, err := store.Read(ctx, partition, "paused-race")
-	if err != nil || !strings.Contains(string(value), `"winner":"new"`) {
-		t.Fatalf("stale process replaced new owner's commit: %s, err=%v", value, err)
+	label, err := os.ReadFile(result)
+	if err != nil {
+		t.Fatalf("stale owner did not report its resumed commit: %v", err)
 	}
+	staleOwner := Owner{Partition: partition, Incarnation: newOwner.Incarnation}
+	if tokenData, err := os.ReadFile(ready); err == nil {
+		_, _ = fmt.Sscan(string(tokenData), &staleOwner.Token)
+	}
+	oldCommitted, newCommitted := committedByFence(t, ctx, store, partition, "paused-race", staleOwner, newOwner)
+	processErrors := map[string]struct{}{}
+	if string(label) != "committed" {
+		processErrors[string(label)] = struct{}{}
+	}
+	assertScenarioFixture(t, "paused-owner-after-expiry-and-takeover", map[string]any{
+		"oldOwnerCommitted": oldCommitted, "newOwnerCommitted": newCommitted, "errors": sortedErrorLabels(processErrors),
+	})
 }
 
-func TestPausedOwnerHelper(t *testing.T) {
-	if os.Getenv("BLOK_DISTRIBUTED_OWNER_HELPER") != "1" {
-		t.Skip("subprocess helper")
+// runPausedOwnerHelper is the stale owner process for
+// TestPausedOwnerProcessCannotCommitAfterTakeover, dispatched by TestMain.
+// It reports the label of its resumed commit attempt; the test process reads
+// the committed records back from etcd.
+func runPausedOwnerHelper() error {
+	endpoints := strings.Split(os.Getenv("BLOK_DISTRIBUTED_ENDPOINTS"), ",")
+	client, err := clientv3.New(clientv3.Config{Endpoints: endpoints, DialTimeout: 2 * time.Second})
+	if err != nil {
+		return err
 	}
-	store, _ := integrationStore(t, "BLOK_DISTRIBUTED_ENDPOINTS")
+	defer client.Close()
+	current, err := client.Get(context.Background(), incarnationKey())
+	if err != nil || len(current.Kvs) == 0 {
+		return fmt.Errorf("read cluster incarnation: %v", err)
+	}
+	store, err := New(context.Background(), client, string(current.Kvs[0].Value))
+	if err != nil {
+		return err
+	}
 	partition := os.Getenv("BLOK_DISTRIBUTED_PARTITION")
 	owner, err := store.Acquire(context.Background(), partition, "paused-owner", 2*time.Second)
 	if err != nil {
-		t.Fatalf("acquire helper lease: %v", err)
+		return fmt.Errorf("acquire helper lease: %w", err)
 	}
 	if err := os.WriteFile(os.Getenv("BLOK_DISTRIBUTED_READY"), []byte(fmt.Sprint(owner.Token)), 0o600); err != nil {
-		t.Fatal(err)
+		return err
 	}
 	stopRenewal := make(chan struct{})
 	defer close(stopRenewal)
@@ -449,9 +536,11 @@ func TestPausedOwnerHelper(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if err := store.Commit(ctx, owner, "paused-race", "state", []byte(`{"winner":"old"}`)); !errors.Is(err, ErrOwnershipLost) {
-		t.Fatalf("resumed owner commit error = %v, want ErrOwnershipLost", err)
+	label := "committed"
+	if err := store.Commit(ctx, owner, "paused-race", "state", []byte(`{"winner":"old"}`)); err != nil {
+		label = errorLabel(err)
 	}
+	return os.WriteFile(os.Getenv("BLOK_DISTRIBUTED_RESULT"), []byte(label), 0o600)
 }
 
 func TestSnapshotRestoreRotatesIncarnationAndPreservesPartitionData(t *testing.T) {
@@ -506,7 +595,11 @@ func TestSnapshotRestoreRotatesIncarnationAndPreservesPartitionData(t *testing.T
 	port := listener.Addr().(*net.TCPAddr).Port
 	_ = listener.Close()
 	name := fmt.Sprintf("blok-distributed-restore-%d", time.Now().UnixNano())
-	args := []string{"run", "-d", "--name", name, "--network", "blok-distributed-spike", "-p", fmt.Sprintf("127.0.0.1:%d:2379", port), "-v", directory + ":/restore", "quay.io/coreos/etcd:v3.6.5", "etcd", "--name=restore", "--data-dir=/restore/restored", "--listen-peer-urls=http://0.0.0.0:2380", "--initial-advertise-peer-urls=http://restore:2380", "--listen-client-urls=http://0.0.0.0:2379", "--advertise-client-urls=http://restore:2379", "--initial-cluster=restore=http://restore:2380", "--initial-cluster-state=new"}
+	network := os.Getenv("BLOK_DISTRIBUTED_ETCD_NETWORK")
+	if network == "" {
+		network = "blok-distributed-spike"
+	}
+	args := []string{"run", "-d", "--name", name, "--network", network, "-p", fmt.Sprintf("127.0.0.1:%d:2379", port), "-v", directory + ":/restore", "quay.io/coreos/etcd:v3.6.5", "etcd", "--name=restore", "--data-dir=/restore/restored", "--listen-peer-urls=http://0.0.0.0:2380", "--initial-advertise-peer-urls=http://restore:2380", "--listen-client-urls=http://0.0.0.0:2379", "--advertise-client-urls=http://restore:2379", "--initial-cluster=restore=http://restore:2380", "--initial-cluster-state=new"}
 	if output, err := exec.Command("docker", args...).CombinedOutput(); err != nil {
 		t.Fatalf("start isolated restored member: %v: %s", err, output)
 	}
@@ -539,17 +632,26 @@ func TestSnapshotRestoreRotatesIncarnationAndPreservesPartitionData(t *testing.T
 	if err := preRotate.RotateIncarnation(ctx, oldOwner.Incarnation, newIncarnation); err != nil {
 		t.Fatalf("rotate incarnation before exposing restored cluster: %v", err)
 	}
-	if _, err := New(ctx, restoredClient, oldOwner.Incarnation); !errors.Is(err, ErrIncarnation) {
-		t.Fatalf("construct new client with stale incarnation = %v, want ErrIncarnation", err)
+	restoreErrors := make(map[string]struct{})
+	if _, err := New(ctx, restoredClient, oldOwner.Incarnation); err != nil {
+		restoreErrors[errorLabel(err)] = struct{}{}
 	}
-	if err := staleStore.Commit(ctx, oldOwner, "stale-after-restore", "state", []byte(`{"stale":true}`)); !errors.Is(err, ErrOwnershipLost) {
-		t.Fatalf("pre-restore owner commit = %v, want ErrOwnershipLost", err)
+	oldIncarnationCommit, oldIncarnationRenew := 0, 0
+	if err := staleStore.Commit(ctx, oldOwner, "stale-after-restore", "state", []byte(`{"stale":true}`)); err != nil {
+		restoreErrors[errorLabel(err)] = struct{}{}
+	} else {
+		oldIncarnationCommit++
 	}
-	if err := staleStore.Renew(ctx, oldOwner); !errors.Is(err, ErrOwnershipLost) {
-		t.Fatalf("pre-restore owner renew = %v, want ErrOwnershipLost", err)
+	if err := staleStore.Renew(ctx, oldOwner); err != nil {
+		restoreErrors[errorLabel(err)] = struct{}{}
+	} else {
+		oldIncarnationRenew++
 	}
-	if _, err := staleStore.Acquire(ctx, partition, "stale-store-after-restore", 3*time.Second); !errors.Is(err, ErrIncarnation) {
-		t.Fatalf("stale store acquire after incarnation rotation = %v, want ErrIncarnation", err)
+	if staleAcquired, err := staleStore.Acquire(ctx, partition, "stale-store-after-restore", 3*time.Second); err != nil {
+		restoreErrors[errorLabel(err)] = struct{}{}
+	} else {
+		_ = staleStore.Release(ctx, staleAcquired)
+		restoreErrors["stale_store_acquired"] = struct{}{}
 	}
 	postRotate, err := New(ctx, restoredClient, newIncarnation)
 	if err != nil {
@@ -562,16 +664,13 @@ func TestSnapshotRestoreRotatesIncarnationAndPreservesPartitionData(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if newOwner.Token >= futureOwner.Token {
-		t.Fatalf("restore did not exercise numeric revision rewind: restored token=%d, discarded post-snapshot token=%d", newOwner.Token, futureOwner.Token)
-	}
 	if err := postRotate.Commit(ctx, newOwner, "post-restore-event", "state", []byte(`{"restored":true}`)); err != nil {
-		t.Fatalf("new-incarnation owner commit: %v", err)
+		restoreErrors[errorLabel(err)] = struct{}{}
 	}
 	assertScenarioFixture(t, "snapshot-restore-revision-rewind", map[string]any{
-		"numericRevisionRewound": true, "oldIncarnationCommit": 0,
-		"oldIncarnationRenew": 0, "freshIncarnationCommit": 1,
-		"errors": []string{"incarnation_mismatch", "ownership_lost"},
+		"numericRevisionRewound": newOwner.Token < futureOwner.Token, "oldIncarnationCommit": oldIncarnationCommit + committedEvents(t, ctx, postRotate, partition, "stale-after-restore"),
+		"oldIncarnationRenew": oldIncarnationRenew, "freshIncarnationCommit": committedEvents(t, ctx, postRotate, partition+"-fresh", "post-restore-event"),
+		"errors": sortedErrorLabels(restoreErrors),
 	})
 }
 

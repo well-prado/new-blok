@@ -140,6 +140,10 @@ func TestAdmissionCapsBoundTenantAndPartitionAcrossIngressAndTakeover(t *testing
 			HTTPOverCap           int    `json:"httpOverTenantCapStatus"`
 			HTTPRetryAfter        string `json:"httpRetryAfter"`
 			HTTPQuorumLoss        int    `json:"httpQuorumLossStatus"`
+			HTTPAccepted          int    `json:"httpAcceptedStatus"`
+			HTTPConflict          int    `json:"httpConflictStatus"`
+			HTTPSignalQuorumLoss  int    `json:"httpSignalQuorumLossStatus"`
+			HTTPRecovered         string `json:"httpRecoveredAdmission"`
 		} `json:"expected"`
 	}
 	readDistributedFixture(t, "admission-capacity-fixtures.json", &fixture)
@@ -301,6 +305,14 @@ func TestSignalAcrossOwnerChangeIsRetryableAndResumesOnce(t *testing.T) {
 		newOwner = acquireWhenFree(t, ctx, direct, partition, "signal-owner-new", 30*time.Second)
 	})
 	payload := json.RawMessage(`{"approved":true}`)
+	unauthorized, err := ingress.DeliverSignal(ctx, tenant, waitID, "unauthorized-signal", "synthetic-principal", payload, false)
+	unauthorizedLabel := signalOutcome(unauthorized, err)
+	if errors.Is(err, ErrUnauthorizedSignal) {
+		unauthorizedLabel = "signal_unauthorized"
+	}
+	if unauthorizedLabel != expected.Unauthorized {
+		t.Fatalf("unauthorized signal=%s err=%v, fixture %s", unauthorizedLabel, err, expected.Unauthorized)
+	}
 	result, err := ingress.DeliverSignal(ctx, tenant, waitID, "owner-change-signal", "synthetic-principal", payload, true)
 	got := "accepted"
 	if errors.Is(err, ErrUnavailable) {
@@ -340,6 +352,7 @@ type signalTimerOwnershipFixture struct {
 	Synthetic               bool   `json:"synthetic"`
 	Name                    string `json:"name"`
 	SignalAcrossOwnerChange struct {
+		Unauthorized                    string `json:"unauthorized"`
 		FirstAttempt                    string `json:"firstAttempt"`
 		WaitAfterFirstAttempt           string `json:"waitAfterFirstAttempt"`
 		RunAfterFirstAttempt            string `json:"runAfterFirstAttempt"`

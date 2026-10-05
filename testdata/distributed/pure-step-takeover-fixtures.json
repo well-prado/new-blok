@@ -1,5 +1,9 @@
 {
   "expectedAttempts": 2,
   "expectedDifferentAttemptIDs": true,
-  "expectedExternalEffects": 0
+  "expectedPureInvocations": 2,
+  "expectedExternalEffects": 1,
+  "expectedFinalState": "completed",
+  "expectedOutput": "{\"value\":42}",
+  "expectedStaleResult": "ownership_lost"
 }

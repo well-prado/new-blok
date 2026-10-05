@@ -3,6 +3,7 @@
   "synthetic": true,
   "name": "signal-timer-ownership-races",
   "signalAcrossOwnerChange": {
+    "unauthorized": "signal_unauthorized",
     "firstAttempt": "unavailable",
     "waitAfterFirstAttempt": "waiting",
     "runAfterFirstAttempt": "waiting",

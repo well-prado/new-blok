@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -523,145 +524,6 @@ func TestFailoverUnderSustainedLoadPreservesFairnessAndEffectCounts(t *testing.T
 	}
 }
 
-func TestTimerAndSignalRaceHasOneFencedWinner(t *testing.T) {
-	fixtureBytes, err := os.ReadFile("../../testdata/distributed/runtime-timer-signal-fixtures.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var fixture struct {
-		UnauthorizedError         string `json:"unauthorizedError"`
-		SignalWinnerState         string `json:"signalWinnerState"`
-		TimerWinnerState          string `json:"timerWinnerState"`
-		ExpectedTransitionWinners int    `json:"expectedTransitionWinners"`
-		ExpectedRunEffects        int64  `json:"expectedRunEffects"`
-	}
-	if err := json.Unmarshal(fixtureBytes, &fixture); err != nil {
-		t.Fatal(err)
-	}
-	store := integrationDistributedStore(t)
-	started := make(chan struct{})
-	release := make(chan struct{})
-	var effects atomic.Int64
-	definition := node.MustDefine("fixture/wait-run", "1.0.0", func(_ context.Context, input integrationInput) (integrationOutput, error) {
-		effects.Add(1)
-		close(started)
-		<-release
-		return integrationOutput{Value: input.Value}, nil
-	}, node.Description("timer/signal owner-race fixture"), node.Schemas(
-		[]byte(`{"type":"object","properties":{"value":{"type":"integer"}},"required":["value"],"additionalProperties":false}`),
-		[]byte(`{"type":"object","properties":{"value":{"type":"integer"}},"required":["value"],"additionalProperties":false}`),
-	), node.Effects("fixture:wait-race")).Any()
-	program := contract.InternalProgram{WorkflowID: "timer-signal-fixture", Digest: "sha256:" + strings.Repeat("c", 64), Instructions: []contract.InternalInstruction{{Index: 0, ID: "wait", Kind: "call", Node: "fixture/wait-run"}}}
-	workflow := Workflow{Program: program, DecodeInput: func(raw json.RawMessage) (any, error) {
-		var input integrationInput
-		if err := json.Unmarshal(raw, &input); err != nil {
-			return nil, err
-		}
-		return input, nil
-	}}
-	runtime, err := New(store, engine.New(map[string]node.Any{"fixture/wait-run": definition}), map[string]Workflow{"timer-signal-fixture": workflow}, Limits{Partitions: 8, PartitionAdmissions: 64, TenantAdmissions: 8, OwnerTTL: 5 * time.Second})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	if err := runtime.Check(ctx); err != nil {
-		t.Fatal(err)
-	}
-	tenant, partition := tenantForEmptyPartition(t, ctx, store, runtime, "timer-tenant")
-	admission, err := runtime.Admit(ctx, Submission{Tenant: tenant, RequestKey: "timer-run", Workflow: "timer-signal-fixture", Input: json.RawMessage(`{"value":9}`)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	owner, err := store.Acquire(ctx, partition, "timer-owner", 5*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	releaseOwnerOnCleanup(t, store, owner)
-	processResult := make(chan error, 1)
-	go func() { _, err := runtime.processOne(ctx, owner); processResult <- err }()
-	select {
-	case <-started:
-	case <-ctx.Done():
-		t.Fatal("workflow did not start")
-	}
-	waitID := "wait-for-signal"
-	if _, err := runtime.ScheduleWait(ctx, owner, admission.RunID, waitID, "ready", time.Now().Add(-time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := runtime.DeliverSignal(ctx, tenant, waitID, "unauthorized-id", "principal", json.RawMessage(`{"value":"x"}`), false); !errors.Is(err, ErrUnauthorizedSignal) || fixture.UnauthorizedError != "signal_unauthorized" {
-		t.Fatalf("unauthorized signal error=%v, want fixture %s", err, fixture.UnauthorizedError)
-	}
-	start := make(chan struct{})
-	type signalOutcome struct {
-		result SignalResult
-		err    error
-	}
-	signalResult := make(chan signalOutcome, 1)
-	timerResult := make(chan []WaitRecord, 1)
-	timerErr := make(chan error, 1)
-	go func() {
-		<-start
-		result, err := runtime.DeliverSignal(ctx, tenant, waitID, "race-signal", "principal", json.RawMessage(`{"value":"ok"}`), true)
-		signalResult <- signalOutcome{result, err}
-	}()
-	go func() {
-		<-start
-		fired, err := runtime.FireDueWaits(ctx, owner, time.Now().UTC(), 8)
-		timerResult <- fired
-		timerErr <- err
-	}()
-	close(start)
-	signal := <-signalResult
-	fired := <-timerResult
-	if err := <-timerErr; err != nil {
-		t.Fatal(err)
-	}
-	if signal.err != nil {
-		t.Fatal(signal.err)
-	}
-	winners := len(fired)
-	if signal.result.Accepted {
-		winners++
-	}
-	if winners != fixture.ExpectedTransitionWinners {
-		t.Fatalf("signal/timer winners=%d, expected %d", winners, fixture.ExpectedTransitionWinners)
-	}
-	wait, err := runtime.GetWait(ctx, tenant, waitID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if wait.State == fixture.SignalWinnerState {
-		if !signal.result.Accepted || len(fired) != 0 {
-			t.Fatalf("signal winner=%+v timerFired=%d wait=%+v", signal.result, len(fired), wait)
-		}
-	} else if wait.State == fixture.TimerWinnerState {
-		if !signal.result.Late || len(fired) != 1 {
-			t.Fatalf("timer winner=%+v timerFired=%d wait=%+v", signal.result, len(fired), wait)
-		}
-	} else {
-		t.Fatalf("wait state=%q, want one of %q or %q", wait.State, fixture.SignalWinnerState, fixture.TimerWinnerState)
-	}
-	if wait.State == fixture.SignalWinnerState {
-		duplicate, err := runtime.DeliverSignal(ctx, tenant, waitID, "race-signal", "principal", json.RawMessage(`{"value":"ok"}`), true)
-		if err != nil || !duplicate.Duplicate {
-			t.Fatalf("duplicate signal=%+v err=%v, want deduplicated", duplicate, err)
-		}
-	} else {
-		late, err := runtime.DeliverSignal(ctx, tenant, waitID, "race-signal", "principal", json.RawMessage(`{"value":"ok"}`), true)
-		if err != nil || !late.Late {
-			t.Fatalf("late duplicate signal=%+v err=%v, want stable late result", late, err)
-		}
-	}
-	close(release)
-	if err := <-processResult; err != nil {
-		t.Fatal(err)
-	}
-	if effects.Load() != fixture.ExpectedRunEffects {
-		t.Fatalf("run effect count=%d, want %d", effects.Load(), fixture.ExpectedRunEffects)
-	}
-}
-
 func TestSignalResumesDistributedRunFromCommittedPrefix(t *testing.T) {
 	fixture := readContinuationFixture(t)
 	store := integrationDistributedStore(t)
@@ -778,64 +640,86 @@ func TestTimerResumesDistributedRunFromCommittedPrefix(t *testing.T) {
 	}
 }
 
+// TestPureStepDispatchCanRetryAfterOwnerTakeover moves ownership after the
+// first owner durably dispatched a pure step and before it invokes the node.
+// The successor re-dispatches under a new attempt and completes the run; the
+// stale owner still runs its pure node but cannot publish the result.
 func TestPureStepDispatchCanRetryAfterOwnerTakeover(t *testing.T) {
 	var fixture struct {
-		ExpectedAttempts        int  `json:"expectedAttempts"`
-		ExpectedDifferentIDs    bool `json:"expectedDifferentAttemptIDs"`
-		ExpectedExternalEffects int  `json:"expectedExternalEffects"`
+		ExpectedAttempts        int    `json:"expectedAttempts"`
+		ExpectedDifferentIDs    bool   `json:"expectedDifferentAttemptIDs"`
+		ExpectedPureInvocations int    `json:"expectedPureInvocations"`
+		ExpectedExternalEffects int    `json:"expectedExternalEffects"`
+		ExpectedFinalState      string `json:"expectedFinalState"`
+		ExpectedOutput          string `json:"expectedOutput"`
+		ExpectedStaleResult     string `json:"expectedStaleResult"`
 	}
-	fixtureData, err := os.ReadFile("../../testdata/distributed/pure-step-takeover-fixtures.json")
+	readDistributedFixture(t, "pure-step-takeover-fixtures.json", &fixture)
+	ledger := effectLedger(filepath.Join(t.TempDir(), "ledger"))
+	direct := integrationDistributedStore(t)
+	hooked := &hookedClient{Client: integrationClient(t)}
+	staleRuntime, err := ownerFaultRuntime(integrationStoreFor(t, hooked), ledger, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := json.Unmarshal(fixtureData, &fixture); err != nil {
+	successorRuntime, err := ownerFaultRuntime(direct, ledger, nil)
+	if err != nil {
 		t.Fatal(err)
 	}
-	store := integrationDistributedStore(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	partition := fmt.Sprintf("p-pure-retry-%d", time.Now().UnixNano())
-	firstOwner, err := store.Acquire(ctx, partition, "pure-retry-old-owner", 5*time.Second)
+	if err := successorRuntime.Check(ctx); err != nil {
+		t.Fatal(err)
+	}
+	const partition = "p-0000"
+	tenant := tenantsInPartition(successorRuntime, partition, "pure-retry", 1)[0]
+	admission, err := successorRuntime.Admit(ctx, Submission{Tenant: tenant, RequestKey: "pure-retry", Workflow: "owner-fault", Input: json.RawMessage(`{"value":40}`)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	releaseOwnerOnCleanup(t, store, firstOwner)
-	runtime := &Runtime{store: store}
-	run := RunRecord{RunID: "run-pure-retry", ArtifactDigest: "sha256:" + strings.Repeat("f", 64)}
-	input := json.RawMessage(`{"value":1}`)
-	identity := engine.StepIdentity{RunID: run.RunID, ArtifactDigest: run.ArtifactDigest, StepID: "pure-step", InputDigest: digest(input), OperationKey: "op:" + strings.Repeat("a", 64)}
-	firstJournal := &runStepJournal{runtime: runtime, owner: firstOwner, record: run}
-	firstAttempt, err := firstJournal.Begin(ctx, identity, input, nil)
-	if err != nil {
-		t.Fatalf("first pure dispatch: %v", err)
+	oldOwner := acquireWhenFree(t, ctx, direct, partition, "pure-retry-old-owner", 30*time.Second)
+	var newOwner distributed.Owner
+	var successor RunRecord
+	var successorErr error
+	hooked.arm("/events/dispatch-", 0, true, func() {
+		if err := direct.Release(ctx, oldOwner); err != nil {
+			t.Errorf("release old owner after pure dispatch: %v", err)
+		}
+		newOwner = acquireWhenFree(t, ctx, direct, partition, "pure-retry-new-owner", 30*time.Second)
+		successor, successorErr = successorRuntime.processOne(ctx, newOwner)
+	})
+	_, staleErr := staleRuntime.processOne(ctx, oldOwner)
+	staleResult := "accepted"
+	if errors.Is(staleErr, distributed.ErrOwnershipLost) {
+		staleResult = "ownership_lost"
+	} else if staleErr != nil {
+		staleResult = "error: " + staleErr.Error()
 	}
-	if err := store.Release(ctx, firstOwner); err != nil {
-		t.Fatalf("release old owner before simulated crash takeover: %v", err)
-	}
-	newOwner, err := store.Acquire(ctx, partition, "pure-retry-new-owner", 5*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	releaseOwnerOnCleanup(t, store, newOwner)
-	t.Logf("pure-step takeover state: partition=%s run=%s state=step-<sha256:...> oldFence=%d newFence=%d", partition, run.RunID, firstOwner.Token, newOwner.Token)
-	newJournal := &runStepJournal{runtime: runtime, owner: newOwner, record: run}
-	if _, completed, err := newJournal.Load(ctx, identity); err != nil || completed {
-		t.Fatalf("pure dispatched step replay state completed=%v err=%v; want safe redispatch", completed, err)
-	}
-	secondAttempt, err := newJournal.Begin(ctx, identity, input, nil)
-	if err != nil {
-		t.Fatalf("retry pure dispatch after takeover: %v", err)
-	}
-	data, _, err := store.ReadState(ctx, partition, stepStateID(identity.OperationKey))
+	events, err := direct.ListEvents(ctx, partition)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var persisted stepRecord
-	if err := json.Unmarshal(data, &persisted); err != nil {
+	attempts := map[int64]stepRecord{}
+	for _, event := range events {
+		var step stepRecord
+		if event.Kind == "step.dispatched" && json.Unmarshal(event.Payload, &step) == nil && step.Identity.StepID == "prepare" {
+			attempts[event.Fence] = step
+		}
+	}
+	final, err := successorRuntime.GetRun(ctx, tenant, admission.RunID)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if persisted.AttemptNumber != fixture.ExpectedAttempts || (firstAttempt.AttemptID != secondAttempt.AttemptID) != fixture.ExpectedDifferentIDs || fixture.ExpectedExternalEffects != 0 {
-		t.Fatalf("attempts=%d first=%s second=%s expected attempts=%d distinct=%v effects=%d", persisted.AttemptNumber, firstAttempt.AttemptID, secondAttempt.AttemptID, fixture.ExpectedAttempts, fixture.ExpectedDifferentIDs, fixture.ExpectedExternalEffects)
+	successorAttempt := attempts[newOwner.Token]
+	t.Logf("pure-step takeover: oldFence=%d newFence=%d attempts=%+v stale=%s final=%s output=%s pure=%d effects=%d", oldOwner.Token, newOwner.Token, attempts, staleResult, final.State, final.Output, ledger.total("pure"), ledger.total("effect"))
+	if successorErr != nil || successor.State != fixture.ExpectedFinalState || final.State != fixture.ExpectedFinalState || string(final.Output) != fixture.ExpectedOutput {
+		t.Fatalf("successor=%+v err=%v final=%+v; fixture %s %s", successor, successorErr, final, fixture.ExpectedFinalState, fixture.ExpectedOutput)
+	}
+	if successorAttempt.AttemptNumber != fixture.ExpectedAttempts || (attempts[oldOwner.Token].CurrentAttempt != successorAttempt.CurrentAttempt) != fixture.ExpectedDifferentIDs || len(attempts) != 2 {
+		t.Fatalf("pure dispatch attempts=%+v; fixture attempts=%d distinct=%v", attempts, fixture.ExpectedAttempts, fixture.ExpectedDifferentIDs)
+	}
+	if ledger.total("pure") != fixture.ExpectedPureInvocations || ledger.total("effect") != fixture.ExpectedExternalEffects || staleResult != fixture.ExpectedStaleResult {
+		t.Fatalf("pure=%d effects=%d stale=%s; fixture %d/%d/%s", ledger.total("pure"), ledger.total("effect"), staleResult, fixture.ExpectedPureInvocations, fixture.ExpectedExternalEffects, fixture.ExpectedStaleResult)
 	}
 }
 
