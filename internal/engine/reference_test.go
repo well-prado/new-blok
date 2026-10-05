@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -180,6 +181,16 @@ type refDuplicateNames struct{}
 
 func (refDuplicateNames) MarshalJSON() ([]byte, error) { return []byte(`{"a":1,"a":2}`), nil }
 
+// malformedTag builds a one-field struct whose json tag go vet would reject
+// in source: Go 1.27's encoding/json still applies the leading identifier
+// of a malformed option and parses quoted parts its own way.
+func malformedTag(field, tag string, value any) any {
+	typ := reflect.StructOf([]reflect.StructField{{Name: field, Type: reflect.TypeOf(value), Tag: reflect.StructTag("json:" + strconv.Quote(tag))}})
+	instance := reflect.New(typ).Elem()
+	instance.Field(0).Set(reflect.ValueOf(value))
+	return instance.Interface()
+}
+
 func referenceSources() map[string]any {
 	base := RefBase{ID: "b-1", Note: "base note"}
 	return map[string]any{
@@ -220,6 +231,12 @@ func referenceSources() map[string]any {
 		"appenderInPointer":  &refHoldsPointerAppender{},
 		"appenderInValue":    refHoldsPointerAppender{},
 		"ignoredOption":      refIgnoredOption{ID: "b-1"},
+		"omitEmptySpace":     malformedTag("ID", "id,omitempty ", ""),
+		"omitEmptySemicolon": malformedTag("ID", "id,omitempty;", ""),
+		"omitEmptyColon":     malformedTag("ID", "id,omitempty:x", ""),
+		"spaceBeforeOption":  malformedTag("ID", "id, omitempty", ""),
+		"stringSpace":        malformedTag("N", "n,string ", int64(5)),
+		"quotedNameString":   malformedTag("N", "'a,string'", int64(5)),
 	}
 }
 

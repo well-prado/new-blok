@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/well-prado/new-blok/internal/jsontag"
 )
 
 // Field references select encoding/json object keys (#241, ADR 0001).
@@ -24,11 +26,13 @@ import (
 // (MarshalJSON, MarshalJSONTo, MarshalText, AppendText) as written.
 //
 // Work is bounded by the selected member, never by its siblings. A struct
-// resolves through a per-type key index, built once per type. Each tag's
-// key name is delegated to encoding/json through a one-field struct with
-// the same json tag, so unusual tags follow encoding/json's own parsing.
-// omitempty and omitzero are decided from the selected field alone; a
-// ,string scalar is the only member encoded. Map keys are named without
+// resolves through a per-type key index, built once per type, for json tags
+// in plain form (internal/jsontag): there the key is the tag's name part and
+// each option's effect is known. A struct with any other tag (quoted parts,
+// malformed options such as ",omitempty ", which encoding/json still
+// applies) resolves against its whole encoding instead. omitempty and
+// omitzero are decided from the selected field alone; a ,string scalar is
+// the only member encoded. Map keys are named without
 // encoding values. Only a container whose own type has a custom encoder
 // (MarshalJSON, MarshalJSONTo, MarshalText or AppendText) is encoded whole,
 // because its keys exist nowhere else.
@@ -453,70 +457,13 @@ type structKey struct {
 
 type structPlan struct {
 	keys map[string]structKey
-	// unsupported marks tags using embed or format, which this index does
-	// not model; such structs resolve against their whole encoding.
+	// unsupported marks a struct with a json tag outside jsontag's plain
+	// form, or using embed or format, which this index does not model; such
+	// structs resolve against their whole encoding.
 	unsupported bool
 }
 
-var (
-	structPlans sync.Map // reflect.Type -> structPlan
-	tagNames    sync.Map // json tag -> tagName
-)
-
-type tagName struct {
-	name    string
-	present bool // false: encoding/json writes no key for this tag
-	err     error
-}
-
-const probeFieldName = "BlokReferenceProbe"
-
-// keyForTag asks encoding/json which key a tag names, so unusual tags follow
-// encoding/json's own tag parsing. An empty name means the tag names no key and
-// the Go field name applies.
-func keyForTag(tag string) tagName {
-	if cached, ok := tagNames.Load(tag); ok {
-		return cached.(tagName)
-	}
-	name := func(fieldName string) (string, bool, error) {
-		probe := reflect.StructOf([]reflect.StructField{{Name: fieldName, Type: stringType, Tag: reflect.StructTag("json:" + strconv.Quote(tag))}})
-		value := reflect.New(probe).Elem()
-		value.Field(0).SetString("x")
-		encoded, err := json.Marshal(value.Interface())
-		if err != nil {
-			return "", false, err
-		}
-		var members map[string]json.RawMessage
-		if err := json.Unmarshal(encoded, &members); err != nil {
-			return "", false, err
-		}
-		for key := range members {
-			return key, true, nil
-		}
-		return "", false, nil
-	}
-	result := tagName{}
-	first, present, err := name(probeFieldName)
-	switch {
-	case err != nil:
-		result.err = err
-	case !present:
-	case first != probeFieldName:
-		result = tagName{name: first, present: true}
-	default:
-		// Either the tag names no key, or it literally names the probe.
-		second, _, err := name(probeFieldName + "B")
-		if err != nil {
-			result.err = err
-		} else if second == probeFieldName {
-			result = tagName{name: probeFieldName, present: true}
-		} else {
-			result = tagName{present: true}
-		}
-	}
-	cached, _ := tagNames.LoadOrStore(tag, result)
-	return cached.(tagName)
-}
+var structPlans sync.Map // reflect.Type -> structPlan
 
 func probeType(field reflect.StructField, jsonTag string) reflect.Type {
 	return reflect.StructOf([]reflect.StructField{{Name: field.Name, Type: field.Type, Tag: reflect.StructTag("json:" + strconv.Quote(jsonTag))}})
@@ -572,23 +519,15 @@ func structPlanFor(typ reflect.Type) structPlan {
 				if tag == "-" {
 					continue
 				}
-				_, options, _ := strings.Cut(tag, ",")
-				omitEmpty, omitZero, quoted, known := tagOptions(options)
-				if !known {
+				options, plain := jsontag.Parse(tag)
+				if !plain || options.Embed || options.Format {
 					plan.unsupported = true
 					break
 				}
+				omitEmpty, omitZero, quoted := options.OmitEmpty, options.OmitZero, options.String
 				key := ""
-				if tagged && tag != "" {
-					derived := keyForTag(tag)
-					if derived.err != nil {
-						plan.unsupported = true
-						break
-					}
-					if !derived.present {
-						continue
-					}
-					key = derived.name
+				if tagged {
+					key = options.Name
 				}
 				index := append(append([]int(nil), entry.index...), position)
 				if key != "" || !structField.Anonymous || fieldType.Kind() != reflect.Struct {
@@ -635,28 +574,6 @@ func structPlanFor(typ reflect.Type) structPlan {
 	}
 	cached, _ := structPlans.LoadOrStore(typ, plan)
 	return cached.(structPlan)
-}
-
-// tagOptions reads the options encoding/json acts on when encoding. Go
-// 1.27's default encoding/json also acts on embed (an unnamed embed field is
-// inlined) and format (encoding fails); a struct using either resolves
-// against its whole encoding (known=false). Every other option, including
-// case:… (decoding only) and look-alikes such as omitEmpty, is ignored by
-// encoding/json, so it is ignored here.
-func tagOptions(options string) (omitEmpty, omitZero, quoted, known bool) {
-	for _, option := range strings.Split(options, ",") {
-		switch {
-		case option == "omitempty":
-			omitEmpty = true
-		case option == "omitzero":
-			omitZero = true
-		case option == "string":
-			quoted = true
-		case option == "embed", option == "format", strings.HasPrefix(option, "format:"):
-			return false, false, false, false
-		}
-	}
-	return omitEmpty, omitZero, quoted, true
 }
 
 func withoutStringOption(tag string) string {

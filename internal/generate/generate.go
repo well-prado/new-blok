@@ -12,6 +12,8 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+
+	"github.com/well-prado/new-blok/internal/jsontag"
 )
 
 const flowImport = "github.com/well-prado/new-blok/flow"
@@ -66,6 +68,11 @@ func Source(source []byte, options Options) ([]byte, error) {
 				// its Go fields are not the keys a reference selects (#241).
 				continue
 			}
+			if _, predictable := accessorFields(named.Underlying().(*types.Struct)); !predictable {
+				// A json tag outside plain form, or embed/format: which
+				// keys encoding/json writes cannot be read from the tags.
+				continue
+			}
 			typesToGenerate = append(typesToGenerate, named)
 		}
 	}
@@ -78,20 +85,12 @@ func Source(source []byte, options Options) ([]byte, error) {
 		name := named.Obj().Name()
 		fmt.Fprintf(&output, "type %sRef struct { value flow.Ref[%s] }\n\n", name, name)
 		fmt.Fprintf(&output, "func %sFields(value flow.Ref[%s]) %sRef { return %sRef{value: value} }\n\n", name, name, name, name)
-		for _, index := range dominantFields(structure) {
-			field := structure.Field(index)
+		accessors, _ := accessorFields(structure)
+		for _, accessor := range accessors {
+			field, key := structure.Field(accessor.index), accessor.key
 			fieldType, err := renderType(field.Type())
 			if err != nil {
 				return nil, fmt.Errorf("%s.%s: %w", name, field.Name(), err)
-			}
-			key, encoded := jsonKey(field.Name(), structure.Tag(index))
-			if !encoded {
-				continue
-			}
-			if quotedField(structure.Tag(index)) {
-				// A reference resolves a ",string" field to its quoted text,
-				// not to the field's Go type (#241).
-				continue
 			}
 			if strings.Contains(key, ".") {
 				// A reference path splits on dots, so this key could never be
@@ -150,82 +149,75 @@ func renderType(typeValue types.Type) (string, error) {
 	}
 }
 
-// dominantFields lists, in declaration order, the exported top-level
-// fields encoding/json writes, one per key: where several share a key, a
-// tagged field beats untagged ones and a remaining tie writes none (#241).
-// Embedded fields are skipped; their promoted keys never beat a top-level
-// one.
-func dominantFields(structure *types.Struct) []int {
+type accessorField struct {
+	index int
+	key   string
+}
+
+// accessorFields lists, in declaration order, the top-level fields that get
+// an accessor: exported, not embedded, written by encoding/json under their
+// key, and handed on as their Go type. Where fields share a key at the top
+// level, a tagged field beats untagged ones and a remaining tie writes none.
+// The contest includes embedded fields that sit at the top level: a tagged
+// embedded field (encoding/json nests it under its tag name) and an untagged
+// embedded non-struct (written under its type name). An untagged embedded
+// struct is flattened one level down, and its keys never beat a top-level
+// one. A ",string" field takes part but gets no accessor: a reference
+// resolves it to its quoted text (#241). predictable is false when a json
+// tag is outside internal/jsontag's plain form or uses embed or format; the
+// keys encoding/json writes then cannot be read from the tags.
+func accessorFields(structure *types.Struct) (accessors []accessorField, predictable bool) {
 	type candidate struct {
-		index  int
-		tagged bool
+		index    int
+		tagged   bool
+		eligible bool
 	}
 	byKey := map[string][]candidate{}
 	for index := 0; index < structure.NumFields(); index++ {
 		field := structure.Field(index)
-		if !field.Exported() || field.Embedded() {
+		value, hasTag := reflect.StructTag(structure.Tag(index)).Lookup("json")
+		if value == "-" || !field.Exported() && !field.Embedded() {
 			continue
 		}
-		key, encoded := jsonKey(field.Name(), structure.Tag(index))
-		if !encoded {
-			continue
+		options, plain := jsontag.Parse(value)
+		if !plain || options.Embed || options.Format {
+			return nil, false
 		}
-		byKey[key] = append(byKey[key], candidate{index: index, tagged: namedByTag(structure.Tag(index))})
+		key, tagged := options.Name, hasTag && options.Name != ""
+		if field.Embedded() && !tagged {
+			fieldType := field.Type()
+			if pointer, ok := fieldType.(*types.Pointer); ok {
+				fieldType = pointer.Elem()
+			}
+			if _, isStruct := fieldType.Underlying().(*types.Struct); isStruct || !field.Exported() {
+				continue
+			}
+		}
+		if key == "" {
+			key = field.Name()
+		}
+		byKey[key] = append(byKey[key], candidate{index: index, tagged: tagged, eligible: !field.Embedded() && !options.String})
 	}
-	var selected []int
-	for _, candidates := range byKey {
+	for key, candidates := range byKey {
 		var tagged []candidate
 		for _, candidate := range candidates {
 			if candidate.tagged {
 				tagged = append(tagged, candidate)
 			}
 		}
+		winner := candidate{index: -1}
 		switch {
 		case len(candidates) == 1:
-			selected = append(selected, candidates[0].index)
+			winner = candidates[0]
 		case len(tagged) == 1:
-			selected = append(selected, tagged[0].index)
+			winner = tagged[0]
+		}
+		if winner.index >= 0 && winner.eligible {
+			accessors = append(accessors, accessorField{index: winner.index, key: key})
 		}
 	}
-	sort.Ints(selected)
-	return selected
-}
-
-// namedByTag reports whether the json tag itself names the key.
-func namedByTag(tag string) bool {
-	value, ok := reflect.StructTag(tag).Lookup("json")
-	name, _, _ := strings.Cut(value, ",")
-	return ok && name != ""
-}
-
-func quotedField(tag string) bool {
-	value, _ := reflect.StructTag(tag).Lookup("json")
-	_, options, _ := strings.Cut(value, ",")
-	for _, option := range strings.Split(options, ",") {
-		if option == "string" {
-			return true
-		}
-	}
-	return false
-}
-
-// jsonKey is the key encoding/json writes for a struct field, which is what
-// a workflow reference selects: the json tag's name when it has one,
-// otherwise the Go field name exactly. A field tagged "-" is never encoded,
-// so it gets no accessor (#240).
-func jsonKey(field, tag string) (string, bool) {
-	value, tagged := reflect.StructTag(tag).Lookup("json")
-	if !tagged {
-		return field, true
-	}
-	name, _, _ := strings.Cut(value, ",")
-	if value == "-" {
-		return "", false
-	}
-	if name == "" {
-		return field, true
-	}
-	return name, true
+	sort.Slice(accessors, func(i, j int) bool { return accessors[i].index < accessors[j].index })
+	return accessors, true
 }
 
 // customJSON reports whether a type, or a pointer to it, has a method

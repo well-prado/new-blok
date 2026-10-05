@@ -2,6 +2,7 @@ package generate
 
 import (
 	"bytes"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -196,6 +197,55 @@ func TestSharedKeyGetsOneAccessor(t *testing.T) {
 	for _, absent := range []string{"func (r LineRef) Name()", "func (r LineRef) Left()", "func (r LineRef) Right()", "func (r LineRef) Count()", "func (r LineRef) Total()"} {
 		if strings.Contains(text, absent) {
 			t.Fatalf("unexpected %s:\n%s", absent, text)
+		}
+	}
+}
+
+// TestTaggedEmbeddedFieldTakesPartInDominance: a tagged embedded field is
+// nested under its tag name at the top level, so it ties with a tagged
+// field of the same key and encoding/json writes neither; an untagged
+// embedded non-struct is written under its type name (#241).
+func TestTaggedEmbeddedFieldTakesPartInDominance(t *testing.T) {
+	source := []byte("package shop\n\n" +
+		"type Inner struct{ Z int64 }\n\n" +
+		"type Label string\n\n" +
+		"type Line struct {\n" +
+		"\tInner `json:\"x\"`\n" +
+		"\tX int64 `json:\"x\"`\n" +
+		"\tLabel\n" +
+		"\tName string `json:\"Label\"`\n" +
+		"\tY int64\n" +
+		"}\n")
+	generated, err := Source(source, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(generated)
+	if strings.Contains(text, "func (r LineRef) X()") {
+		t.Fatalf("X ties with the tagged embedded Inner and is never written:\n%s", text)
+	}
+	for _, present := range []string{
+		`func (r LineRef) Name() flow.Ref[string] { return flow.Select[Line, string](r.value, "Label") }`,
+		`func (r LineRef) Y() flow.Ref[int64] { return flow.Select[Line, int64](r.value, "Y") }`,
+	} {
+		if !strings.Contains(text, present) {
+			t.Fatalf("missing %q:\n%s", present, text)
+		}
+	}
+}
+
+// TestNonPlainTagsGetNoAccessors: encoding/json applies a malformed option's
+// leading identifier (",string " still quotes) and parses quoted parts its
+// own way, so a type with such a tag gets no accessors at all (#241).
+func TestNonPlainTagsGetNoAccessors(t *testing.T) {
+	for _, tag := range []string{`n,string `, `'a,string'`, `n,omitempty;`} {
+		source := []byte("package shop\n\ntype Line struct {\n\tCount int64 `json:" + strconv.Quote(tag) + "`\n\tTotal int64\n}\n")
+		generated, err := Source(source, Options{})
+		if err != nil {
+			t.Fatalf("tag %q: %v", tag, err)
+		}
+		if strings.Contains(string(generated), "LineRef") {
+			t.Fatalf("tag %q: generated accessors:\n%s", tag, generated)
 		}
 	}
 }

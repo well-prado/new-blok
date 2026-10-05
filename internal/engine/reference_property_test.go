@@ -21,7 +21,11 @@ import (
 var (
 	propertyGoNames  = []string{"A", "B", "C", "D", "E"}
 	propertyTagNames = []string{"A", "B", "a", "b", "-"}
-	propertyOptions  = []string{"", ",omitempty", ",omitzero", ",string", ",required"}
+	// Plain options, plus malformed spellings encoding/json still applies
+	// (",omitempty ") or ignores (", omitempty"), quoted options and v2's
+	// embed.
+	propertyOptions = []string{"", ",omitempty", ",omitzero", ",string", ",required", ",case:ignore",
+		",omitempty ", ",omitzero;", ",string:x", ", omitempty", ",'string'", ",omitEmpty", ",embed", ",omitempty,"}
 )
 
 type propertyShapes struct {

@@ -123,27 +123,32 @@ workflow) as decoded maps.
   descending into a value `encoding/json` cannot encode (a func, a map with
   `bool` keys) fails with `value has no JSON encoding`.
 - **Work is bounded by the selected member.** A struct resolves through a key
-  index built once per type; siblings are never encoded. Each tag's key name
-  is delegated to `encoding/json` through a one-field struct carrying the same
-  json tag, because unusual names are not fixed: Go 1.27's default (v2-backed)
-  `encoding/json` encodes a field tagged `json:"it's"` under `"it"` and a
-  `string`-kind map key with `MarshalText` under its text, while its v1
-  implementation (`GOEXPERIMENT=nojsonv2`) falls back to the Go field name
-  and uses the raw string. The supported and tested implementation is Go
-  1.27's default; the v1 mode is untested, because this repository does not
-  build in it (`internal/engine/observation.go` imports `encoding/json/v2`).
-  `omitempty` and `omitzero` are decided from the
-  selected field alone, with `encoding/json`'s definitions (v1's emptiness,
-  which the v2-backed implementation keeps for `encoding/json`, and a type's
-  own `IsZero`). The only member ever encoded is a `,string` scalar. Map keys are
-  named without encoding values. A container whose own type has one of the
-  four encoders is the one case encoded whole, because its keys exist
-  nowhere else. Of the tag options Go 1.27's `encoding/json` parses, `embed`
-  (an unnamed `embed` field is inlined) and `format:…` (encoding fails) are
-  not modelled, so a struct using either also resolves against its whole
-  encoding. Every other option, including `case:…` (decoding only), unknown
-  options such as `required`, and look-alikes such as `omitEmpty`, is ignored
-  by `encoding/json` and here.
+  index built once per type; siblings are never encoded. The index reads json
+  tags only in *plain form* (`internal/jsontag`): a valid UTF-8 name part
+  without quotes, backslashes or backticks, which `encoding/json` uses
+  verbatim as the key, and options that are each empty, a whole identifier,
+  `case:<identifier>` or `format:<value>`. Outside plain form, Go 1.27's
+  `encoding/json` decides the effect by its own parsing: it keeps the leading
+  identifier of a malformed option and still applies it (`,omitempty ` and
+  `,omitempty;` still omit, `,string ` still quotes), skips an option that
+  does not start with a letter (`, omitempty`), and reads quoted parts its own
+  way (`json:"'a,string'"` keeps the Go name and quotes). A struct with any
+  tag outside plain form therefore resolves against its whole encoding, as
+  does one using `embed` (an unnamed `embed` field is inlined) or `format:…`
+  (encoding fails). Within plain form, `omitempty`, `omitzero` and `string`
+  are modelled; every other identifier, including `case:…` (decoding only),
+  unknown options such as `required` and look-alikes such as `omitEmpty`, is
+  ignored by `encoding/json` and here. `omitempty` and `omitzero` are decided
+  from the selected field alone, with `encoding/json`'s definitions (v1's
+  emptiness, which the v2-backed implementation keeps for `encoding/json`,
+  and a type's own `IsZero`). The only member ever encoded is a `,string`
+  scalar. Map keys are named without encoding values. A container whose own
+  type has one of the four encoders is encoded whole, because its keys exist
+  nowhere else. The supported and tested implementation is Go 1.27's default
+  (v2-backed) `encoding/json`. Its v1 implementation (`GOEXPERIMENT=nojsonv2`)
+  names some keys differently (for example a `string`-kind map key with
+  `MarshalText`) and is untested: this repository does not build in that
+  mode (`internal/engine/observation.go` imports `encoding/json/v2`).
 - **Typed values stay typed.** A selected field is handed on as its Go value,
   so native nodes receive their declared input types whether the source node
   returned a `T` or a `*T`. Only a `,string` member, and members of a
@@ -164,9 +169,10 @@ name where a json tag renames the field, a `json:"-"` field, an embedded type's
 name, a field of a type with its own encoder, or an empty `omitempty` / zero
 `omitzero` field. A reference through a `,string` field now yields its quoted
 text. Migration: select the key the value has in its JSON (`blok generate`
-accessors do, #240; they now also skip `,string` fields and types with any
-of the four encoders, and emit one accessor per key, for the field
-`encoding/json` writes); read promoted fields at the parent level; move data the
+accessors do, #240; they now also skip `,string` fields, types with any of
+the four encoders and types with a tag outside plain form, and emit at most
+one accessor per key, for the field `encoding/json` writes, counting tagged
+embedded fields in the contest); read promoted fields at the parent level; move data the
 workflow must read out of `json:"-"`. No reference in this repository's
 examples, fixtures or scaffolds needed migration.
 

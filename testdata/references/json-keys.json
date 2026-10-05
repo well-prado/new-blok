@@ -58,6 +58,12 @@
     {"id": "pointer-receiver-append-text-in-pointer-output", "kind": "rejected", "source": "appenderInPointer", "path": ["p", "Secret"], "expected": {"error": "cannot read \"Secret\" from a JSON string"}},
     {"id": "pointer-receiver-append-text-skipped-in-value-output", "kind": "valid", "source": "appenderInValue", "path": ["p", "Secret"], "expected": {"value": 0}},
     {"id": "ignored-tag-option-keeps-the-key", "kind": "valid", "source": "ignoredOption", "path": ["id"], "expected": {"value": "b-1"}},
+    {"id": "malformed-omitempty-trailing-space-still-omits", "kind": "rejected", "source": "omitEmptySpace", "path": ["id"], "expected": {"error": "field \"id\" is missing"}},
+    {"id": "malformed-omitempty-trailing-semicolon-still-omits", "kind": "rejected", "source": "omitEmptySemicolon", "path": ["id"], "expected": {"error": "field \"id\" is missing"}},
+    {"id": "malformed-omitempty-trailing-colon-still-omits", "kind": "rejected", "source": "omitEmptyColon", "path": ["id"], "expected": {"error": "field \"id\" is missing"}},
+    {"id": "option-with-leading-space-is-not-applied", "kind": "valid", "source": "spaceBeforeOption", "path": ["id"], "expected": {"value": ""}},
+    {"id": "malformed-string-option-still-quotes", "kind": "valid", "source": "stringSpace", "path": ["n"], "expected": {"value": "5"}},
+    {"id": "quoted-name-tag-keeps-go-name-and-string-option", "kind": "valid", "source": "quotedNameString", "path": ["N"], "expected": {"value": "5"}},
     {"id": "duplicate-custom-names-keep-the-last", "kind": "valid", "source": "duplicateNames", "path": ["a"], "expected": {"value": 2}},
     {"id": "nil-map-is-null", "kind": "rejected", "source": "nilMap", "path": ["x"], "expected": {"error": "cannot read \"x\" from null"}},
     {"id": "number-cannot-be-descended", "kind": "rejected", "source": "tagged", "path": ["TotalCents", "x"], "expected": {"error": "cannot read \"x\" from a JSON number"}}
