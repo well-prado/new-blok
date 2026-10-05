@@ -355,7 +355,7 @@ func main() {
 }
 
 // execute runs one command and returns the process exit code. check, test
-// and inspect follow the exit-code contract in ADR 0023; every other command
+// and inspect follow the exit-code contract in ADR 0024; every other command
 // exits 1 on any error, as before.
 func execute(args []string, stdout, stderr io.Writer, stdin io.Reader) int {
 	if len(args) > 0 && toolCommands[args[0]] {

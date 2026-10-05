@@ -1,4 +1,4 @@
-# ADR 0023: The check, test and inspect CLI contract
+# ADR 0024: The check, test and inspect CLI contract
 
 - Status: implementation in review for E11-T02 (#65)
 - Date: 2026-10-05

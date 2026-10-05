@@ -1,5 +1,5 @@
 // Package devtool is the API behind blok check, blok test and blok inspect
-// (E11-T02, ADR 0023). Each command returns one versioned Report; the CLI
+// (E11-T02, ADR 0024). Each command returns one versioned Report; the CLI
 // only encodes it, so the CLI's machine output and this API's values are the
 // same diagnostics by construction.
 //
@@ -20,7 +20,7 @@ import (
 // Version names the report schema. A consumer must reject a report whose
 // version it does not know. Additive fields keep this version; renaming,
 // removing or retyping a field, a status, an exit code or a diagnostic code
-// requires a new one (ADR 0023).
+// requires a new one (ADR 0024).
 const Version = "blok-cli/v1"
 
 // Exit codes are part of the contract. Every command that gets past argument
