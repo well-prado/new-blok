@@ -834,7 +834,9 @@ func (j *Journal) Operation(ctx context.Context, operationKey string) (Operation
 }
 
 func (j *Journal) withTx(ctx context.Context, name string, fn func(*sql.Tx) error) error {
-	err := j.database.WithTx(ctx, func(tx *sql.Tx) error {
+	// Every transition writes first, so it can take its turn in the store's
+	// writer queue (#214).
+	err := j.database.WithTx(store.Writer(ctx), func(tx *sql.Tx) error {
 		// Reserve the writer before reading a snapshot. SQLite cannot wait when
 		// upgrading a read transaction to a writer; even an empty UPDATE takes
 		// the writer reservation without changing any committed values.
@@ -858,10 +860,8 @@ func (j *Journal) withTx(ctx context.Context, name string, fn func(*sql.Tx) erro
 	return err
 }
 
-// withRead runs a read beside the store's writers instead of queuing it
-// behind them (#214).
 func (j *Journal) withRead(ctx context.Context, fn func(*sql.Tx) error) error {
-	return j.database.WithTx(store.ReadOnly(ctx), fn)
+	return j.database.WithTx(ctx, fn)
 }
 
 func (j *Journal) now() int64 { return j.clock().UTC().UnixNano() }

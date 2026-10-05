@@ -514,3 +514,109 @@ func TestNestedSubmissionJoinedWithRetryableErrorIsNotRetried(t *testing.T) {
 		})
 	}
 }
+
+// TestHandlerReadingItsOwnStoreCompletes: a handler that reads its own store
+// through an ordinary transaction, as examples/order's Service.Get does,
+// runs beside its claim and completes. Only the store's marked writers are
+// queued (#214); a read nested in a claim is not one of them.
+func TestHandlerReadingItsOwnStoreCompletes(t *testing.T) {
+	ctx := context.Background()
+	database := openSQLite(t, filepath.Join(t.TempDir(), "read.db"))
+	queue, err := New(ctx, database, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queue.Enqueue(ctx, EnqueueRequest{RequestKey: "job", Kind: "job", Payload: []byte(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	var readErr error
+	began := time.Now()
+	processed, err := processBounded(queue, func(handlerCtx context.Context, _ Tx, _ Job) error {
+		var jobs int
+		readErr = database.WithTx(handlerCtx, func(tx *sql.Tx) error {
+			return tx.QueryRowContext(handlerCtx, `SELECT COUNT(*) FROM worker_jobs`).Scan(&jobs)
+		})
+		if readErr == nil && jobs != 1 {
+			readErr = fmt.Errorf("read %d jobs", jobs)
+		}
+		if _, err := queue.Get(handlerCtx, "job"); err != nil && readErr == nil {
+			readErr = err
+		}
+		return readErr
+	})
+	if err != nil || !processed {
+		t.Fatalf("processed=%v err=%v", processed, err)
+	}
+	if readErr != nil {
+		t.Fatalf("the handler's read of its own store failed: %v", readErr)
+	}
+	if took := time.Since(began); took > time.Second {
+		t.Fatalf("the handler's read waited %v", took)
+	}
+	if job, err := queue.Get(ctx, "job"); err != nil || job.State != StateCompleted {
+		t.Fatalf("job=%+v err=%v; want completed", job, err)
+	}
+}
+
+// writerMarks records whether each transaction reached the store marked as
+// a writer.
+type writerMarks struct {
+	store.Database
+	mu    sync.Mutex
+	marks []bool
+}
+
+func (d *writerMarks) WriteDomain() *store.WriteDomain {
+	w, _ := store.WriteDomainOf(d.Database)
+	return w
+}
+
+func (d *writerMarks) WithTx(ctx context.Context, fn func(*sql.Tx) error) error {
+	d.mu.Lock()
+	d.marks = append(d.marks, store.IsWriter(ctx))
+	d.mu.Unlock()
+	return d.Database.WithTx(ctx, fn)
+}
+
+func (d *writerMarks) take() []bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	marks := d.marks
+	d.marks = nil
+	return marks
+}
+
+// TestQueueWritesAreMarkedAndReadsAreNot: the queue's write-first
+// transactions take turns in the store's writer queue and its reads do not
+// (#214). Losing a mark would let a write contend unordered again; adding
+// one to a read would queue it behind running handlers.
+func TestQueueWritesAreMarkedAndReadsAreNot(t *testing.T) {
+	ctx := context.Background()
+	marks := &writerMarks{Database: openSQLite(t, filepath.Join(t.TempDir(), "marks.db"))}
+	queue, err := New(ctx, marks, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marks.take()
+	if _, err := queue.Enqueue(ctx, EnqueueRequest{RequestKey: "job", Kind: "job", Payload: []byte(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if got := marks.take(); len(got) != 1 || !got[0] {
+		t.Fatalf("Enqueue marks=%v; want one marked writer", got)
+	}
+	if _, err := queue.ProcessOnce(ctx, func(context.Context, Tx, Job) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if got := marks.take(); len(got) != 1 || !got[0] {
+		t.Fatalf("ProcessOnce marks=%v; want one marked claim", got)
+	}
+	if _, err := queue.Get(ctx, "job"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queue.Settled(ctx, "job"); err != nil {
+		t.Fatal(err)
+	}
+	if got := marks.take(); len(got) != 2 || got[0] || got[1] {
+		t.Fatalf("Get/Settled marks=%v; want two unmarked reads", got)
+	}
+}

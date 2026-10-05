@@ -152,7 +152,8 @@ func uriPath(path string) string {
 type connection struct {
 	database    *sql.DB
 	writeDomain *store.WriteDomain
-	// writers queues this handle's writers, one at a time, in arrival order.
+	// writers queues this handle's marked writers (store.Writer), one at a
+	// time, in arrival order.
 	writers      chan struct{}
 	busyTimeout  time.Duration
 	beforeCommit func()
@@ -165,15 +166,14 @@ func (c *connection) WithTx(ctx context.Context, fn func(*sql.Tx) error) error {
 	if fn == nil {
 		return errors.New("sqlite: transaction callback is required")
 	}
-	readOnly := store.IsReadOnly(ctx)
-	if !readOnly {
+	if store.IsWriter(ctx) {
 		release, err := c.queueWriter(ctx)
 		if err != nil {
 			return err
 		}
 		defer release()
 	}
-	tx, err := c.database.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable, ReadOnly: readOnly})
+	tx, err := c.database.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
 		return busy(fmt.Errorf("sqlite: begin: %w", err), c.writeDomain)
 	}
@@ -193,8 +193,9 @@ func (c *connection) WithTx(ctx context.Context, fn func(*sql.Tx) error) error {
 	return nil
 }
 
-// queueWriter waits for this handle's earlier writers, first come first
-// served, and returns the release for the writer's turn (#214). Left to
+// queueWriter waits for this handle's earlier marked writers (store.Writer),
+// first come first served, and returns the release for the writer's turn
+// (#214). Left to
 // SQLite, contending writers poll the lock with ever longer sleeps, so the
 // writers that have waited longest poll least often and newcomers keep
 // overtaking them: a writer can wait out the whole busy timeout behind
@@ -202,8 +203,9 @@ func (c *connection) WithTx(ctx context.Context, fn func(*sql.Tx) error) error {
 // writer waits only for those ahead of it. The wait is bounded by the busy
 // timeout and fails as SQLite's would, with ErrBusy naming the write domain,
 // so a handler that submits to the store its own claim holds still fails
-// after one busy wait (#207). SQLite's busy timeout still applies to writers
-// on other handles and in other processes.
+// after one busy wait (#207). SQLite's busy handler still governs unmarked
+// writers and writers on other handles and in other processes; a marked
+// writer that meets one waits up to the busy timeout again there.
 func (c *connection) queueWriter(ctx context.Context) (func(), error) {
 	release := func() { <-c.writers }
 	select {

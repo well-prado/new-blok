@@ -459,7 +459,7 @@ func (q *Queue) Enqueue(ctx context.Context, request EnqueueRequest) (EnqueueRes
 	// ID from the clock let equal payloads collide under a coarse clock.
 	jobID := "job:" + digest([]byte(request.RequestKey))[:32]
 	var result EnqueueResult
-	err = q.withTx(ctx, func(tx *sql.Tx) error {
+	err = q.withTx(store.Writer(ctx), func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `INSERT INTO worker_jobs
 			(job_id, request_key, kind, payload_json, payload_digest, max_attempts, principal_json, state, available_at, created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(request_key) DO NOTHING`,
@@ -564,7 +564,10 @@ func (q *Queue) ProcessOnce(ctx context.Context, handler Handler) (bool, error) 
 			activeDomain.active.Store(false)
 		}
 	}()
-	err := q.withTx(txCtx, func(tx *sql.Tx) error {
+	// The claim writes first (#176), so it takes its turn in the store's
+	// writer queue (#214); the handler then runs inside that turn, as it
+	// runs inside the write lock.
+	err := q.withTx(store.Writer(txCtx), func(tx *sql.Tx) error {
 		job, lease, err := q.claim(ctx, tx)
 		if errors.Is(err, ErrNotFound) {
 			return nil
@@ -666,7 +669,7 @@ func (q *Queue) ProcessOnce(ctx context.Context, handler Handler) (bool, error) 
 	if err != nil && !processed && !errors.Is(err, ErrConsumerLost) && ctx.Err() != nil {
 		// The consumer was lost while this worker waited for its write
 		// turn (#214): it claimed nothing, so the job is untouched.
-		err = fmt.Errorf("%w: %w", ErrConsumerLost, ctx.Err())
+		err = fmt.Errorf("%w: %w", ErrConsumerLost, errors.Join(ctx.Err(), err))
 	}
 	if errors.Is(err, ErrConsumerLost) && lost.ID != "" {
 		if deferErr := q.deferLost(txCtx, lost); deferErr != nil {
@@ -693,7 +696,7 @@ func (q *Queue) ProcessOnce(ctx context.Context, handler Handler) (bool, error) 
 // attempt: the job is retried after a backoff, or dead once its attempts
 // are spent. A crash before it commits leaves one uncounted redelivery.
 func (q *Queue) chargeLostClaim(ctx context.Context, job Job) error {
-	return q.withTx(ctx, func(tx *sql.Tx) error {
+	return q.withTx(store.Writer(ctx), func(tx *sql.Tx) error {
 		state, available := StateDead, q.now()
 		if job.Attempt < job.MaxAttempts {
 			state = StatePending
@@ -710,7 +713,7 @@ func (q *Queue) chargeLostClaim(ctx context.Context, job Job) error {
 // the claim has been rolled back. A crash between the two leaves one
 // uncounted redelivery, never an acknowledged one.
 func (q *Queue) deferLost(ctx context.Context, job Job) error {
-	return q.withTx(ctx, func(tx *sql.Tx) error {
+	return q.withTx(store.Writer(ctx), func(tx *sql.Tx) error {
 		state, message := StatePending, ""
 		if job.Deferrals+1 > MaxDeferrals {
 			state, message = StateDead, DeferralExhausted
@@ -765,9 +768,7 @@ func (q *Queue) Settled(ctx context.Context, requestKey string) (bool, error) {
 
 func (q *Queue) Get(ctx context.Context, requestKey string) (Job, error) {
 	var job Job
-	// A read: it runs beside writers, so a status check is not held up by
-	// a claim whose handler is still running (#214).
-	err := q.withTx(store.ReadOnly(ctx), func(tx *sql.Tx) error {
+	err := q.withTx(ctx, func(tx *sql.Tx) error {
 		var err error
 		job, err = scanJob(tx.QueryRowContext(ctx, `SELECT job_id, request_key, kind, payload_json, attempt, max_attempts, deferrals, principal_json, state, error_text FROM worker_jobs WHERE request_key = ?`, requestKey))
 		return err

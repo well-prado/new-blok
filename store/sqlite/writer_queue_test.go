@@ -12,8 +12,8 @@ import (
 	"github.com/well-prado/new-blok/store"
 )
 
-// TestWritersTakeTheLockInArrivalOrder: writers that queue behind a held
-// write lock commit in the order they arrived (#214). Left to SQLite's busy
+// TestWritersTakeTheLockInArrivalOrder: marked writers that queue behind a
+// held write lock commit in the order they arrived (#214). Left to SQLite's busy
 // handler, a writer that has waited longest polls least often, so later
 // writers overtake it and it can be starved out to the busy timeout.
 func TestWritersTakeTheLockInArrivalOrder(t *testing.T) {
@@ -31,7 +31,7 @@ func TestWritersTakeTheLockInArrivalOrder(t *testing.T) {
 	}
 	holding, release, held := make(chan struct{}), make(chan struct{}), make(chan error, 1)
 	go func() {
-		held <- db.WithTx(ctx, func(tx *sql.Tx) error {
+		held <- db.WithTx(store.Writer(ctx), func(tx *sql.Tx) error {
 			if _, err := tx.ExecContext(ctx, `INSERT INTO commits (writer) VALUES (-1)`); err != nil {
 				return err
 			}
@@ -51,7 +51,7 @@ func TestWritersTakeTheLockInArrivalOrder(t *testing.T) {
 		group.Add(1)
 		go func() {
 			defer group.Done()
-			errs <- db.WithTx(ctx, func(tx *sql.Tx) error {
+			errs <- db.WithTx(store.Writer(ctx), func(tx *sql.Tx) error {
 				_, err := tx.ExecContext(ctx, `INSERT INTO commits (writer) VALUES (?)`, i)
 				return err
 			})
@@ -71,7 +71,7 @@ func TestWritersTakeTheLockInArrivalOrder(t *testing.T) {
 		}
 	}
 	var order []int
-	if err := db.WithTx(store.ReadOnly(ctx), func(tx *sql.Tx) error {
+	if err := db.WithTx(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, `SELECT writer FROM commits WHERE writer >= 0 ORDER BY seq`)
 		if err != nil {
 			return err
@@ -98,12 +98,15 @@ func TestWritersTakeTheLockInArrivalOrder(t *testing.T) {
 	}
 }
 
-// TestReadOnlyTransactionDoesNotQueueBehindAWriter: a marked read runs beside
-// a writer that holds the lock, reading the last committed state, instead of
-// waiting for the writer's turn to end (#214).
-func TestReadOnlyTransactionDoesNotQueueBehindAWriter(t *testing.T) {
+// TestUnmarkedTransactionsAreNotQueued: only marked writers take turns. A
+// read runs beside a queued writer that holds the lock, including a read
+// nested inside that writer's own callback on the same handle, which waited
+// out the busy timeout when every transaction was queued (#214 review). A
+// marked writer behind another fails after the busy timeout with ErrBusy
+// naming the handle's write domain.
+func TestUnmarkedTransactionsAreNotQueued(t *testing.T) {
 	ctx := context.Background()
-	db, err := (Backend{}).Open(ctx, filepath.Join(t.TempDir(), "read.db"))
+	db, err := (Backend{BusyTimeout: 200 * time.Millisecond}).Open(ctx, filepath.Join(t.TempDir(), "read.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,58 +117,50 @@ func TestReadOnlyTransactionDoesNotQueueBehindAWriter(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	read := func() (int, time.Duration, error) {
+		begin := time.Now()
+		var count int
+		err := db.WithTx(ctx, func(tx *sql.Tx) error {
+			return tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM rows`).Scan(&count)
+		})
+		return count, time.Since(begin), err
+	}
 	holding, release, held := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+	var nestedCount int
+	var nestedTook time.Duration
+	var nestedErr error
 	go func() {
-		held <- db.WithTx(ctx, func(tx *sql.Tx) error {
+		held <- db.WithTx(store.Writer(ctx), func(tx *sql.Tx) error {
 			if _, err := tx.ExecContext(ctx, `INSERT INTO rows VALUES (1)`); err != nil {
 				return err
 			}
+			nestedCount, nestedTook, nestedErr = read()
 			close(holding)
 			<-release
 			return nil
 		})
 	}()
 	<-holding
-	defer func() {
-		close(release)
-		if err := <-held; err != nil {
-			t.Fatal(err)
-		}
-	}()
+	if nestedErr != nil || nestedCount != 0 || nestedTook > 100*time.Millisecond {
+		t.Fatalf("a read nested in the queued writer: count=%d after %v, err=%v", nestedCount, nestedTook, nestedErr)
+	}
+	if count, took, err := read(); err != nil || count != 0 || took > 100*time.Millisecond {
+		t.Fatalf("a read beside the queued writer: count=%d after %v, err=%v", count, took, err)
+	}
 	begin := time.Now()
-	var count int
-	err = db.WithTx(store.ReadOnly(ctx), func(tx *sql.Tx) error {
-		return tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM rows`).Scan(&count)
-	})
-	if err != nil || count != 0 {
-		t.Fatalf("read beside the writer: count=%d err=%v", count, err)
-	}
-	if elapsed := time.Since(begin); elapsed > time.Second {
-		t.Fatalf("the read waited %v behind the writer", elapsed)
-	}
-	// An unmarked transaction is a writer and waits its turn, bounded by the
-	// busy timeout.
-	short, err := (Backend{BusyTimeout: 200 * time.Millisecond}).Open(ctx, filepath.Join(t.TempDir(), "short.db"))
-	if err != nil {
+	err = db.WithTx(store.Writer(ctx), func(*sql.Tx) error { return nil })
+	elapsed := time.Since(begin)
+	close(release)
+	if err := <-held; err != nil {
 		t.Fatal(err)
 	}
-	defer short.Close()
-	hold := make(chan struct{})
-	holdingShort := make(chan struct{})
-	go func() {
-		_ = short.WithTx(ctx, func(*sql.Tx) error { close(holdingShort); <-hold; return nil })
-	}()
-	<-holdingShort
-	defer close(hold)
-	begin = time.Now()
-	err = short.WithTx(ctx, func(*sql.Tx) error { return nil })
 	if !errors.Is(err, store.ErrBusy) {
-		t.Fatalf("an unmarked transaction behind a writer returned %v; want store.ErrBusy", err)
+		t.Fatalf("a marked writer behind another returned %v; want store.ErrBusy", err)
 	}
-	if domain, named := store.ErrorWriteDomain(err); !named || !store.SameWriteDomain(domain, mustWriteDomain(t, short)) {
+	if domain, named := store.ErrorWriteDomain(err); !named || !store.SameWriteDomain(domain, mustWriteDomain(t, db)) {
 		t.Fatalf("the queue timeout named %v (named=%v); want the handle's domain", domain, named)
 	}
-	if elapsed := time.Since(begin); elapsed < 200*time.Millisecond || elapsed > 2*time.Second {
+	if elapsed < 200*time.Millisecond || elapsed > 2*time.Second {
 		t.Fatalf("the queued writer gave up after %v; want the 200ms busy timeout", elapsed)
 	}
 }
