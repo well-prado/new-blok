@@ -235,7 +235,15 @@ closes the attachment, so a later reader gets the reconstruction and `end` at
 once. One connection makes at most `MaxDuration / RecoveredPoll` durable
 reads, and `Authorize` and `Policy` are still evaluated once per connection.
 Polling stops as soon as a trusted publisher claims the run, which then ends
-with its own terminal frame. A failed poll is skipped, not retried at once.
+with its own terminal frame. A failed poll (a timeout, an outage) is skipped,
+not retried at once. A source that classifies its errors
+(`inspect.RefusingSource`) can report a poll as refused, meaning the reader
+may no longer see the run; that follower is closed at once, without `end`, so
+a revoked grant does not stay open until `MaxDuration` (its reconnect gets
+the not-found answer). A source that also implements
+`inspect.UnavailableSource` names what a reconstruction could not include;
+those notes (at most 8, each at most 128 bytes) join the snapshot's
+`unavailable` list.
 
 **Idle unfinished runs (#263).** A run that started here and never finished
 (suspended, or whose execution stopped without a terminal transition) used to
@@ -260,12 +268,22 @@ records are keyed by an operation key that digests each step's resolved
 input, so the source replays the run through the engine's journaled
 interpreter with a read-only journal that restores committed outputs, as a
 takeover does, and stops at the first step without one. That journal refuses
-every dispatch, so inspection never invokes a node and never writes. A replay
-reads at most one record per instruction and stops after one step beyond the
-requested page. The distributed store records no timestamps, so run and step
-times are zero; step input is not kept (only its digest); a step record holds
-only its current attempt; a terminal record whose input was dropped to fit
-(#265) is shown without steps.
+every dispatch, so inspection never invokes a node and never writes. Only the
+end of the committed journal ends a replay normally: a store error, a
+malformed record or an expired context fails the read, which is then never
+returned as a shorter page (and a poll is skipped rather than sending it as
+the final reconstruction). A replay reads at most one record per instruction
+and stops after one step beyond the requested page. Depth is bounded per
+read: a page must start within the first 256 steps (`MaxInspectionSteps`), so
+one read costs at most 256 + limit + 1 step reads (457 for the largest page);
+the page that reaches the bound is marked truncated and offers no next
+cursor, and a page starting beyond it is refused before any read. The stream's
+snapshot is always the first page. The distributed store records no
+timestamps, so run and step times are zero, and every cluster snapshot lists
+`timestamps` as unavailable; step input is not kept (only its digest); a step
+record holds only its current attempt. A run whose registered artifact no
+longer matches, or whose input is no longer retained (#265), is shown without
+steps and says which.
 
 Cluster runs do not emit live inspection events (ADR 0019). A cluster run
 executes on whichever replica owns its partition, while the hub is
@@ -294,6 +312,7 @@ execution (they only read), and end the stream at the terminal state.
 | durable snapshot read / size (one per admitted reader) | 5 s / 64 KiB | 1 min / 1 MiB | no snapshot; the gap is still sent |
 | recovered follower poll `RecoveredPoll` | 2 s | 100 ms – 1 min | one durable read per tick; a failed read is skipped |
 | unfinished run idle bound `IdleTimeout` | 10 min | 2 h | past it, an unfollowed unfinished run is recyclable by a recovered read |
+| cluster reconstruction depth `MaxInspectionSteps` | 256 steps | fixed | a page starting beyond it is refused; the page reaching it is truncated |
 
 `Hub.Close` ends every subscription (`shutdown`) and refuses new ones while
 publication continues, so stopping the stream never affects a run.
@@ -373,5 +392,10 @@ principal answered 404, and a mapped reader attached the run under its
 tenant. A journal run completed with no publisher ended its follower within a
 poll interval, with bounded reads, no resent snapshot, one policy evaluation
 and no payload under default capture; a hub at `MaxRuns` with idle unfinished
-runs admitted the recovered read only past `IdleTimeout`. Each guarded
-behavior was shown to fail under a deliberate mutation.
+runs admitted the recovered read only past `IdleTimeout`. A completed run read
+under 1–60 ms deadlines returned only full pages or errors, never a short
+page; paging a 300-step run by cursor stopped at a truncated page at the bound
+whose read cost 262 store reads, and a deeper page was refused with no read; a
+follower stopped polling once a publisher claimed its run, an outage skipped
+polls, and a refusal closed the follower. Each guarded behavior was shown to
+fail under a deliberate mutation.

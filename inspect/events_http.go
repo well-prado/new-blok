@@ -177,10 +177,11 @@ func (h *eventHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reque
 		replay, err = admission.Subscribe(runID, cursor, h.cfg.Authorize)
 	}
 	var snapshot *inspection.Page
+	var notes []string
 	if errors.Is(err, event.ErrNotFound) && h.cfg.Source != nil {
-		page, sourceErr := h.snapshot(request.Context(), principal, runID, fields)
+		page, pageNotes, sourceErr := h.snapshot(request.Context(), principal, runID, fields)
 		if sourceErr == nil {
-			snapshot = &page
+			snapshot, notes = &page, pageNotes
 			if owners, ok := h.cfg.Source.(RunOwnerSource); ok {
 				// Follow live only under the run's durable owner, so the
 				// engine's trusted publications reach it and the reader is
@@ -226,8 +227,8 @@ func (h *eventHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reque
 		defer hub.Unsubscribe(sub, "client_closed")
 	}
 	if replay.Gap != nil && snapshot == nil && h.cfg.Source != nil {
-		if page, sourceErr := h.snapshot(request.Context(), principal, runID, fields); sourceErr == nil {
-			snapshot = &page
+		if page, pageNotes, sourceErr := h.snapshot(request.Context(), principal, runID, fields); sourceErr == nil {
+			snapshot, notes = &page, pageNotes
 		}
 	}
 	session := &eventSession{writer: writer, control: control, timeout: h.cfg.WriteTimeout, seen: cursor}
@@ -239,7 +240,7 @@ func (h *eventHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reque
 		gap, _ := json.Marshal(replay.Gap)
 		planned = append(planned, plannedFrame{id: replay.GapCursor, name: event.GapName, data: gap})
 		if snapshot != nil {
-			if data, ok := h.snapshotFrame(*snapshot); ok {
+			if data, ok := h.snapshotFrame(*snapshot, notes); ok {
 				planned = append(planned, plannedFrame{id: replay.GapCursor, name: "snapshot", data: data})
 				sent = data
 			}
@@ -355,8 +356,16 @@ func (h *eventHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reque
 				poll = nil
 				continue
 			}
-			page, err := h.snapshot(request.Context(), principal, runID, fields)
+			page, pageNotes, err := h.snapshot(request.Context(), principal, runID, fields)
 			if err != nil {
+				if h.refused(err) {
+					// The source no longer lets this reader see the run:
+					// close the connection now rather than at MaxDuration.
+					// A reconnect gets the not-found answer.
+					stopWatching()
+					hub.Unsubscribe(sub, "revoked")
+					return
+				}
 				// Unavailable for now; the next poll tries again, and
 				// MaxDuration still bounds the subscription.
 				continue
@@ -370,7 +379,7 @@ func (h *eventHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reque
 				poll = nil
 				continue
 			}
-			if data, ok := h.snapshotFrame(page); ok && !bytes.Equal(data, sent) {
+			if data, ok := h.snapshotFrame(page, pageNotes); ok && !bytes.Equal(data, sent) {
 				if session.frame(plannedFrame{id: session.seen, name: "snapshot", data: data}) != nil || session.flush() != nil {
 					return
 				}
@@ -524,18 +533,27 @@ type recoveredSnapshot struct {
 	Unavailable   []string        `json:"unavailable"`
 }
 
-// snapshotFrame encodes a reconstruction, or reports that it does not fit
-// SnapshotBytes.
-func (h *eventHandler) snapshotFrame(page inspection.Page) ([]byte, bool) {
-	data, err := json.Marshal(recoveredSnapshot{Source: "journal", Reconstructed: true, Page: page, Unavailable: []string{"transient transitions", "logs", "payloads the journal does not keep"}})
+// snapshotFrame encodes a reconstruction with what it could not include, or
+// reports that it does not fit SnapshotBytes.
+func (h *eventHandler) snapshotFrame(page inspection.Page, notes []string) ([]byte, bool) {
+	unavailable := append([]string{"transient transitions", "logs", "payloads the journal does not keep"}, notes...)
+	data, err := json.Marshal(recoveredSnapshot{Source: "journal", Reconstructed: true, Page: page, Unavailable: unavailable})
 	return data, err == nil && len(data) <= h.cfg.SnapshotBytes
 }
 
-func (h *eventHandler) snapshot(parent context.Context, principal, runID string, fields map[inspection.Field]bool) (inspection.Page, error) {
+// refused reports a failed source read that a RefusingSource classifies as
+// the reader no longer being allowed to see the run.
+func (h *eventHandler) refused(err error) bool {
+	refusing, ok := h.cfg.Source.(RefusingSource)
+	var failed *sourceReadError
+	return ok && errors.As(err, &failed) && refusing.Refused(failed.cause)
+}
+
+func (h *eventHandler) snapshot(parent context.Context, principal, runID string, fields map[inspection.Field]bool) (inspection.Page, []string, error) {
 	ctx, cancel := context.WithTimeout(parent, h.cfg.SourceTimeout)
 	defer cancel()
 	policy := inspection.Policy{Fields: fields, MaxPageSize: defaultEventSnapshotPage, MaxResponseBytes: h.cfg.SnapshotBytes - 512}
-	return InspectSource(ctx, h.cfg.Source, principal, policy, inspection.Query{Version: inspection.Version, RunID: runID, Limit: defaultEventSnapshotPage})
+	return inspectSource(ctx, h.cfg.Source, principal, policy, inspection.Query{Version: inspection.Version, RunID: runID, Limit: defaultEventSnapshotPage})
 }
 
 func terminalStatus(status inspection.Status) bool {

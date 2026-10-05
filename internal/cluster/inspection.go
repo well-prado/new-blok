@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 
 	"github.com/well-prado/new-blok/contract/inspection"
 	"github.com/well-prado/new-blok/internal/engine"
@@ -14,9 +15,30 @@ import (
 // a run: one linearizable run read each.
 const MaxInspectionTenants = 16
 
-// errInspectionStop ends an inspection replay at the first step the step
-// journal has no committed result for. It never reaches a caller.
+// MaxInspectionSteps bounds how deep into a run inspection reads (#278 F2):
+// a page must start within the first MaxInspectionSteps step facts, so one
+// read replays at most MaxInspectionSteps+limit+1 step records (457 at the
+// largest page of 200), whatever the cursor asks for. A page that reaches
+// the bound is served whole, marked truncated, and offers no next cursor; a
+// page starting beyond it is refused with ErrInspectionDepth.
+const MaxInspectionSteps = 256
+
+// ErrInspectionDepth refuses a page that starts beyond MaxInspectionSteps.
+var ErrInspectionDepth = errors.New("cluster: inspection page is beyond the replay bound")
+
+// errInspectionStop ends an inspection replay normally: the run has no
+// further committed step, or this read has all the steps it needs. It never
+// reaches a caller; a store error or an expired context fails the read
+// instead.
 var errInspectionStop = errors.New("cluster: inspection replay reached the end of the committed journal")
+
+// Notes for what a reconstruction could not include, for the reader to tell
+// "not there" from "not readable".
+const (
+	unavailableTimestamps = "timestamps (the distributed store keeps none)"
+	unavailableArtifact   = "steps (the registered workflow artifact does not match the run)"
+	unavailableInput      = "steps (the run's input is no longer retained)"
+)
 
 // InspectionSource reads durable cluster runs for inspection (ADR 0016,
 // #263). It implements inspection.Source and inspect.RunOwnerSource over
@@ -60,14 +82,26 @@ func (s *InspectionSource) RunOwner(ctx context.Context, reader, runID string) (
 // is read first and authorized by tenant; payloads are projected only for
 // the selected fields and capped at maxPayload. The replay reads at most one
 // step record per program instruction, and stops after offset+limit+1
-// matching steps, so a later page is announced without reading it.
+// matching steps, so a later page is announced without reading it. A read
+// that a store error or its context ends before the page is complete fails;
+// it never returns a short page.
 func (s *InspectionSource) ReadInspection(ctx context.Context, reader, runID, stepID string, offset, limit int, fields map[inspection.Field]bool, maxPayload int) (inspection.Run, []inspection.Step, int, error) {
+	run, steps, total, _, err := s.ReadInspectionUnavailable(ctx, reader, runID, stepID, offset, limit, fields, maxPayload)
+	return run, steps, total, err
+}
+
+// ReadInspectionUnavailable is ReadInspection that also names what the
+// reconstruction could not include (inspect.UnavailableSource).
+func (s *InspectionSource) ReadInspectionUnavailable(ctx context.Context, reader, runID, stepID string, offset, limit int, fields map[inspection.Field]bool, maxPayload int) (inspection.Run, []inspection.Step, int, []string, error) {
 	if reader == "" || runID == "" || offset < 0 || limit < 1 || limit > 200 || maxPayload < inspection.MinPayloadBytes {
-		return inspection.Run{}, nil, 0, ErrNotFound
+		return inspection.Run{}, nil, 0, nil, ErrNotFound
+	}
+	if offset >= MaxInspectionSteps {
+		return inspection.Run{}, nil, 0, nil, ErrInspectionDepth
 	}
 	record, partition, err := s.locate(ctx, reader, runID)
 	if err != nil {
-		return inspection.Run{}, nil, 0, err
+		return inspection.Run{}, nil, 0, nil, err
 	}
 	run := inspection.Run{ID: record.RunID, Workflow: record.Workflow, Status: runStatus(record.State), ErrorCode: record.ErrorCode}
 	if fields[inspection.FieldInput] {
@@ -76,12 +110,28 @@ func (s *InspectionSource) ReadInspection(ctx context.Context, reader, runID, st
 	if fields[inspection.FieldOutput] {
 		run.Output = boundedRaw(record.Output, maxPayload)
 	}
-	steps := s.replay(ctx, partition, record, stepID, offset+limit+1, fields, maxPayload)
+	steps, notes, err := s.replay(ctx, partition, record, stepID, offset+limit+1, fields, maxPayload)
+	if err != nil {
+		return inspection.Run{}, nil, 0, nil, err
+	}
+	notes = append([]string{unavailableTimestamps}, notes...)
 	total := len(steps)
 	if offset >= total {
-		return run, []inspection.Step{}, total, nil
+		return run, []inspection.Step{}, total, notes, nil
 	}
-	return run, steps[offset:min(offset+limit, total)], total, nil
+	if offset+limit >= MaxInspectionSteps && total > offset+limit {
+		// More steps exist, but the next page would start beyond the
+		// bound: the extra step marks this page truncated, and a total
+		// ending at the page offers no cursor that would be refused.
+		return run, steps[offset : offset+limit+1], offset + limit, notes, nil
+	}
+	return run, steps[offset:min(offset+limit, total)], total, notes, nil
+}
+
+// Refused reports an error that means the reader may no longer see the run
+// (inspect.RefusingSource), as opposed to one that failed the read.
+func (s *InspectionSource) Refused(err error) bool {
+	return errors.Is(err, ErrNotFound)
 }
 
 // locate finds runID among the tenants reader may look up. The owner is the
@@ -114,21 +164,33 @@ func (s *InspectionSource) locate(ctx context.Context, reader, runID string) (Ru
 	return RunRecord{}, "", ErrNotFound
 }
 
-func (s *InspectionSource) replay(ctx context.Context, partition string, record RunRecord, stepID string, budget int, fields map[inspection.Field]bool, maxPayload int) []inspection.Step {
+// replay returns the run's committed step facts, at most budget of them. A
+// store error, a malformed record or an expired context fails it; only the
+// end of the committed journal (or of the budget) ends it normally.
+func (s *InspectionSource) replay(ctx context.Context, partition string, record RunRecord, stepID string, budget int, fields map[inspection.Field]bool, maxPayload int) ([]inspection.Step, []string, error) {
 	workflow, ok := s.runtime.workflows[record.Workflow]
 	if !ok || workflow.Program.Digest != record.ArtifactDigest {
 		// Without the exact registered artifact the operation keys cannot
-		// be derived; the run is reported without steps.
-		return nil
+		// be derived; the run is reported without steps, and says why.
+		return nil, []string{unavailableArtifact}, nil
 	}
 	input, err := workflow.DecodeInput(record.Input)
 	if err != nil {
 		// Includes a terminal record whose input was dropped to fit (#265).
-		return nil
+		return nil, []string{unavailableInput}, nil
 	}
 	journal := &inspectionJournal{store: s.runtime.store, partition: partition, record: record, stepID: stepID, budget: budget, fields: fields, maxPayload: maxPayload}
 	_, _ = s.runtime.engine.RunJournaled(ctx, workflow.Program, input, record.RunID, journal)
-	return journal.steps
+	if journal.err != nil {
+		return nil, nil, journal.err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	if journal.inputMismatch {
+		return nil, []string{unavailableInput}, nil
+	}
+	return journal.steps, nil, nil
 }
 
 // inspectionJournal is a read-only engine.StepJournal and WaitJournal. It
@@ -145,26 +207,58 @@ type inspectionJournal struct {
 	maxPayload int
 	steps      []inspection.Step
 	matched    int
+	// err is the store, context or record failure that ended the replay.
+	err error
+	// inputMismatch: the stored input does not reproduce the run's input
+	// digest (a decoder that accepts a dropped input).
+	inputMismatch bool
+}
+
+// fail records why the replay could not complete and stops it.
+func (j *inspectionJournal) fail(err error) error {
+	if j.err == nil {
+		j.err = err
+	}
+	return errInspectionStop
+}
+
+// read is one step or wait record read; a missing record is (nil, false).
+func (j *inspectionJournal) read(ctx context.Context, stateID string) ([]byte, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, j.fail(err)
+	}
+	data, revision, err := j.store.ReadState(ctx, j.partition, stateID)
+	if err != nil {
+		return nil, false, j.fail(err)
+	}
+	return data, revision != 0, nil
 }
 
 func (j *inspectionJournal) VerifyRun(_ context.Context, runID, artifact, inputDigest string) error {
-	if runID != j.record.RunID || artifact != j.record.ArtifactDigest || inputDigest != j.record.InputDigest {
+	if runID != j.record.RunID || artifact != j.record.ArtifactDigest {
+		return j.fail(fmt.Errorf("cluster: inspection replay identity mismatch for run %s", j.record.RunID))
+	}
+	if inputDigest != j.record.InputDigest {
+		j.inputMismatch = true
 		return errInspectionStop
 	}
 	return nil
 }
 
 func (j *inspectionJournal) Load(ctx context.Context, identity engine.StepIdentity) (json.RawMessage, bool, error) {
-	if j.matched >= j.budget || !sameStepIdentity(identity, j.record, identity.StepID) {
+	if j.matched >= j.budget {
 		return nil, false, errInspectionStop
 	}
-	data, revision, err := j.store.ReadState(ctx, j.partition, stepStateID(identity.OperationKey))
-	if err != nil || revision == 0 {
+	if !sameStepIdentity(identity, j.record, identity.StepID) {
+		return nil, false, j.fail(fmt.Errorf("cluster: inspection replay step identity mismatch at %s", identity.StepID))
+	}
+	data, found, err := j.read(ctx, stepStateID(identity.OperationKey))
+	if err != nil || !found {
 		return nil, false, errInspectionStop
 	}
 	var persisted stepRecord
-	if json.Unmarshal(data, &persisted) != nil || persisted.Identity != identity {
-		return nil, false, errInspectionStop
+	if err := json.Unmarshal(data, &persisted); err != nil || persisted.Identity != identity {
+		return nil, false, j.fail(fmt.Errorf("cluster: malformed step record at %s", identity.StepID))
 	}
 	step := inspection.Step{ID: identity.StepID, Status: j.stepStatus(persisted), Attempt: persisted.AttemptNumber}
 	attempt := inspection.Attempt{ID: persisted.CurrentAttempt, Number: persisted.AttemptNumber, Status: step.Status}
@@ -202,16 +296,19 @@ func (j *inspectionJournal) stepStatus(persisted stepRecord) inspection.Status {
 }
 
 func (j *inspectionJournal) Await(ctx context.Context, identity engine.WaitIdentity) (engine.WaitResult, bool, error) {
-	if j.matched >= j.budget || !sameStepIdentity(identity.Step, j.record, identity.Step.StepID) {
+	if j.matched >= j.budget {
 		return engine.WaitResult{}, false, errInspectionStop
 	}
-	data, revision, err := j.store.ReadState(ctx, j.partition, waitStateID(j.record.Tenant, WaitIDFor(j.record.RunID, identity.Step.StepID)))
-	if err != nil || revision == 0 {
+	if !sameStepIdentity(identity.Step, j.record, identity.Step.StepID) {
+		return engine.WaitResult{}, false, j.fail(fmt.Errorf("cluster: inspection replay wait identity mismatch at %s", identity.Step.StepID))
+	}
+	data, found, err := j.read(ctx, waitStateID(j.record.Tenant, WaitIDFor(j.record.RunID, identity.Step.StepID)))
+	if err != nil || !found {
 		return engine.WaitResult{}, false, errInspectionStop
 	}
 	var wait WaitRecord
-	if json.Unmarshal(data, &wait) != nil || wait.RunID != j.record.RunID || wait.Tenant != j.record.Tenant || wait.OperationKey != identity.Step.OperationKey {
-		return engine.WaitResult{}, false, errInspectionStop
+	if err := json.Unmarshal(data, &wait); err != nil || wait.RunID != j.record.RunID || wait.Tenant != j.record.Tenant || wait.OperationKey != identity.Step.OperationKey {
+		return engine.WaitResult{}, false, j.fail(fmt.Errorf("cluster: malformed wait record at %s", identity.Step.StepID))
 	}
 	step := inspection.Step{ID: identity.Step.StepID, Attempt: 1}
 	var result engine.WaitResult
@@ -225,7 +322,7 @@ func (j *inspectionJournal) Await(ctx context.Context, identity engine.WaitIdent
 		step.Status = inspection.StatusCompleted
 		result = engine.WaitResult{TimedOut: true}
 	default:
-		return engine.WaitResult{}, false, errInspectionStop
+		return engine.WaitResult{}, false, j.fail(fmt.Errorf("cluster: wait record at %s has state %q", identity.Step.StepID, wait.State))
 	}
 	if step.Status == inspection.StatusCompleted && j.fields[inspection.FieldOutput] {
 		encoded, _ := json.Marshal(result)

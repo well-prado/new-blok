@@ -3,6 +3,7 @@ package inspect_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -200,4 +201,133 @@ func TestRecoveredPollIsBounded(t *testing.T) {
 			t.Errorf("RecoveredPoll %s refused: %v", poll, err)
 		}
 	}
+}
+
+// revocableSource is the journal's owner-only source with a switchable
+// refusal and a switchable outage; it classifies its own errors.
+type revocableSource struct {
+	*countingOwnerSource
+	revoked, failing atomic.Bool
+}
+
+var errSyntheticOutage = errors.New("synthetic durable outage")
+
+func (s *revocableSource) ReadInspection(ctx context.Context, principal, runID, stepID string, offset, limit int, fields map[inspection.Field]bool, maxPayload int) (inspection.Run, []inspection.Step, int, error) {
+	if s.revoked.Load() {
+		s.reads.Add(1)
+		return inspection.Run{}, nil, 0, journal.ErrNotFound
+	}
+	if s.failing.Load() {
+		s.reads.Add(1)
+		return inspection.Run{}, nil, 0, errSyntheticOutage
+	}
+	return s.countingOwnerSource.ReadInspection(ctx, principal, runID, stepID, offset, limit, fields, maxPayload)
+}
+
+func (s *revocableSource) Refused(err error) bool { return errors.Is(err, journal.ErrNotFound) }
+
+func admitHeldRun(t *testing.T, store *journal.Journal, key string) string {
+	t.Helper()
+	admission, err := store.Admit(context.Background(), journal.AdmissionRequest{Principal: "alice", RequestKey: key, Workflow: "quote", ArtifactDigest: "sha256:" + key, Input: []byte(`{"sku":"coffee","quantity":1}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return admission.RunID
+}
+
+func streamClosed(stream *sseStream, within time.Duration) bool {
+	select {
+	case <-stream.done:
+		return true
+	case <-time.After(within):
+		return false
+	}
+}
+
+// TestPollingStopsOnceAPublisherClaimsTheRun is review finding F4 on #278:
+// once a trusted publisher claims a recovered run it is live, ends with its
+// own terminal frame, and its follower stops reading the durable source.
+func TestPollingStopsOnceAPublisherClaimsTheRun(t *testing.T) {
+	store, closeJournal := openJournal(t, filepath.Join(t.TempDir(), "claimed.db"))
+	defer closeJournal()
+	runID := admitHeldRun(t, store, "claimed")
+	source := &countingOwnerSource{store: store}
+	live := newLiveApp(t, liveConfig{
+		handler: inspect.EventHandlerConfig{Source: source, RecoveredPoll: 100 * time.Millisecond, MaxDuration: time.Minute},
+		nodes:   map[string]node.Any{"test/gate": (&gateNode{}).node(t)},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, _, stream := openStream(t, ctx, live.eventsURL(runID), "alice", "")
+	if stream == nil {
+		t.Fatal("follower refused")
+	}
+	defer stream.close()
+	stream.until(t, "snapshot", 5*time.Second)
+	waitFor(t, func() bool { return source.reads.Load() >= 3 })
+	live.stream.Observe(inspection.Event{Kind: inspection.StepProcessing, RunID: runID, Principal: "alice", StepID: "gate", Attempt: 1, At: time.Now()})
+	if frame, _ := stream.next(t, 5*time.Second); frame.Event != "step.processing" {
+		t.Fatalf("claimed run frame=%+v", frame)
+	}
+	time.Sleep(250 * time.Millisecond) // a poll already in flight may finish
+	claimed := source.reads.Load()
+	time.Sleep(time.Second)
+	if reads := source.reads.Load(); reads > claimed {
+		t.Fatalf("%d durable reads after a publisher claimed the run", reads-claimed)
+	}
+	live.stream.Observe(inspection.Event{Kind: inspection.RunCompleted, RunID: runID, Principal: "alice", At: time.Now()})
+	if got := strings.Join(frameNames(stream.rest(t, 5*time.Second)), ","); got != "run.completed,end" {
+		t.Fatalf("live end frames=%s", got)
+	}
+}
+
+// TestRefusedPollClosesTheFollower: a follower whose poll the source refuses
+// (its grant was revoked) is closed at once, without an end, rather than
+// left open until MaxDuration; a failed poll (an outage) is only skipped.
+func TestRefusedPollClosesTheFollower(t *testing.T) {
+	store, closeJournal := openJournal(t, filepath.Join(t.TempDir(), "revoked.db"))
+	defer closeJournal()
+	source := &revocableSource{countingOwnerSource: &countingOwnerSource{store: store}}
+	live := newLiveApp(t, liveConfig{
+		handler: inspect.EventHandlerConfig{Source: source, RecoveredPoll: 100 * time.Millisecond, MaxDuration: time.Minute},
+		nodes:   map[string]node.Any{"test/gate": (&gateNode{}).node(t)},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	follow := func(key string) (string, *sseStream) {
+		runID := admitHeldRun(t, store, key)
+		_, _, stream := openStream(t, ctx, live.eventsURL(runID), "alice", "")
+		if stream == nil {
+			t.Fatal("follower refused")
+		}
+		stream.until(t, "snapshot", 5*time.Second)
+		return runID, stream
+	}
+	runID, outage := follow("outage")
+	source.failing.Store(true)
+	waitFor(t, func() bool { return source.reads.Load() >= 4 })
+	if streamClosed(outage, 500*time.Millisecond) {
+		t.Fatal("an outage closed the follower")
+	}
+	source.failing.Store(false)
+	if err := store.CompleteRun(ctx, runID, json.RawMessage(`1`)); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(frameNames(outage.rest(t, 5*time.Second)), ","); got != "snapshot,end" {
+		t.Fatalf("after the outage frames=%s", got)
+	}
+
+	_, revoked := follow("revoked")
+	source.revoked.Store(true)
+	started := time.Now()
+	if !streamClosed(revoked, 5*time.Second) {
+		t.Fatal("a revoked follower was left open")
+	}
+	if took := time.Since(started); took > 2*time.Second {
+		t.Fatalf("revoked follower closed after %s", took)
+	}
+	if rest := revoked.rest(t, time.Second); len(rest) != 0 {
+		t.Fatalf("a revoked follower was sent %v", frameNames(rest))
+	}
+	waitFor(t, func() bool { return live.stream.Hub().Stats().Readers == 0 })
 }
