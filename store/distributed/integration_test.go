@@ -708,10 +708,21 @@ func waitRead(ctx context.Context, client *clientv3.Client, endpoint, key string
 	}
 }
 
+// composeArgs maps a fault on a compose service to the docker command that
+// injects it. An isolated environment names its containers through
+// BLOK_DISTRIBUTED_ETCD_VOTERS and BLOK_DISTRIBUTED_S3_CONTAINER, so a fault
+// reaches the store the test actually uses; otherwise the shared
+// benchmarks/distributed compose project is targeted.
 func composeArgs(args ...string) []string {
-	if len(args) > 1 && os.Getenv("BLOK_DISTRIBUTED_ETCD_VOTERS") != "" {
-		voters := integrationEtcdVoters()
-		services := map[string]string{"etcd1": voters[0], "etcd2": voters[1], "etcd3": voters[2]}
+	if len(args) > 1 && (os.Getenv("BLOK_DISTRIBUTED_ETCD_VOTERS") != "" || os.Getenv("BLOK_DISTRIBUTED_S3_CONTAINER") != "") {
+		services := map[string]string{}
+		if os.Getenv("BLOK_DISTRIBUTED_ETCD_VOTERS") != "" {
+			voters := integrationEtcdVoters()
+			services["etcd1"], services["etcd2"], services["etcd3"] = voters[0], voters[1], voters[2]
+		}
+		if container := os.Getenv("BLOK_DISTRIBUTED_S3_CONTAINER"); container != "" {
+			services["s3"] = container
+		}
 		mapped := []string{args[0]}
 		for _, service := range args[1:] {
 			voter, ok := services[service]
