@@ -1,0 +1,34 @@
+{
+  "version": "blok-cli/v1",
+  "command": "check",
+  "status": "passed",
+  "exitCode": 0,
+  "project": {
+    "name": "shop",
+    "module": "example.com/shop",
+    "runtime": "go",
+    "layout": "classic",
+    "triggers": [
+      "http"
+    ]
+  },
+  "checks": [
+    {
+      "name": "layout",
+      "state": "passed"
+    },
+    {
+      "name": "bindings",
+      "state": "passed"
+    },
+    {
+      "name": "workflow-steps",
+      "state": "passed"
+    },
+    {
+      "name": "go-vet",
+      "state": "passed"
+    }
+  ],
+  "diagnostics": []
+}

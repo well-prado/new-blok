@@ -66,6 +66,15 @@ path outside the project is refused. It may list explicit `workflows` paths
 (default `workflows`); layout discovery reads nodes and workflows from their
 descriptors without running code ([ADR 0023](docs/decisions/0023-layout-discovery.md)).
 
+In the application, `blok check` validates it without running any of its
+code (`blok.json` and `go.mod`, node import independence, stale bindings,
+workflow step ids and `go vet`), `blok test` runs its tests through
+`go test`, and `blok inspect` describes its nodes, workflows and HTTP routes
+with source, test and example references. Each takes `--json` for the
+versioned `blok-cli/v1` report and exits 0 when clean, 1 on problems and 130
+when interrupted ([ADR 0024](docs/decisions/0024-check-test-inspect-cli-contract.md)).
+Their Windows behaviour is unverified.
+
 The initial toolchain is Go 1.27.1. The first application milestone delivers a quote service that can be authored, tested and served entirely in Go. Follow the [roadmap](ROADMAP.md) for implementation order, issue dependencies, and exit evidence.
 
 ### Run the native quote application

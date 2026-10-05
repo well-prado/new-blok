@@ -1,0 +1,106 @@
+{
+  "version": "blok-cli/v1",
+  "command": "inspect",
+  "status": "passed",
+  "exitCode": 0,
+  "project": {
+    "name": "shop",
+    "module": "example.com/shop",
+    "runtime": "go",
+    "layout": "classic",
+    "triggers": [
+      "http"
+    ]
+  },
+  "catalog": {
+    "fields": [
+      "nodes",
+      "descriptions",
+      "sources",
+      "tests",
+      "examples",
+      "schemas"
+    ],
+    "nodes": [
+      {
+        "id": "app/audit",
+        "version": "1.0.0",
+        "runtime": "go",
+        "package": "runtimes/go/nodes/audit",
+        "description": "[redacted: sensitive-looking log message]",
+        "deterministic": false,
+        "effects": [
+          "ledger.write"
+        ],
+        "inputSchema": {
+          "properties": {
+            "password": "[redacted]"
+          },
+          "type": "object"
+        },
+        "outputSchema": {
+          "properties": {
+            "password": "[redacted]"
+          },
+          "type": "object"
+        },
+        "source": "runtimes/go/nodes/audit/audit.go:17:13",
+        "tests": [
+          {
+            "name": "TestAuditDescriptor",
+            "source": "runtimes/go/nodes/audit/audit_test.go:8:6"
+          }
+        ],
+        "examples": [
+          {
+            "name": "ExampleAudit",
+            "source": "runtimes/go/nodes/audit/audit_test.go:14:6"
+          }
+        ]
+      },
+      {
+        "id": "app/calculate-quote",
+        "version": "1.0.0",
+        "runtime": "go",
+        "package": "runtimes/go/nodes/quote",
+        "description": "Calculates a quote from an injected catalog",
+        "deterministic": false,
+        "inputSchema": {
+          "type": "object"
+        },
+        "outputSchema": {
+          "properties": {
+            "currency": {
+              "type": "string"
+            },
+            "quantity": {
+              "type": "integer"
+            },
+            "sku": {
+              "type": "string"
+            },
+            "totalCents": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "sku",
+            "quantity",
+            "totalCents",
+            "currency"
+          ],
+          "type": "object"
+        },
+        "source": "runtimes/go/nodes/quote/quote.go:19:9",
+        "tests": [
+          {
+            "name": "TestQuoteOverHTTP",
+            "source": "internal/app/app_test.go:13:6"
+          }
+        ]
+      }
+    ],
+    "redacted": 3
+  },
+  "diagnostics": []
+}

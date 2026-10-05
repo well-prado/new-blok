@@ -1,0 +1,10 @@
+project example.com/shop (classic layout)
+check layout          passed
+check bindings        passed
+check workflow-steps  passed
+check go-vet          failed
+workflows/quotes/quotes.go:18:37: go_compile_error: the Go code does not compile
+  expected: Go code that type-checks
+  actual: quote.OutputFields(result).TotalCentz undefined (type quote.OutputRef has no field or method TotalCentz)
+  fix: fix the Go compile error at this position
+blok check: failed, 1 problem

@@ -1,0 +1,9 @@
+project example.com/shop (classic layout)
+node app/calculate-quote@1.0.0 (runtimes/go/nodes/quote)  runtimes/go/nodes/quote/quote.go:19:9
+  Calculates a quote from an injected catalog
+  test TestQuoteOverHTTP  internal/app/app_test.go:13:6
+workflow quote@1.0.0 (workflows/quotes)  workflows/quotes/quotes.go:16:9
+  step calculate call  workflows/quotes/quotes.go:17:13
+  test TestQuoteOverHTTP  internal/app/app_test.go:13:6
+trigger http POST /quotes -> app/quote  internal/app/app.go:39:26
+blok inspect: passed
