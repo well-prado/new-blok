@@ -299,7 +299,14 @@ func newTracedHost(t *testing.T, ingress trigger.TraceIngress, ratio float64) *t
 		}
 	}
 	h.submit = &recordingSubmitter{queue: h.queue}
-	if h.consumer, err = pubsub.New(h.broker, pubsub.Subscription{Name: "orders", Principal: trigger.Principal{ID: "publisher"}, Kind: "quote.pubsub", Submit: h.submit, InputSchema: quote.InputSchema, FetchWait: time.Millisecond, Trace: ingress, TracePolicy: h.app.TracePolicy()}); err != nil {
+	// Pub/sub refuses Extract without an enabled policy
+	// (ErrTracePolicyRequired), so an untraced host leaves it off, as an
+	// application must.
+	pubsubIngress := ingress
+	if !h.app.TracePolicy().Enabled() {
+		pubsubIngress = trigger.TraceIngress{}
+	}
+	if h.consumer, err = pubsub.New(h.broker, pubsub.Subscription{Name: "orders", Principal: trigger.Principal{ID: "publisher"}, Kind: "quote.pubsub", Submit: h.submit, InputSchema: quote.InputSchema, FetchWait: time.Millisecond, Trace: pubsubIngress, TracePolicy: h.app.TracePolicy()}); err != nil {
 		t.Fatal(err)
 	}
 	httpServer, err := blokhttp.New(h.app, []blokhttp.Endpoint{{Method: "POST", Path: "/quotes", InputSchema: quote.InputSchema, Authenticate: bearer, Trace: ingress, Handle: func(ctx context.Context, in blokhttp.Input) (any, error) {
@@ -1002,6 +1009,16 @@ func TestTraceIngressUndefinedSamplingIsRefusedAtStartup(t *testing.T) {
 	_, mcpErr := tmcp.New(application, tmcp.Config{Name: "n", Version: "1", Catalog: tracedCatalog{}, Authenticate: func(context.Context, string, *http.Request) (tool.Principal, error) { return tool.Principal{}, nil }, Expose: []string{"selection/quote@1.0.0"}, Trace: bad})
 	_, grpcErr := bgrpc.New(application, func(context.Context) (trigger.Principal, error) { return trigger.Principal{}, nil }, []bgrpc.Binding{{Method: quoteMethod(t), Workflow: "selection/quote", WorkflowInput: quote.InputSchema, InputSchema: quote.InputSchema, OutputSchema: quoteOutput, Authorize: bgrpc.AllowAuthenticated, Handle: func(context.Context, bgrpc.Call) (json.RawMessage, error) { return nil, nil }, Trace: bad}})
 	_, pubsubErr := pubsub.New(&traceBroker{}, pubsub.Subscription{Name: "orders", Principal: trigger.Principal{ID: "p"}, Kind: "k", Submit: queue, InputSchema: quote.InputSchema, Trace: bad})
+	_, pubsubForgotten := pubsub.New(&traceBroker{}, pubsub.Subscription{Name: "orders", Principal: trigger.Principal{ID: "p"}, Kind: "k", Submit: queue, InputSchema: quote.InputSchema, Trace: trigger.TraceIngress{Extract: true}})
+	if !errors.Is(pubsubForgotten, pubsub.ErrTracePolicyRequired) {
+		t.Errorf("pubsub accepted Trace.Extract without a TracePolicy: %v", pubsubForgotten)
+	}
+	if _, err := pubsub.New(&traceBroker{}, pubsub.Subscription{Name: "orders", Principal: trigger.Principal{ID: "p"}, Kind: "k", Submit: queue, InputSchema: quote.InputSchema, Trace: trigger.TraceIngress{Extract: true}, TracePolicy: observe.TracePolicy{Ratio: 0.1}}); err != nil {
+		t.Errorf("pubsub refused Extract with an enabled policy: %v", err)
+	}
+	if _, err := pubsub.New(&traceBroker{}, pubsub.Subscription{Name: "orders", Principal: trigger.Principal{ID: "p"}, Kind: "k", Submit: queue, InputSchema: quote.InputSchema}); err != nil {
+		t.Errorf("pubsub refused an untraced subscription: %v", err)
+	}
 	_, pubsubPolicyErr := pubsub.New(&traceBroker{}, pubsub.Subscription{Name: "orders", Principal: trigger.Principal{ID: "p"}, Kind: "k", Submit: queue, InputSchema: quote.InputSchema, TracePolicy: observe.TracePolicy{Ratio: 2}})
 	for name, err := range map[string]error{"http": httpErr, "webhook": webhookErr, "sse": sseErr, "websocket": wsErr, "mcp": mcpErr, "grpc": grpcErr, "pubsub": pubsubErr} {
 		if err == nil || !strings.Contains(err.Error(), "invalid_trace_ingress") {

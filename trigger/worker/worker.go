@@ -1048,16 +1048,15 @@ func (q *Queue) Submit(ctx context.Context, submission trigger.Submission) (bool
 var _ trigger.Submitter = (*Queue)(nil)
 
 // encodeTrace stores a valid trace context as its canonical traceparent and
-// tracestate, and anything else as empty. An invalid tracestate is dropped
-// rather than discarding the context.
+// tracestate, and anything else as empty. An invalid tracestate, or a member
+// of it the redaction boundary flags, is dropped rather than discarding the
+// context.
 func encodeTrace(trace observe.TraceContext) (traceparent, tracestate string) {
 	if !trace.TraceID.IsValid() || !trace.SpanID.IsValid() {
 		return "", ""
 	}
 	trace.Flags &= observe.FlagSampled
-	if !observe.ValidTracestate(trace.State) {
-		trace.State = ""
-	}
+	trace.State = trigger.SafeTracestate(trace.State)
 	return trace.Traceparent(), trace.State
 }
 
@@ -1069,6 +1068,7 @@ func decodeTrace(traceparent, tracestate string) observe.TraceContext {
 	if !ok {
 		return observe.TraceContext{}
 	}
+	trace.State = trigger.SafeTracestate(trace.State)
 	return trace
 }
 

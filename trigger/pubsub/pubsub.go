@@ -52,6 +52,11 @@ const (
 	MaxMessageIDBytes = 256
 )
 
+// ErrTracePolicyRequired refuses a subscription that sets Trace.Extract
+// without an enabled TracePolicy: pass app.Application.TracePolicy(), and
+// leave Extract off when the application does not trace.
+var ErrTracePolicyRequired = errors.New("trace extraction needs an enabled Subscription.TracePolicy (app.Application.TracePolicy()); leave Trace.Extract off when the application does not trace")
+
 // Dead-letter reasons recorded with a terminated message.
 const (
 	ReasonTooLarge         = "too_large"
@@ -129,7 +134,9 @@ type Subscription struct {
 	Trace trigger.TraceIngress
 	// TracePolicy is the application's head-sampling policy
 	// (app.Application.TracePolicy). The consumer has no application, so
-	// it is passed here; when it is disabled, Trace extracts nothing.
+	// it is passed here. New refuses Trace.Extract without an enabled
+	// policy (ErrTracePolicyRequired) rather than silently extracting
+	// nothing.
 	TracePolicy observe.TracePolicy
 }
 
@@ -168,6 +175,11 @@ func New(source Source, sub Subscription) (*Consumer, error) {
 	}
 	if err := errors.Join(sub.Trace.Validate(), sub.TracePolicy.Validate()); err != nil {
 		return nil, fmt.Errorf("pubsub: subscription %s: %w", sub.Name, err)
+	}
+	if sub.Trace.Extract && !sub.TracePolicy.Enabled() {
+		// The consumer has no application to read the policy from, so a
+		// forgotten TracePolicy would silently extract nothing (#285 review).
+		return nil, fmt.Errorf("pubsub: subscription %s: %w", sub.Name, ErrTracePolicyRequired)
 	}
 	if sub.MaxInFlight <= 0 {
 		sub.MaxInFlight = DefaultMaxInFlight

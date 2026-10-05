@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/well-prado/new-blok/contract/observe"
+	"github.com/well-prado/new-blok/observe/redact"
 )
 
 // The W3C Trace Context carrier field names. HTTP header lookups
@@ -54,7 +55,22 @@ func (t TraceIngress) Parent(policy observe.TracePolicy, traceparent, tracestate
 	if !ok {
 		return observe.TraceContext{}, false
 	}
-	return policy.Inbound(remote, t.Sampling)
+	parent, ok := policy.Inbound(remote, t.Sampling)
+	if !ok {
+		return observe.TraceContext{}, false
+	}
+	parent.State = SafeTracestate(parent.State)
+	return parent, true
+}
+
+// SafeTracestate returns state without any list member the redaction
+// boundary (observe/redact, ADR 0021) flags, as written or in an encoded
+// form: a caller's tracestate is forwarded to every worker call and to the
+// exporter, so a credential in it must not survive admission. Every place
+// that stores or hands on a trace context received from outside a run uses
+// it (#285 review F1).
+func SafeTracestate(state string) string {
+	return observe.FilterTracestate(state, redact.Sensitive)
 }
 
 // Context returns ctx carrying Parent's result as its active trace context

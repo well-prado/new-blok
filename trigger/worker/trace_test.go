@@ -132,6 +132,10 @@ func TestMalformedTraceIsNeitherStoredNorAnError(t *testing.T) {
 	zeroSpan.SpanID = observe.SpanID{}
 	badState := valid
 	badState.State = "vendor=é"
+	credential := valid
+	credential.State = "pw=password:hunter2,vendor=1"
+	cleanState := valid
+	cleanState.State = "vendor=1"
 	cases := []struct {
 		key        string
 		trace      observe.TraceContext
@@ -144,6 +148,8 @@ func TestMalformedTraceIsNeitherStoredNorAnError(t *testing.T) {
 		{key: "stored-version-ff", trace: valid, overwrite: []string{"ff" + traceA[2:], ""}},
 		{key: "stored-garbage", trace: valid, overwrite: []string{"not a trace", "vendor=1"}},
 		{key: "stored-bad-state", trace: valid, overwrite: []string{traceA, "vendor=\x01"}, want: valid},
+		{key: "stored-credential", trace: valid, overwrite: []string{traceA, "token=SYNTHETIC-ts-0001,vendor=1"}, want: cleanState},
+		{key: "enqueued-credential", trace: credential, want: cleanState, wantColumn: [2]string{traceA, "vendor=1"}},
 	}
 	for _, tc := range cases {
 		if _, err := queue.Enqueue(context.Background(), EnqueueRequest{RequestKey: tc.key, Kind: "test", Payload: []byte(`{}`), Trace: tc.trace}); err != nil {

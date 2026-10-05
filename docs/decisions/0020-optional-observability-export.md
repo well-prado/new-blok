@@ -133,6 +133,18 @@ run.
 - Exactly one `tracestate` value of at most 256 printable bytes is kept.
   More than one, an oversized or a non-printable one is dropped and the
   `traceparent` is still used, as W3C allows.
+- **No credential survives in the tracestate.** It is forwarded verbatim to
+  every worker call (`Call.tracestate`, the Node SDK's
+  `ctx.trace.tracestate`) and becomes every exported span's `trace_state`,
+  so it is a disclosure path for whatever a caller put in it.
+  `observe.FilterTracestate` drops each list member the redaction flags
+  and keeps the others; if what remains is still flagged as a whole,
+  nothing is kept. `ExtractTrace` and `TracePolicy.Inbound` apply the
+  shared plain pattern (`SensitiveText`), and the trigger layer
+  (`trigger.SafeTracestate`: `TraceIngress.Parent` and the worker queue on
+  enqueue and on read) applies the full ADR 0021 boundary,
+  `observe/redact.Sensitive`, which also decodes base64, percent-encoded
+  and JSON forms. `token=…,pw=password:…,vendor=ok` arrives as `vendor=ok`.
 
 **Where each adapter reads it, and where it goes.** Always after routing,
 admission, authentication, authorization and input validation, so it
@@ -142,11 +154,11 @@ cannot change any of them:
 | --- | --- | --- |
 | HTTP | request headers | the handler's context (`observe.WithTrace`); the engine already joins `TraceFrom(ctx)` when `Invocation.Trace` is not set |
 | gRPC | incoming metadata | the handler's context |
-| WebSocket | upgrade request headers, resolved once per connection | the context of `OnConnect`, every `OnMessage` and `OnDisconnect` |
+| WebSocket | upgrade request headers, resolved once per connection | the context of `OnConnect`, every `OnMessage` and `OnDisconnect`. A long-lived connection is therefore one trace of unbounded length: every run it starts, for as long as it stays open, is a child of the single remote span of the upgrade request, with one sampling decision. A backend that bounds trace size or duration may truncate or split it; an application that wants a trace per message carries its own context in the message and passes it as `Invocation.Trace` |
 | MCP | headers of the HTTP request carrying the `tools/call` | the context given to `Catalog.Invoke` |
 | Webhook | request headers (not covered by the provider signature) | `Submission.Trace` → job record |
 | SSE start | request headers | `Submission.Trace` → job record |
-| Pub/sub | message headers, when the driver's message implements `pubsub.TraceCarrier` (`natsjs` does, collecting every spelling of the case-sensitive NATS names) | `Submission.Trace` → job record. The consumer has no application, so `Subscription.TracePolicy` carries the policy |
+| Pub/sub | message headers, when the driver's message implements `pubsub.TraceCarrier` (`natsjs` does, collecting every spelling of the case-sensitive NATS names) | `Submission.Trace` → job record. The consumer has no application, so `Subscription.TracePolicy` carries the policy; `pubsub.New` refuses `Trace.Extract` without an enabled one (`ErrTracePolicyRequired`) instead of silently extracting nothing |
 | Worker | `EnqueueRequest.Trace` / `Submission.Trace`, stored with the job | the handler's context (`observe.TraceFrom`) and `Job.Trace` |
 | Cron | none: an occurrence has no upstream | deliberately nothing. A tick's own context is never captured; the run is a root |
 
@@ -158,8 +170,10 @@ have no trace. The trace is correlation, not identity: it is not in the
 payload digest or the duplicate comparison, so a provider redelivery with
 a new `traceparent` is a duplicate (never a conflict), and the first
 committed trace is kept. An invalid context is not stored, an invalid
-tracestate is dropped, and a stored value that does not parse is ignored
-when the job runs. The queue keeps the stored sampled flag: its producers
+tracestate (or a member the redaction flags) is dropped, and a stored value
+that does not parse is ignored when the job runs; a stored tracestate is
+filtered again on read, so a row written by an older or foreign writer
+cannot hand a credential to a worker. The queue keeps the stored sampled flag: its producers
 are trusted application code (ADR 0005), and an ingress adapter in front of
 it has already applied its policy.
 
@@ -328,6 +342,8 @@ digest; tests compute it from discovery.
 
 ## Limits
 
+- A WebSocket connection is one trace under one remote span for its whole
+  life (see the table above).
 - Inbound trace extraction is opt-in per endpoint (#276). MCP reads the
   carrying HTTP request's headers, not a `traceparent` in the call's
   `_meta`. A job enqueued from inside a traced step does not capture that

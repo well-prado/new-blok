@@ -163,3 +163,85 @@ func TestIgnoreDecidesLocallyWhateverTheCallerSends(t *testing.T) {
 		}
 	}
 }
+
+// TestExtractTraceDropsCredentialShapedTracestateMembers (#285 review F1):
+// tracestate is forwarded to exporters and workers, so a member the shared
+// credential pattern flags never survives extraction; the traceparent and
+// the other members do.
+func TestExtractTraceDropsCredentialShapedTracestateMembers(t *testing.T) {
+	cases := []struct{ tracestate, want string }{
+		{"token=SYNTHETIC-ts-0001,pw=password:hunter2", ""},
+		{"vendor=ok,token=SYNTHETIC-ts-0001,pw=password:hunter2,other=1", "vendor=ok,other=1"},
+		{"rojo=00f067aa0ba902b7, api_key=SYNTHETIC-k3y-0002 ,congo=t61rcWkgMzE", "rojo=00f067aa0ba902b7,congo=t61rcWkgMzE"},
+		{"vendor=AKIAABCDEFGHIJKLMNOP", ""},
+		{"vendor=ok", "vendor=ok"},
+	}
+	for _, tc := range cases {
+		parsed, ok := observe.ExtractTrace([]string{validParent}, []string{tc.tracestate})
+		if !ok || parsed.TraceID.String() != "4bf92f3577b34da6a3ce929d0e0e4736" {
+			t.Fatalf("%q: the traceparent was not kept: %+v ok=%v", tc.tracestate, parsed, ok)
+		}
+		if parsed.State != tc.want || strings.Contains(parsed.State, "SYNTHETIC") || strings.Contains(parsed.State, "hunter2") {
+			t.Fatalf("%q: state %q, want %q", tc.tracestate, parsed.State, tc.want)
+		}
+		if observe.SensitiveText(parsed.State) {
+			t.Fatalf("%q: extracted state %q is still sensitive", tc.tracestate, parsed.State)
+		}
+	}
+	// A context built elsewhere is cleaned the same way when a run joins it.
+	remote, _ := observe.ExtractTrace([]string{validParent}, nil)
+	remote.State = "token=SYNTHETIC-ts-0001,vendor=ok"
+	if parent, ok := (observe.TracePolicy{Ratio: 1}).Inbound(remote, observe.HonorInboundSampling); !ok || parent.State != "vendor=ok" {
+		t.Fatalf("Inbound kept %q (ok=%v)", parent.State, ok)
+	}
+}
+
+// TestIgnoreSamplingIsIndependentOfTheCallersTraceID (#285 review F4): the
+// ignore policy must not apply the ratio arithmetic to the caller's id. An
+// id that arithmetic always samples, and one it never samples, must both be
+// sampled at the local ratio.
+func TestIgnoreSamplingIsIndependentOfTheCallersTraceID(t *testing.T) {
+	always := remoteParent(t, "00-4bf92f3577b34da60000000000000000-00f067aa0ba902b7-01")
+	never := remoteParent(t, "00-4bf92f3577b34da6ffffffffffffffff-00f067aa0ba902b7-01")
+	half := observe.TracePolicy{Ratio: 0.5}
+	if !half.Samples(always.TraceID) || half.Samples(never.TraceID) {
+		t.Fatal("the fixture ids do not pin the ratio arithmetic; the test would be vacuous")
+	}
+	for name, remote := range map[string]observe.TraceContext{"always-sampled id": always, "never-sampled id": never} {
+		sampled := 0
+		const draws = 2000
+		for range draws {
+			if parent, _ := half.Inbound(remote, observe.IgnoreInboundSampling); parent.Sampled() {
+				sampled++
+			}
+		}
+		// Binomial(2000, 0.5): mean 1000, standard deviation 22.
+		if sampled < 850 || sampled > 1150 {
+			t.Fatalf("%s: %d of %d sampled at ratio 0.5; the decision follows the caller's id", name, sampled, draws)
+		}
+	}
+}
+
+func TestFilterTracestateDropsOnlyFlaggedMembers(t *testing.T) {
+	flagged := func(member string) bool { return strings.HasPrefix(member, "bad=") }
+	cases := []struct {
+		state     string
+		sensitive func(string) bool
+		want      string
+	}{
+		{"a=1, b=2", flagged, "a=1, b=2"},
+		{"a=1, bad=x ,b=2", flagged, "a=1,b=2"},
+		{"bad=x", flagged, ""},
+		{"", flagged, ""},
+		{strings.Repeat("x", observe.MaxTracestateBytes+1), flagged, ""},
+		{"a=1,token=SYNTHETIC-1", nil, "a=1"},
+		{"a=1,b=2", func(string) bool { return false }, "a=1,b=2"},
+		// Members that are clean apart but flagged together keep nothing.
+		{"a=1,b=2", func(s string) bool { return s == "a=1,b=2" }, ""},
+	}
+	for _, tc := range cases {
+		if got := observe.FilterTracestate(tc.state, tc.sensitive); got != tc.want {
+			t.Fatalf("FilterTracestate(%q) = %q, want %q", tc.state, got, tc.want)
+		}
+	}
+}
