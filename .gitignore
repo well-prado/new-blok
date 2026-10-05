@@ -9,3 +9,28 @@
 runtime/nodejs/node_modules/
 runtime/nodejs/dist/
 /benchmarks/parity/old-engine/node_modules/
+
+# Build outputs. `go build` without -o drops a binary named after the main
+# package's directory (or, for a module root, the last element of its module
+# path) into the tree. Each entry is anchored to the exact path so it can never
+# match a source file or directory of the same name (examples/recipes/shop is
+# a source directory; examples/recipes/cmd/shop/shop is the binary). Adding a
+# main package? Add its binary here: internal/tooling/repohygiene checks it.
+/benchmarks/distributed/distributed
+/cmd/store-spike/store-spike
+/cmd/blok/blok
+/contract/observe/testdata/footprint/footprint
+/observe/otel/testdata/footprint/footprint
+/examples/deploy/cmd/durable/durable
+/examples/deploy/cmd/native/native
+/examples/deploy/cmd/node/node
+/examples/quote/cmd/quote/quote
+/examples/recipes/cmd/shop/shop
+/examples/recipes/external/shopapp/recipes.shopapp
+/trigger/testdata/selection/http/http
+/trigger/testdata/selection/none/none
+/trigger/testdata/selection/worker/worker
+
+# Test binaries from `go test -c` / `-o`, and Windows build outputs.
+*.test
+*.exe
