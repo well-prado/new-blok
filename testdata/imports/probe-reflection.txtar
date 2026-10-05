@@ -10,7 +10,10 @@ unverified, in a pattern, an object literal or a class body alike (they
 are not told apart). TypeScript index signatures and mapped types are
 types, not keys, and stay verified; a key that starts like a mapped
 type, [k in o ? a : b] (also ||, &&, ?? or a comma), selects a value
-rather than a boolean and is unverified. Controls already held: a computed
+rather than a boolean and is unverified. Each reflection API is pinned
+alone (define-properties, own-descriptors, set-prototype), and this before
+a computed key is not the this.<name> form: this[k] reaching the Function
+constructor, and this[i - 1], whose numeric key is otherwise safe. Controls already held: a computed
 process.env key, import.meta.resolve then import(u), vm, and an escaped
 eval.
 -- blok.json --
@@ -87,7 +90,34 @@ const fs = require("fs"); const vm = require("node:vm");
 vm.runInThisContext(fs.readFileSync(require.resolve("../../../shared/c.txt"), "utf8"));
 -- nodes/nodejs/vm-run/node.json --
 {"name":"probe/vm-run","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/define-properties/index.js --
+const o = {};
+Object.defineProperties(o, { x: { value: 1 } });
+module.exports = o;
+-- nodes/nodejs/define-properties/node.json --
+{"name":"probe/define-properties","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/own-descriptors/index.js --
+module.exports = Object.getOwnPropertyDescriptors({ a: 1 });
+-- nodes/nodejs/own-descriptors/node.json --
+{"name":"probe/own-descriptors","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/set-prototype/index.js --
+module.exports = Object.setPrototypeOf({ a: 1 }, null);
+-- nodes/nodejs/set-prototype/node.json --
+{"name":"probe/set-prototype","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/this-computed-ctor/index.js --
+module.exports = function () {
+  const k = "constr" + "uctor";
+  return this[k]("return 1")();
+};
+-- nodes/nodejs/this-computed-ctor/node.json --
+{"name":"probe/this-computed-ctor","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/this-numeric-key/index.js --
+module.exports = function (i) {
+  return this[i - 1];
+};
+-- nodes/nodejs/this-numeric-key/node.json --
+{"name":"probe/this-numeric-key","version":"1.0.0","runtime":"nodejs"}
 -- shared/c.txt --
 x
 -- @expect --
-{"diagnostics":[["ownership_dynamic_import","nodes/nodejs/meta-resolve-import/index.mjs:2"],["ownership_node_imports_node","nodes/nodejs/meta-resolve-import/index.mjs:1"],["ownership_unsupported_form","nodes/nodejs/class-computed-member/index.js:1"],["ownership_unsupported_form","nodes/nodejs/define-property/index.js:2"],["ownership_unsupported_form","nodes/nodejs/define-property/index.js:3"],["ownership_unsupported_form","nodes/nodejs/descriptor-ctor/index.js:2"],["ownership_unsupported_form","nodes/nodejs/descriptor-ctor/index.js:2"],["ownership_unsupported_form","nodes/nodejs/destructure-computed/index.js:2"],["ownership_unsupported_form","nodes/nodejs/destructure-in-select/index.js:2"],["ownership_unsupported_form","nodes/nodejs/destructure-template/index.js:1"],["ownership_unsupported_form","nodes/nodejs/process-env-computed/index.js:1"],["ownership_unsupported_form","nodes/nodejs/tagged-template/index.js:2"],["ownership_unsupported_form","nodes/nodejs/tagged-template/index.js:2"],["ownership_unsupported_form","nodes/nodejs/unicode-eval/index.js:1"],["ownership_unsupported_form","nodes/nodejs/vm-run/index.js:1"]],"nodes":[["nodes/nodejs/b","verified"],["nodes/nodejs/class-computed-member","unverified"],["nodes/nodejs/define-property","unverified"],["nodes/nodejs/descriptor-ctor","unverified"],["nodes/nodejs/destructure-computed","unverified"],["nodes/nodejs/destructure-in-select","unverified"],["nodes/nodejs/destructure-template","unverified"],["nodes/nodejs/meta-resolve-import","violation"],["nodes/nodejs/process-env-computed","unverified"],["nodes/nodejs/safe-keys","verified"],["nodes/nodejs/tagged-template","unverified"],["nodes/nodejs/unicode-eval","unverified"],["nodes/nodejs/vm-run","unverified"]]}
+{"diagnostics":[["ownership_dynamic_import","nodes/nodejs/meta-resolve-import/index.mjs:2"],["ownership_node_imports_node","nodes/nodejs/meta-resolve-import/index.mjs:1"],["ownership_unsupported_form","nodes/nodejs/class-computed-member/index.js:1"],["ownership_unsupported_form","nodes/nodejs/define-properties/index.js:2"],["ownership_unsupported_form","nodes/nodejs/define-property/index.js:2"],["ownership_unsupported_form","nodes/nodejs/define-property/index.js:3"],["ownership_unsupported_form","nodes/nodejs/descriptor-ctor/index.js:2"],["ownership_unsupported_form","nodes/nodejs/descriptor-ctor/index.js:2"],["ownership_unsupported_form","nodes/nodejs/destructure-computed/index.js:2"],["ownership_unsupported_form","nodes/nodejs/destructure-in-select/index.js:2"],["ownership_unsupported_form","nodes/nodejs/destructure-template/index.js:1"],["ownership_unsupported_form","nodes/nodejs/own-descriptors/index.js:1"],["ownership_unsupported_form","nodes/nodejs/process-env-computed/index.js:1"],["ownership_unsupported_form","nodes/nodejs/set-prototype/index.js:1"],["ownership_unsupported_form","nodes/nodejs/tagged-template/index.js:2"],["ownership_unsupported_form","nodes/nodejs/tagged-template/index.js:2"],["ownership_unsupported_form","nodes/nodejs/this-computed-ctor/index.js:3"],["ownership_unsupported_form","nodes/nodejs/this-computed-ctor/index.js:3"],["ownership_unsupported_form","nodes/nodejs/this-numeric-key/index.js:2"],["ownership_unsupported_form","nodes/nodejs/unicode-eval/index.js:1"],["ownership_unsupported_form","nodes/nodejs/vm-run/index.js:1"]],"nodes":[["nodes/nodejs/b","verified"],["nodes/nodejs/class-computed-member","unverified"],["nodes/nodejs/define-properties","unverified"],["nodes/nodejs/define-property","unverified"],["nodes/nodejs/descriptor-ctor","unverified"],["nodes/nodejs/destructure-computed","unverified"],["nodes/nodejs/destructure-in-select","unverified"],["nodes/nodejs/destructure-template","unverified"],["nodes/nodejs/meta-resolve-import","violation"],["nodes/nodejs/own-descriptors","unverified"],["nodes/nodejs/process-env-computed","unverified"],["nodes/nodejs/safe-keys","verified"],["nodes/nodejs/set-prototype","unverified"],["nodes/nodejs/tagged-template","unverified"],["nodes/nodejs/this-computed-ctor","unverified"],["nodes/nodejs/this-numeric-key","unverified"],["nodes/nodejs/unicode-eval","unverified"],["nodes/nodejs/vm-run","unverified"]]}

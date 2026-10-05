@@ -185,8 +185,8 @@
     },
     "probe-reflection": {
       "runtime": "nodejs",
-      "outputRecords": 13,
-      "errorRecords": 15,
+      "outputRecords": 18,
+      "errorRecords": 21,
       "effectRecords": 0
     }
   }
