@@ -81,12 +81,19 @@ func TestMigrationFixtures(t *testing.T) {
 			switch fixture.Mutation {
 			case "output-earlier-call":
 				doc.Workflow.Instructions[len(doc.Workflow.Instructions)-1].References[0].Step = "load"
-			case "call-self-reference":
+			case "call-self-reference", "call-forward-reference":
 				call := &doc.Workflow.Instructions[1]
-				call.References[0].Step = call.ID
+				if fixture.Mutation == "call-self-reference" {
+					call.References[0].Step = call.ID
+				} else {
+					// The first call reads the later call's output.
+					doc.Workflow.Instructions[0].References = []contract.Reference{{Step: call.ID}}
+				}
+				// Errorf, not Fatalf: Export below must still be checked, so a
+				// regressed shared validator shows Export failing closed alone.
 				var validationError *contract.Error
 				if err := doc.Validate(); !errors.As(err, &validationError) || validationError.Code != "invalid_reference" {
-					t.Fatalf("public document validator error = %v, want invalid_reference", err)
+					t.Errorf("public document validator error = %v, want invalid_reference", err)
 				}
 			case "extra-call-reference":
 				call := &doc.Workflow.Instructions[1]
@@ -100,10 +107,16 @@ func TestMigrationFixtures(t *testing.T) {
 			}
 			if _, err := Export(doc); err == nil {
 				t.Fatal("Export() silently dropped unsupported document semantics")
-			} else if fixture.Mutation == "call-self-reference" {
+			} else if fixture.Mutation == "call-self-reference" || fixture.Mutation == "call-forward-reference" {
+				// The shared validator rejects first (invalid_reference); Export's
+				// own earlier-call check is the independent fail-closed path
+				// (unsupported_export_document) if that validator ever regresses.
 				var validationError *contract.Error
-				if !errors.As(err, &validationError) || validationError.Code != fixture.Code {
-					t.Fatalf("Export() error = %T %v; expected contract code %q", err, err, fixture.Code)
+				var diagnostic Diagnostic
+				sharedRejected := errors.As(err, &validationError) && validationError.Code == fixture.Code
+				exportRejected := asDiagnostic(err, &diagnostic) && diagnostic.Code == "unsupported_export_document" && diagnostic.Remediation != ""
+				if !sharedRejected && !exportRejected {
+					t.Fatalf("Export() error = %T %v; expected contract code %q or Export's own unsupported_export_document", err, err, fixture.Code)
 				}
 			} else {
 				var diagnostic Diagnostic

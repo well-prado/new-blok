@@ -178,6 +178,7 @@
   "exportCases": [
     { "name": "output-must-return-final-call", "mutation": "output-earlier-call", "code": "unsupported_export_document" },
     { "name": "call-self-reference-is-rejected-at-both-boundaries", "mutation": "call-self-reference", "code": "invalid_reference" },
+    { "name": "call-forward-reference-is-rejected-at-both-boundaries", "mutation": "call-forward-reference", "code": "invalid_reference" },
     { "name": "extra-call-reference-is-not-dropped", "mutation": "extra-call-reference", "code": "unsupported_export_document" },
     { "name": "multiple-bindings-are-not-dropped", "mutation": "multiple-bindings", "code": "unsupported_export_document" },
     { "name": "unreferenced-descriptor-is-not-dropped", "mutation": "unreferenced-node", "code": "unsupported_export_document" }

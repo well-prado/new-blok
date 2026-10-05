@@ -33,6 +33,14 @@ The accepted subset is deliberately structural:
   input root. References to completed earlier steps may include a path
   projection, which is preserved. `@trigger` is accepted only as the complete
   trigger value; trigger-field projections remain unsupported.
+- **The trigger value is the old request envelope, not the body.** Executed
+  against the published 2.5.0 Runner, a root `{"$ref":{"step":"@trigger"}}`
+  resolves to `ctx.request` — `{body, headers, query, params, method, url}` —
+  and `@trigger.body` is the payload. A converted workflow takes that complete
+  value as its input, so the application composition that binds it must pass
+  the same envelope (not the bare body) for the behavior to match. The
+  `unsupported_trigger_projection` remediation says so; it previously told
+  users to "pass the complete trigger body", which was wrong.
 - Trigger configuration must be an empty object. Provider routes, auth,
   middleware, acknowledgments and delivery policy are configured and proven in
   application composition, not inferred by the converter.
@@ -82,7 +90,20 @@ and updated valid/invalid fixtures under ADR 0001.
   unsupported Export mutations must fail with `unsupported_export_document`.
 - `migration/blokv2_test.go` verifies structural round-trip, schema preservation,
   size/step/inventory bounds, identity collisions, forward refs and bounded
-  diagnostics.
-- Full #108 completion remains open until equivalent raw startup, idle, load
-  and recovery distributions, independent Review R and the issue's remaining
-  gates are recorded. A passing converter test is not application parity.
+  diagnostics. The self- and forward-reference Export cases assert the shared
+  validator and Export separately: with the shared validator reverted to its
+  pre-#218 behaviour only the validator assertion fails and Export still
+  refuses through its own earlier-call check; with that check also disabled,
+  Export silently exports the self-reference and the test fails.
+- `benchmarks/parity/migration_execution_test.go` executes the same Blok v2
+  JSON source on both engines: as given through the published 2.5.0
+  `Configuration`/`Runner`, and through `Convert`, the canonical compiler and
+  the native engine. The supported two-step source (trigger envelope ->
+  provider quote -> earlier-step `body` projection -> pure formatter) produces
+  the predeclared output with one provider call and one effect on both sides.
+  A source projecting `@trigger.body`, which the old runner executes
+  successfully, is refused with `unsupported_trigger_projection` and no
+  document. Both assertions were proven red by making `Convert` drop the
+  trigger projection and, separately, the earlier-step path projection.
+- A passing converter test is not application parity; the broader #108
+  evidence and its limits are in `benchmarks/parity/README.md`.

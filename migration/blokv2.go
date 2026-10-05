@@ -232,7 +232,7 @@ func Convert(source []byte, inventory map[string]contract.NodeDescriptor) (contr
 			}
 			if ref.Step == "@trigger" {
 				if len(ref.Path) != 0 {
-					return contract.Document{}, Diagnostic{Code: "unsupported_trigger_projection", Path: path + ".inputs", Message: "the target executor currently accepts the complete trigger value, not a projected trigger field", Remediation: "normalize the input in a typed node before migration or pass the complete trigger body"}
+					return contract.Document{}, Diagnostic{Code: "unsupported_trigger_projection", Path: path + ".inputs", Message: "the target executor currently accepts the complete trigger value, not a projected trigger field", Remediation: "pass the complete trigger value (in Blok 2.x a root @trigger is the whole ctx.request envelope: body, headers, query, params, method, url) and project fields in a typed node"}
 				}
 			} else {
 				if !priorSteps[ref.Step] {
