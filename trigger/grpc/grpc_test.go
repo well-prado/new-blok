@@ -318,10 +318,13 @@ func TestDeadlinesAndCancellation(t *testing.T) {
 		{"client cancels before its deadline, workflow returns late", 5 * time.Second, 300 * time.Millisecond, 50 * time.Millisecond, false, 400 * time.Millisecond, codes.Canceled, context.Canceled},
 	} {
 		observed := make(chan error, 1)
+		bounded := make(chan time.Time, 1)
 		adapter, err := tgrpc.New(started(t), principals, []tgrpc.Binding{{
 			Method: orders.Methods().ByName("Place"), Workflow: "place", WorkflowInput: f.Order, InputSchema: f.Order, OutputSchema: f.Placed, Authorize: tgrpc.AllowAuthenticated,
 			Timeout: tc.binding,
 			Handle: func(ctx context.Context, call tgrpc.Call) (json.RawMessage, error) {
+				deadline, _ := ctx.Deadline()
+				bounded <- deadline
 				if tc.ignore {
 					time.Sleep(300 * time.Millisecond)
 					observed <- nil
@@ -342,6 +345,7 @@ func TestDeadlinesAndCancellation(t *testing.T) {
 			answered <- status.Code(err)
 			return response, err
 		}))
+		began := time.Now()
 		ctx, cancel := context.WithTimeout(as(context.Background(), "alice"), tc.client)
 		if tc.cancel > 0 {
 			time.AfterFunc(tc.cancel, cancel)
@@ -362,10 +366,21 @@ func TestDeadlinesAndCancellation(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatalf("%s: the workflow kept running", tc.name)
 		}
+		// The workflow runs under the shorter of the client's deadline and
+		// the binding's timeout, whatever status the call then reports.
+		select {
+		case deadline := <-bounded:
+			if want := began.Add(min(tc.client, tc.binding)); deadline.After(want.Add(time.Second)) {
+				t.Fatalf("%s: the workflow's deadline %v is not the shorter of the client's and the binding's", tc.name, deadline.Sub(began))
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s: the workflow never ran", tc.name)
+		}
 		server := <-answered
 		// The client's reset at its own deadline can reach the server
 		// before the server's slightly later deadline; it then reads as a
-		// cancel, indistinguishable on the wire (#230, statusFor).
+		// cancel, indistinguishable on the wire (#230, statusFor). The
+		// deadline check above still holds the server to the client's.
 		if tc.name == "client deadline shorter" && server == codes.Canceled {
 			continue
 		}
