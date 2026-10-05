@@ -535,41 +535,105 @@ func stalled(t *testing.T, f *fixture, stream string) net.Conn {
 	return conn
 }
 
-// flood publishes large events as fast as possible and returns the longest
-// time a single Publish took.
-func flood(t *testing.T, hub *sse.Hub, stream string, events int) time.Duration {
-	t.Helper()
+// flood publishes large events as fast as possible.
+func flood(hub *sse.Hub, stream string, events int) error {
 	data := json.RawMessage(`"` + strings.Repeat("x", 60<<10) + `"`)
-	var longest time.Duration
 	for i := 0; i < events; i++ {
-		began := time.Now()
 		if _, err := hub.Publish(stream, sse.Event{Type: "progress", Data: data}); err != nil {
-			t.Fatal(err)
+			return err
 		}
-		longest = max(longest, time.Since(began))
 	}
-	return longest
+	return nil
 }
 
 // TestSlowSubscriberIsDisconnectedNotBuffered: a subscriber that stops
 // reading lets its bounded queue fill, and is then disconnected; publishing
-// never waits for it, and the hub retains only its replay bound.
+// does not block on it, and the hub retains only its replay bound.
+//
+// What it guards, and what it does not (#310): a publisher that blocks on
+// the stalled subscriber for up to its write timeout (an hour here), or for
+// ever. The flood is awaited under a two-minute safety bound, and the
+// subscriber must have been cut off as slow, not released by its write
+// timeout. A brief, bounded wait per publish is not detected: no single
+// publish is timed any more, because under load one was descheduled for
+// longer than the 50 ms bound that used to stand for "no wait".
+// TestSlowSubscriberIsCutAtItsQueueBound counts what a subscriber had
+// consumed when it was cut off, without timing anything.
 func TestSlowSubscriberIsDisconnectedNotBuffered(t *testing.T) {
+	const writeTimeout, safety = time.Hour, 2 * time.Minute
 	f := newFixture(t, sse.HubConfig{RetainBytes: 1 << 20, MaxEventBytes: 64 << 10}, func(e *sse.Endpoint) {
 		e.QueueDepth = 4
-		e.WriteTimeout = time.Minute
+		e.WriteTimeout = writeTimeout
 	})
 	stream := f.started(t, "alice", "k1")
 	conn := stalled(t, f, stream)
 	defer conn.Close()
-	longest := flood(t, f.hub, stream, 600)
-	f.closed.wait(t, sse.ReasonSlow)
-	if longest > publishBound {
-		t.Fatalf("a publish waited %v for a slow subscriber", longest)
+	done := make(chan error, 1)
+	go func() { done <- flood(f.hub, stream, 600) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(safety):
+		t.Fatalf("publishing did not finish while a subscriber stalled: it waited for the subscriber")
 	}
+	f.closed.wait(t, sse.ReasonSlow)
 	if stats := f.hub.Stats(); stats.SlowSubscribers != 1 || stats.EvictedEvents == 0 {
 		t.Fatalf("stats %+v", stats)
 	}
+}
+
+// TestSlowSubscriberIsCutAtItsQueueBound counts instead of timing (#310). A
+// subscriber whose write never completes holds one event in that write and
+// QueueDepth more in its queue. Each of those publications returns while it
+// has consumed nothing more, and the next one cuts it off: the hub neither
+// waits for it nor buffers past its bound.
+func TestSlowSubscriberIsCutAtItsQueueBound(t *testing.T) {
+	const depth = 4
+	transport, err := newWriteGateListener()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newFixtureWithListener(t, sse.HubConfig{RetainBytes: 1 << 20, MaxEventBytes: 64 << 10}, func(e *sse.Endpoint) {
+		e.QueueDepth = depth
+		e.WriteTimeout = time.Hour
+		e.Heartbeat = time.Hour
+	}, transport)
+	stream := f.started(t, "alice", "k1")
+	conn := blockedSubscription(t, f, stream, transport)
+	defer conn.Close()
+	// publish fails the test rather than hang when a publication waits for
+	// the subscriber, whose write would release it only after an hour.
+	publish := func(n int) {
+		t.Helper()
+		done := make(chan error, 1)
+		go func() {
+			_, err := f.hub.Publish(stream, sse.Event{Type: "progress", Data: json.RawMessage(fmt.Sprintf(`{"n":%d}`, n))})
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(time.Minute):
+			t.Fatalf("publication %d waited for a subscriber that had consumed nothing", n)
+		}
+	}
+	publish(1)
+	transport.waitBlocked(t) // the subscriber holds event 1 in a write that never completes
+	for n := 2; n <= depth+1; n++ {
+		publish(n)
+		if slow := f.hub.Stats().SlowSubscribers; slow != 0 {
+			t.Fatalf("cut off at publication %d with room left in its queue of %d", n, depth)
+		}
+	}
+	publish(depth + 2)
+	if slow := f.hub.Stats().SlowSubscribers; slow != 1 {
+		t.Fatalf("a full queue of %d did not cut the subscriber off at publication %d: SlowSubscribers=%d", depth, depth+2, slow)
+	}
+	f.closed.wait(t, sse.ReasonSlow)
 }
 
 // TestBlockedWriteTimesOut: a subscriber whose socket stops draining is

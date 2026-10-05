@@ -26,6 +26,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/encoding"
@@ -297,99 +298,176 @@ func TestGeneratedClientRoundTripsEveryKind(t *testing.T) {
 // workflow, and a workflow that ignores its context and returns late still
 // fails the call. Each case is told apart by what the workflow observed and
 // by the status the server itself answered.
+//
+// No case races the wall clock (#310). The connection is ready before a call
+// starts, so a call's deadline is not spent dialing; a client cancels once
+// its workflow is running, not after a fixed delay; and every wait is for an
+// event, under a safety bound far below the one-minute bound on the side of
+// each case that must not end it, so a workflow that only that bound would
+// stop still reads as running. The deadline is judged by what the workflow
+// had left of it on entry, measured on the server against a deadline the
+// server set: load can only shorten it, so it must not exceed the shorter of
+// the client's deadline and the binding's timeout, plus 10 ms for the
+// clock reads around it. One precondition cannot be made
+// event-driven: a client deadline has to start before the request is sent.
+// When the request does not reach the workflow before that deadline, or a
+// cancel is issued too close to it, the attempt proves nothing either way;
+// it is repeated with the client's deadline doubled, still far below the
+// binding's.
 func TestDeadlinesAndCancellation(t *testing.T) {
 	f := loadCases(t)
 	sku, quantity := "tea", int32(1)
 	order := &orderpb.Order{Sku: &sku, Quantity: &quantity}
+	const long, safety = time.Minute, 20 * time.Second
 	for _, tc := range []struct {
 		name     string
 		binding  time.Duration
 		client   time.Duration
-		cancel   time.Duration
-		ignore   bool
-		lag      time.Duration
+		cancel   bool // the client cancels once its workflow is running
+		ignore   bool // the workflow ignores its context and returns late
+		late     bool // the workflow returns only after its deadline has passed
 		code     codes.Code
 		observed error
 	}{
-		{"client deadline shorter", 5 * time.Second, 50 * time.Millisecond, 0, false, 0, codes.DeadlineExceeded, nil},
-		{"binding timeout shorter", 100 * time.Millisecond, 5 * time.Second, 0, false, 0, codes.DeadlineExceeded, context.DeadlineExceeded},
-		{"client cancels", 5 * time.Second, 5 * time.Second, 50 * time.Millisecond, false, 0, codes.Canceled, context.Canceled},
-		{"workflow ignores its deadline", 100 * time.Millisecond, 5 * time.Second, 0, true, 0, codes.DeadlineExceeded, nil},
-		{"client cancels before its deadline, workflow returns late", 5 * time.Second, 300 * time.Millisecond, 50 * time.Millisecond, false, 400 * time.Millisecond, codes.Canceled, context.Canceled},
+		{"client deadline shorter", long, 50 * time.Millisecond, false, false, false, codes.DeadlineExceeded, nil},
+		{"binding timeout shorter", 100 * time.Millisecond, long, false, false, false, codes.DeadlineExceeded, context.DeadlineExceeded},
+		{"client cancels", long, 2 * long, true, false, false, codes.Canceled, context.Canceled},
+		{"workflow ignores its deadline", 100 * time.Millisecond, long, false, true, false, codes.DeadlineExceeded, nil},
+		{"client cancels before its deadline, workflow returns late", long, time.Second, true, false, true, codes.Canceled, context.Canceled},
 	} {
-		observed := make(chan error, 1)
-		bounded := make(chan time.Time, 1)
-		adapter, err := tgrpc.New(started(t), principals, []tgrpc.Binding{{
-			Method: orders.Methods().ByName("Place"), Workflow: "place", WorkflowInput: f.Order, InputSchema: f.Order, OutputSchema: f.Placed, Authorize: tgrpc.AllowAuthenticated,
-			Timeout: tc.binding,
-			Handle: func(ctx context.Context, call tgrpc.Call) (json.RawMessage, error) {
-				deadline, ok := ctx.Deadline()
-				if !ok {
-					// A workflow with no deadline is never the shorter bound.
-					deadline = time.Now().Add(time.Hour)
+		// attempt reports false when the call never put the property to
+		// the test: the request missed the client's deadline, or the cancel
+		// came too close to it.
+		attempt := func(client time.Duration) bool {
+			observed := make(chan error, 1)
+			left := make(chan time.Duration, 1)
+			running := make(chan struct{})
+			adapter, err := tgrpc.New(started(t), principals, []tgrpc.Binding{{
+				Method: orders.Methods().ByName("Place"), Workflow: "place", WorkflowInput: f.Order, InputSchema: f.Order, OutputSchema: f.Placed, Authorize: tgrpc.AllowAuthenticated,
+				Timeout: tc.binding,
+				Handle: func(ctx context.Context, call tgrpc.Call) (json.RawMessage, error) {
+					deadline, ok := ctx.Deadline()
+					if !ok {
+						// A workflow with no deadline is never the shorter bound.
+						deadline = time.Now().Add(time.Hour)
+					}
+					left <- time.Until(deadline)
+					close(running)
+					if tc.ignore {
+						time.Sleep(time.Until(deadline) + 200*time.Millisecond)
+						observed <- nil
+						return echo(ctx, call)
+					}
+					<-ctx.Done()
+					observed <- ctx.Err()
+					if tc.late {
+						time.Sleep(time.Until(deadline) + 100*time.Millisecond)
+					}
+					return nil, ctx.Err()
+				},
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			answered := make(chan codes.Code, 1)
+			_, conn := serve(t, adapter, grpc.UnaryInterceptor(func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+				response, err := handler(ctx, req)
+				answered <- status.Code(err)
+				return response, err
+			}))
+			ready(t, conn, safety)
+			began := time.Now()
+			ctx, cancel := context.WithTimeout(as(context.Background(), "alice"), client)
+			defer cancel()
+			canceled := make(chan time.Time, 1)
+			if tc.cancel {
+				go func() {
+					select {
+					case <-running:
+						canceled <- time.Now()
+						cancel()
+					case <-ctx.Done():
+						// The deadline came first: no cancel was issued.
+						canceled <- time.Time{}
+					}
+				}()
+			}
+			_, err = orderpb.NewOrdersClient(conn).Place(ctx, order)
+			cancel()
+			var remaining time.Duration
+			select {
+			case remaining = <-left:
+			case <-time.After(safety):
+				if client < tc.binding && status.Code(err) == codes.DeadlineExceeded {
+					return false
 				}
-				bounded <- deadline
-				if tc.ignore {
-					time.Sleep(300 * time.Millisecond)
-					observed <- nil
-					return echo(ctx, call)
+				t.Fatalf("%s: the workflow never ran (the client got %v)", tc.name, err)
+			}
+			if tc.late {
+				if at := <-canceled; at.IsZero() || at.After(began.Add(client/2)) {
+					return false
 				}
-				<-ctx.Done()
-				observed <- ctx.Err()
-				time.Sleep(tc.lag)
-				return nil, ctx.Err()
-			},
-		}})
-		if err != nil {
-			t.Fatal(err)
-		}
-		answered := make(chan codes.Code, 1)
-		_, conn := serve(t, adapter, grpc.UnaryInterceptor(func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-			response, err := handler(ctx, req)
-			answered <- status.Code(err)
-			return response, err
-		}))
-		began := time.Now()
-		ctx, cancel := context.WithTimeout(as(context.Background(), "alice"), tc.client)
-		if tc.cancel > 0 {
-			time.AfterFunc(tc.cancel, cancel)
-		}
-		_, err = orderpb.NewOrdersClient(conn).Place(ctx, order)
-		cancel()
-		if tc.code != codes.Canceled && status.Code(err) != tc.code {
-			t.Fatalf("%s: the client got %v", tc.name, err)
-		}
-		select {
-		case seen := <-observed:
-			if tc.observed != nil && !errors.Is(seen, tc.observed) {
-				t.Fatalf("%s: the workflow observed %v, want %v", tc.name, seen, tc.observed)
 			}
-			if !tc.ignore && seen == nil {
-				t.Fatalf("%s: the workflow was not canceled", tc.name)
+			if tc.code != codes.Canceled && status.Code(err) != tc.code {
+				t.Fatalf("%s: the client got %v", tc.name, err)
 			}
-		case <-time.After(2 * time.Second):
-			t.Fatalf("%s: the workflow kept running", tc.name)
-		}
-		// The workflow runs under the shorter of the client's deadline and
-		// the binding's timeout, whatever status the call then reports.
-		select {
-		case deadline := <-bounded:
-			if want := began.Add(min(tc.client, tc.binding)); deadline.After(want.Add(time.Second)) {
-				t.Fatalf("%s: the workflow's deadline %v is not the shorter of the client's and the binding's", tc.name, deadline.Sub(began))
+			select {
+			case seen := <-observed:
+				if tc.observed != nil && !errors.Is(seen, tc.observed) {
+					t.Fatalf("%s: the workflow observed %v, want %v", tc.name, seen, tc.observed)
+				}
+				if !tc.ignore && seen == nil {
+					t.Fatalf("%s: the workflow was not canceled", tc.name)
+				}
+			case <-time.After(safety):
+				t.Fatalf("%s: the workflow kept running", tc.name)
 			}
-		case <-time.After(2 * time.Second):
-			t.Fatalf("%s: the workflow never ran", tc.name)
+			// The workflow runs under the shorter of the client's deadline
+			// and the binding's timeout, whatever status the call then
+			// reports.
+			if limit := min(client, tc.binding) + 10*time.Millisecond; remaining > limit {
+				t.Fatalf("%s: the workflow started with %v left, more than the shorter of the client's %v and the binding's %v", tc.name, remaining, client, tc.binding)
+			}
+			var server codes.Code
+			select {
+			case server = <-answered:
+			case <-time.After(safety):
+				t.Fatalf("%s: the server never answered", tc.name)
+			}
+			// The client's reset at its own deadline can reach the server
+			// before the server's slightly later deadline; it then reads as
+			// a cancel, indistinguishable on the wire (#230, statusFor). The
+			// deadline check above still holds the server to the client's.
+			if tc.name == "client deadline shorter" && server == codes.Canceled {
+				return true
+			}
+			if server != tc.code {
+				t.Fatalf("%s: the server answered %v, want %v", tc.name, server, tc.code)
+			}
+			return true
 		}
-		server := <-answered
-		// The client's reset at its own deadline can reach the server
-		// before the server's slightly later deadline; it then reads as a
-		// cancel, indistinguishable on the wire (#230, statusFor). The
-		// deadline check above still holds the server to the client's.
-		if tc.name == "client deadline shorter" && server == codes.Canceled {
-			continue
+		const attempts = 6
+		client := tc.client
+		for n := 1; !attempt(client); n++ {
+			if n == attempts {
+				t.Fatalf("%s: no attempt in %d reached the workflow in time; the last client deadline was %v", tc.name, attempts, client)
+			}
+			t.Logf("%s: the call did not reach the workflow within the client's %v; doubling it", tc.name, client)
+			client *= 2
 		}
-		if server != tc.code {
-			t.Fatalf("%s: the server answered %v, want %v", tc.name, server, tc.code)
+	}
+}
+
+// ready connects conn and waits until it is ready, so a call's own deadline
+// is not spent dialing.
+func ready(t *testing.T, conn *grpc.ClientConn, within time.Duration) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), within)
+	defer cancel()
+	conn.Connect()
+	for state := conn.GetState(); state != connectivity.Ready; state = conn.GetState() {
+		if !conn.WaitForStateChange(ctx, state) {
+			t.Fatalf("the connection never became ready: %v", state)
 		}
 	}
 }
