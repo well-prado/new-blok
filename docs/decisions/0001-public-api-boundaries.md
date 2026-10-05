@@ -106,10 +106,14 @@ This is a behavioral correction linked to
 [#244](https://github.com/well-prado/new-blok/issues/244), not a wire-shape or
 document-version change. Inputs with no program form now fail `Lower` with an
 error naming the call instead of silently running on the workflow input: a
-`flow.Lit` value, a field of the workflow input, a reference that is not a
-strictly earlier call of the same program (forward, self, or another
-definition's step), and an empty field segment. The output reference follows
-the same earlier-call rule. Control constructs (`If`, `Choose`, `Each`,
+`flow.Lit` value, a field of the workflow input, a reference whose step id
+is not a strictly earlier call of the same program (forward, self, or a step
+id only another definition has), and an empty field segment. The output
+reference follows the same earlier-call rule. References are matched by step
+id, not by the builder that made them: a reference leaked from another
+definition whose step id happens to equal an earlier local call's lowers to
+that local call, and a leaked workflow-input reference lowers as this
+workflow's input. Neither is detected. Control constructs (`If`, `Choose`, `Each`,
 `Parallel`, `TryFinally`, `Child`, `Compare`, `Default`, `Template`) are still
 rejected as a whole; their arm calls never lower on their own. Migration: a
 workflow that lowered a literal or workflow-input field as a call input
