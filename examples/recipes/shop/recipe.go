@@ -178,6 +178,11 @@ func Migrate(ctx context.Context, database store.Database) error {
 		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) FROM shop_schema_migrations`).Scan(&version); err != nil {
 			return err
 		}
+		// A newer binary migrated these tables to a shape this one does
+		// not know: refuse rather than read or write them (#291).
+		if version > len(migrations) {
+			return &store.NewerSchemaError{Component: "shop", Version: version, Supported: len(migrations)}
+		}
 		for next := version + 1; next <= len(migrations); next++ {
 			for _, statement := range migrations[next-1] {
 				if _, err := tx.ExecContext(ctx, statement); err != nil {
@@ -212,8 +217,9 @@ var migrations = [][]string{
 
 // Teardown removes only this recipe's tables and the worker queue tables it
 // selected: the jobs, and the tombstones and counters of compacted jobs
-// (#290), so a later install does not inherit their dedupe identities.
-// Close all application processes before calling it.
+// (#290), so a later install does not inherit their dedupe identities, and
+// the queue's schema stamp (#291), so it does not outlive the tables it
+// describes. Close all application processes before calling it.
 func Teardown(ctx context.Context, database store.Database) error {
 	if database == nil {
 		return errors.New("shop: database is required")
@@ -224,7 +230,12 @@ func Teardown(ctx context.Context, database store.Database) error {
 				return err
 			}
 		}
-		return nil
+		var stamps int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'blok_schema_versions'`).Scan(&stamps); err != nil || stamps == 0 {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `DELETE FROM blok_schema_versions WHERE component = 'worker'`)
+		return err
 	})
 }
 

@@ -445,46 +445,77 @@ func New(ctx context.Context, database store.Database, clock func() time.Time, o
 	queue := &Queue{database: database, writeDomain: writeDomain, clock: clock, lease: configured.lease, busyTimeout: busyTimeout, claimTurn: claimTurnFor(writeDomain), schemas: map[string]schema.Schema{}, hold: configured.hold, minRetention: configured.minRetention}
 	if err := migration.Retry(ctx, func() error {
 		return queue.withTx(ctx, func(tx *sql.Tx) error {
-			if err := createJobs(ctx, tx); err != nil {
-				return err
-			}
-			if err := ensureColumn(ctx, tx, "deferrals", "INTEGER NOT NULL DEFAULT 0"); err != nil {
-				return err
-			}
-			if err := ensureColumn(ctx, tx, "principal_json", "TEXT NOT NULL DEFAULT ''"); err != nil {
-				return err
-			}
-			// enqueue_seq orders jobs that share a created_at by when they were
-			// enqueued (#217). Jobs from before the column existed keep 0 and
-			// fall back to job_id among themselves.
-			if err := ensureColumn(ctx, tx, "enqueue_seq", "INTEGER NOT NULL DEFAULT 0"); err != nil {
-				return err
-			}
-			if _, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS worker_jobs_enqueue_seq ON worker_jobs (enqueue_seq)`); err != nil {
-				return err
-			}
-			// The trace context a job's run joins (#276). Jobs from before
-			// the columns existed carry none.
-			if err := ensureColumn(ctx, tx, "traceparent", "TEXT NOT NULL DEFAULT ''"); err != nil {
-				return err
-			}
-			if err := ensureColumn(ctx, tx, "tracestate", "TEXT NOT NULL DEFAULT ''"); err != nil {
-				return err
-			}
-			// The operational census (ADR 0022) reads only unfinished and
-			// dead jobs through this covering partial index, so its cost
-			// follows the live queue, not the completed history (#105).
-			if _, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS worker_jobs_unfinished ON worker_jobs (state, lease_until, available_at) WHERE state <> 'completed'`); err != nil {
-				return err
-			}
-			// Tombstones, erasure counters and the finished-job index
-			// Compact reads (#290).
-			return migrateRetention(ctx, tx)
+			return migration.Apply(ctx, tx, migration.Schema{Component: "worker", Supported: schemaVersion, Infer: inferSchemaVersion}, func(int) error {
+				return migrate(ctx, tx)
+			})
 		})
 	}); err != nil {
 		return nil, fmt.Errorf("worker: schema: %w", err)
 	}
 	return queue, nil
+}
+
+// schemaVersion is the highest queue schema version this binary
+// understands (#291): 1 before #290, 2 with #290's tombstones
+// (worker_compacted, worker_meta). A worker from before #290 does not read
+// tombstones, so a duplicate of a compacted job submitted through it runs
+// again; New refuses a queue stamped with a newer version than this one.
+// Raise it with every change an older binary would misread, together with
+// the migration step that makes it. It is a variable only so tests can
+// stand in for an older binary.
+var schemaVersion = 2
+
+// inferSchemaVersion classifies a queue written before the stamp existed by
+// its shape: 0 when it has no tables yet, 2 when it has tombstones (#290),
+// else 1.
+func inferSchemaVersion(ctx context.Context, tx *sql.Tx) (int, error) {
+	if found, err := migration.TableExists(ctx, tx, "worker_jobs"); err != nil || !found {
+		return 0, err
+	}
+	if found, err := migration.TableExists(ctx, tx, "worker_compacted"); err != nil || found {
+		return 2, err
+	}
+	return 1, nil
+}
+
+// migrate brings the queue's tables to the current shape. Every step is
+// guarded by the shape it changes and runs on every open (#291).
+func migrate(ctx context.Context, tx *sql.Tx) error {
+	if err := createJobs(ctx, tx); err != nil {
+		return err
+	}
+	if err := ensureColumn(ctx, tx, "deferrals", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := ensureColumn(ctx, tx, "principal_json", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	// enqueue_seq orders jobs that share a created_at by when they were
+	// enqueued (#217). Jobs from before the column existed keep 0 and
+	// fall back to job_id among themselves.
+	if err := ensureColumn(ctx, tx, "enqueue_seq", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS worker_jobs_enqueue_seq ON worker_jobs (enqueue_seq)`); err != nil {
+		return err
+	}
+	// The trace context a job's run joins (#276). Jobs from before
+	// the columns existed carry none.
+	if err := ensureColumn(ctx, tx, "traceparent", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := ensureColumn(ctx, tx, "tracestate", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	// The operational census (ADR 0022) reads only unfinished and
+	// dead jobs through this covering partial index, so its cost
+	// follows the live queue, not the completed history (#105).
+	if _, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS worker_jobs_unfinished ON worker_jobs (state, lease_until, available_at) WHERE state <> 'completed'`); err != nil {
+		return err
+	}
+	// Tombstones, erasure counters and the finished-job index
+	// Compact reads (#290).
+	return migrateRetention(ctx, tx)
 }
 
 func createJobs(ctx context.Context, tx *sql.Tx) error {
