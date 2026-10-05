@@ -69,6 +69,10 @@ type Job struct {
 	Trace observe.TraceContext
 	State string
 	Error string
+	// Compacted reports a finished job that Compact erased (#290): only its
+	// ID, kind, state and attempt counts remain, with the RequestKey it was
+	// looked up by. Payload, Principal, Trace, Error and Deferrals are empty.
+	Compacted bool
 }
 
 const (
@@ -371,12 +375,23 @@ type Queue struct {
 	claimTurn chan struct{}
 	mu        sync.RWMutex
 	schemas   map[string]schema.Schema
+	// hold and minRetention are the application's retention policy for
+	// finished jobs (WithRetentionHold, WithMinRetention).
+	hold         func(RetainedJob) bool
+	minRetention time.Duration
+	// compactRowHook, test-only, runs before each row a compaction write
+	// transaction erases.
+	compactRowHook func()
 }
 
 // Option configures a Queue.
 type Option func(*options)
 
-type options struct{ lease time.Duration }
+type options struct {
+	lease        time.Duration
+	hold         func(RetainedJob) bool
+	minRetention time.Duration
+}
 
 // WithLease sets how long a started attempt keeps its job from other workers
 // (DefaultLease otherwise). It bounds how long a job waits after its worker
@@ -387,6 +402,20 @@ type options struct{ lease time.Duration }
 // would lose the attempt to another worker.
 func WithLease(lease time.Duration) Option {
 	return func(o *options) { o.lease = lease }
+}
+
+// WithRetentionHold sets the application's legal hold for finished jobs:
+// Compact keeps every job for which hold returns true, with all of its
+// content (#290). A hold that panics keeps the job.
+func WithRetentionHold(hold func(RetainedJob) bool) Option {
+	return func(o *options) { o.hold = hold }
+}
+
+// WithMinRetention sets the application's legal minimum for finished jobs:
+// Compact never erases a job that finished less than minimum ago, whatever
+// cutoff it is given (#290). New refuses a negative minimum.
+func WithMinRetention(minimum time.Duration) Option {
+	return func(o *options) { o.minRetention = minimum }
 }
 
 func New(ctx context.Context, database store.Database, clock func() time.Time, opts ...Option) (*Queue, error) {
@@ -406,11 +435,14 @@ func New(ctx context.Context, database store.Database, clock func() time.Time, o
 	if !ok {
 		busyTimeout = defaultBusyTimeout
 	}
+	if configured.minRetention < 0 {
+		return nil, errors.New("worker: minimum retention must not be negative")
+	}
 	if configured.lease <= 2*busyTimeout {
 		return nil, fmt.Errorf("worker: lease %v must be longer than twice the store's busy timeout (%v)", configured.lease, busyTimeout)
 	}
 	writeDomain, _ := store.WriteDomainOf(database)
-	queue := &Queue{database: database, writeDomain: writeDomain, clock: clock, lease: configured.lease, busyTimeout: busyTimeout, claimTurn: claimTurnFor(writeDomain), schemas: map[string]schema.Schema{}}
+	queue := &Queue{database: database, writeDomain: writeDomain, clock: clock, lease: configured.lease, busyTimeout: busyTimeout, claimTurn: claimTurnFor(writeDomain), schemas: map[string]schema.Schema{}, hold: configured.hold, minRetention: configured.minRetention}
 	if err := migration.Retry(ctx, func() error {
 		return queue.withTx(ctx, func(tx *sql.Tx) error {
 			if err := createJobs(ctx, tx); err != nil {
@@ -442,8 +474,12 @@ func New(ctx context.Context, database store.Database, clock func() time.Time, o
 			// The operational census (ADR 0022) reads only unfinished and
 			// dead jobs through this covering partial index, so its cost
 			// follows the live queue, not the completed history (#105).
-			_, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS worker_jobs_unfinished ON worker_jobs (state, lease_until, available_at) WHERE state <> 'completed'`)
-			return err
+			if _, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS worker_jobs_unfinished ON worker_jobs (state, lease_until, available_at) WHERE state <> 'completed'`); err != nil {
+				return err
+			}
+			// Tombstones, erasure counters and the finished-job index
+			// Compact reads (#290).
+			return migrateRetention(ctx, tx)
 		})
 	}); err != nil {
 		return nil, fmt.Errorf("worker: schema: %w", err)
@@ -564,11 +600,14 @@ func (q *Queue) Enqueue(ctx context.Context, request EnqueueRequest) (EnqueueRes
 		// enqueue_seq is one past the highest so far, read under this
 		// transaction's write lock, so it follows commit order. It is stored
 		// rather than taken from SQLite's rowid, which SQLite documents VACUUM
-		// may renumber for tables without an INTEGER PRIMARY KEY.
+		// may renumber for tables without an INTEGER PRIMARY KEY. A key
+		// whose job Compact erased still has its tombstone, and inserts
+		// nothing (#290).
 		res, err := tx.ExecContext(ctx, `INSERT INTO worker_jobs
 			(job_id, request_key, kind, payload_json, payload_digest, max_attempts, principal_json, state, available_at, created_at, updated_at, enqueue_seq, traceparent, tracestate)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(enqueue_seq), 0) + 1 FROM worker_jobs), ?, ?) ON CONFLICT(request_key) DO NOTHING`,
-			jobID, request.RequestKey, request.Kind, []byte(request.Payload), payloadDigest, request.MaxAttempts, principal, StatePending, q.now(), q.now(), q.now(), traceparent, tracestate)
+			SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(enqueue_seq), 0) + 1 FROM worker_jobs), ?, ?
+			WHERE NOT EXISTS (SELECT 1 FROM worker_compacted WHERE request_digest = ?) ON CONFLICT(request_key) DO NOTHING`,
+			jobID, request.RequestKey, request.Kind, []byte(request.Payload), payloadDigest, request.MaxAttempts, principal, StatePending, q.now(), q.now(), q.now(), traceparent, tracestate, digest([]byte(request.RequestKey)))
 		if err != nil {
 			return err
 		}
@@ -578,6 +617,19 @@ func (q *Queue) Enqueue(ctx context.Context, request EnqueueRequest) (EnqueueRes
 		}
 		if count == 0 {
 			job, err := scanJob(tx.QueryRowContext(ctx, `SELECT `+jobColumns+` FROM worker_jobs WHERE request_key = ?`, request.RequestKey))
+			if errors.Is(err, sql.ErrNoRows) {
+				// The key's job was compacted: its tombstone keeps the
+				// identity a duplicate must match, and nothing else.
+				tombstone, identity, err := compacted(ctx, tx, request.RequestKey)
+				if err != nil {
+					return err
+				}
+				if identity != identityDigest(request.Kind, payloadDigest, principal) {
+					return ErrRequestConflict
+				}
+				result = EnqueueResult{Job: tombstone, Accepted: false}
+				return nil
+			}
 			if err != nil {
 				return err
 			}
@@ -1100,8 +1152,8 @@ func encodePrincipal(principal trigger.Principal) (string, error) {
 }
 
 // Settled reports whether the work submitted under a request key has
-// finished or been dead-lettered. A key never submitted has nothing running
-// and is settled.
+// finished or been dead-lettered. A key never submitted, or whose job's
+// tombstone has expired, has nothing running and is settled.
 func (q *Queue) Settled(ctx context.Context, requestKey string) (bool, error) {
 	job, err := q.Get(ctx, requestKey)
 	if errors.Is(err, ErrNotFound) {
@@ -1113,16 +1165,19 @@ func (q *Queue) Settled(ctx context.Context, requestKey string) (bool, error) {
 	return job.State == StateCompleted || job.State == StateDead, nil
 }
 
+// Get reads the job submitted under requestKey. A job Compact erased is
+// returned as its tombstone (Job.Compacted); a key never submitted, or whose
+// tombstone expired, is ErrNotFound.
 func (q *Queue) Get(ctx context.Context, requestKey string) (Job, error) {
 	var job Job
 	err := q.withTx(ctx, func(tx *sql.Tx) error {
 		var err error
 		job, err = scanJob(tx.QueryRowContext(ctx, `SELECT `+jobColumns+` FROM worker_jobs WHERE request_key = ?`, requestKey))
+		if errors.Is(err, sql.ErrNoRows) {
+			job, _, err = compacted(ctx, tx, requestKey)
+		}
 		return err
 	})
-	if errors.Is(err, sql.ErrNoRows) {
-		return Job{}, ErrNotFound
-	}
 	return job, err
 }
 

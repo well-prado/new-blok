@@ -365,6 +365,13 @@ it does not hold. What is guaranteed:
   backups no longer than their erasure deadline allows. Erasing content
   inside an existing backup file is outside the framework.
 
+**The worker queue (#290).** A worker job's payload, principal, trace
+context, error text and request key are erased the same way, by
+`worker.Queue.Compact`: digest-only tombstones that keep the queue's dedupe
+contract, a legal hold that fails closed, a legal minimum, bounded batches,
+and the same pending log purge. Its design and dedupe window are in ADR 0006
+("Retention of finished jobs").
+
 ### 8. The tenant of a reconciliation (#286)
 
 A reconciliation belongs to the tenant that decided it: the tenant of the
