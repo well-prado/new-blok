@@ -177,7 +177,15 @@ func processBounded(queue *Queue, handler Handler) (bool, error) {
 
 func openSQLite(t *testing.T, path string) store.Database {
 	t.Helper()
-	database, err := (sqlite.Backend{}).Open(context.Background(), path)
+	return openSQLiteWaiting(t, path, 0)
+}
+
+// openSQLiteWaiting opens path with a busy timeout of wait (zero for the
+// backend's default). A writer queued behind another on the same handle
+// waits this long before ErrBusy (#214).
+func openSQLiteWaiting(t *testing.T, path string, wait time.Duration) store.Database {
+	t.Helper()
+	database, err := (sqlite.Backend{BusyTimeout: wait}).Open(context.Background(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,8 +207,8 @@ func TestHandlerSelfSubmitWithDetachedContextFails(t *testing.T) {
 // write domain but does not name it on its busy errors. The queue names its
 // own domain on the saturation it returns, so the job fails the same way.
 func TestHandlerSelfSubmitToUnannotatedBackendFails(t *testing.T) {
-	database := openSQLite(t, filepath.Join(t.TempDir(), "self.db"))
 	wait := 250 * time.Millisecond
+	database := openSQLiteWaiting(t, filepath.Join(t.TempDir(), "self.db"), wait)
 	nested := unannotatedBusyDatabase{forwardingShortBusyDatabase{shortBusyDatabase{Database: database, timeout: wait}}}
 	runSelfSubmit(t, selfSubmit{outer: database, nested: nested, detach: true, wait: wait})
 }
@@ -210,10 +218,10 @@ func TestHandlerSelfSubmitToUnannotatedBackendFails(t *testing.T) {
 // context check even with the handler's context. The store still names the
 // domain it was busy on, so the job fails as a nested submission (#207).
 func TestHandlerSelfSubmitThroughOpaqueWrapperFails(t *testing.T) {
-	database := openSQLite(t, filepath.Join(t.TempDir(), "self.db"))
+	wait := 250 * time.Millisecond
+	database := openSQLiteWaiting(t, filepath.Join(t.TempDir(), "self.db"), wait)
 	for _, detach := range []bool{false, true} {
 		t.Run(fmt.Sprintf("detach=%v", detach), func(t *testing.T) {
-			wait := 250 * time.Millisecond
 			runSelfSubmit(t, selfSubmit{outer: database, nested: shortBusyDatabase{Database: database, timeout: wait}, detach: detach, wait: wait})
 		})
 	}
@@ -288,8 +296,8 @@ func TestHandlerDetachedSubmitToAnotherBusyStoreDefers(t *testing.T) {
 	for _, opaque := range []bool{false, true} {
 		t.Run(fmt.Sprintf("opaque=%v", opaque), func(t *testing.T) {
 			ctx := context.Background()
-			outerDB := openSQLite(t, filepath.Join(t.TempDir(), "outer.db"))
-			otherDB := openSQLite(t, filepath.Join(t.TempDir(), "other.db"))
+			outerDB := openSQLiteWaiting(t, filepath.Join(t.TempDir(), "outer.db"), wait)
+			otherDB := openSQLiteWaiting(t, filepath.Join(t.TempDir(), "other.db"), wait)
 			var otherQueueDB store.Database = forwardingShortBusyDatabase{shortBusyDatabase{Database: otherDB, timeout: wait}}
 			if opaque {
 				otherQueueDB = shortBusyDatabase{Database: otherDB, timeout: wait}
@@ -365,8 +373,8 @@ func TestHandlerJoinedSaturationIsClassifiedByEveryDomain(t *testing.T) {
 			expected := nestedStoreExpected(t, scenario.expected)
 			wait := 250 * time.Millisecond
 			ctx := context.Background()
-			outerDB := openSQLite(t, filepath.Join(t.TempDir(), "outer.db"))
-			otherDB := openSQLite(t, filepath.Join(t.TempDir(), "other.db"))
+			outerDB := openSQLiteWaiting(t, filepath.Join(t.TempDir(), "outer.db"), wait)
+			otherDB := openSQLiteWaiting(t, filepath.Join(t.TempDir(), "other.db"), wait)
 			outer, err := New(ctx, outerDB, time.Now)
 			if err != nil {
 				t.Fatal(err)
@@ -453,7 +461,7 @@ func TestNestedSubmissionJoinedWithRetryableErrorIsNotRetried(t *testing.T) {
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			ctx := context.Background()
-			database := openSQLite(t, filepath.Join(t.TempDir(), "jobs.db"))
+			database := openSQLiteWaiting(t, filepath.Join(t.TempDir(), "jobs.db"), wait)
 			queue, err := New(ctx, database, time.Now)
 			if err != nil {
 				t.Fatal(err)

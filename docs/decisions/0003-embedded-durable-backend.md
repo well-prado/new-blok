@@ -12,7 +12,8 @@ The SQLite configuration used by the port is:
 
 - WAL journal mode;
 - `synchronous=FULL`;
-- a 5-second busy timeout on every pooled connection;
+- a 5-second busy timeout on every pooled connection, configurable through
+  `sqlite.Backend.BusyTimeout`, that also bounds the writer queue (#214);
 - foreign-key enforcement enabled.
 
 `Database.WithTx` returns only after the transaction commit succeeds. Durable
@@ -69,7 +70,8 @@ handler or catalog that writes before or around `engine.Run`, or a custom
 `tool.Gate` whose `Publish` reads a busy store after a native tool's
 effect). Retrying such work is safe only if its writes are idempotent. A worker
 whose consumer is canceled while it waits reports `ErrConsumerLost`, after
-up to the busy timeout, because the driver does not interrupt a busy wait.
+up to the busy timeout, because its claim transaction is deliberately not
+canceled with the consumer.
 
 Measured with 4 workers draining 200 instant jobs, 5 samples per run
 (`NEWBLOK_MEASURE_CLAIM=1 go test -run TestMeasureClaimContention -v
@@ -151,6 +153,58 @@ is tested at its single-transaction boundary, so its outer retry cannot hide
 the defect. `provider/database_contention_test.go` verifies the same contention
 and then verifies duplicate/conflicting operation behavior and exactly one
 business row plus one outbox row. These tests fail on the pre-fix callbacks.
-The existing 5-second busy timeout still bounds waiting: writer starvation or
-an exhausted timeout may legitimately return an error. This is not a promise
-of unlimited contention tolerance.
+The existing 5-second busy timeout still bounds waiting: an exhausted timeout
+may legitimately return an error. This is not a promise of unlimited
+contention tolerance.
+
+## Fair writer queue (#214)
+
+SQLite's busy handler is not a queue. A writer that finds the lock taken
+sleeps for 1, 2, 5, … up to 100 ms between polls, so the writers that have
+waited longest poll least often, and writers that just arrived keep taking
+the lock first. Measured with 200 submissions (16 in flight) and 4 workers on
+one handle (macOS arm64, go1.27.1), no transaction held the write lock for
+1 ms (p50 43 µs). Yet the longest wait reached the full 5 s busy timeout, and
+submissions failed `store.ErrBusy` in 5 of 8 runs. A writer was starved, not
+slowed.
+
+Each `sqlite` handle therefore queues its writers itself, first come first
+served, before beginning their transaction. A writer waits only for the
+writers ahead of it, and the wait is bounded by the busy timeout. When the
+bound is reached, the transaction fails like SQLite's own: `store.ErrBusy`
+annotated with the handle's write domain. A handler that submits to the store
+its own claim holds therefore still fails after one busy wait (#207).
+SQLite's busy handler still governs contention with other handles and other
+processes. Every `:memory:` handle shares one database and one queue.
+
+(`NEWBLOK_MEASURE_WRITER_WAITS=1 go test -run TestMeasureWriterWaits
+-count=8 -v ./trigger/worker/`.) On the same harness with the queue, there
+were no busy failures in 16 runs:
+
+| build | longest wait |
+|---|---|
+| plain | 2.3–3.0 ms |
+| `-race` | 19–25 ms |
+
+That is what an ordered queue predicts: contenders × hold time.
+
+Reads must not queue behind a claim whose handler is still running. A
+transaction whose context is marked `store.ReadOnly` bypasses the queue and
+reads a committed WAL snapshot beside the writer, as before. Its callback
+must not write; a write under the mark is not ordered with the queue. The
+marked reads are:
+- the journal's reads (`withRead`: Run, Operation, Wait, AuditCount,
+  Recover, RequireArtifact, PlanUpgrade, RetainedArtifacts, outcomes,
+  inspection);
+- the worker's `Get` and `Settled`;
+- the approval store's `Get`.
+
+An unmarked transaction is a writer and takes its turn. That is always safe,
+though it is slower for a read that a slow writer holds up. Backends other
+than `sqlite` may ignore the mark.
+
+| Change | Class | Migration |
+| --- | --- | --- |
+| `store.ReadOnly` / `store.IsReadOnly` | additive | Mark read-only `WithTx` calls; unmarked calls keep their behaviour, ordered as writers |
+| `sqlite.Backend.BusyTimeout` | additive | Zero keeps 5 s |
+| `sqlite` writers on one handle wait in arrival order | behavioral | Same bound and `store.ErrBusy`; a wrapper that lowered `PRAGMA busy_timeout` inside a transaction no longer shortens a same-handle wait, so set `BusyTimeout` instead |

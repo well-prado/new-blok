@@ -40,6 +40,24 @@ type Database interface {
 	Close() error
 }
 
+type readOnlyKey struct{}
+
+// ReadOnly marks ctx for a WithTx whose callback only reads. A backend may run
+// such a transaction beside its writers instead of queuing it behind them, so
+// a status read is not held up by a slow writer (#214). Mark only the context
+// passed to WithTx: the callback must not write, and a write made under the
+// mark is not ordered with the other writers. An unmarked transaction is
+// treated as a writer.
+func ReadOnly(ctx context.Context) context.Context {
+	return context.WithValue(ctx, readOnlyKey{}, true)
+}
+
+// IsReadOnly reports whether ctx was marked by ReadOnly.
+func IsReadOnly(ctx context.Context) bool {
+	marked, _ := ctx.Value(readOnlyKey{}).(bool)
+	return marked
+}
+
 // WriteDomain identifies databases that contend for the same write lock.
 // Its identity is opaque to callers.
 type WriteDomain struct {

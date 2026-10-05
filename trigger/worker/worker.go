@@ -663,6 +663,11 @@ func (q *Queue) ProcessOnce(ctx context.Context, handler Handler) (bool, error) 
 		// contexts no longer represent a held write lock.
 		activeDomain.active.Store(false)
 	}
+	if err != nil && !processed && !errors.Is(err, ErrConsumerLost) && ctx.Err() != nil {
+		// The consumer was lost while this worker waited for its write
+		// turn (#214): it claimed nothing, so the job is untouched.
+		err = fmt.Errorf("%w: %w", ErrConsumerLost, ctx.Err())
+	}
 	if errors.Is(err, ErrConsumerLost) && lost.ID != "" {
 		if deferErr := q.deferLost(txCtx, lost); deferErr != nil {
 			err = errors.Join(err, deferErr)
@@ -760,7 +765,9 @@ func (q *Queue) Settled(ctx context.Context, requestKey string) (bool, error) {
 
 func (q *Queue) Get(ctx context.Context, requestKey string) (Job, error) {
 	var job Job
-	err := q.withTx(ctx, func(tx *sql.Tx) error {
+	// A read: it runs beside writers, so a status check is not held up by
+	// a claim whose handler is still running (#214).
+	err := q.withTx(store.ReadOnly(ctx), func(tx *sql.Tx) error {
 		var err error
 		job, err = scanJob(tx.QueryRowContext(ctx, `SELECT job_id, request_key, kind, payload_json, attempt, max_attempts, deferrals, principal_json, state, error_text FROM worker_jobs WHERE request_key = ?`, requestKey))
 		return err

@@ -858,8 +858,10 @@ func (j *Journal) withTx(ctx context.Context, name string, fn func(*sql.Tx) erro
 	return err
 }
 
+// withRead runs a read beside the store's writers instead of queuing it
+// behind them (#214).
 func (j *Journal) withRead(ctx context.Context, fn func(*sql.Tx) error) error {
-	return j.database.WithTx(ctx, fn)
+	return j.database.WithTx(store.ReadOnly(ctx), fn)
 }
 
 func (j *Journal) now() int64 { return j.clock().UTC().UnixNano() }

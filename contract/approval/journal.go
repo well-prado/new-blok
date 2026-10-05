@@ -134,7 +134,7 @@ func (s *JournalStore) Get(ctx context.Context, id string) (Decision, bool, erro
 	}
 	var d Decision
 	found := false
-	err := s.database.WithTx(ctx, func(tx *sql.Tx) error {
+	err := s.database.WithTx(store.ReadOnly(ctx), func(tx *sql.Tx) error {
 		var encoded, proposalJSON []byte
 		var binding, recorded string
 		err := tx.QueryRowContext(ctx, `SELECT decision,proposal,binding,recorded_at FROM approval_decisions_v1 WHERE id=?`, id).Scan(&encoded, &proposalJSON, &binding, &recorded)
