@@ -293,7 +293,8 @@ No wire, journal, artifact, worker or manifest contract changes.
   import, reference, composition root), relative (classic layout), alias
   (`paths` via `extends`, `baseUrl`, re-export), package (`exports`
   conditions, `file:` dependency with pattern subpath, `#imports` to a
-  package), generated (direct and via a shared generated registry),
+  package, a shared package whose non-first `require` condition reaches a
+  node), generated (direct and via a shared generated registry),
   transitive (ESM → re-export → CommonJS), dynamic/evaluating forms,
   unresolved and cycle, links (shared and `node_modules`), case, workflow,
   JSX and an unsupported runtime.
@@ -302,14 +303,15 @@ No wire, journal, artifact, worker or manifest contract changes.
   fixture node file (its `../../../sdk/nodejs/index.js` import unchanged in
   the unified layout; the workspace package `@blok/nodejs-sdk` for a second
   node), verify with zero diagnostics and non-empty graphs.
-- `TestImportForms` pins 45 lexical cases; `TestRepositoryNodeSourcesLex`
+- `TestImportForms` pins 46 lexical cases; `TestRepositoryNodeSourcesLex`
   lexes every Node.js source in the repository. Differentially, the pinned
   TypeScript 5.9.3 parser and this lexer found the identical 111 imports in
   the repository's 31 Node.js sources and the identical 51 in the fixtures.
 - `TestCheckNeverExecutesSource` is structural: the package imports nothing
   that builds, loads or runs code and reads only through the `os.Root`;
   fixtures carry a Go `init` panic and a top-level JavaScript `throw`.
-- Mutations are listed in the pull request; each turns a test red.
+- 18 mutations, each applied to a committed tree and reverted, turn a
+  test red; they are listed in the pull request.
 
 ## Limits
 
