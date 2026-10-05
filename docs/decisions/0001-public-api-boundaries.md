@@ -436,7 +436,8 @@ lowering cannot import `flow`, which imports it), guarded by the conformance
 tests; the catalog still composes only calls and children, so a control
 construct remains unsupported for agent tools; and a literal remains
 invisible in the stored program, so the engine sees that call as taking the
-workflow input until dispatch substitutes it.
+workflow input until dispatch substitutes it; #260 (below) makes that
+program unrunnable outside dispatch.
 
 #### Catalog literals are checked against the tool's input schema (#261)
 
@@ -486,6 +487,57 @@ check covers any literal the lowering returns, whatever the instruction kind.
 `agent/literal_validation_test.go` holds the cases; each rejection case is
 red on the pre-#261 catalog, which registers the workflow and then, on
 invocation, runs the reserve effect before failing.
+
+#### A catalog program runs only through catalog dispatch (#260)
+
+Because the program has no literal form, the stored catalog program is only
+correct while dispatch substitutes the literals. The #257 review showed what
+happens otherwise: it ran the stored program through `engine.RunObserved`
+outside dispatch, the `StepProcessing` event for the literal call recorded
+the workflow input (`{"quantity":2,"sku":"SECRET"}`), and the node ran with
+it instead of the literal. Nothing observed or journaled catalog runs, so the
+hazard was latent, but it was held off only by convention.
+
+**Rule: never run, observe or journal a catalog program except through
+catalog dispatch.** It is now enforced by the package structure, not by
+review. The lowered program and its literals live in the unexported fields of
+`agent/internal/catalogprogram.Program`, which package `agent` cannot read.
+The type exposes `Literals` (copies of the values dispatch hands the calls),
+`Equal` and `GoString` (for tests and diagnostics), and one `Run`, which
+builds the dispatch nodes, substitutes every literal and runs the engine.
+`Run` takes no observer, journal or engine, so none can be attached.
+`catalogprogram.Lower` is the only caller of the lowering with
+`Options.Literals`. Package `agent` no longer imports `internal/engine` or
+`internal/lowering`, so it cannot build an engine or lower a literal itself.
+Nothing that leaves the package carries the program: `Listing` and
+`Catalog.List` (what MCP lists) never did, and the artifact digest still
+hashes the recorded `flow.Program`, whose literal is already public through
+`flow.Definition.Program`, and not the lowered one.
+
+**Decision: guard, do not observe.** The other option was substituting the
+literal inside the engine, through a node wrapper or a synthetic step, so
+that observed inputs would equal what the node received. That changes the
+step count, the `WithMaxSteps` budget and the event stream. It is also the
+program-literal-form question #249 deferred. If catalog runs need
+inspection (#77) or a journal later, that is the design to take up then.
+Until then, `Run` refuses both by having no way to accept them.
+
+Compatibility: an internal refactor, linked to
+[#260](https://github.com/well-prado/new-blok/issues/260). No public API,
+wire shape, document version, artifact digest, gate admission, dispatch input
+or result changes. `agent/dispatch_corpus_test.go` compares nine literal and
+non-literal workflows with a golden file generated on origin/main before the
+change. The comparison covers every admission (identity, digests, effects,
+capabilities, budget, input bytes), every published output, every node
+input, the result and error, and every listing digest.
+`agent/program_guard_test.go` runs the review's escape as an overlay file.
+On origin/main it compiles and shows the hazard. Now it fails to compile on
+`catalogprogram.Program`. The same file walks every value package `agent`
+can reach for a `contract.InternalProgram`, and checks the import boundary.
+`agent/internal/catalogprogram` pins its surface and allows only `flow` and
+itself to import the lowering. Limits: a determined in-module caller could
+still use `reflect` or `unsafe`, or edit `catalogprogram` itself; the
+surface test makes the second visible in review.
 
 The initial portable contract is a bounded, JSON-compatible value subset with
 explicit semantics for missing, null, optional fields, objects, arrays, string,
