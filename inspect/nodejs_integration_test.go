@@ -180,7 +180,15 @@ func TestActualNodeWorkerRunProducesInspectionProjection(t *testing.T) {
 	}
 	logPolicy := fullPolicy()
 	logPolicy.Fields[inspectioncontract.FieldLogs] = true
-	logged, err := recorder.Inspect("app-1", logPolicy, inspectioncontract.Query{Version: inspectioncontract.Version, RunID: "node-run-1"})
+	// Worker logs reach inspection asynchronously and may land just after the
+	// step, and the run, completed (contract/runtime Call.OnLog; #226).
+	var logged inspectioncontract.Page
+	for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		logged, err = recorder.Inspect("app-1", logPolicy, inspectioncontract.Query{Version: inspectioncontract.Version, RunID: "node-run-1"})
+		if err != nil || len(logged.Steps) > 0 && len(logged.Steps[0].Logs) > 0 || time.Now().After(deadline) {
+			break
+		}
+	}
 	if err != nil || len(logged.Steps[0].Logs) != 1 || logged.Steps[0].Logs[0].Message != "quote calculated" || strings.Contains(string(logged.Steps[0].Logs[0].Attrs), "synthetic-token-value") || !strings.Contains(string(logged.Steps[0].Logs[0].Attrs), "redacted") {
 		t.Fatalf("actual Node log inspection=%+v err=%v", logged, err)
 	}
