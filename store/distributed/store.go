@@ -30,10 +30,11 @@ var (
 	// other slots remain free; callers re-read capacity before rejecting.
 	ErrAdmissionSlotTaken = errors.New("distributed store: chosen admission slot was taken concurrently")
 	// ErrRecordTooLarge reports that an encoded state or event payload
-	// exceeds MaxPayloadBytes. It is checked before any transaction is sent,
-	// so nothing was written; it is a property of the record, not of the
-	// cluster, and retrying the same record can never succeed.
-	ErrRecordTooLarge = errors.New("distributed store: encoded record exceeds MaxPayloadBytes")
+	// exceeds MaxPayloadBytes, or that a whole transaction exceeds the etcd
+	// transport bound. Nothing was written; it is a property of the records,
+	// not of the cluster, and retrying the same records can never succeed.
+	// The concrete error is a *RecordTooLargeError naming the record.
+	ErrRecordTooLarge = errors.New("distributed store: encoded record exceeds its bound")
 )
 
 const MaxPayloadBytes = 512 << 10
@@ -49,11 +50,22 @@ type Client interface {
 type Store struct {
 	client      Client
 	incarnation string
+	limits      RequestLimits
 }
 
-func New(ctx context.Context, client Client, incarnation string) (*Store, error) {
+// New establishes or verifies the cluster incarnation. The etcd transport
+// bounds default to etcd's own defaults; pass WithRequestLimits when the
+// members' --max-request-bytes or the client's MaxCallSendMsgSize differ.
+func New(ctx context.Context, client Client, incarnation string, options ...Option) (*Store, error) {
 	if client == nil || !validName(incarnation) {
 		return nil, errors.New("distributed store: etcd client and explicit cluster incarnation are required")
+	}
+	store := &Store{client: client, incarnation: incarnation, limits: RequestLimits{ServerMaxRequestBytes: DefaultServerMaxRequestBytes, ClientMaxCallSendBytes: DefaultClientMaxCallSendBytes}}
+	for _, option := range options {
+		option(store)
+	}
+	if store.limits.effective() < MinRequestBytes {
+		return nil, fmt.Errorf("distributed store: etcd request limits %+v are below the %d bytes two bounded records need", store.limits, MinRequestBytes)
 	}
 	key := incarnationKey()
 	response, err := client.Txn(ctx).
@@ -71,7 +83,7 @@ func New(ctx context.Context, client Client, incarnation string) (*Store, error)
 			return nil, ErrIncarnation
 		}
 	}
-	return &Store{client: client, incarnation: incarnation}, nil
+	return store, nil
 }
 
 // RotateIncarnation is an offline restore barrier. Recovery tooling must call
@@ -270,7 +282,7 @@ func (s *Store) Release(ctx context.Context, owner Owner) error {
 // to etcd. The transaction is the authority: a process pause, lease expiry or
 // takeover that ordered before this transaction makes the compare fail.
 func (s *Store) Commit(ctx context.Context, owner Owner, id, kind string, payload []byte) error {
-	if err := recordBounds(payload); err != nil {
+	if err := checkPayload(payload); err != nil {
 		return err
 	}
 	if !owner.valid() || !validName(id) || !validName(kind) || !json.Valid(payload) {
@@ -281,14 +293,15 @@ func (s *Store) Commit(ctx context.Context, owner Owner, id, kind string, payloa
 	if err != nil {
 		return fmt.Errorf("distributed store: encode event: %w", err)
 	}
-	response, err := s.client.Txn(ctx).
-		If(
-			clientv3.Compare(clientv3.Value(incarnationKey()), "=", owner.Incarnation),
-			clientv3.Compare(clientv3.CreateRevision(ownerKey(owner.Incarnation, owner.Partition)), "=", owner.Token),
-			clientv3.Compare(clientv3.Value(ownerKey(owner.Incarnation, owner.Partition)), "=", owner.ID),
-			clientv3.Compare(clientv3.Version(key), "=", 0),
-		).
-		Then(clientv3.OpPut(key, string(encoded))).Commit()
+	response, err := s.commitTxn(ctx, []clientv3.Cmp{
+		clientv3.Compare(clientv3.Value(incarnationKey()), "=", owner.Incarnation),
+		clientv3.Compare(clientv3.CreateRevision(ownerKey(owner.Incarnation, owner.Partition)), "=", owner.Token),
+		clientv3.Compare(clientv3.Value(ownerKey(owner.Incarnation, owner.Partition)), "=", owner.ID),
+		clientv3.Compare(clientv3.Version(key), "=", 0),
+	}, []clientv3.Op{clientv3.OpPut(key, string(encoded))})
+	if errors.Is(err, ErrRecordTooLarge) {
+		return err
+	}
 	if err != nil {
 		return fmt.Errorf("distributed store: commit (outcome must be reconciled by event ID): %w", err)
 	}
@@ -359,7 +372,10 @@ func (s *Store) FreeAdmissionSlots(ctx context.Context, partition, tenant string
 // ErrAlreadyWritten by reading and comparing the event's full payload, and
 // treats ErrAdmissionSlotTaken as contention, not as exhausted capacity.
 func (s *Store) CommitAdmission(ctx context.Context, partition, tenant, globalSlot, tenantSlot, runID string, state, payload []byte) error {
-	if err := recordBounds(state, payload); err != nil {
+	if err := checkState(runID, state); err != nil {
+		return err
+	}
+	if err := checkPayload(payload); err != nil {
 		return err
 	}
 	if !validName(partition) || !validName(tenant) || !validName(globalSlot) || !validName(tenantSlot) || !validName(runID) || !json.Valid(state) || !json.Valid(payload) {
@@ -374,20 +390,21 @@ func (s *Store) CommitAdmission(ctx context.Context, partition, tenant, globalSl
 	if err != nil {
 		return fmt.Errorf("distributed store: encode admission: %w", err)
 	}
-	response, err := s.client.Txn(ctx).
-		If(
-			clientv3.Compare(clientv3.Value(incarnationKey()), "=", s.incarnation),
-			clientv3.Compare(clientv3.Version(eventPath), "=", 0),
-			clientv3.Compare(clientv3.Version(statePath), "=", 0),
-			clientv3.Compare(clientv3.Version(globalPath), "=", 0),
-			clientv3.Compare(clientv3.Version(tenantPath), "=", 0),
-		).
-		Then(
-			clientv3.OpPut(eventPath, string(encodedEvent)),
-			clientv3.OpPut(statePath, string(state)),
-			clientv3.OpPut(globalPath, runID),
-			clientv3.OpPut(tenantPath, runID),
-		).Commit()
+	response, err := s.commitTxn(ctx, []clientv3.Cmp{
+		clientv3.Compare(clientv3.Value(incarnationKey()), "=", s.incarnation),
+		clientv3.Compare(clientv3.Version(eventPath), "=", 0),
+		clientv3.Compare(clientv3.Version(statePath), "=", 0),
+		clientv3.Compare(clientv3.Version(globalPath), "=", 0),
+		clientv3.Compare(clientv3.Version(tenantPath), "=", 0),
+	}, []clientv3.Op{
+		clientv3.OpPut(eventPath, string(encodedEvent)),
+		clientv3.OpPut(statePath, string(state)),
+		clientv3.OpPut(globalPath, runID),
+		clientv3.OpPut(tenantPath, runID),
+	})
+	if errors.Is(err, ErrRecordTooLarge) {
+		return err
+	}
 	if err != nil {
 		return fmt.Errorf("distributed store: admission commit (outcome must be reconciled by run ID): %w", err)
 	}
@@ -410,7 +427,10 @@ func (s *Store) CommitAdmission(ctx context.Context, partition, tenant, globalSl
 // ReleaseAdmissionSlots frees the run's capacity in the same fenced
 // transition that publishes its terminal state.
 func (s *Store) ReleaseAdmissionSlots(ctx context.Context, owner Owner, runID, tenant, globalSlot, tenantSlot string, expectedRevision int64, eventID, kind string, state, payload []byte) (int64, error) {
-	if err := recordBounds(state, payload); err != nil {
+	if err := checkState(runID, state); err != nil {
+		return 0, err
+	}
+	if err := checkPayload(payload); err != nil {
 		return 0, err
 	}
 	if !owner.valid() || !validName(runID) || !validName(tenant) || !validName(globalSlot) || !validName(tenantSlot) || expectedRevision < 1 || !validName(eventID) || !validName(kind) || !json.Valid(state) || !json.Valid(payload) {
@@ -424,17 +444,18 @@ func (s *Store) ReleaseAdmissionSlots(ctx context.Context, owner Owner, runID, t
 	if err != nil {
 		return 0, err
 	}
-	response, err := s.client.Txn(ctx).
-		If(
-			clientv3.Compare(clientv3.Value(incarnationKey()), "=", owner.Incarnation),
-			clientv3.Compare(clientv3.CreateRevision(ownerKey(owner.Incarnation, owner.Partition)), "=", owner.Token),
-			clientv3.Compare(clientv3.Value(ownerKey(owner.Incarnation, owner.Partition)), "=", owner.ID),
-			clientv3.Compare(clientv3.ModRevision(statePath), "=", expectedRevision),
-			clientv3.Compare(clientv3.Value(globalPath), "=", runID),
-			clientv3.Compare(clientv3.Value(tenantPath), "=", runID),
-			clientv3.Compare(clientv3.Version(eventPath), "=", 0),
-		).
-		Then(clientv3.OpPut(statePath, string(state)), clientv3.OpPut(eventPath, string(encodedEvent)), clientv3.OpDelete(globalPath), clientv3.OpDelete(tenantPath)).Commit()
+	response, err := s.commitTxn(ctx, []clientv3.Cmp{
+		clientv3.Compare(clientv3.Value(incarnationKey()), "=", owner.Incarnation),
+		clientv3.Compare(clientv3.CreateRevision(ownerKey(owner.Incarnation, owner.Partition)), "=", owner.Token),
+		clientv3.Compare(clientv3.Value(ownerKey(owner.Incarnation, owner.Partition)), "=", owner.ID),
+		clientv3.Compare(clientv3.ModRevision(statePath), "=", expectedRevision),
+		clientv3.Compare(clientv3.Value(globalPath), "=", runID),
+		clientv3.Compare(clientv3.Value(tenantPath), "=", runID),
+		clientv3.Compare(clientv3.Version(eventPath), "=", 0),
+	}, []clientv3.Op{clientv3.OpPut(statePath, string(state)), clientv3.OpPut(eventPath, string(encodedEvent)), clientv3.OpDelete(globalPath), clientv3.OpDelete(tenantPath)})
+	if errors.Is(err, ErrRecordTooLarge) {
+		return 0, err
+	}
 	if err != nil {
 		return 0, fmt.Errorf("distributed store: release admission (outcome must be reconciled by event ID): %w", err)
 	}
@@ -450,7 +471,10 @@ func (s *Store) ReleaseAdmissionSlots(ctx context.Context, owner Owner, runID, t
 // primitive: ownership, incarnation, prior state and stable transition ID are
 // all compared in the same transaction as both writes.
 func (s *Store) CommitFencedState(ctx context.Context, owner Owner, stateID string, expectedRevision int64, eventID, kind string, state, payload []byte) (int64, error) {
-	if err := recordBounds(state, payload); err != nil {
+	if err := checkState(stateID, state); err != nil {
+		return 0, err
+	}
+	if err := checkPayload(payload); err != nil {
 		return 0, err
 	}
 	if !owner.valid() || !validName(stateID) || expectedRevision < 0 || !validName(eventID) || !validName(kind) || !json.Valid(state) || !json.Valid(payload) {
@@ -466,15 +490,16 @@ func (s *Store) CommitFencedState(ctx context.Context, owner Owner, stateID stri
 	if expectedRevision > 0 {
 		stateCompare = clientv3.Compare(clientv3.ModRevision(stateKey), "=", expectedRevision)
 	}
-	response, err := s.client.Txn(ctx).
-		If(
-			clientv3.Compare(clientv3.Value(incarnationKey()), "=", owner.Incarnation),
-			clientv3.Compare(clientv3.CreateRevision(ownerKey(owner.Incarnation, owner.Partition)), "=", owner.Token),
-			clientv3.Compare(clientv3.Value(ownerKey(owner.Incarnation, owner.Partition)), "=", owner.ID),
-			stateCompare,
-			clientv3.Compare(clientv3.Version(transitionKey), "=", 0),
-		).
-		Then(clientv3.OpPut(stateKey, string(state)), clientv3.OpPut(transitionKey, string(encodedEvent))).Commit()
+	response, err := s.commitTxn(ctx, []clientv3.Cmp{
+		clientv3.Compare(clientv3.Value(incarnationKey()), "=", owner.Incarnation),
+		clientv3.Compare(clientv3.CreateRevision(ownerKey(owner.Incarnation, owner.Partition)), "=", owner.Token),
+		clientv3.Compare(clientv3.Value(ownerKey(owner.Incarnation, owner.Partition)), "=", owner.ID),
+		stateCompare,
+		clientv3.Compare(clientv3.Version(transitionKey), "=", 0),
+	}, []clientv3.Op{clientv3.OpPut(stateKey, string(state)), clientv3.OpPut(transitionKey, string(encodedEvent))})
+	if errors.Is(err, ErrRecordTooLarge) {
+		return 0, err
+	}
 	if err != nil {
 		return 0, fmt.Errorf("distributed store: fenced state commit (outcome must be reconciled by transition ID): %w", err)
 	}
@@ -500,13 +525,13 @@ func (s *Store) CommitFencedWaitStates(ctx context.Context, owner Owner, mutatio
 }
 
 func (s *Store) commitFencedStates(ctx context.Context, owner Owner, mutations []StateMutation, timer *TimerIndexMutation, eventID, kind string, payload []byte) (int64, error) {
-	if err := recordBounds(payload); err != nil {
-		return 0, err
-	}
 	for _, mutation := range mutations {
-		if err := recordBounds(mutation.State); err != nil {
+		if err := checkState(mutation.StateID, mutation.State); err != nil {
 			return 0, err
 		}
+	}
+	if err := checkPayload(payload); err != nil {
+		return 0, err
 	}
 	if !owner.valid() || len(mutations) < 1 || len(mutations) > 8 || !validName(eventID) || !validName(kind) || !json.Valid(payload) {
 		return 0, errors.New("distributed store: bounded fenced state mutations, event identity and JSON payload are required")
@@ -550,7 +575,10 @@ func (s *Store) commitFencedStates(ctx context.Context, owner Owner, mutations [
 	}
 	conditions = append(conditions, clientv3.Compare(clientv3.Version(eventPath), "=", 0))
 	operations = append(operations, clientv3.OpPut(eventPath, string(encodedEvent)))
-	response, err := s.client.Txn(ctx).If(conditions...).Then(operations...).Commit()
+	response, err := s.commitTxn(ctx, conditions, operations)
+	if errors.Is(err, ErrRecordTooLarge) {
+		return 0, err
+	}
 	if err != nil {
 		return 0, fmt.Errorf("distributed store: fenced multi-state commit (outcome must be reconciled by transition ID): %w", err)
 	}
@@ -675,19 +703,20 @@ func (s *Store) ReadState(ctx context.Context, partition, stateID string) ([]byt
 // configuration. Replicas with a different partition map or admission limit
 // fail closed rather than silently creating incompatible queues.
 func (s *Store) EnsureSetting(ctx context.Context, name string, value []byte) error {
-	if err := recordBounds(value); err != nil {
+	if err := checkPayload(value); err != nil {
 		return err
 	}
 	if !validName(name) || len(value) == 0 || !json.Valid(value) {
 		return errors.New("distributed store: valid setting name and JSON value are required")
 	}
 	key := "/blok/v1/incarnations/" + url.PathEscape(s.incarnation) + "/settings/" + url.PathEscape(name)
-	response, err := s.client.Txn(ctx).
-		If(
-			clientv3.Compare(clientv3.Value(incarnationKey()), "=", s.incarnation),
-			clientv3.Compare(clientv3.Version(key), "=", 0),
-		).
-		Then(clientv3.OpPut(key, string(value))).Commit()
+	response, err := s.commitTxn(ctx, []clientv3.Cmp{
+		clientv3.Compare(clientv3.Value(incarnationKey()), "=", s.incarnation),
+		clientv3.Compare(clientv3.Version(key), "=", 0),
+	}, []clientv3.Op{clientv3.OpPut(key, string(value))})
+	if errors.Is(err, ErrRecordTooLarge) {
+		return err
+	}
 	if err != nil {
 		return fmt.Errorf("distributed store: establish immutable setting: %w", err)
 	}
@@ -761,17 +790,6 @@ func (s *Store) cleanupLease(id clientv3.LeaseID) {
 
 func (o Owner) valid() bool {
 	return validName(o.Partition) && validName(o.ID) && validName(o.Incarnation) && o.Token > 0 && o.LeaseID != 0
-}
-
-// recordBounds measures records as they will be persisted: callers pass the
-// already-encoded bytes, so HTML escaping or envelope fields are counted.
-func recordBounds(records ...[]byte) error {
-	for _, record := range records {
-		if len(record) > MaxPayloadBytes {
-			return fmt.Errorf("%w: %d > %d bytes", ErrRecordTooLarge, len(record), MaxPayloadBytes)
-		}
-	}
-	return nil
 }
 
 func validName(value string) bool {
