@@ -15,8 +15,7 @@ import (
 	"time"
 
 	"github.com/well-prado/new-blok/contract"
-	runtimecontract "github.com/well-prado/new-blok/contract/runtime"
-	"github.com/well-prado/new-blok/internal/compile"
+	"github.com/well-prado/new-blok/flow"
 	"github.com/well-prado/new-blok/node"
 )
 
@@ -98,8 +97,8 @@ func businessFields(base map[string]string, extra ...string) map[string]string {
 }
 
 // businessNativePrograms returns the native business nodes and the quote and
-// order programs, compiled by the canonical document compiler with each step
-// reading the previous step's whole output (flow.Lower is avoided: #244).
+// order programs, authored with flow (each step reads the previous step's
+// whole output) and lowered with flow.Lower, fixed by #244.
 func businessNativePrograms(providerURL string) (map[string]node.Any, contract.InternalProgram, contract.InternalProgram, error) {
 	client := persistentHTTPClient()
 	line := map[string]string{"requestKey": "string", "sku": "string", "quantity": "integer"}
@@ -217,7 +216,7 @@ func businessNativePrograms(providerURL string) (map[string]node.Any, contract.I
 		}},
 	}
 	nodes := map[string]node.Any{}
-	descriptors := map[string]contract.NodeDescriptor{}
+	definitions := map[string]node.Definition[map[string]any, map[string]any]{}
 	for _, item := range specs {
 		options := []node.Option{node.Description(item.description), node.Schemas(businessSchema(item.in), businessSchema(item.out))}
 		if item.effects {
@@ -230,26 +229,20 @@ func businessNativePrograms(providerURL string) (map[string]node.Any, contract.I
 			return nil, contract.InternalProgram{}, contract.InternalProgram{}, err
 		}
 		nodes[item.name] = definition.Any()
-		descriptor := definition.Descriptor()
-		descriptors[item.name] = contract.NodeDescriptor{ID: item.name, Version: descriptor.Version, Digest: runtimecontract.CanonicalDigest(descriptor.InputSchema), InputSchema: descriptor.InputSchema, OutputSchema: descriptor.OutputSchema}
+		definitions[item.name] = definition
 	}
 	chain := func(id string, steps ...[2]string) (contract.InternalProgram, error) {
-		first, last := descriptors[steps[0][1]], descriptors[steps[len(steps)-1][1]]
-		document := contract.Document{Version: contract.CurrentVersion, Workflow: contract.Workflow{
-			ID: id, Name: id, Version: "1.0.0", Digest: runtimecontract.CanonicalDigest([]byte("issue108-" + id + "-v1")),
-			InputSchema: first.InputSchema, OutputSchema: last.OutputSchema,
-		}}
-		for index, step := range steps {
-			instruction := contract.Instruction{ID: step[0], Kind: "call", Node: step[1]}
-			if index > 0 {
-				instruction.References = []contract.Reference{{Step: steps[index-1][0]}}
+		definition, err := flow.Define(flow.Spec{Name: id, Version: "1.0.0"}, func(builder *flow.Builder, input flow.Ref[map[string]any]) flow.Ref[map[string]any] {
+			current := input
+			for _, step := range steps {
+				current = flow.Call(builder, step[0], definitions[step[1]], current)
 			}
-			document.Workflow.Instructions = append(document.Workflow.Instructions, instruction)
-			document.Nodes = append(document.Nodes, descriptors[step[1]])
+			return current
+		})
+		if err != nil {
+			return contract.InternalProgram{}, err
 		}
-		document.Workflow.Instructions = append(document.Workflow.Instructions, contract.Instruction{ID: "output", Kind: "output", References: []contract.Reference{{Step: steps[len(steps)-1][0]}}})
-		compiled, err := compile.Compile(document)
-		return compiled.Program, err
+		return definition.Lower()
 	}
 	quote, err := chain("parity-business-quote", [2]string{"lookup", "parity-business-quote-lookup"}, [2]string{"price", "parity-business-quote-price"})
 	if err != nil {

@@ -121,10 +121,10 @@ Which runtime path each comparison exercises:
 
 Two findings about the engines themselves came out of executing them:
 
-- `flow.Definition.Lower()` drops call input references, so a later call
-  silently receives the workflow input (#244). The reserve→commit program is
-  therefore built through the canonical document compiler with an explicit
-  reference until #244 is fixed.
+- `flow.Definition.Lower()` dropped call input references, so a later call
+  silently received the workflow input (#244, fixed on `main` by #246). The
+  native reserve→commit and business-logic programs are authored with `flow`
+  and lowered with `Lower`, so these workloads now also exercise that fix.
 - A root `@trigger` in published Blok 2.x is the whole request envelope
   (`ctx.request`), not the body. ADR 0019 and the converter's remediation now
   say so; a converted workflow must be bound to that same envelope.

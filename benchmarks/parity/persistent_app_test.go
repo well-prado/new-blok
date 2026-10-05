@@ -20,9 +20,7 @@ import (
 	"time"
 
 	"github.com/well-prado/new-blok/contract"
-	runtimecontract "github.com/well-prado/new-blok/contract/runtime"
 	"github.com/well-prado/new-blok/flow"
-	"github.com/well-prado/new-blok/internal/compile"
 	"github.com/well-prado/new-blok/internal/engine"
 	"github.com/well-prado/new-blok/node"
 	"github.com/well-prado/new-blok/store/sqlite"
@@ -365,34 +363,18 @@ func persistentProviderNode(t *testing.T, providerURL string) node.Definition[ma
 	return definition
 }
 
-// compileReserveCommit builds the two-step program through the canonical
-// document compiler, with commit reading reserve's `body` by an explicit
-// reference. flow.Definition.Lower is not used here: it currently drops call
-// input references (#244), so a lowered commit would silently receive the
-// workflow input instead of the reservation.
+// compileReserveCommit lowers the two-step program authored with flow:
+// commit reads reserve's `body` field. Before #244 was fixed, Lower dropped
+// that reference and commit silently received the workflow input.
 func compileReserveCommit(reserve, commit node.Definition[map[string]any, map[string]any]) (contract.InternalProgram, error) {
-	reserveDescriptor, commitDescriptor := reserve.Descriptor(), commit.Descriptor()
-	document := contract.Document{
-		Version: contract.CurrentVersion,
-		Workflow: contract.Workflow{
-			ID:           "parity-persistent-reserve-commit",
-			Name:         "parity-persistent-reserve-commit",
-			Version:      "1.0.0",
-			Digest:       runtimecontract.CanonicalDigest([]byte("issue108-reserve-commit-v1")),
-			InputSchema:  reserveDescriptor.InputSchema,
-			OutputSchema: commitDescriptor.OutputSchema,
-			Instructions: []contract.Instruction{
-				{ID: "reserve", Kind: "call", Node: reserveDescriptor.Name},
-				{ID: "commit", Kind: "call", Node: commitDescriptor.Name, References: []contract.Reference{{Step: "reserve", Path: []string{"body"}}}},
-				{ID: "output", Kind: "output", References: []contract.Reference{{Step: "commit"}}},
-			},
-		},
+	definition, err := flow.Define(flow.Spec{Name: "parity-persistent-reserve-commit", Version: "1.0.0"}, func(builder *flow.Builder, input flow.Ref[map[string]any]) flow.Ref[map[string]any] {
+		reservation := flow.Call(builder, "reserve", reserve, input)
+		return flow.Call(builder, "commit", commit, flow.Select[map[string]any, map[string]any](reservation, "body"))
+	})
+	if err != nil {
+		return contract.InternalProgram{}, err
 	}
-	for _, descriptor := range []node.Descriptor{reserveDescriptor, commitDescriptor} {
-		document.Nodes = append(document.Nodes, contract.NodeDescriptor{ID: descriptor.Name, Version: descriptor.Version, Digest: runtimecontract.CanonicalDigest(descriptor.InputSchema), InputSchema: descriptor.InputSchema, OutputSchema: descriptor.OutputSchema})
-	}
-	compiled, err := compile.Compile(document)
-	return compiled.Program, err
+	return definition.Lower()
 }
 
 // persistentOperationNode calls one provider operation and returns
