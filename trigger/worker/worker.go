@@ -625,11 +625,17 @@ func (q *Queue) ProcessOnce(ctx context.Context, handler Handler) (bool, error) 
 		// detached context, or a wrapper that hides WriteDomain) the
 		// submission waits out the busy timeout and names the domain it
 		// waited on: if that is this claim's, the claim itself held the
-		// lock, and deferring would only repeat the wait (#207). Busy errors
-		// and deadlines from other domains defer normally.
+		// lock, and deferring would only repeat the wait (#207). A handler
+		// may join that failure with saturation from another store, so the
+		// job fails if any branch of the error names this claim's domain,
+		// not only the first. Busy errors and deadlines from other domains
+		// alone defer normally.
 		if errors.Is(handlerErr, trigger.ErrSaturated) && !errors.Is(handlerErr, ErrNestedSubmission) {
-			if domain, named := store.ErrorWriteDomain(handlerErr); named && store.SameWriteDomain(domain, q.writeDomain) {
-				handlerErr = fmt.Errorf("%w: %w", ErrNestedSubmission, handlerErr)
+			for _, domain := range store.ErrorWriteDomains(handlerErr) {
+				if store.SameWriteDomain(domain, q.writeDomain) {
+					handlerErr = fmt.Errorf("%w: %w", ErrNestedSubmission, handlerErr)
+					break
+				}
 			}
 		}
 		if errors.Is(handlerErr, trigger.ErrSaturated) && !errors.Is(handlerErr, ErrNestedSubmission) {

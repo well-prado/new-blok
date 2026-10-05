@@ -28,3 +28,39 @@ func TestWithWriteDomainAnnotatesWithoutChangingTheError(t *testing.T) {
 		t.Fatal("an unannotated error named a domain")
 	}
 }
+
+func TestErrorWriteDomainsReportsEveryJoinedBranch(t *testing.T) {
+	first, second, outer := NewWriteDomain(), NewWriteDomain(), NewWriteDomain()
+	busy := func(domain *WriteDomain) error {
+		return WithWriteDomain(fmt.Errorf("sqlite: begin: %w", ErrBusy), domain)
+	}
+	joined := fmt.Errorf("handler: %w", errors.Join(busy(first), errors.New("plain"), busy(second)))
+	if got := ErrorWriteDomains(joined); len(got) != 2 || got[0] != first || got[1] != second {
+		t.Fatalf("joined domains=%v; want [%v %v]", got, first, second)
+	}
+	if got, _ := ErrorWriteDomain(joined); got != first {
+		t.Fatalf("ErrorWriteDomain=%v; want the first branch %v", got, first)
+	}
+	// An annotation hides those nested inside it, as for ErrorWriteDomain.
+	if got := ErrorWriteDomains(WithWriteDomain(joined, outer)); len(got) != 1 || got[0] != outer {
+		t.Fatalf("outer annotation domains=%v; want [%v]", got, outer)
+	}
+	// A wrapper that exposes its cause only through As is still read, as
+	// errors.As reads it.
+	hidden := asOnlyError{cause: busy(first)}
+	if got := ErrorWriteDomains(errors.Join(busy(second), hidden)); len(got) != 2 || got[0] != second || got[1] != first {
+		t.Fatalf("As-only wrapper domains=%v; want [%v %v]", got, second, first)
+	}
+	if got := ErrorWriteDomains(errors.Join(errors.New("a"), nil)); len(got) != 0 {
+		t.Fatalf("unannotated domains=%v; want none", got)
+	}
+	if got := ErrorWriteDomains(nil); len(got) != 0 {
+		t.Fatalf("nil domains=%v; want none", got)
+	}
+}
+
+// asOnlyError exposes its cause through As but not Unwrap.
+type asOnlyError struct{ cause error }
+
+func (e asOnlyError) Error() string      { return "redacted" }
+func (e asOnlyError) As(target any) bool { return errors.As(e.cause, target) }
