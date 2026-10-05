@@ -112,6 +112,34 @@ and a missing or mismatched artifact fails closed. The S3 integration test
 proves the existing content-addressed blob adapter across takeover, not an
 artifact-registry integration.
 
+Records are bounded after encoding (#254). The edge bound `MaxInputBytes`
+counts request bytes, but `encoding/json` HTML-escapes `<`, `>` and `&` to six
+bytes each, so a body under the edge bound can encode into a run, wait or
+late-signal record over `distributed.MaxPayloadBytes`. The store measures every
+encoded state and event payload before sending a transaction and reports an
+over-bound record as `distributed.ErrRecordTooLarge`; the runtime classifies it
+as `ErrInvalid`, never `ErrUnavailable`. Admission and both signal paths
+(waiting and late) answer it with HTTP 400 and no `Retry-After`: retrying the
+same record can never succeed, and nothing durable was written. 400 rather
+than 413 because both handlers already answer a body over the edge bound with
+400 and map `ErrInvalid` to 400, so "too large" has one status whichever layer
+detects it. The effective bound for HTML-heavy content is therefore about one
+sixth of `MaxInputBytes`. A genuine storage outage is unchanged: 503 +
+`Retry-After`.
+
+Compatibility classification for #254: behavioral only, and only for requests
+that encode over the bound (previously a permanent 503 + `Retry-After`, now a
+definite 400). Persisted bytes are unchanged: records are still encoded with
+HTML escaping, so stored run, wait and event bytes, the canonical input digest
+used to match a retried request key, the byte-for-byte event comparison used to
+reconcile an ambiguous late-signal or admission commit, and the
+`testdata/distributed` fixtures are all unaffected, and mixed-version replicas
+agree on every record. Encoding with `SetEscapeHTML(false)` was considered and
+rejected: it would let such payloads through, but it changes the stored bytes
+and the input digest of any input containing those characters, so a request or
+late signal retried across a rolling upgrade could be reported as a conflict.
+`distributed.ErrRecordTooLarge` is an additive exported error.
+
 Timer and signal records are persisted as fenced, tenant-scoped transitions;
 signal/timer races have one committed winner. A journaled wait now suspends the
 run after its committed prefix, then a signal or due timer atomically records

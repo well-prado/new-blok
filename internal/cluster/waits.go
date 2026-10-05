@@ -175,6 +175,9 @@ func (r *Runtime) DeliverSignal(ctx context.Context, tenant, waitID, signalID, p
 		if commitErr == nil {
 			return SignalResult{Accepted: true}, nil
 		}
+		if err := tooLarge(commitErr); err != nil {
+			return SignalResult{}, err
+		}
 		latestData, latestRevision, readErr := r.store.ReadState(ctx, partition, stateID)
 		if readErr != nil {
 			return SignalResult{}, fmt.Errorf("%w: reconcile signal race after %v: %v", ErrUnavailable, commitErr, readErr)
@@ -222,6 +225,9 @@ func (r *Runtime) commitLateSignal(ctx context.Context, owner distributed.Owner,
 	err := r.store.Commit(ctx, owner, id, "wait.signal_late", data)
 	if err == nil {
 		return nil
+	}
+	if tooLargeErr := tooLarge(err); tooLargeErr != nil {
+		return tooLargeErr
 	}
 	if !errors.Is(err, distributed.ErrAlreadyWritten) {
 		// A storage outage or an owner change between reading the owner
