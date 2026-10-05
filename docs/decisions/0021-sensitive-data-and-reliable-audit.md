@@ -305,11 +305,23 @@ which overwrites deleted content with zeros in the page, in freed cell
 space and on freed and overflow pages. The write-ahead log still holds
 older copies of every page written since it was last reset, so `Compact`
 then calls the store's optional `store.Purger.PurgeLog`
-(`PRAGMA wal_checkpoint(TRUNCATE)`) and reports `LogPurged`. A reader's
-open snapshot keeps the log in use: the purge then waits up to the busy
-timeout and reports `LogPurged = false`, and the content stays in the log
-until a later `PurgeLog` succeeds. Applications that must prove erasure
-check `LogPurged` or call `PurgeLog` themselves.
+(`PRAGMA wal_checkpoint(TRUNCATE)`). A reader's open snapshot keeps the log
+in use, and a truncating checkpoint holds every writer while it waits for
+readers, so the purge waits at most 100 ms (or the busy timeout, if
+shorter) and then fails with `store.ErrBusy`, truncating nothing. The debt
+is not forgotten: the compaction that erases content increments
+`erasure_generation` in `journal_meta` in the same transaction, a
+successful purge records the generation it covered as `purged_generation`,
+and every later `Compact`, even one that removes nothing and even in a
+restarted process, retries the purge while the first exceeds the second.
+`CompactionReport.LogPurged` reports a purge in this pass and
+`PurgePending` that erased content may still be in the log. Measured with a
+reader held across a compaction: concurrent writers waited at most
+103–108 ms (three runs), where they had waited the full 5 s busy timeout
+and failed busy; the next compaction after the reader closed, in a freshly
+opened journal, removed the content from the log
+(`TestBlockedLogPurgeIsRetriedWithoutStallingWriters`). A reader that never
+closes keeps the content in the log for as long as it stays open.
 
 **Upgrading.** Opening a journal written before #281 migrates it inside the
 schema transaction, so a crash leaves the old journal intact and the next
@@ -318,7 +330,9 @@ open migrates (shown with a killed process). Legacy tombstones
 digest-only tombstones (their unknown `input_digest` stays empty and
 `compacted_at` 0) and the table is dropped. Legacy reconciliations are
 rebuilt with their run id and digests, keeping their content while their run
-is retained; one whose operation is gone is erased. Reopening a migrated
+is retained; one whose operation is gone is erased. Such an orphan cannot
+exist in a journal origin/main wrote, because its foreign key forbade it,
+so that branch is defensive and no test reaches it. Reopening a migrated
 journal changes nothing. Content that origin/main deleted before secure
 deletion existed stays in the file's free space, beyond the reach of any
 row; one `store.Purger.PurgeFree` (`VACUUM`, then the log purge) removes it.
@@ -386,7 +400,8 @@ Erasure (#281), classified separately:
   is `Tombstones` and `Journal.AuditCount` is `TombstoneCount`; neither is
   public API.
 - **Additive**: `journal.Config.MinRetention`,
-  `CompactionReport.ErasedReconciliations` and `LogPurged`,
+  `CompactionReport.ErasedReconciliations`, `LogPurged` and `PurgePending`,
+  the `journal_meta` table (created on open),
   `Reconciliation.Erased`, and the optional `store.Purger` capability
   (`PurgeLog`, `PurgeFree`, `store.PurgerOf`).
 
@@ -456,8 +471,15 @@ Erasure (#281), classified separately:
   [#284](https://github.com/well-prado/new-blok/issues/284).
 - Erasure (§7) is retention-driven only: there is no API to erase one
   run or one subject's runs on request before their cutoff. Failed,
-  canceled and uncertain runs are never compacted, so their content is kept
-  until the application deletes it.
+  canceled and uncertain runs are never compacted, and a parent's copy of a
+  child's result is kept with the parent, so that content is kept
+  ([#289](https://github.com/well-prado/new-blok/issues/289)).
+- Worker queue payloads (`worker_jobs`) are kept forever; they are outside
+  the journal's compaction
+  ([#290](https://github.com/well-prado/new-blok/issues/290)).
+- The journal has no schema version, so an older binary opening a migrated
+  journal is not refused
+  ([#291](https://github.com/well-prado/new-blok/issues/291)).
 - Erasure stops at SQLite's files. The filesystem, an SSD's remapped
   blocks, VACUUM's temporary file, OS caches, copies an application made
   and backups taken before an erasure are outside it (§7). Compaction runs
@@ -467,9 +489,12 @@ Erasure (#281), classified separately:
   record is pruned. A digest of low-entropy content (a short result such
   as `{"ok":true}`) can be confirmed by guessing; digests are
   pseudonymous, not anonymous.
-- Secure deletion costs extra writes on every delete and update in the
-  shared database (journal, audit, worker queue, cron, approvals); the
-  cost was not measured.
+- Secure deletion applies to every delete and update in the shared
+  database (journal, audit, worker queue, cron, approvals). Measured in
+  review over 500 operations, three interleaved samples each, without and
+  with it: worker queue 295–342 vs 301–397 ms, journal 89–112 vs
+  87–121 ms, `Compact` 27–29 vs 31–33 ms (about +12%). Worker and journal
+  costs are within noise; compaction pays for the zeroing.
 - Prune tombstones (`audit_pruned_v1`) keep a pruned record's id digest
   and kind forever, so Verify can tell pruned from missing.
 - No hash chain or external anchoring of audit records.

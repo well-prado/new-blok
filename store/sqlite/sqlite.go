@@ -40,6 +40,9 @@ const (
 	// deleted content with zeros, in the page and on freed pages, instead of
 	// leaving it readable in the file until the space is reused (#281).
 	secureDelete = "secure_delete(ON)"
+	// maxLogPurgeWait bounds how long PurgeLog waits for readers to leave
+	// the log, since the checkpoint holds writers meanwhile (#281).
+	maxLogPurgeWait = 100 * time.Millisecond
 	// defaultBusyTimeout bounds how long a writer waits for the write lock,
 	// in the writer queue and in SQLite's busy handler, before ErrBusy.
 	defaultBusyTimeout = 5 * time.Second
@@ -276,7 +279,8 @@ func (c *connection) Backup(ctx context.Context, destination string) error {
 // PurgeLog checkpoints the write-ahead log into the database and truncates
 // it (#281). It takes this handle's writer turn, so marked writers on the
 // handle are not starved by it; it fails with store.ErrBusy when a reader
-// on any handle still needs the log, after SQLite's busy timeout.
+// on any handle still needs the log after maxLogPurgeWait (or the busy
+// timeout, if shorter), so writers wait at most that long behind it.
 func (c *connection) PurgeLog(ctx context.Context) error {
 	release, err := c.queueWriter(ctx)
 	if err != nil {
@@ -286,9 +290,25 @@ func (c *connection) PurgeLog(ctx context.Context) error {
 	return c.purgeLog(ctx)
 }
 
+// purgeLog runs the truncating checkpoint on a connection of its own whose
+// busy timeout is maxLogPurgeWait, not the store's. A truncating checkpoint
+// holds the write lock while it waits for readers, so waiting the full busy
+// timeout for a long reader would hold every writer that long (#281).
 func (c *connection) purgeLog(ctx context.Context) error {
+	conn, err := c.database.Conn(ctx)
+	if err != nil {
+		return busy(fmt.Errorf("sqlite: purge log: %w", err), c.writeDomain)
+	}
+	defer conn.Close()
+	wait := min(c.busyTimeout, maxLogPurgeWait)
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout=%d", wait.Milliseconds())); err != nil {
+		return fmt.Errorf("sqlite: purge log: %w", err)
+	}
+	// The connection goes back to the pool; restore the store's timeout even
+	// when ctx is done.
+	defer conn.ExecContext(context.WithoutCancel(ctx), fmt.Sprintf("PRAGMA busy_timeout=%d", c.busyTimeout.Milliseconds()))
 	var blocked, frames, copied int
-	if err := c.database.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&blocked, &frames, &copied); err != nil {
+	if err := conn.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&blocked, &frames, &copied); err != nil {
 		return busy(fmt.Errorf("sqlite: purge log: %w", err), c.writeDomain)
 	}
 	if blocked != 0 {

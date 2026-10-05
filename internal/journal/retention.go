@@ -20,13 +20,21 @@ type CompactionReport struct {
 	// ErasedReconciliations counts reconciliations whose evidence, provider
 	// result and actor this pass erased, keeping their identity and digests.
 	ErasedReconciliations int
-	// LogPurged reports that the store truncated its write-ahead log after
-	// this pass, so no older copy of an erased page survives there. It is
-	// false when nothing was removed, when the store cannot purge, and when
-	// a reader still needed the log; the content then stays in the log
-	// until a later purge (store.PurgerOf) succeeds.
+	// LogPurged reports that this pass truncated the store's write-ahead
+	// log because an erasure, this pass's or an earlier one's, was waiting
+	// for it, so no older copy of an erased page survives there.
 	LogPurged bool
+	// PurgePending reports that erased content may still be in the log: a
+	// reader kept the log in use. The pending purge is persisted and every
+	// later Compact retries it until it succeeds. Both flags stay false on
+	// a store that cannot purge (store.PurgerOf).
+	PurgePending bool
 }
+
+const (
+	metaErasureGeneration = "erasure_generation"
+	metaPurgedGeneration  = "purged_generation"
+)
 
 // runOwnedTables hold rows that belong to one run and die with it, children
 // before the run itself so no foreign key is ever left dangling (#281).
@@ -42,16 +50,19 @@ var runOwnedTables = []string{"journal_waits", "journal_signals", "journal_check
 // canceled run, one the configured legal Hold keeps, or one completed less
 // than Config.MinRetention ago. The audit contract's records
 // (contract/audit) are not deleted here; they have their own retention (ADR
-// 0021). After a pass that removed a run it purges the store's log.
+// 0021). It then purges the store's log whenever an erasure, this pass's
+// or an earlier blocked one, still owes a purge.
 func (j *Journal) Compact(ctx context.Context, before time.Time) (CompactionReport, error) {
 	cutoff := before
 	if legal := j.clock().Add(-j.minimum); j.minimum > 0 && legal.Before(cutoff) {
 		cutoff = legal
 	}
+	purger, purgeable := store.PurgerOf(j.database)
 	var report CompactionReport
 	var backfilled []audit.Record
+	var pending int64
 	err := j.withTx(ctx, "compact", func(tx *sql.Tx) error {
-		report, backfilled = CompactionReport{}, nil
+		report, backfilled, pending = CompactionReport{}, nil, 0
 		runs, err := compactionCandidates(ctx, tx, cutoff)
 		if err != nil {
 			return err
@@ -70,7 +81,21 @@ func (j *Journal) Compact(ctx context.Context, before time.Time) (CompactionRepo
 			report.ErasedReconciliations += erased
 			backfilled = append(backfilled, records...)
 		}
-		return tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM journal_compacted`).Scan(&report.Tombstones)
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM journal_compacted`).Scan(&report.Tombstones); err != nil {
+			return err
+		}
+		if !purgeable {
+			return nil
+		}
+		// The erasure and the record that its purge is owed commit together,
+		// so a crash or a blocked purge can never lose the debt.
+		if report.RemovedRuns > 0 {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO journal_meta (name, value) VALUES (?, 1) ON CONFLICT(name) DO UPDATE SET value = value + 1`, metaErasureGeneration); err != nil {
+				return err
+			}
+		}
+		pending, err = pendingPurge(ctx, tx)
+		return err
 	})
 	if err != nil {
 		return report, err
@@ -78,12 +103,32 @@ func (j *Journal) Compact(ctx context.Context, before time.Time) (CompactionRepo
 	if j.audit != nil && len(backfilled) > 0 {
 		j.audit.Notify(backfilled...)
 	}
-	if report.RemovedRuns > 0 {
-		if purger, ok := store.PurgerOf(j.database); ok {
-			report.LogPurged = purger.PurgeLog(ctx) == nil
+	if pending > 0 {
+		report.LogPurged = purger.PurgeLog(ctx) == nil
+		report.PurgePending = !report.LogPurged
+		if report.LogPurged {
+			// Record what the purge covered: every erasure committed before
+			// it, up to the generation read in the compaction. A later
+			// erasure keeps a higher generation and stays pending.
+			if err := j.withTx(ctx, "purge-record", func(tx *sql.Tx) error {
+				_, err := tx.ExecContext(ctx, `INSERT INTO journal_meta (name, value) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET value = max(value, excluded.value)`, metaPurgedGeneration, pending)
+				return err
+			}); err != nil {
+				report.PurgePending = true
+			}
 		}
 	}
 	return report, nil
+}
+
+// pendingPurge returns the erasure generation still owed a log purge, or 0.
+func pendingPurge(ctx context.Context, tx *sql.Tx) (int64, error) {
+	var erased, purged int64
+	err := tx.QueryRowContext(ctx, `SELECT COALESCE((SELECT value FROM journal_meta WHERE name = ?), 0), COALESCE((SELECT value FROM journal_meta WHERE name = ?), 0)`, metaErasureGeneration, metaPurgedGeneration).Scan(&erased, &purged)
+	if err != nil || erased <= purged {
+		return 0, err
+	}
+	return erased, nil
 }
 
 type compactionCandidate struct {

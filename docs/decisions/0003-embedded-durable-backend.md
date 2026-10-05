@@ -130,12 +130,17 @@ file after a truncating checkpoint.
 - **`secure_delete=ON`** is set through the DSN (`_pragma`), so every pooled
   connection has it, not only the one that ran `configure`. SQLite then
   zeroes deleted content in the page and on freed and overflow pages. It is
-  on for the whole database, since every component shares it; its write
-  cost was not measured.
+  on for the whole database, since every component shares it. Measured in
+  review over 500 operations, three interleaved samples, without and with
+  it: worker queue 295–342 vs 301–397 ms, journal 89–112 vs 87–121 ms,
+  journal compaction 27–29 vs 31–33 ms (about +12%).
 - **`store.Purger`** is a new optional `Database` capability. `PurgeLog`
-  runs `PRAGMA wal_checkpoint(TRUNCATE)` in the handle's writer turn and
-  returns `store.ErrBusy` when a reader still needs the log, having
-  truncated nothing. `PurgeFree` runs `VACUUM` and then `PurgeLog`, removing
+  runs `PRAGMA wal_checkpoint(TRUNCATE)` in the handle's writer turn, on a
+  connection whose busy timeout is at most 100 ms: the checkpoint holds
+  writers while it waits for readers, so it must not wait the store's full
+  timeout. It returns `store.ErrBusy` when a reader still needs the log,
+  having truncated nothing; the journal persists the pending purge and
+  retries it (ADR 0021 §7). `PurgeFree` runs `VACUUM` and then `PurgeLog`, removing
   free space written before secure deletion was on; it rewrites the whole
   database and needs free space of its size. `:memory:` has no log, so
   `PurgeLog` is a no-op there.

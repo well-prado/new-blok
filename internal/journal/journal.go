@@ -363,6 +363,10 @@ var schemaStatements = []string{
 	// digests (#281). The table has no foreign key to journal_operations:
 	// the decision outlives its compacted operation.
 	reconciliationsTable("journal_reconciliations"),
+	// journal_meta holds the journal's own counters: erasure_generation
+	// counts compactions that erased content, purged_generation the latest
+	// one whose log purge succeeded (#281).
+	`CREATE TABLE IF NOT EXISTS journal_meta (name TEXT PRIMARY KEY, value INTEGER NOT NULL)`,
 	// The compaction tombstone proves a run existed and ended; it holds
 	// digests and timestamps only (#281).
 	`CREATE TABLE IF NOT EXISTS journal_compacted (

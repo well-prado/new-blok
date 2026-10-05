@@ -3,6 +3,7 @@ package audit_test
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -141,5 +142,91 @@ func TestCompactionBackfillsAPreAuditReconciliationRecord(t *testing.T) {
 	}
 	if found := r.rowMarkers(); len(found) != 0 {
 		t.Fatalf("content after compaction: %v", found)
+	}
+}
+
+// TestBlockedLogPurgeIsRetriedWithoutStallingWriters: a reader's snapshot
+// blocks the log purge after an erasure. The purge must wait only briefly,
+// so concurrent writers are not held for the store's busy timeout, and it
+// must stay pending: a later compaction that removes nothing retries it
+// once the reader is gone, and the erased content leaves the log.
+func TestBlockedLogPurgeIsRetriedWithoutStallingWriters(t *testing.T) {
+	r := newRig(t, rigOptions{})
+	run := r.contentRun("BLOCKED", true)
+	r.clock = r.clock.Add(48 * time.Hour)
+	held, release, done := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+	go func() {
+		done <- r.db.WithTx(context.Background(), func(tx *sql.Tx) error {
+			var n int
+			if err := tx.QueryRow(`SELECT COUNT(*) FROM journal_runs`).Scan(&n); err != nil {
+				return err
+			}
+			close(held)
+			<-release
+			return nil
+		})
+	}()
+	<-held
+	stop := make(chan struct{})
+	slowest := make(chan time.Duration, 1)
+	writerErrors := make(chan error, 1)
+	go func() {
+		var worst time.Duration
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				slowest <- worst
+				return
+			default:
+			}
+			start := time.Now()
+			if _, err := r.journal.Admit(r.ctx, journal.AdmissionRequest{RequestKey: fmt.Sprintf("writer-%d", i), Principal: "alice", Workflow: "orders", ArtifactDigest: digest("artifact"), Input: []byte(`{}`)}); err != nil {
+				select {
+				case writerErrors <- err:
+				default:
+				}
+			}
+			worst = max(worst, time.Since(start))
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+	time.Sleep(20 * time.Millisecond)
+	report, err := r.journal.Compact(r.ctx, r.clock)
+	time.Sleep(20 * time.Millisecond)
+	close(stop)
+	worst := <-slowest
+	if err != nil || report.RemovedRuns != 1 || report.LogPurged || !report.PurgePending {
+		t.Fatalf("compact beside a reader=%+v err=%v", report, err)
+	}
+	select {
+	case err := <-writerErrors:
+		t.Fatalf("a concurrent writer failed behind the blocked purge: %v", err)
+	default:
+	}
+	if worst > time.Second {
+		t.Fatalf("a concurrent writer waited %v behind the blocked purge", worst)
+	}
+	if found := fileMarkers(t, r.path, run.Markers); len(found) == 0 {
+		t.Fatal("fixture: the blocked purge must leave the content in the log")
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("slowest concurrent writer behind the blocked purge: %v", worst)
+	// The debt is persisted: a journal opened afresh on the file, as after a
+	// restart, retries it in a compaction that removes nothing.
+	reopened := openRig(t, r.path, rigOptions{})
+	reopened.clock = r.clock
+	report, err = reopened.journal.Compact(reopened.ctx, reopened.clock)
+	if err != nil || report.RemovedRuns != 0 || !report.LogPurged || report.PurgePending {
+		t.Fatalf("retry compaction=%+v err=%v", report, err)
+	}
+	if found := fileMarkers(t, r.path, run.Markers); len(found) != 0 {
+		t.Fatalf("pending purge was not retried: %v", found)
+	}
+	// Nothing is pending any more, so a further pass does not purge again.
+	if report, err := r.journal.Compact(r.ctx, r.clock); err != nil || report.LogPurged || report.PurgePending {
+		t.Fatalf("idle compaction=%+v err=%v", report, err)
 	}
 }

@@ -139,7 +139,8 @@ func BusyTimeoutOf(database Database) (time.Duration, bool) {
 // that setting was on keeps deleted content in its free space.
 type Purger interface {
 	// PurgeLog writes the write-ahead log back into the database and
-	// truncates it, so no older copy of a page survives there. It fails with
+	// truncates it, so no older copy of a page survives there. It waits for
+	// readers only briefly, since writers wait behind it, and fails with
 	// ErrBusy, having truncated nothing, while a reader's snapshot still
 	// needs the log; retry it later.
 	PurgeLog(context.Context) error
