@@ -45,6 +45,10 @@ type Limits struct {
 
 const MaxInputBytes = distributed.MaxPayloadBytes - 4096
 
+// acquireRetryInterval bounds how often a worker retries acquiring a partition
+// that another owner holds or that storage could not grant.
+const acquireRetryInterval = 250 * time.Millisecond
+
 const (
 	maxPartitions          = 256
 	maxPartitionAdmissions = 4096
@@ -205,7 +209,10 @@ func (r *Runtime) Admit(ctx context.Context, request Submission) (Admission, err
 		if err == nil {
 			return Admission{RunID: runID, Accepted: true, State: run.State}, nil
 		}
-		if errors.Is(err, distributed.ErrAlreadyWritten) {
+		if errors.Is(err, distributed.ErrAlreadyWritten) || errors.Is(err, distributed.ErrAdmissionConflict) {
+			// A concurrent ingress committed this request identity first.
+			// Reconcile against its committed record: identical input is a
+			// duplicate, any other input is a definite conflict.
 			existing, _, readErr := r.readRun(ctx, partition, runID)
 			if readErr != nil {
 				return Admission{}, fmt.Errorf("%w: reconcile duplicate admission: %v", ErrUnavailable, readErr)
@@ -430,10 +437,11 @@ func (r *Runtime) runPartition(ctx context.Context, partition, ownerID string) e
 	for ctx.Err() == nil {
 		owner, err := r.store.Acquire(ctx, partition, ownerID, r.limits.OwnerTTL)
 		if err != nil {
-			if !errors.Is(err, distributed.ErrOwnershipLost) && ctx.Err() == nil {
-				if waitErr := waitContext(ctx, 250*time.Millisecond); waitErr != nil {
-					return waitErr
-				}
+			// Whether another owner holds the partition or storage refused the
+			// grant, retry at a bounded rate: a standby worker must not spin
+			// lease grants against etcd while it waits for a takeover.
+			if waitErr := waitContext(ctx, acquireRetryInterval); waitErr != nil {
+				return waitErr
 			}
 			continue
 		}

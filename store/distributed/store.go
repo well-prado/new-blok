@@ -22,6 +22,9 @@ var (
 	ErrStateConflict  = errors.New("distributed store: state revision changed")
 	ErrAdmissionFull  = errors.New("distributed store: bounded admission capacity is full")
 	ErrConfigConflict = errors.New("distributed store: immutable cluster setting conflicts with existing configuration")
+	// ErrAdmissionConflict reports that the request's admission identity is
+	// already committed with a different payload. It is definite, not retryable.
+	ErrAdmissionConflict = errors.New("distributed store: request identity conflicts with committed admission")
 )
 
 const MaxPayloadBytes = 512 << 10
@@ -383,7 +386,7 @@ func (s *Store) CommitAdmission(ctx context.Context, partition, tenant, globalSl
 		if string(current.Kvs[0].Value) == string(encodedEvent) {
 			return ErrAlreadyWritten
 		}
-		return errors.New("distributed store: request identity conflicts with committed admission")
+		return ErrAdmissionConflict
 	}
 	return ErrAdmissionFull
 }

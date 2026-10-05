@@ -1,0 +1,26 @@
+{
+  "fixtureVersion": 1,
+  "synthetic": true,
+  "name": "sustained-concurrent-load-with-worker-kill",
+  "limits": {"partitions": 8, "partitionAdmissions": 16, "tenantAdmissions": 4, "ownerTTLMillis": 2000},
+  "workers": 3,
+  "ingressClients": 2,
+  "ingressSeconds": 10,
+  "killWorkerAtSeconds": 4,
+  "noisyTenantSubmitters": 8,
+  "steadyTenants": 3,
+  "backgroundTenants": 8,
+  "effectMillis": 10,
+  "drainTimeoutSeconds": 120,
+  "expected": {
+    "failedRuns": 0,
+    "nonTerminalRuns": 0,
+    "maxEffectsPerRun": 1,
+    "completedRunsWithoutExactlyOneEffect": 0,
+    "effectsWithoutAcceptedRun": 0,
+    "unexpectedIngressErrors": 0,
+    "killedWorkerOwnedFairnessPartition": true,
+    "minCompletedRuns": 100,
+    "minSteadyToNoisyCompletionRatio": 0.5
+  }
+}

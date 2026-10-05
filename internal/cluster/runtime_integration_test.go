@@ -55,6 +55,10 @@ func TestTwoIngressNodesPersistAndExecuteOneIdempotentRun(t *testing.T) {
 		ExpectedEffects            int    `json:"expectedEffects"`
 		ExpectedFinalState         string `json:"expectedFinalState"`
 		SameKeyDifferentInputError string `json:"sameKeyDifferentInputError"`
+		ConflictingIngressRequests int    `json:"conflictingIngressRequests"`
+		ExpectedConflictAccepted   int    `json:"expectedConflictAccepted"`
+		ExpectedConflictDuplicates int    `json:"expectedConflictDuplicates"`
+		ExpectedConflictRejections int    `json:"expectedConflictRejections"`
 	}
 	if err := json.Unmarshal(fixtureBytes, &fixture); err != nil {
 		t.Fatal(err)
@@ -165,6 +169,68 @@ func TestTwoIngressNodesPersistAndExecuteOneIdempotentRun(t *testing.T) {
 	if _, err := first.Admit(ctx, Submission{Tenant: tenant, RequestKey: request.RequestKey, Workflow: request.Workflow, Input: json.RawMessage(`{"value":42}`)}); !errors.Is(err, ErrRequestConflict) {
 		t.Fatalf("same-key changed-input error=%v, expected fixture error %s", err, fixture.SameKeyDifferentInputError)
 	}
+
+	// The same request key with two different inputs, raced concurrently
+	// through both ingress clients: exactly one input is accepted, every
+	// identical retry reconciles to it and every different input conflicts.
+	type conflictOutcome struct {
+		input     string
+		admission Admission
+		err       error
+	}
+	conflictStart := make(chan struct{})
+	conflictResults := make(chan conflictOutcome, fixture.ConflictingIngressRequests)
+	var conflictReady sync.WaitGroup
+	for index := 0; index < fixture.ConflictingIngressRequests; index++ {
+		conflictReady.Add(1)
+		go func(index int) {
+			defer conflictReady.Done()
+			input := fmt.Sprintf(`{"value":%d}`, 50+index%2)
+			runtime := first
+			if (index/2)%2 == 1 {
+				runtime = second
+			}
+			<-conflictStart
+			admission, err := runtime.Admit(ctx, Submission{Tenant: tenant, RequestKey: "request-conflict", Workflow: "distributed-fixture", Input: json.RawMessage(input)})
+			conflictResults <- conflictOutcome{input, admission, err}
+		}(index)
+	}
+	close(conflictStart)
+	conflictReady.Wait()
+	close(conflictResults)
+	winner := ""
+	outcomes := make([]conflictOutcome, 0, fixture.ConflictingIngressRequests)
+	for outcome := range conflictResults {
+		outcomes = append(outcomes, outcome)
+		if outcome.err == nil && outcome.admission.Accepted {
+			if winner != "" {
+				t.Fatalf("two inputs accepted for one request key: %s and %s", winner, outcome.input)
+			}
+			winner = outcome.input
+		}
+	}
+	var conflictAccepted, conflictDuplicates, conflictRejected int
+	for _, outcome := range outcomes {
+		switch {
+		case outcome.err == nil && outcome.admission.Accepted:
+			conflictAccepted++
+		case outcome.err == nil && outcome.input == winner:
+			conflictDuplicates++
+		case errors.Is(outcome.err, ErrRequestConflict) && outcome.input != winner:
+			conflictRejected++
+		default:
+			t.Fatalf("conflicting ingress outcome input=%s admission=%+v err=%v winner=%s", outcome.input, outcome.admission, outcome.err, winner)
+		}
+	}
+	if conflictAccepted != fixture.ExpectedConflictAccepted || conflictDuplicates != fixture.ExpectedConflictDuplicates || conflictRejected != fixture.ExpectedConflictRejections {
+		t.Fatalf("conflicting ingress accepted=%d duplicates=%d conflicts=%d; fixture %d/%d/%d", conflictAccepted, conflictDuplicates, conflictRejected, fixture.ExpectedConflictAccepted, fixture.ExpectedConflictDuplicates, fixture.ExpectedConflictRejections)
+	}
+	effectsBefore := effects.Load()
+	conflictRun, err := first.processOne(ctx, owner)
+	if err != nil || conflictRun.State != fixture.ExpectedFinalState || string(conflictRun.Input) != winner || effects.Load()-effectsBefore != int64(fixture.ExpectedEffects) {
+		t.Fatalf("conflict winner run=%+v err=%v winner=%s effect delta=%d", conflictRun, err, winner, effects.Load()-effectsBefore)
+	}
+	t.Logf("concurrent same-key race: winner input %s accepted once, %d duplicates, %d conflicts", winner, conflictDuplicates, conflictRejected)
 }
 
 func TestTakeoverPersistsUncertaintyAndRejectsPausedOwnersResult(t *testing.T) {
