@@ -80,6 +80,12 @@ const (
 	// lost its lease before acknowledging, for example because the handler
 	// kills its own process (#245).
 	ClaimAbandoned = "claim_abandoned"
+	// HandlerPanicked is the error recorded for an attempt whose handler
+	// panicked or called runtime.Goexit instead of returning (#267). The
+	// handler's writes were rolled back and the attempt failed: the job is
+	// retried after a backoff, or dead once its attempts are spent. The
+	// panic value is not recorded, and ProcessOnce does not recover it.
+	HandlerPanicked = "handler_panicked"
 	// MaxDeferrals bounds saturation and consumer-loss redeliveries per job.
 	MaxDeferrals = 16
 	// DeferralExhausted is the dead-letter code once MaxDeferrals is spent.
@@ -691,6 +697,14 @@ func (q *Queue) takeClaimTurn() (func(), error) {
 // ProcessOnce returns instead of leaving database/sql to abort it in the
 // background while the write lock is still held.
 //
+// A handler that panics, or calls runtime.Goexit, does not return, and
+// neither does ProcessOnce: the panic reaches its caller with its original
+// value; ProcessOnce does not recover it (#267). On the way out the store
+// rolls the handle transaction back, the handler's writes with it, and the
+// attempt fails as HandlerPanicked: the job is retried after a backoff, or
+// dead once its attempts are spent. The claim turn is held until that
+// accounting has committed.
+//
 // The handler runs inside a write transaction, which holds the store's single
 // write lock until it commits: handlers of concurrent workers run one at a
 // time, and every other writer waits for them under the busy timeout. Keep
@@ -766,11 +780,28 @@ func (q *Queue) handle(ctx, txCtx context.Context, handler Handler, job Job, lea
 	// shows the started attempt's lease again, not held (#180).
 	held := lease + 1
 	ran, lost, died := false, false, false
+	// inHandler is true while the handler runs. Still true once the handle
+	// transaction has unwound, it means the handler panicked or called
+	// runtime.Goexit instead of returning (#267).
+	inHandler := false
 	var activeDomain *claimedWriteDomain
 	defer func() {
 		if activeDomain != nil {
 			activeDomain.active.Store(false)
 		}
+		if !inHandler {
+			return
+		}
+		// The store rolled the handle transaction back on the way out, the
+		// handler's writes with it. The attempt, counted when it started,
+		// fails: the job is retried after a backoff, or dead once its
+		// attempts are spent, as for any handle transaction that rolled back
+		// after its handler ran (ADR 0006). The panic value is not recorded.
+		// The panic, or the Goexit, then continues to the caller unchanged,
+		// still holding the claim turn until this accounting has committed.
+		// If it cannot commit, the attempt stays counted and the job is
+		// redelivered once the start's lease expires, as after a crash.
+		_ = q.chargeAttempt(txCtx, job, lease, HandlerPanicked)
 	}()
 	// This transaction also writes first (#176), taking the lease over, so it
 	// too takes its turn in the store's writer queue (#214); the handler then
@@ -811,8 +842,9 @@ func (q *Queue) handle(ctx, txCtx context.Context, handler Handler, job Job, lea
 			activeDomain.active.Store(true)
 			handlerCtx = context.WithValue(ctx, claimedWriteDomainKey{}, activeDomain)
 		}
-		ran = true
+		ran, inHandler = true, true
 		handlerErr := handler(handlerCtx, Tx{claim: claimed}, job)
+		inHandler = false
 		if ctx.Err() != nil {
 			// Returning an error discards the handler's writes with its
 			// outcome: the delivery was never acknowledged.
@@ -920,6 +952,10 @@ func (q *Queue) handle(ctx, txCtx context.Context, handler Handler, job Job, lea
 	}
 }
 
+// claimEnded is the error recorded for an attempt whose handle transaction
+// ended under its handler, or failed to commit.
+const claimEnded = "claim transaction ended"
+
 // errLeaseExpired reports that a started attempt's lease was taken by
 // another worker before this worker's handler transaction could take it over.
 var errLeaseExpired = errors.New("worker: lease expired")
@@ -930,13 +966,20 @@ var errLeaseExpired = errors.New("worker: lease expired")
 // crash before this commits still counts it; the job is then redelivered
 // once the attempt's lease expires.
 func (q *Queue) chargeLostClaim(ctx context.Context, job Job, lease int64) error {
+	return q.chargeAttempt(ctx, job, lease, claimEnded)
+}
+
+// chargeAttempt ends a started attempt whose handler ran and whose handle
+// transaction rolled back as a failed attempt, recording reason as the
+// job's error.
+func (q *Queue) chargeAttempt(ctx context.Context, job Job, lease int64, reason string) error {
 	return q.withTx(store.Writer(ctx), func(tx *sql.Tx) error {
 		state, available := StateDead, q.now()
 		if job.Attempt < job.MaxAttempts {
 			state = StatePending
 			available += int64(time.Duration(job.Attempt) * time.Second)
 		}
-		_, err := tx.ExecContext(ctx, `UPDATE worker_jobs SET state = ?, available_at = ?, lease_until = NULL, error_text = ?, updated_at = ? WHERE job_id = ? AND state = ? AND lease_until = ?`, state, available, "claim transaction ended", q.now(), job.ID, StateProcessing, lease)
+		_, err := tx.ExecContext(ctx, `UPDATE worker_jobs SET state = ?, available_at = ?, lease_until = NULL, error_text = ?, updated_at = ? WHERE job_id = ? AND state = ? AND lease_until = ?`, state, available, reason, q.now(), job.ID, StateProcessing, lease)
 		return err
 	})
 }

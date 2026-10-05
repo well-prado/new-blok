@@ -4,7 +4,8 @@
 - Date: 2026-10-02
 - Amended: #188 (worker nested-store diagnostics and saturation), #207
   (undetected self-submits fail after one busy wait), #245 (a started
-  attempt is committed before its handler runs)
+  attempt is committed before its handler runs), #267 (a panicking handler
+  fails its attempt and releases the write lock)
 - Roadmap: E09-T02 ([#55](https://github.com/well-prado/new-blok/issues/55))
 - Amends: [ADR 0005](0005-trigger-adapter-contract.md) (webhook declaration)
 - Consumers: webhook now; cron (#56) and pubsub (#57) are expected to submit
@@ -192,6 +193,38 @@ How each ending treats the started attempt:
 | Lease taken by another worker before the handler starts | stays counted | left to that worker; `ProcessOnce` returns `worker.ErrClaimLost` |
 | Claim lost under the handler (#180), or the handle transaction fails to commit | stays counted | retried after a backoff, or dead (`claim transaction ended`) |
 | Process dies | stays counted | redelivered when the lease expires, or dead (`claim_abandoned`) once attempts are spent |
+| Handler panics or calls `runtime.Goexit`, and the caller recovers (#267) | stays counted | retried after a backoff, or dead (`handler_panicked`) once attempts are spent; the panic reaches the caller |
+
+**A handler that panics (#267).** Before #267 a handler panic left its
+handle transaction open: the store did not roll back a callback that
+panicked, and the transaction's context is deliberately not cancelable, so
+database/sql never rolled it back either. A supervisor that recovered the
+panic kept a process in which every write to the file, from any handle,
+failed busy until it exited. The store now rolls back every transaction
+whose callback does not return (ADR 0003). `ProcessOnce` does not recover
+the panic: it reaches the caller with its own value, and an unrecovered
+panic still kills the process.
+
+On the way out, a separate write-first transaction counts the attempt as
+failed, matched on the start's lease like the other accounting below, while
+the worker still holds the claim turn. It is the row for a handle
+transaction that rolled back after its handler ran: retried after the usual
+backoff of one second per attempt, or dead once `MaxAttempts` is spent. The
+error is `handler_panicked` (`worker.HandlerPanicked`); the panic value is
+not recorded, because arbitrary text never reaches the dead-letter record.
+No deferral is charged. A `runtime.Goexit` in the handler is the same: the
+handler did not return. If that accounting cannot commit, the attempt stays
+counted and the job is redelivered when the lease expires, as after a
+crash.
+
+Why a failed, retried attempt and not the "handler fails" row: a panic
+carries no `HandlerError`, so there is no retryable or terminal verdict to
+read, and the "handler fails" row would dead-letter a plain error at once.
+The outcome should not depend on whether a supervisor recovers the panic.
+Unrecovered, the process dies, and the job gets `MaxAttempts` runs before it
+is dead (`claim_abandoned`). Recovered, it gets the same `MaxAttempts`
+runs, without waiting out the lease each time, and a dead-letter code that
+says what happened.
 
 The accounting after a rolled-back handle transaction (give back, defer,
 charge) is its own write-first transaction, matched on the start's lease, so
@@ -327,6 +360,7 @@ is never parsed before verification.
 | One started attempt per write domain per process (claim turn) | behavioral | A worker that cannot take the turn within the busy timeout fails with `store.ErrBusy` naming the write domain and starts nothing, where it used to wait for the write lock with the same timeout and outcome |
 | `store.BusyTimeoutProvider` / `store.BusyTimeoutOf`; SQLite reports its busy timeout | additive | Stores and wrappers may expose it; without it the worker assumes 5 s |
 | Workers from before #245 on the same store (mixed versions) | compatibility limit | No migration is needed and both claim only pending jobs and expired leases, so an old worker skips a new worker's live lease. An old worker's own crashed attempts stay uncounted. An old worker that claims a job whose attempts new workers' crashes have spent does not dead-letter it at the claim, as new workers do: it runs the handler once more, at attempt `MaxAttempts`+1, and dead-letters it only if that attempt fails. Run one version per store |
+| A handler that panics or calls `runtime.Goexit` fails its attempt (#267): `worker.HandlerPanicked` | behavioral, additive | No schema change. The panic still propagates from `ProcessOnce` unchanged. Where a recovered panic left the job leased with its handle transaction open, and the store busy for every writer until the process exited, the job is now pending after a backoff with error `handler_panicked`, or dead once its attempts are spent |
 | Jobs tied on `created_at` are claimed in enqueue order; `enqueue_seq` column and index | behavioral, schema | added by `worker.New`; existing jobs keep 0 and stay in `job_id` order among themselves |
 | New package `trigger/webhook` | additive | none |
 

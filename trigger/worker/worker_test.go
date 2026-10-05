@@ -1024,12 +1024,11 @@ func TestLeaseIsConfigurableAndLongerThanTwoBusyTimeouts(t *testing.T) {
 // way out, or every later ProcessOnce on the write domain in this process
 // would wait out the busy timeout for a turn nobody holds (#245 review).
 //
-// The test checks the turn itself rather than running the next job: the
-// panic also leaves the handler's SQLite transaction open, because
-// sqlite's WithTx does not roll back when its callback panics, so every
-// later write to this store fails busy whatever the turn does. That store
-// defect predates #245 (origin/main 078f29a behaves the same) and is
-// reported separately.
+// The test checks the turn itself, apart from the store: before #267 the
+// panic also left the handler's SQLite transaction open, so every later
+// write to the store failed busy whatever the turn did. That the next job
+// then runs, and how the panicked attempt is counted, is
+// TestPanickingHandlerRollsBackAndFailsItsAttempt.
 func TestPanickingHandlerReleasesTheClaimTurn(t *testing.T) {
 	ctx := context.Background()
 	database, err := (sqlite.Backend{BusyTimeout: 300 * time.Millisecond}).Open(ctx, filepath.Join(t.TempDir(), "panic.db"))
