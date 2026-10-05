@@ -1,0 +1,23 @@
+{
+  "name": "@new-blok/parity-old-engine",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "24.21.0"
+  },
+  "scripts": {
+    "run": "node run.mjs"
+  },
+  "dependencies": {
+    "@blokjs/core": "2.5.0",
+    "@blokjs/runner": "2.5.0",
+    "@blokjs/shared": "2.5.0",
+    "@blokjs/trigger-sse": "2.5.0",
+    "@blokjs/trigger-webhook": "2.5.0",
+    "@blokjs/trigger-worker": "2.5.0",
+    "hono": "4.11.7",
+    "pg-boss": "10.4.2",
+    "pg": "8.23.1",
+    "zod": "3.25.76"
+  }
+}
