@@ -33,6 +33,18 @@ type Error struct{ Code, Message string }
 
 func (e *Error) Error() string { return e.Code + ": " + e.Message }
 
+// ClassNotFound is the DomainError class for a record the caller cannot
+// see: one that does not exist, or one that exists but the caller may not
+// read. Return the same error (code and class) in both cases, so that no
+// trigger can tell them apart: HTTP answers 404 and gRPC NotFound with the
+// error's code, and only that code reaches the caller. It is terminal: the
+// framework never retries it (#306, ADR 0005). trigger.ClassNotFound is the
+// same value on the adapter side.
+const ClassNotFound = "not_found"
+
+// DomainError is a node failure with a stable public Code and Class. Triggers
+// map the class to their protocol (validation, not_found, ...) and expose
+// only the code; Err stays private.
 type DomainError struct {
 	Code      string
 	Class     string
