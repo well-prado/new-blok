@@ -34,6 +34,10 @@ type Reconciliation struct {
 	Result       json.RawMessage
 	State        string
 	Duplicate    bool
+	// Erased reports a duplicate whose run was compacted: its actor,
+	// evidence and result were erased (#281) and are returned empty. Only
+	// the operation key and state remain.
+	Erased bool
 }
 
 type UpgradePlan struct {
@@ -114,11 +118,23 @@ func (j *Journal) reconcileOnce(ctx context.Context, operationKey, actor, eviden
 	inserted := false
 	err := j.withTx(ctx, "reconcile", func(tx *sql.Tx) error {
 		var existing Reconciliation
+		var existingEvidence sql.NullString
 		var existingResult []byte
+		var evidenceDigest, resultDigest string
 		var createdAt int64
+		var erasedAt sql.NullInt64
 		var runID string
-		err := tx.QueryRowContext(ctx, `SELECT r.operation_key, r.actor, r.evidence, r.result_json, r.state, r.created_at, o.run_id FROM journal_reconciliations r JOIN journal_operations o ON o.operation_key = r.operation_key WHERE r.operation_key = ?`, operationKey).Scan(&existing.OperationKey, &existing.Actor, &existing.Evidence, &existingResult, &existing.State, &createdAt, &runID)
+		err := tx.QueryRowContext(ctx, `SELECT operation_key, run_id, actor, evidence, result_json, evidence_digest, result_digest, state, created_at, erased_at FROM journal_reconciliations WHERE operation_key = ?`, operationKey).Scan(&existing.OperationKey, &runID, &existing.Actor, &existingEvidence, &existingResult, &evidenceDigest, &resultDigest, &existing.State, &createdAt, &erasedAt)
+		if err == nil && erasedAt.Valid {
+			// The run was compacted: the decision is still a duplicate, but
+			// there is no content left to return, and an audit record that
+			// is missing can no longer be reproduced (compaction writes it
+			// first when audit is composed).
+			reconciliation = Reconciliation{OperationKey: existing.OperationKey, State: existing.State, Duplicate: true, Erased: true}
+			return nil
+		}
 		if err == nil {
+			existing.Evidence = existingEvidence.String
 			existing.Result = append([]byte(nil), existingResult...)
 			existing.Duplicate = true
 			reconciliation = existing
@@ -131,7 +147,7 @@ func (j *Journal) reconcileOnce(ctx context.Context, operationKey, actor, eviden
 			if err != nil || recorded {
 				return err
 			}
-			record, inserted, err = j.audit.Append(ctx, tx, reconciliationRecord(ctx, existing.OperationKey, existing.Actor, existing.Evidence, existing.Result, runID, createdAt))
+			record, inserted, err = j.audit.Append(ctx, tx, reconciliationRecord(audit.TenantFrom(ctx), existing.OperationKey, existing.Actor, evidenceDigest, resultDigest, runID, createdAt))
 			return err
 		}
 		if !errors.Is(err, sql.ErrNoRows) {
@@ -145,7 +161,8 @@ func (j *Journal) reconcileOnce(ctx context.Context, operationKey, actor, eviden
 			return ErrNotReconciliable
 		}
 		now := j.now()
-		if _, err := tx.ExecContext(ctx, `INSERT INTO journal_reconciliations (operation_key, actor, evidence, result_json, state, created_at) VALUES (?, ?, ?, ?, ?, ?)`, operationKey, actor, evidence, []byte(result), operationCommitted, now); err != nil {
+		evidenceDigest, resultDigest = audit.Digest([]byte(evidence)), audit.Digest(result)
+		if _, err := tx.ExecContext(ctx, `INSERT INTO journal_reconciliations (operation_key, run_id, actor, evidence, result_json, evidence_digest, result_digest, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, operationKey, runID, actor, evidence, []byte(result), evidenceDigest, resultDigest, operationCommitted, now); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE journal_attempts SET state = ?, result_json = ?, finished_at = ? WHERE attempt_id = ? AND operation_key = ? AND state = ?`, attemptCommitted, []byte(result), now, attemptID, operationKey, attemptUncertain); err != nil {
@@ -155,7 +172,7 @@ func (j *Journal) reconcileOnce(ctx context.Context, operationKey, actor, eviden
 			return err
 		}
 		reconciliation = Reconciliation{OperationKey: operationKey, Actor: actor, Evidence: evidence, Result: append([]byte(nil), result...), State: operationCommitted}
-		record, inserted, err = j.audit.Append(ctx, tx, reconciliationRecord(ctx, operationKey, actor, evidence, result, runID, now))
+		record, inserted, err = j.audit.Append(ctx, tx, reconciliationRecord(audit.TenantFrom(ctx), operationKey, actor, evidenceDigest, resultDigest, runID, now))
 		return err
 	})
 	if err != nil {
@@ -168,13 +185,14 @@ func (j *Journal) reconcileOnce(ctx context.Context, operationKey, actor, eviden
 }
 
 // reconciliationRecord binds evidence and result by digest only: the
-// evidence text and the provider result never enter audit. Its time is the
+// evidence text and the provider result never enter audit. The digests are
+// the ones stored with the reconciliation, and its time is the
 // reconciliation's own, so a re-delivery produces the identical record.
-func reconciliationRecord(ctx context.Context, operationKey, actor, evidence string, result []byte, runID string, at int64) audit.Record {
+func reconciliationRecord(tenant, operationKey, actor, evidenceDigest, resultDigest, runID string, at int64) audit.Record {
 	return audit.Record{
-		ID: "reconcile:" + operationKey, Kind: audit.KindReconciliation, Tenant: audit.TenantFrom(ctx),
+		ID: "reconcile:" + operationKey, Kind: audit.KindReconciliation, Tenant: tenant,
 		Actor: actor, Subject: operationKey, RunID: runID, Action: "reconcile", Outcome: audit.OutcomeApplied,
-		Digests: map[string]string{"evidence": audit.Digest([]byte(evidence)), "result": audit.Digest(result)},
+		Digests: map[string]string{"evidence": evidenceDigest, "result": resultDigest},
 		At:      time.Unix(0, at).UTC(),
 	}
 }
@@ -305,7 +323,7 @@ func (j *Journal) ActiveRuns(ctx context.Context, tx *sql.Tx, runIDs []string) (
 		}
 		known := map[string]bool{}
 		rows, err := tx.QueryContext(ctx, `SELECT run_id, state FROM journal_runs WHERE run_id IN (`+placeholders+`)
-			UNION ALL SELECT run_id, 'compacted' FROM journal_audit WHERE run_id IN (`+placeholders+`)`, args...)
+			UNION ALL SELECT run_id, 'compacted' FROM journal_compacted WHERE run_id IN (`+placeholders+`)`, args...)
 		if err != nil {
 			return nil, err
 		}

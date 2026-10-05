@@ -6,6 +6,7 @@
   builds on ADR 0008 (durable approvals, #75), ADR 0016 (inspection, #76/#77),
   ADR 0020 (optional observability, #79) and the #49 journal retention,
   compaction, backup and restore
+- Amended by: #281 (§7, erasure of run data)
 - Amends: [ADR 0008](0008-durable-tool-policy.md) (approval decisions now
   require audit), [ADR 0016](0016-versioned-inspection.md) (projection
   redaction and error labels), [ADR 0020](0020-optional-observability-export.md)
@@ -75,7 +76,8 @@ the decision and its record exactly once. A re-delivered approval or
 reconciliation whose record is missing (it predates audit) writes that
 record. A re-delivered reconciliation whose record exists is a duplicate
 and never rewrites it, whatever tenant context carries the re-delivery; a
-backfilled record takes the re-delivery's tenant.
+backfilled record takes the re-delivery's tenant (#286 tracks changing
+that). A record compaction backfills (§7) takes the system tenant `""`.
 
 ### 3. Access
 
@@ -120,7 +122,9 @@ never:
 
 Journal run compaction (#49, `journal.Compact`) already deletes only
 completed runs; it now also honours `journal.Config.Hold` (a legal hold on
-run data, reported as `HeldRuns`). Compaction never touches audit records.
+run data, reported as `HeldRuns`) and, since #281,
+`journal.Config.MinRetention`. Compaction never deletes audit records; what
+it erases is described in §7.
 
 ### 5. Backup and restore
 
@@ -249,6 +253,95 @@ Applications keep secrets out of free-form text and out of node outputs,
 use opaque secret references, and treat any custom export they add as
 outside this guarantee.
 
+### 7. Erasure of run data (#281)
+
+Compaction is the journal's erasure. A run's content is everything an
+application or provider handed the framework for it: request key,
+principal, input, effect inputs and results, uncertainty and failure text,
+scope inputs and outputs, checkpoint state, signal payloads, child and join
+results, the output, and a reconciliation's evidence, provider result and
+actor. It is kept exactly as long as the run is retained, and erased with
+it.
+
+`journal.Compact(ctx, before)` erases each completed run that finished
+strictly before the cutoff, unless `Config.Hold` keeps it (a panicking hold
+keeps it) or it finished less than `Config.MinRetention` ago (the cutoff is
+clamped to `now − MinRetention`, as `audit.Prune` does). Failed, canceled,
+uncertain and active runs are never compacted. For each erased run, in one
+transaction:
+
+1. Each reconciliation of the run whose audit record is missing (it
+   predates audit) gets that record first, under the system tenant `""`,
+   since the actor it needs is about to be erased. Without an audit
+   journal composed nothing is written, and `Verify` reports the decision as
+   it reports any pre-audit decision (#284).
+2. Each reconciliation keeps its operation key, run id, state, creation
+   time, `evidence_digest` and `result_digest` (the digests its audit
+   record carries) and gains `erased_at`; actor, evidence and result are
+   erased. The row stays, so `audit.Verify`'s cross-check still knows the
+   decision existed, and the record's digests stay comparable to it.
+3. Attempts, then operations, then waits, signals, checkpoints, scopes,
+   children and joins are deleted, then the run. The children-first order
+   is what origin/main lacked: a reconciliation, a checkpoint or a scope
+   made every compaction that reached such a run fail on a foreign key, so
+   it could never be compacted. `journal_reconciliations` no longer has a
+   foreign key to its operation, because the decision outlives it.
+4. A tombstone (`journal_compacted`) is left: run id, `request_digest`,
+   artifact, `input_digest`, `output_digest`, state, `completed_at`,
+   `compacted_at`. It proves the run existed and ended (`ActiveRuns` reads
+   it, so the run's audit records become prunable) and holds no content. The
+   request key is digested because it is application-chosen and may carry
+   personal data, as audit prune tombstones digest record ids.
+
+A re-delivered reconciliation whose run was compacted is a duplicate that
+returns `Duplicate` and `Erased` with the operation key and state only:
+erased content is never returned again, to any caller or tenant. Before
+erasure a duplicate still returns the stored evidence and result; who may
+receive them is #286's decision, which this one does not change.
+
+**Bytes, not just rows.** Deleting a row only hides it. The SQLite backend
+therefore opens every pooled connection with `secure_delete=ON` (ADR 0003),
+which overwrites deleted content with zeros in the page, in freed cell
+space and on freed and overflow pages. The write-ahead log still holds
+older copies of every page written since it was last reset, so `Compact`
+then calls the store's optional `store.Purger.PurgeLog`
+(`PRAGMA wal_checkpoint(TRUNCATE)`) and reports `LogPurged`. A reader's
+open snapshot keeps the log in use: the purge then waits up to the busy
+timeout and reports `LogPurged = false`, and the content stays in the log
+until a later `PurgeLog` succeeds. Applications that must prove erasure
+check `LogPurged` or call `PurgeLog` themselves.
+
+**Upgrading.** Opening a journal written before #281 migrates it inside the
+schema transaction, so a crash leaves the old journal intact and the next
+open migrates (shown with a killed process). Legacy tombstones
+(`journal_audit`, which kept the output and request key) are rewritten as
+digest-only tombstones (their unknown `input_digest` stays empty and
+`compacted_at` 0) and the table is dropped. Legacy reconciliations are
+rebuilt with their run id and digests, keeping their content while their run
+is retained; one whose operation is gone is erased. Reopening a migrated
+journal changes nothing. Content that origin/main deleted before secure
+deletion existed stays in the file's free space, beyond the reach of any
+row; one `store.Purger.PurgeFree` (`VACUUM`, then the log purge) removes it.
+It rewrites the whole database, so it is the operator's explicit step after
+upgrading, not part of opening.
+
+**Backup and restore.** A backup is a copy, and erasure cannot reach a copy
+it does not hold. What is guaranteed:
+
+- A backup taken after a compaction holds none of the erased content
+  (`Backup` writes a fresh file with `VACUUM INTO`: no free space, no log),
+  and restoring it verifies.
+- A backup taken before a compaction still holds the content. **Restoring
+  it re-imports content that was erased after it was taken.** Nothing in
+  the backup can know about a later erasure. What is guaranteed is that
+  erasure is a function of the policy, not a remembered list: the next
+  `Compact` with the same cutoff, hold and minimum erases again everything
+  it erased before, and `audit.Verify` passes before and after.
+- Applications with an erasure obligation therefore run `Compact` (and
+  check `LogPurged`) on every restored database before serving it, and keep
+  backups no longer than their erasure deadline allows. Erasing content
+  inside an existing backup file is outside the framework.
+
 ## Compatibility
 
 Pre-alpha. Classified per surface:
@@ -272,6 +365,30 @@ Pre-alpha. Classified per surface:
   `journal.Config.Hold`, `journal.CompactionReport.HeldRuns`,
   `agent.ErrSensitiveListing`. New tables are created on open; no existing
   table changes. The `inspection/v1` wire shape is unchanged.
+
+Erasure (#281), classified separately:
+
+- **Behaviour change, with data migration**: opening a journal rewrites
+  `journal_audit` into `journal_compacted` and drops it, and rebuilds
+  `journal_reconciliations` without its foreign key, adding `run_id`,
+  `evidence_digest`, `result_digest` and `erased_at` (`evidence` and
+  `result_json` become nullable). Both happen in the schema transaction,
+  once, and are not reversible: an older binary does not understand the
+  new tables (it recreates an empty `journal_audit` and would write content
+  into it again), so downgrade by restoring a pre-upgrade backup.
+- **Behaviour change**: `Compact` now also deletes a run's waits, signals,
+  checkpoints, scopes, children and joins, erases its reconciliations'
+  content, and compacts runs it used to fail on; it purges the store's log
+  afterwards. A duplicate reconciliation of a compacted run returns empty
+  actor, evidence and result with `Erased`. The SQLite backend deletes
+  securely on every connection (ADR 0003).
+- **Breaking (internal package)**: `journal.CompactionReport.RetainedAudit`
+  is `Tombstones` and `Journal.AuditCount` is `TombstoneCount`; neither is
+  public API.
+- **Additive**: `journal.Config.MinRetention`,
+  `CompactionReport.ErasedReconciliations` and `LogPurged`,
+  `Reconciliation.Erased`, and the optional `store.Purger` capability
+  (`PurgeLog`, `PurgeFree`, `store.PurgerOf`).
 
 ## Evidence
 
@@ -311,6 +428,20 @@ Pre-alpha. Classified per surface:
   projection size gate (`inspect/bound_internal_test.go`).
 - 52 deliberate mutations, each shown red; commands and results are in the
   PR.
+- Erasure (#281), against real SQLite files: `contract/audit/erasure_test.go`
+  (a compacted run, a reconciled run, legal hold, and restore of backups
+  taken before and after erasure, each byte-searching the database file,
+  its log and its shared-memory index for distinct synthetic markers, with
+  `Verify` passing), `erasure_migration_test.go` (a journal written by
+  origin/main at `ea3eec6`,
+  `testdata/restore/erasure-281/legacy-main-ea3eec6.db.gz`, migrated,
+  reopened unchanged, and killed inside the migration transaction),
+  `erasure_limits_test.go` (legal minimum, the legacy free-space residue
+  and `PurgeFree`, a reader blocking the log purge, the pre-audit record
+  backfill), and `store/sqlite/erasure_test.go` (secure deletion on every
+  pooled connection, a control without it that keeps the content, purge
+  refusing beside a reader). The tests are red on origin/main; mutations
+  are listed in the PR.
 
 ## Limits
 
@@ -323,11 +454,22 @@ Pre-alpha. Classified per surface:
   reported by `Verify` as `ErrMismatch`, not as legacy; an audit start
   marker is
   [#284](https://github.com/well-prado/new-blok/issues/284).
-- Retention and erasure of durable state are [#281](https://github.com/well-prado/new-blok/issues/281): the compaction tombstone
-  (`journal_audit`, #49) still stores a compacted run's output, and
-  reconciliation evidence text is kept forever in `journal_reconciliations`,
-  and `Compact` can fail on a reconciled run's foreign key.
-  Neither is this audit contract, and no read API exposes them.
+- Erasure (§7) is retention-driven only: there is no API to erase one
+  run or one subject's runs on request before their cutoff. Failed,
+  canceled and uncertain runs are never compacted, so their content is kept
+  until the application deletes it.
+- Erasure stops at SQLite's files. The filesystem, an SSD's remapped
+  blocks, VACUUM's temporary file, OS caches, copies an application made
+  and backups taken before an erasure are outside it (§7). Compaction runs
+  in one transaction however many runs it erases.
+- An erased reconciliation keeps its operation key, run id, state, time
+  and digests forever, and its audit record keeps the actor until the
+  record is pruned. A digest of low-entropy content (a short result such
+  as `{"ok":true}`) can be confirmed by guessing; digests are
+  pseudonymous, not anonymous.
+- Secure deletion costs extra writes on every delete and update in the
+  shared database (journal, audit, worker queue, cron, approvals); the
+  cost was not measured.
 - Prune tombstones (`audit_pruned_v1`) keep a pruned record's id digest
   and kind forever, so Verify can tell pruned from missing.
 - No hash chain or external anchoring of audit records.

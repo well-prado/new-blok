@@ -131,6 +131,31 @@ func BusyTimeoutOf(database Database) (time.Duration, bool) {
 	return timeout, timeout > 0
 }
 
+// Purger is an optional Database capability for erasure (#281). Deleting a
+// row removes it from queries; these remove what deletion leaves behind in
+// the database's own files. A backend that zeroes deleted content as it
+// deletes (SQLite's secure_delete) still keeps older copies of a page in its
+// write-ahead log until the log is truncated, and a database written before
+// that setting was on keeps deleted content in its free space.
+type Purger interface {
+	// PurgeLog writes the write-ahead log back into the database and
+	// truncates it, so no older copy of a page survives there. It fails with
+	// ErrBusy, having truncated nothing, while a reader's snapshot still
+	// needs the log; retry it later.
+	PurgeLog(context.Context) error
+	// PurgeFree rebuilds the database without free pages or free space and
+	// then purges the log, so content deleted before deletion zeroed it is
+	// gone too. It rewrites the whole database and needs free disk space of
+	// its size.
+	PurgeFree(context.Context) error
+}
+
+// PurgerOf reports a database's purge capability when it has one.
+func PurgerOf(database Database) (Purger, bool) {
+	purger, ok := database.(Purger)
+	return purger, ok
+}
+
 // WithWriteDomain annotates err with the write domain it concerns, typically
 // the domain whose write lock a transaction waited for before failing with
 // ErrBusy. The result matches everything err matches. A nil err or domain

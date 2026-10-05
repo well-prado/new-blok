@@ -36,6 +36,10 @@ func busy(err error, domain *store.WriteDomain) error {
 const (
 	journalMode = "WAL"
 	synchronous = "FULL"
+	// secureDelete is set on every pooled connection: SQLite then overwrites
+	// deleted content with zeros, in the page and on freed pages, instead of
+	// leaving it readable in the file until the space is reused (#281).
+	secureDelete = "secure_delete(ON)"
 	// defaultBusyTimeout bounds how long a writer waits for the write lock,
 	// in the writer queue and in SQLite's busy handler, before ErrBusy.
 	defaultBusyTimeout = 5 * time.Second
@@ -56,7 +60,10 @@ type Backend struct {
 	BusyTimeout time.Duration
 }
 
-var _ store.Backend = Backend{}
+var (
+	_ store.Backend = Backend{}
+	_ store.Purger  = (*connection)(nil)
+)
 
 func (b Backend) busyTimeout() time.Duration {
 	if b.BusyTimeout > 0 {
@@ -116,12 +123,12 @@ func configure(ctx context.Context, database *sql.DB, timeout time.Duration) err
 // so each handle shares the database and participates in one writer domain.
 func dsn(path string, timeout time.Duration) string {
 	if path == ":memory:" {
-		return fmt.Sprintf("file:/new-blok-memory?vfs=memdb&_busy_timeout=%d&_journal_mode=MEMORY&_synchronous=FULL&_foreign_keys=ON", timeout.Milliseconds())
+		return fmt.Sprintf("file:/new-blok-memory?vfs=memdb&_busy_timeout=%d&_journal_mode=MEMORY&_synchronous=FULL&_foreign_keys=ON&_pragma=%s", timeout.Milliseconds(), secureDelete)
 	}
 	return (&url.URL{
 		Scheme:   "file",
 		Path:     uriPath(path),
-		RawQuery: fmt.Sprintf("_busy_timeout=%d&_journal_mode=WAL&_synchronous=FULL&_foreign_keys=ON", timeout.Milliseconds()),
+		RawQuery: fmt.Sprintf("_busy_timeout=%d&_journal_mode=WAL&_synchronous=FULL&_foreign_keys=ON&_pragma=%s", timeout.Milliseconds(), secureDelete),
 	}).String()
 }
 
@@ -264,6 +271,44 @@ func (c *connection) Backup(ctx context.Context, destination string) error {
 		return fmt.Errorf("sqlite: backup: %w", err)
 	}
 	return nil
+}
+
+// PurgeLog checkpoints the write-ahead log into the database and truncates
+// it (#281). It takes this handle's writer turn, so marked writers on the
+// handle are not starved by it; it fails with store.ErrBusy when a reader
+// on any handle still needs the log, after SQLite's busy timeout.
+func (c *connection) PurgeLog(ctx context.Context) error {
+	release, err := c.queueWriter(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return c.purgeLog(ctx)
+}
+
+func (c *connection) purgeLog(ctx context.Context) error {
+	var blocked, frames, copied int
+	if err := c.database.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&blocked, &frames, &copied); err != nil {
+		return busy(fmt.Errorf("sqlite: purge log: %w", err), c.writeDomain)
+	}
+	if blocked != 0 {
+		return store.WithWriteDomain(fmt.Errorf("sqlite: purge log: %w: a reader still uses the log", store.ErrBusy), c.writeDomain)
+	}
+	return nil
+}
+
+// PurgeFree rebuilds the database with VACUUM, which leaves no free page and
+// no free space holding deleted content, then purges the log (#281).
+func (c *connection) PurgeFree(ctx context.Context) error {
+	release, err := c.queueWriter(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if _, err := c.database.ExecContext(ctx, "VACUUM"); err != nil {
+		return busy(fmt.Errorf("sqlite: purge free space: %w", err), c.writeDomain)
+	}
+	return c.purgeLog(ctx)
 }
 
 func (c *connection) Integrity(ctx context.Context) error {
