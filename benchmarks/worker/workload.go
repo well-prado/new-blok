@@ -51,20 +51,68 @@ var ReceiptSchema = []byte(`{"type":"object","properties":{"orderId":{"type":"st
 
 // Provider is an actual bounded HTTP endpoint with observed requests and effects.
 // Uncertain deliberately commits the effect then drops the HTTP response.
+//
+// Two modes hold a request at a barrier instead of sleeping for a fixed time,
+// so a test can act inside the window however slow the machine is:
+//   - "delay" parks the request BEFORE the effect is committed;
+//   - "late" commits the effect, then parks BEFORE the response is written.
+//
+// A parked request resumes only when Release is called. If its caller goes away
+// first (the worker is killed, the context is canceled) or the provider is
+// closed, the request is abandoned and never proceeds. Abandoned reports it.
 type Provider struct {
-	Server    *httptest.Server
-	mu        sync.Mutex
-	requests  int
-	effects   map[string]Paid
-	committed chan string
+	Server      *httptest.Server
+	mu          sync.Mutex
+	requests    int
+	effects     map[string]Paid
+	committed   chan string
+	held        chan string
+	abandoned   chan string
+	release     chan struct{}
+	closing     chan struct{}
+	releaseOnce sync.Once
+	closeOnce   sync.Once
 }
 
 func NewProvider() *Provider {
-	p := &Provider{effects: make(map[string]Paid), committed: make(chan string, 1024)}
+	p := &Provider{effects: make(map[string]Paid), committed: make(chan string, 1024), held: make(chan string, 1024), abandoned: make(chan string, 1024), release: make(chan struct{}), closing: make(chan struct{})}
 	p.Server = httptest.NewServer(http.HandlerFunc(p.serve))
 	return p
 }
-func (p *Provider) Close() { p.Server.Close() }
+
+// Close unblocks any parked request, then stops the server.
+func (p *Provider) Close() {
+	p.closeOnce.Do(func() { close(p.closing) })
+	p.Server.Close()
+}
+
+// Release lets every parked and future "delay"/"late" request continue. It is
+// idempotent. Tests that kill or cancel the caller never need it.
+func (p *Provider) Release() { p.releaseOnce.Do(func() { close(p.release) }) }
+
+// Held yields the order ID of each "delay" request that is parked before its
+// effect. The request has been counted; no effect exists yet.
+func (p *Provider) Held() <-chan string { return p.held }
+
+// Abandoned yields the order ID of each parked request whose caller went away
+// (or whose provider closed) before Release: it never committed or answered.
+func (p *Provider) Abandoned() <-chan string { return p.abandoned }
+
+// park blocks until Release, reporting true, or until the request is abandoned,
+// reporting false.
+func (p *Provider) park(r *http.Request, id string) bool {
+	select {
+	case <-p.release:
+		return true
+	case <-r.Context().Done():
+	case <-p.closing:
+	}
+	select {
+	case p.abandoned <- id:
+	default:
+	}
+	return false
+}
 func (p *Provider) Counts() (requests, effects int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -102,9 +150,11 @@ func (p *Provider) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	if input.Mode == "delay" {
 		select {
-		case <-r.Context().Done():
+		case p.held <- input.OrderID:
+		default:
+		}
+		if !p.park(r, input.OrderID) {
 			return
-		case <-time.After(100 * time.Millisecond):
 		}
 	}
 	paid := Paid{OrderID: input.OrderID, TotalCents: input.TotalCents, ReceiptID: "receipt-" + input.OrderID}
@@ -131,8 +181,8 @@ func (p *Provider) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if input.Mode == "late" {
-		time.Sleep(100 * time.Millisecond)
+	if input.Mode == "late" && !p.park(r, input.OrderID) {
+		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(paid)
