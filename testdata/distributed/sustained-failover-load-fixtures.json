@@ -1,5 +1,5 @@
 {
-  "fixtureVersion": 1,
+  "fixtureVersion": 2,
   "synthetic": true,
   "name": "sustained-concurrent-load-with-worker-kill",
   "limits": {
@@ -29,7 +29,7 @@
     "unexpectedIngressErrors": 0,
     "spuriousAdmissionFull": 0,
     "killedWorkerOwnedFairnessPartition": true,
-    "minCompletedRuns": 50,
+    "minTerminalFractionAtIngressEnd": 0.5,
     "minSteadyToNoisyCompletionRatio": 0.5
   }
 }

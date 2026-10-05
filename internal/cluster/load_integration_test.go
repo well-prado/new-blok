@@ -172,7 +172,7 @@ type sustainedLoadFixture struct {
 		UnexpectedIngressErrors        int     `json:"unexpectedIngressErrors"`
 		SpuriousAdmissionFull          int     `json:"spuriousAdmissionFull"`
 		KilledWorkerOwnedFairness      bool    `json:"killedWorkerOwnedFairnessPartition"`
-		MinCompletedRuns               int     `json:"minCompletedRuns"`
+		MinTerminalFractionAtIngress   float64 `json:"minTerminalFractionAtIngressEnd"`
 		MinSteadyToNoisyCompletionRate float64 `json:"minSteadyToNoisyCompletionRatio"`
 	} `json:"expected"`
 }
@@ -330,7 +330,9 @@ func TestSustainedLoadFailoverWithWorkerKill(t *testing.T) {
 			}
 			close(start)
 			group.Wait()
-			if err := waitContext(ctx, time.Duration(fixture.BurstEveryMillis)*time.Millisecond); err != nil {
+			// Never wait past the ingress deadline: throughput is measured
+			// the moment ingress stops.
+			if err := waitContext(ctx, min(time.Duration(fixture.BurstEveryMillis)*time.Millisecond, time.Until(deadline))); err != nil {
 				return
 			}
 		}
@@ -384,6 +386,28 @@ func TestSustainedLoadFailoverWithWorkerKill(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	submitters.Wait()
+	// Throughput floor. After the drain below every accepted run is terminal
+	// however slowly the workers ran, so the final count cannot show a
+	// slowdown. Measure instead, the moment ingress stops, how many accepted
+	// runs had already left their admission slot (reached a terminal state).
+	// Admission is bounded by tenant and partition slots, so if completion
+	// slows, the slots stay full and accepted runs pile up unfinished.
+	mu.Lock()
+	acceptedAtIngressEnd := len(accepted)
+	mu.Unlock()
+	activeAtIngressEnd := 0
+	for partition := 0; partition < limits.Partitions; partition++ {
+		active, err := store.ListActiveRunIDs(ctx, fmt.Sprintf("p-%04d", partition), limits.PartitionAdmissions)
+		if err != nil {
+			t.Fatal(err)
+		}
+		activeAtIngressEnd += len(active)
+	}
+	terminalAtIngressEnd := acceptedAtIngressEnd - activeAtIngressEnd
+	terminalFraction := 0.0
+	if acceptedAtIngressEnd > 0 {
+		terminalFraction = float64(terminalAtIngressEnd) / float64(acceptedAtIngressEnd)
+	}
 
 	drainDeadline := time.Now().Add(time.Duration(fixture.DrainTimeoutSeconds) * time.Second)
 	for {
@@ -482,6 +506,7 @@ func TestSustainedLoadFailoverWithWorkerKill(t *testing.T) {
 		fixture.Workers, fixture.IngressClients, len(accepted), states, totalEffects, states["completed"], uncertainWithEffect, sumCounts(full), len(spuriousFull), len(unexpected), takeover.Round(time.Millisecond), victim.id)
 	t.Logf("burst partition %s: %d distinct tenants per burst every %dms: outcomes=%v", burstPartition, fixture.BurstTenants, fixture.BurstEveryMillis, burstOutcomes)
 	t.Logf("contended partition %s: completions=%v admission-full=%v steady/noisy ratio=%.2f", fairnessPartition, contendedCompletions, contendedFull, ratio)
+	t.Logf("at ingress end: accepted=%d still-active=%d terminal=%d (%.0f%% of accepted; fixture min %.0f%%)", acceptedAtIngressEnd, activeAtIngressEnd, terminalAtIngressEnd, 100*terminalFraction, 100*fixture.Expected.MinTerminalFractionAtIngress)
 	if len(spuriousFull) != fixture.Expected.SpuriousAdmissionFull {
 		t.Errorf("admission_full without an exhausted-capacity read=%d (first: %v), fixture %d", len(spuriousFull), spuriousFull[:min(3, len(spuriousFull))], fixture.Expected.SpuriousAdmissionFull)
 	}
@@ -497,8 +522,11 @@ func TestSustainedLoadFailoverWithWorkerKill(t *testing.T) {
 	if !fixture.Expected.KilledWorkerOwnedFairness || takeover == 0 {
 		t.Errorf("no successor took the killed worker's partition")
 	}
-	if states["completed"] < fixture.Expected.MinCompletedRuns || ratio < fixture.Expected.MinSteadyToNoisyCompletionRate {
-		t.Errorf("completed=%d steady/noisy ratio=%.2f; fixture min %d / %.2f", states["completed"], ratio, fixture.Expected.MinCompletedRuns, fixture.Expected.MinSteadyToNoisyCompletionRate)
+	if terminalFraction < fixture.Expected.MinTerminalFractionAtIngress {
+		t.Errorf("throughput floor: %d of %d accepted runs (%.0f%%) were terminal when ingress stopped; fixture min %.0f%%", terminalAtIngressEnd, acceptedAtIngressEnd, 100*terminalFraction, 100*fixture.Expected.MinTerminalFractionAtIngress)
+	}
+	if ratio < fixture.Expected.MinSteadyToNoisyCompletionRate {
+		t.Errorf("steady/noisy ratio=%.2f; fixture min %.2f", ratio, fixture.Expected.MinSteadyToNoisyCompletionRate)
 	}
 }
 
@@ -510,40 +538,161 @@ func sumCounts(values map[string]int) int {
 	return total
 }
 
-// TestWorkerReleasesPartitionAfterProcessingError runs a worker whose
-// registered artifact does not match an accepted run, a deterministic
-// processing error. A healthy worker must take the partition over promptly
-// instead of waiting for the faulty worker's lease to expire, and the faulty
-// worker must back off rather than flap on the partition.
-func TestWorkerReleasesPartitionAfterProcessingError(t *testing.T) {
-	var fixture struct {
-		FixtureVersion int    `json:"fixtureVersion"`
-		Synthetic      bool   `json:"synthetic"`
-		Name           string `json:"name"`
-		Limits         struct {
-			Partitions          int `json:"partitions"`
-			PartitionAdmissions int `json:"partitionAdmissions"`
-			TenantAdmissions    int `json:"tenantAdmissions"`
-			OwnerTTLMillis      int `json:"ownerTTLMillis"`
-		} `json:"limits"`
-		Expected struct {
-			FaultyOwnedFirst       bool    `json:"faultyWorkerOwnedFirst"`
-			MaxHandoverMillis      int     `json:"maxHandoverMillis"`
-			FinalState             string  `json:"finalState"`
-			ExternalEffects        int     `json:"externalEffects"`
-			MaxFaultyAcquisitionsS float64 `json:"maxFaultyAcquisitionsPerSecond"`
-		} `json:"expected"`
-	}
-	readDistributedFixture(t, "worker-error-release-fixtures.json", &fixture)
-	limits := Limits{Partitions: fixture.Limits.Partitions, PartitionAdmissions: fixture.Limits.PartitionAdmissions, TenantAdmissions: fixture.Limits.TenantAdmissions, OwnerTTL: time.Duration(fixture.Limits.OwnerTTLMillis) * time.Millisecond}
-	ledger := effectLedger(filepath.Join(t.TempDir(), "ledger"))
-	store := integrationDistributedStore(t)
-	healthy := newCountedEffectRuntime(t, integrationDistributedStore(t), ledger, limits)
-	faultyClient := &hookedClient{Client: integrationClient(t)}
-	faulty := newCountedEffectRuntime(t, integrationStoreFor(t, faultyClient), ledger, limits)
+type workerErrorLimits struct {
+	Partitions          int `json:"partitions"`
+	PartitionAdmissions int `json:"partitionAdmissions"`
+	TenantAdmissions    int `json:"tenantAdmissions"`
+	OwnerTTLMillis      int `json:"ownerTTLMillis"`
+}
+
+func (l workerErrorLimits) limits() Limits {
+	return Limits{Partitions: l.Partitions, PartitionAdmissions: l.PartitionAdmissions, TenantAdmissions: l.TenantAdmissions, OwnerTTL: time.Duration(l.OwnerTTLMillis) * time.Millisecond}
+}
+
+// newFaultyWorker returns a runtime whose registered artifact for
+// "acceptance-effect" does not match the one admission records: every attempt
+// to process such a run fails deterministically. Its etcd client records each
+// lease grant and each successful partition acquisition.
+func newFaultyWorker(t *testing.T, ledger effectLedger, limits Limits) (*Runtime, *hookedClient) {
+	t.Helper()
+	client := &hookedClient{Client: integrationClient(t)}
+	faulty := newCountedEffectRuntime(t, integrationStoreFor(t, client), ledger, limits)
 	mismatched := faulty.workflows["acceptance-effect"]
 	mismatched.Program.Digest = "sha256:" + strings.Repeat("9", 64)
 	faulty.workflows["acceptance-effect"] = mismatched
+	return faulty, client
+}
+
+func waitForAcquisitions(ctx context.Context, client *hookedClient, count int, timeout time.Duration) []time.Time {
+	deadline := time.Now().Add(timeout)
+	for {
+		acquired := client.acquisitions()
+		if len(acquired) >= count || time.Now().After(deadline) || ctx.Err() != nil {
+			return acquired
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestFaultyWorkerAloneBacksOffExponentially runs a worker whose registered
+// artifact does not match an accepted run, with no other worker present, so
+// nothing else ever takes the partition. After each processing error the
+// worker releases the partition and waits before acquiring it again; that wait
+// must double from 500ms up to min(16s, OwnerTTL). The owner TTL is the
+// runtime's own knob for the cap, so a 4s TTL brings the cap within reach of
+// a test: the gaps between successive acquisitions must be at least 0.5s, 1s,
+// 2s, 4s, 4s, and never exceed the cap by more than a scheduling slack. A flat
+// retry interval, a backoff that does not grow, or one that ignores the TTL
+// cap each fails this test.
+func TestFaultyWorkerAloneBacksOffExponentially(t *testing.T) {
+	var fixture struct {
+		FixtureVersion   int               `json:"fixtureVersion"`
+		Synthetic        bool              `json:"synthetic"`
+		Name             string            `json:"name"`
+		Limits           workerErrorLimits `json:"limits"`
+		MaxObserveMillis int               `json:"maxObserveMillis"`
+		Expected         struct {
+			BackoffCapMillis int    `json:"backoffCapMillis"`
+			MinGapsMillis    []int  `json:"minAcquisitionGapsMillis"`
+			GapSlackMillis   int    `json:"gapSlackMillis"`
+			FinalState       string `json:"finalState"`
+			ExternalEffects  int    `json:"externalEffects"`
+		} `json:"expected"`
+	}
+	readDistributedFixture(t, "worker-error-backoff-fixtures.json", &fixture)
+	limits := fixture.Limits.limits()
+	if want := min(16*time.Second, limits.OwnerTTL); time.Duration(fixture.Expected.BackoffCapMillis)*time.Millisecond != want {
+		t.Fatalf("fixture backoff cap %dms, but min(16s, OwnerTTL %s) is %s", fixture.Expected.BackoffCapMillis, limits.OwnerTTL, want)
+	}
+	ledger := effectLedger(filepath.Join(t.TempDir(), "ledger"))
+	admitter := newCountedEffectRuntime(t, integrationDistributedStore(t), ledger, limits)
+	faulty, faultyClient := newFaultyWorker(t, ledger, limits)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(fixture.MaxObserveMillis)*time.Millisecond+30*time.Second)
+	defer cancel()
+	if err := admitter.Check(ctx); err != nil {
+		t.Fatal(err)
+	}
+	const partition = "p-0000"
+	tenant := tenantsInPartition(admitter, partition, "worker-backoff", 1)[0]
+	admission, err := admitter.Admit(ctx, Submission{Tenant: tenant, RequestKey: "worker-backoff", Workflow: "acceptance-effect", Input: json.RawMessage(`{"value":1}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	faultyCtx, stopFaulty := context.WithCancel(ctx)
+	faultyDone := make(chan error, 1)
+	go func() { faultyDone <- faulty.Run(faultyCtx, "faulty-worker") }()
+	acquired := waitForAcquisitions(ctx, faultyClient, len(fixture.Expected.MinGapsMillis)+1, time.Duration(fixture.MaxObserveMillis)*time.Millisecond)
+	stopFaulty()
+	if err := <-faultyDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("faulty Run=%v, want it to keep retrying until stopped", err)
+	}
+	final, err := admitter.GetRun(ctx, tenant, admission.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gaps := make([]time.Duration, 0, len(acquired))
+	for index := 1; index < len(acquired); index++ {
+		gaps = append(gaps, acquired[index].Sub(acquired[index-1]))
+	}
+	rounded := make([]string, len(gaps))
+	for index, gap := range gaps {
+		rounded[index] = gap.Round(time.Millisecond).String()
+	}
+	elapsed := time.Duration(0)
+	if len(acquired) > 1 {
+		elapsed = acquired[len(acquired)-1].Sub(acquired[0])
+	}
+	t.Logf("faulty worker alone (owner TTL %s, backoff cap %dms): %d acquisitions, %d lease grants over %s; gaps=%v; state=%s effects=%d", limits.OwnerTTL, fixture.Expected.BackoffCapMillis, len(acquired), faultyClient.grant.Load(), elapsed.Round(time.Millisecond), rounded, final.State, ledger.total("effect"))
+	if len(gaps) != len(fixture.Expected.MinGapsMillis) {
+		t.Fatalf("observed %d acquisition gaps in %dms, fixture expects %d", len(gaps), fixture.MaxObserveMillis, len(fixture.Expected.MinGapsMillis))
+	}
+	slack := time.Duration(fixture.Expected.GapSlackMillis) * time.Millisecond
+	for index, gap := range gaps {
+		floor := time.Duration(fixture.Expected.MinGapsMillis[index]) * time.Millisecond
+		if gap < floor || gap > floor+slack {
+			t.Errorf("acquisition gap %d = %s, fixture wants [%s, %s] (backoff doubling from 500ms, capped at %dms)", index+1, gap.Round(time.Millisecond), floor, floor+slack, fixture.Expected.BackoffCapMillis)
+		}
+	}
+	if final.State != fixture.Expected.FinalState || ledger.total("effect") != fixture.Expected.ExternalEffects {
+		t.Errorf("state=%s effects=%d; fixture %s/%d (a faulty worker must never run the mismatched artifact)", final.State, ledger.total("effect"), fixture.Expected.FinalState, fixture.Expected.ExternalEffects)
+	}
+}
+
+// TestWorkerReleasesPartitionAfterProcessingError runs a worker whose
+// registered artifact does not match an accepted run, a deterministic
+// processing error. A healthy worker must take the partition over promptly
+// instead of waiting for the faulty worker's lease to expire. The faulty
+// worker's backoff is measured alone by
+// TestFaultyWorkerAloneBacksOffExponentially. Here, from the handover start
+// until a fixed time after the healthy worker took over, the faulty worker
+// (now a standby) must never request lease grants faster than one per
+// acquireRetryInterval, the minimum every retry path in runPartition waits.
+func TestWorkerReleasesPartitionAfterProcessingError(t *testing.T) {
+	var fixture struct {
+		FixtureVersion int               `json:"fixtureVersion"`
+		Synthetic      bool              `json:"synthetic"`
+		Name           string            `json:"name"`
+		Limits         workerErrorLimits `json:"limits"`
+		// ObserveAfterHandoverMillis keeps counting the faulty worker's
+		// lease grants for this long after the healthy worker took over.
+		ObserveAfterHandoverMillis int `json:"observeAfterHandoverMillis"`
+		Expected                   struct {
+			FaultyOwnedFirst            bool   `json:"faultyWorkerOwnedFirst"`
+			MaxHandoverMillis           int    `json:"maxHandoverMillis"`
+			FinalState                  string `json:"finalState"`
+			ExternalEffects             int    `json:"externalEffects"`
+			MinFaultyGrantSpacingMillis int    `json:"minFaultyGrantSpacingMillis"`
+		} `json:"expected"`
+	}
+	readDistributedFixture(t, "worker-error-release-fixtures.json", &fixture)
+	spacing := time.Duration(fixture.Expected.MinFaultyGrantSpacingMillis) * time.Millisecond
+	if spacing != acquireRetryInterval {
+		t.Fatalf("fixture grant spacing %s, acquireRetryInterval %s", spacing, acquireRetryInterval)
+	}
+	limits := fixture.Limits.limits()
+	ledger := effectLedger(filepath.Join(t.TempDir(), "ledger"))
+	healthy := newCountedEffectRuntime(t, integrationDistributedStore(t), ledger, limits)
+	faulty, faultyClient := newFaultyWorker(t, ledger, limits)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	if err := healthy.Check(ctx); err != nil {
@@ -562,13 +711,10 @@ func TestWorkerReleasesPartitionAfterProcessingError(t *testing.T) {
 		stopFaulty()
 		<-faultyDone
 	}()
-	ownedFirst := false
-	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
-		if owner, err := store.CurrentOwner(ctx, partition); err == nil && owner.ID == "faulty-worker" {
-			ownedFirst = true
-			break
-		}
-	}
+	// The faulty worker's acquisition is read from the transaction that wrote
+	// the owner key: it releases within milliseconds of its error, so polling
+	// the owner can miss that it ever held the partition.
+	ownedFirst := len(waitForAcquisitions(ctx, faultyClient, 1, 10*time.Second)) > 0
 	// Let the faulty worker hit its processing error at least once.
 	time.Sleep(300 * time.Millisecond)
 	grantsBefore := faultyClient.grant.Load()
@@ -589,9 +735,17 @@ func TestWorkerReleasesPartitionAfterProcessingError(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	handover := time.Since(started)
-	acquisitionRate := float64(faultyClient.grant.Load()-grantsBefore) / handover.Seconds()
-	t.Logf("faulty worker owned first=%v; healthy worker completed the run after %s (owner TTL %s); faulty lease grants during handover=%.1f/s state=%s effects=%d", ownedFirst, handover.Round(time.Millisecond), limits.OwnerTTL, acquisitionRate, final.State, ledger.total("effect"))
-	if ownedFirst != fixture.Expected.FaultyOwnedFirst || handover > time.Duration(fixture.Expected.MaxHandoverMillis)*time.Millisecond || final.State != fixture.Expected.FinalState || ledger.total("effect") != fixture.Expected.ExternalEffects || acquisitionRate > fixture.Expected.MaxFaultyAcquisitionsS {
-		t.Fatalf("ownedFirst=%v handover=%s state=%s effects=%d faultyGrants=%.1f/s; fixture %+v", ownedFirst, handover, final.State, ledger.total("effect"), acquisitionRate, fixture.Expected)
+	// Every retry path waits at least acquireRetryInterval between lease
+	// grants, so a window of length W holds at most W/interval+1 of them. A
+	// count, not a rate: one legitimate grant in a short window is within it.
+	// The window extends past the handover, because during a fast handover
+	// the faulty worker is still inside its first backoff and grants nothing.
+	time.Sleep(time.Duration(fixture.ObserveAfterHandoverMillis) * time.Millisecond)
+	window := time.Since(started)
+	grants := faultyClient.grant.Load() - grantsBefore
+	maxGrants := int64(window/spacing) + 1
+	t.Logf("faulty worker owned first=%v; healthy worker completed the run after %s (owner TTL %s); faulty lease grants over %s from handover start=%d (at most %d at one per %s) state=%s effects=%d", ownedFirst, handover.Round(time.Millisecond), limits.OwnerTTL, window.Round(time.Millisecond), grants, maxGrants, spacing, final.State, ledger.total("effect"))
+	if ownedFirst != fixture.Expected.FaultyOwnedFirst || handover > time.Duration(fixture.Expected.MaxHandoverMillis)*time.Millisecond || final.State != fixture.Expected.FinalState || ledger.total("effect") != fixture.Expected.ExternalEffects || grants > maxGrants {
+		t.Fatalf("ownedFirst=%v handover=%s state=%s effects=%d faultyGrants=%d (max %d); fixture %+v", ownedFirst, handover, final.State, ledger.total("effect"), grants, maxGrants, fixture.Expected)
 	}
 }
