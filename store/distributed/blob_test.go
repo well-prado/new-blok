@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"testing"
 	"time"
+
+	"github.com/well-prado/new-blok/internal/clustertest"
 )
 
 func TestS3BlobOutageBlocksReferenceAndResume(t *testing.T) {
@@ -16,6 +18,8 @@ func TestS3BlobOutageBlocksReferenceAndResume(t *testing.T) {
 	if endpoint == "" {
 		t.Skip("set BLOK_DISTRIBUTED_S3_ENDPOINT for the real S3-compatible object-store test")
 	}
+	// Wait for the cluster lock before this test's deadlines start.
+	clustertest.Endpoints(t)
 	bucket := fmt.Sprintf("blok-%d", time.Now().UnixNano())
 	blobs, err := NewS3BlobStore(endpoint, bucket, "spike-access", "spike-secret-only-local", false)
 	if err != nil {
@@ -103,6 +107,8 @@ func TestPartitionTakeoverKeepsTimerSignalAndBlobReferences(t *testing.T) {
 	if endpoint == "" {
 		t.Skip("set BLOK_DISTRIBUTED_S3_ENDPOINT for the real S3-compatible object-store test")
 	}
+	// Wait for the cluster lock before this test's deadlines start.
+	clustertest.Endpoints(t)
 	bucket := fmt.Sprintf("blok-%d", time.Now().UnixNano())
 	blobs, err := NewS3BlobStore(endpoint, bucket, "spike-access", "spike-secret-only-local", false)
 	if err != nil {

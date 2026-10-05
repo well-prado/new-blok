@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/well-prado/new-blok/contract"
+	"github.com/well-prado/new-blok/internal/clustertest"
 	"github.com/well-prado/new-blok/internal/engine"
 	"github.com/well-prado/new-blok/node"
 	"github.com/well-prado/new-blok/store/distributed"
@@ -417,7 +418,7 @@ func TestOwnerFaultsAroundEveryStepTransition(t *testing.T) {
 					helperEndpoints := strings.Join(endpoints, ",")
 					helperDir := dir
 					if fault == "partition" {
-						voters := integrationEtcdVoters()
+						voters := clustertest.Voters()
 						internal := make([]string, len(voters))
 						for index, voter := range voters {
 							internal[index] = "http://" + voter + ":2379"

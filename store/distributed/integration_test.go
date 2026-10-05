@@ -19,6 +19,8 @@ import (
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
+
+	"github.com/well-prado/new-blok/internal/clustertest"
 )
 
 func TestDistributedCompetingOwnersAndExpiredOwnerAreFenced(t *testing.T) {
@@ -215,6 +217,8 @@ func sortedErrorLabels(observed map[string]struct{}) []string {
 }
 
 func TestReplicaPauseCatchupAndQuorumLoss(t *testing.T) {
+	// This test pauses voters: it runs alone on the shared cluster.
+	clustertest.Disrupt(t)
 	store, client := integrationStore(t, "BLOK_DISTRIBUTED_ENDPOINTS")
 	endpoints := strings.Split(os.Getenv("BLOK_DISTRIBUTED_ENDPOINTS"), ",")
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
@@ -338,6 +342,8 @@ func assertEventPayload(t *testing.T, encoded []byte, owner Owner, id, kind, exp
 }
 
 func TestNetworkPartitionedVoterAllowsMajorityCommitAndCatchesUp(t *testing.T) {
+	// This test partitions a voter: it runs alone on the shared cluster.
+	clustertest.Disrupt(t)
 	store, client := integrationStore(t, "BLOK_DISTRIBUTED_ENDPOINTS")
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
@@ -350,7 +356,7 @@ func TestNetworkPartitionedVoterAllowsMajorityCommitAndCatchesUp(t *testing.T) {
 	if network == "" {
 		network = "blok-distributed-spike"
 	}
-	voters := integrationEtcdVoters()
+	voters := clustertest.Voters()
 	voter := voters[2]
 	endpoints := strings.Split(os.Getenv("BLOK_DISTRIBUTED_ENDPOINTS"), ",")
 	if output, err := exec.Command("docker", "network", "disconnect", network, voter).CombinedOutput(); err != nil {
@@ -769,6 +775,9 @@ func integrationStore(t *testing.T, env string) (*Store, *clientv3.Client) {
 	if endpoints[0] == "" {
 		t.Skipf("set %s to run against the real three-member etcd cluster", env)
 	}
+	// Hold the shared cluster lock for the rest of t, so another package's
+	// disruptive test cannot pause voters mid-test (internal/clustertest).
+	clustertest.Hold(t, endpoints, clustertest.Shared)
 	client, err := clientv3.New(clientv3.Config{Endpoints: endpoints, DialTimeout: 2 * time.Second})
 	if err != nil {
 		t.Fatal(err)
@@ -787,14 +796,6 @@ func integrationStore(t *testing.T, env string) (*Store, *clientv3.Client) {
 		t.Fatal(err)
 	}
 	return store, client
-}
-
-func integrationEtcdVoters() []string {
-	voters := strings.Split(os.Getenv("BLOK_DISTRIBUTED_ETCD_VOTERS"), ",")
-	if len(voters) == 3 && voters[0] != "" && voters[1] != "" && voters[2] != "" {
-		return voters
-	}
-	return []string{"blok-distributed-spike-etcd1-1", "blok-distributed-spike-etcd2-1", "blok-distributed-spike-etcd3-1"}
 }
 
 func waitRead(ctx context.Context, client *clientv3.Client, endpoint, key string) error {
@@ -830,7 +831,7 @@ func composeArgs(args ...string) []string {
 	if len(args) > 1 && (os.Getenv("BLOK_DISTRIBUTED_ETCD_VOTERS") != "" || os.Getenv("BLOK_DISTRIBUTED_S3_CONTAINER") != "") {
 		services := map[string]string{}
 		if os.Getenv("BLOK_DISTRIBUTED_ETCD_VOTERS") != "" {
-			voters := integrationEtcdVoters()
+			voters := clustertest.Voters()
 			services["etcd1"], services["etcd2"], services["etcd3"] = voters[0], voters[1], voters[2]
 		}
 		if container := os.Getenv("BLOK_DISTRIBUTED_S3_CONTAINER"); container != "" {

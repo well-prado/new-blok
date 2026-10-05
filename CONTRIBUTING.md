@@ -10,6 +10,8 @@ go test -race ./...
 go build ./...
 ```
 
+The distributed tests run only when `BLOK_DISTRIBUTED_ENDPOINTS` (with `BLOK_DISTRIBUTED_ETCD_VOTERS`, `BLOK_DISTRIBUTED_ETCD_NETWORK` and `BLOK_DISTRIBUTED_S3_*`) names a real etcd cluster; plain `go test -race ./...` is safe with it set, because `internal/clustertest` gives every cluster test a shared lock and every test that pauses or partitions voters an exclusive one, across packages, keyed by the endpoints (no `-p=1` needed).
+
 Formatting follows `gofmt`. Focus tests on observable behavior, failure handling and contract boundaries. Durable execution changes require process-crash evidence; worker changes require cross-language conformance; performance changes require profiles and repeated measurements.
 
 Create a branch named `codex/<issue>-<description>` and one pull request per implementation issue. Describe the problem, resulting behavior, tests, compatibility impact, and limitations. Include the issue's required evidence. Keep its project status current. Never publish secrets or customer data.

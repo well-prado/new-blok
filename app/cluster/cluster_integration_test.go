@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -16,6 +15,7 @@ import (
 
 	"github.com/well-prado/new-blok/contract"
 	"github.com/well-prado/new-blok/internal/cluster"
+	"github.com/well-prado/new-blok/internal/clustertest"
 	"github.com/well-prado/new-blok/internal/engine"
 	"github.com/well-prado/new-blok/node"
 	"github.com/well-prado/new-blok/store/distributed"
@@ -32,6 +32,8 @@ type distributedHTTPOutput struct {
 }
 
 func TestDistributedHTTPAdmissionAndLifecycleWorker(t *testing.T) {
+	// Wait for the cluster lock before this test's deadlines start.
+	clustertest.Endpoints(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	store := namespacedDistributedStore(t)
@@ -122,10 +124,7 @@ func tenantForPartition(runtime *cluster.Runtime, partition string) string {
 // immutable runtime settings on the shared real cluster.
 func namespacedDistributedStore(t *testing.T) *distributed.Store {
 	t.Helper()
-	endpoints := strings.Split(os.Getenv("BLOK_DISTRIBUTED_ENDPOINTS"), ",")
-	if endpoints[0] == "" {
-		t.Skip("set BLOK_DISTRIBUTED_ENDPOINTS to run the app composition test against real etcd")
-	}
+	endpoints := clustertest.Endpoints(t)
 	client, err := clientv3.New(clientv3.Config{Endpoints: endpoints, DialTimeout: 2 * time.Second, DialKeepAliveTime: time.Second, DialKeepAliveTimeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
@@ -144,6 +143,8 @@ func namespacedDistributedStore(t *testing.T) *distributed.Store {
 }
 
 func TestDistributedHTTPStatusMappingForCapacityConflictAndOutage(t *testing.T) {
+	// This test pauses voters: it runs alone on the shared cluster.
+	clustertest.Disrupt(t)
 	var fixture struct {
 		Limits struct {
 			Partitions          int `json:"partitions"`
@@ -229,26 +230,7 @@ func TestDistributedHTTPStatusMappingForCapacityConflictAndOutage(t *testing.T) 
 		t.Fatalf("second tenant was blocked by the first tenant's backlog: status=%d body=%s", response.Code, response.Body.String())
 	}
 	outageTenant := tenantForPartition(runtime, "p-0001")
-	voters := strings.Split(os.Getenv("BLOK_DISTRIBUTED_ETCD_VOTERS"), ",")
-	if len(voters) != 3 || voters[0] == "" {
-		t.Fatal("BLOK_DISTRIBUTED_ETCD_VOTERS must name the three voter containers")
-	}
-	paused := make([]string, 0, 2)
-	restore := func() {
-		for index := len(paused) - 1; index >= 0; index-- {
-			if output, err := exec.Command("docker", "unpause", paused[index]).CombinedOutput(); err != nil {
-				t.Errorf("restore voter %s: %v: %s", paused[index], err, output)
-			}
-		}
-		paused = paused[:0]
-	}
-	t.Cleanup(restore)
-	for _, voter := range voters[1:] {
-		if output, err := exec.Command("docker", "pause", voter).CombinedOutput(); err != nil {
-			t.Fatalf("pause voter %s: %v: %s", voter, err, output)
-		}
-		paused = append(paused, voter)
-	}
+	restore := clustertest.PauseQuorum(t)
 	outageCtx, stop := context.WithTimeout(ctx, 3*time.Second)
 	outage := post(outageCtx, outageTenant, "during-outage", `{"value":1}`)
 	stop()
@@ -284,6 +266,8 @@ func TestDistributedHTTPStatusMappingForCapacityConflictAndOutage(t *testing.T) 
 // quorum. The late-signal record cannot be written, so the response must be
 // a retryable 503, and the same signal after recovery is recorded as late.
 func TestDistributedLateSignalDuringOutageIsRetryable(t *testing.T) {
+	// This test pauses voters: it runs alone on the shared cluster.
+	clustertest.Disrupt(t)
 	store := namespacedDistributedStore(t)
 	program := contract.InternalProgram{WorkflowID: "late-signal-fixture", Digest: "sha256:" + strings.Repeat("5", 64), Instructions: []contract.InternalInstruction{
 		{Index: 0, ID: "approval", Kind: "wait", Wait: &contract.WaitInstruction{Name: "approval", TimeoutMillis: 1}},
@@ -343,26 +327,7 @@ func TestDistributedLateSignalDuringOutageIsRetryable(t *testing.T) {
 		signals.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/signals", strings.NewReader(body)).WithContext(requestCtx))
 		return recorder
 	}
-	voters := strings.Split(os.Getenv("BLOK_DISTRIBUTED_ETCD_VOTERS"), ",")
-	if len(voters) != 3 || voters[0] == "" {
-		t.Fatal("BLOK_DISTRIBUTED_ETCD_VOTERS must name the three voter containers")
-	}
-	paused := make([]string, 0, 2)
-	restore := func() {
-		for index := len(paused) - 1; index >= 0; index-- {
-			if output, err := exec.Command("docker", "unpause", paused[index]).CombinedOutput(); err != nil {
-				t.Errorf("restore voter %s: %v: %s", paused[index], err, output)
-			}
-		}
-		paused = paused[:0]
-	}
-	t.Cleanup(restore)
-	for _, voter := range voters[1:] {
-		if output, err := exec.Command("docker", "pause", voter).CombinedOutput(); err != nil {
-			t.Fatalf("pause voter %s: %v: %s", voter, err, output)
-		}
-		paused = append(paused, voter)
-	}
+	restore := clustertest.PauseQuorum(t)
 	outageCtx, stopOutage := context.WithTimeout(ctx, 3*time.Second)
 	during := send(outageCtx)
 	stopOutage()

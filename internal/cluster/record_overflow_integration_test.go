@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/well-prado/new-blok/contract"
+	"github.com/well-prado/new-blok/internal/clustertest"
 	"github.com/well-prado/new-blok/internal/engine"
 	"github.com/well-prado/new-blok/node"
 	"github.com/well-prado/new-blok/store/distributed"
@@ -463,6 +464,9 @@ func TestDueTimerOfATerminalRunClosesItsWait(t *testing.T) {
 // committed once quorum returned, so the pure step runs once (it did) or
 // twice (the successor re-dispatched it), never more.
 func TestRealOutageAtStepCompletionStaysRetryable(t *testing.T) {
+	// Voters are paused inside transaction hooks: hold the exclusive
+	// cluster lock before the test starts, not mid-transaction.
+	clustertest.Disrupt(t)
 	h := newOverflowHarness(t)
 	client := &hookedClient{Client: integrationClient(t)}
 	outageRuntime := *h.runtime
@@ -471,7 +475,7 @@ func TestRealOutageAtStepCompletionStaysRetryable(t *testing.T) {
 	owner := acquireWhenFree(t, h.ctx, outageRuntime.store, h.partition, "outage-owner", 30*time.Second)
 	restore := func() {}
 	// The first step transaction is the dispatch, the second the result.
-	hook := client.arm("/step-", 1, false, func() { restore = pauseQuorum(t, outageRuntime.store) })
+	hook := client.arm("/step-", 1, false, func() { restore = clustertest.PauseQuorum(t) })
 	started := time.Now()
 	_, err := outageRuntime.processOne(h.ctx, owner)
 	elapsed := time.Since(started)

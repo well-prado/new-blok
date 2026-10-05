@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -16,6 +15,7 @@ import (
 	"time"
 
 	"github.com/well-prado/new-blok/contract"
+	"github.com/well-prado/new-blok/internal/clustertest"
 	"github.com/well-prado/new-blok/internal/engine"
 	"github.com/well-prado/new-blok/node"
 	"github.com/well-prado/new-blok/store/distributed"
@@ -771,6 +771,8 @@ func TestTenantFairCursorSurvivesPartitionOwnerTakeover(t *testing.T) {
 }
 
 func TestScheduleWaitClassifiesQuorumLossAsUnavailable(t *testing.T) {
+	// This test pauses voters: it runs alone on the shared cluster.
+	clustertest.Disrupt(t)
 	store := integrationDistributedStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -780,34 +782,16 @@ func TestScheduleWaitClassifiesQuorumLossAsUnavailable(t *testing.T) {
 		t.Fatal(err)
 	}
 	releaseOwnerOnCleanup(t, store, owner)
-	voters := integrationEtcdVoters()
+	voters := clustertest.Voters()
 	t.Logf("quorum-loss probe state: voters=%v paused=%v partition=%s run=absent wait=wait-absent", voters, voters[1:], partition)
-	paused := make([]string, 0, 2)
-	defer func() {
-		for index := len(paused) - 1; index >= 0; index-- {
-			_ = exec.Command("docker", "unpause", paused[index]).Run()
-		}
-	}()
-	for _, container := range voters[1:] {
-		output, err := exec.CommandContext(ctx, "docker", "pause", container).CombinedOutput()
-		if err != nil {
-			t.Fatalf("pause voter %s: %v: %s", container, err, output)
-		}
-		paused = append(paused, container)
-	}
+	restore := clustertest.PauseQuorum(t)
 	blockedCtx, stop := context.WithTimeout(ctx, 3*time.Second)
 	_, err = (&Runtime{store: store}).scheduleWait(blockedCtx, owner, "run-absent", "wait-absent", "approval", time.Now().Add(time.Minute), engine.StepIdentity{}, 0)
 	stop()
 	if !errors.Is(err, ErrUnavailable) || errors.Is(err, distributed.ErrOwnershipLost) {
 		t.Fatalf("quorum-loss schedule error=%v, want retryable ErrUnavailable and not ErrOwnershipLost", err)
 	}
-	for index := len(paused) - 1; index >= 0; index-- {
-		output, err := exec.CommandContext(ctx, "docker", "unpause", paused[index]).CombinedOutput()
-		if err != nil {
-			t.Fatalf("restore voter %s: %v: %s", paused[index], err, output)
-		}
-		paused = paused[:index]
-	}
+	restore()
 	var recoveryErr error
 	for ctx.Err() == nil {
 		if _, _, recoveryErr = store.ReadState(ctx, partition, "recovery-check"); recoveryErr == nil {
@@ -822,6 +806,8 @@ func TestScheduleWaitClassifiesQuorumLossAsUnavailable(t *testing.T) {
 }
 
 func TestStepJournalQuorumLossDefersAcceptedRun(t *testing.T) {
+	// This test pauses voters: it runs alone on the shared cluster.
+	clustertest.Disrupt(t)
 	var fixture struct {
 		ExpectedFailureClass      string `json:"expectedFailureClass"`
 		ExpectedPrefixInvocations int64  `json:"expectedPrefixInvocations"`
@@ -890,7 +876,7 @@ func TestStepJournalQuorumLossDefersAcceptedRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	releaseOwnerOnCleanup(t, store, owner)
-	voters := integrationEtcdVoters()
+	voters := clustertest.Voters()
 	t.Logf("quorum journal recovery state: voters=%v paused=%v partition=%s run=%s", voters, voters[1:], partition, admission.RunID)
 	type processResult struct {
 		record RunRecord
@@ -908,21 +894,7 @@ func TestStepJournalQuorumLossDefersAcceptedRun(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("prefix did not reach quorum-loss barrier")
 	}
-	containers := voters[1:]
-	paused := make([]string, 0, len(containers))
-	restoreVoters := func() {
-		for index := len(paused) - 1; index >= 0; index-- {
-			_ = exec.Command("docker", "unpause", paused[index]).Run()
-		}
-	}
-	t.Cleanup(restoreVoters)
-	for _, container := range containers {
-		output, pauseErr := exec.CommandContext(ctx, "docker", "pause", container).CombinedOutput()
-		if pauseErr != nil {
-			t.Fatalf("pause voter %s: %v: %s", container, pauseErr, output)
-		}
-		paused = append(paused, container)
-	}
+	restoreVoters := clustertest.PauseQuorum(t)
 	unblock()
 	var oldResult processResult
 	select {
@@ -934,13 +906,7 @@ func TestStepJournalQuorumLossDefersAcceptedRun(t *testing.T) {
 	if !errors.As(oldResult.err, &engineErr) || engineErr.Class != fixture.ExpectedFailureClass {
 		t.Fatalf("journal outage result=%v; want failure class %q", oldResult.err, fixture.ExpectedFailureClass)
 	}
-	for index := len(paused) - 1; index >= 0; index-- {
-		output, unpauseErr := exec.CommandContext(ctx, "docker", "unpause", paused[index]).CombinedOutput()
-		if unpauseErr != nil {
-			t.Fatalf("restore voter %s: %v: %s", paused[index], unpauseErr, output)
-		}
-		paused = paused[:index]
-	}
+	restoreVoters()
 	afterOutage, err := runtime.GetRun(ctx, tenant, admission.RunID)
 	if err != nil {
 		t.Fatal(err)
@@ -1024,14 +990,6 @@ func newWaitIntegrationRuntime(t *testing.T, store *distributed.Store, workflowN
 		t.Fatal(err)
 	}
 	return runtime
-}
-
-func integrationEtcdVoters() []string {
-	voters := strings.Split(os.Getenv("BLOK_DISTRIBUTED_ETCD_VOTERS"), ",")
-	if len(voters) == 3 && voters[0] != "" && voters[1] != "" && voters[2] != "" {
-		return voters
-	}
-	return []string{"blok-distributed-spike-etcd1-1", "blok-distributed-spike-etcd2-1", "blok-distributed-spike-etcd3-1"}
 }
 
 func partitionWithoutPendingRuns(ctx context.Context, store *distributed.Store, partitions int) (string, error) {
