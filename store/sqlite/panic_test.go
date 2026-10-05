@@ -146,6 +146,11 @@ func testWithTxExit(t *testing.T, path string, marked bool, exit exit) {
 	if recovered != exit.recovered {
 		t.Fatalf("the caller recovered %#v; want the original panic value %#v", recovered, exit.recovered)
 	}
+	// The rollback has completed by the time the exit reaches the caller:
+	// the transaction's pooled connection is back.
+	if inUse := conn.database.Stats().InUse; inUse != 0 {
+		t.Fatalf("%d pooled connection(s) still in use after the exit; want the transaction rolled back before it reaches the caller", inUse)
+	}
 	// The writer queue's one slot: had it leaked, every later marked writer
 	// on this handle would wait out the busy timeout for a turn nobody holds
 	// (#214).
@@ -198,4 +203,64 @@ func sanitize(name string) string {
 		}
 	}
 	return string(out)
+}
+
+// TestPanickingWriterRollsBackBeforeTheNextWriterTakesItsTurn: a marked
+// writer that panics must have rolled back before the writer queued behind
+// it gets its turn (#214, #267). Released first, the next writer would start
+// while the lock was still held and wait for it in SQLite's busy handler,
+// unordered again, and fail busy if the rollback were slow. The next writer
+// checks, as soon as its turn begins, that its own connection is the only
+// one in use on the handle.
+func TestPanickingWriterRollsBackBeforeTheNextWriterTakesItsTurn(t *testing.T) {
+	ctx := context.Background()
+	db, err := (Backend{BusyTimeout: panicBusyTimeout}).Open(ctx, filepath.Join(t.TempDir(), "order.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	conn := db.(*connection)
+	if err := db.WithTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `CREATE TABLE rows (writer TEXT NOT NULL)`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	value := &panicValue{name: "queued writer bug"}
+	holding, leave := make(chan struct{}), make(chan struct{})
+	exited := make(chan any, 1)
+	go func() {
+		recovered, _ := leaveTx(store.Writer(ctx), db, func(tx *sql.Tx) error {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO rows VALUES ('panics')`); err != nil {
+				return err
+			}
+			close(holding)
+			<-leave
+			panic(value)
+		})
+		exited <- recovered
+	}()
+	<-holding
+	inUse := make(chan int, 1)
+	next := make(chan error, 1)
+	go func() {
+		next <- db.WithTx(store.Writer(ctx), func(tx *sql.Tx) error {
+			inUse <- conn.database.Stats().InUse
+			_, err := tx.ExecContext(ctx, `INSERT INTO rows VALUES ('next')`)
+			return err
+		})
+	}()
+	// Let the next writer queue behind the held turn. Had it not queued
+	// yet, it would still find the rollback done.
+	time.Sleep(50 * time.Millisecond)
+	close(leave)
+	if recovered := <-exited; recovered != value {
+		t.Fatalf("the caller recovered %#v; want %#v", recovered, value)
+	}
+	if got := <-inUse; got != 1 {
+		t.Fatalf("the next writer's turn began with %d connections in use; want 1, its own: the panicked transaction must roll back before the turn is released", got)
+	}
+	if err := <-next; err != nil {
+		t.Fatalf("the next writer: %v", err)
+	}
 }

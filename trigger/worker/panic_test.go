@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/well-prado/new-blok/store"
 	"github.com/well-prado/new-blok/store/sqlite"
+	"github.com/well-prado/new-blok/trigger"
 )
 
 // panicBusyTimeout is the store's busy timeout in this file. A write that
@@ -224,4 +226,45 @@ func countEffects(t *testing.T, database store.Database) map[string]int {
 		t.Fatal(err)
 	}
 	return effects
+}
+
+// TestAReturningHandlerCommitsInTwoTransactions: the panic accounting
+// (#267) runs only for a handler that did not return. A job whose handler
+// returns, whatever it returns, costs exactly the two write transactions of
+// ADR 0006, the start and the handle, and nothing else. An extra accounting
+// transaction would match no row, change nothing a test could see, and still
+// take the write lock once per job while holding the claim turn.
+func TestAReturningHandlerCommitsInTwoTransactions(t *testing.T) {
+	for _, outcome := range []struct {
+		name  string
+		err   error
+		state string
+	}{
+		{"succeeds", nil, StateCompleted},
+		{"fails", errors.New("handler failed"), StateDead},
+		{"fails retryably", &HandlerError{Retryable: true, Message: "retry"}, StatePending},
+		{"is saturated", fmt.Errorf("another store: %w", trigger.ErrSaturated), StatePending},
+	} {
+		t.Run(outcome.name, func(t *testing.T) {
+			ctx := context.Background()
+			marks := &writerMarks{Database: openSQLite(t, filepath.Join(t.TempDir(), "count.db"))}
+			queue, err := New(ctx, marks, time.Now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := queue.Enqueue(ctx, EnqueueRequest{RequestKey: "job", Kind: "test", Payload: []byte(`{}`), MaxAttempts: 3}); err != nil {
+				t.Fatal(err)
+			}
+			marks.take()
+			if _, err := queue.ProcessOnce(ctx, func(context.Context, Tx, Job) error { return outcome.err }); err != nil {
+				t.Fatal(err)
+			}
+			if got := marks.take(); len(got) != 2 {
+				t.Fatalf("ProcessOnce ran %d transactions (writer marks %v); want 2, the start and the handle", len(got), got)
+			}
+			if job, err := queue.Get(ctx, "job"); err != nil || job.State != outcome.state {
+				t.Fatalf("job=%+v err=%v; want state %s", job, err, outcome.state)
+			}
+		})
+	}
 }
