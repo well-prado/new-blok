@@ -232,6 +232,17 @@ func (j *Journal) backfillReconciliationRecords(ctx context.Context, tx *sql.Tx,
 		if recorded {
 			continue
 		}
+		if !p.tenant.Valid {
+			// An unowned row whose record was pruned: re-creating it under
+			// "" would file the decision under a tenant that never made it.
+			pruned, err := audit.Pruned(ctx, tx, "reconcile:"+p.key, audit.KindReconciliation)
+			if err != nil {
+				return nil, err
+			}
+			if pruned {
+				continue
+			}
+		}
 		// The record is missing, so the stored tenant (or "") is the only
 		// account of who decided it.
 		record, inserted, err := j.audit.Append(ctx, tx, reconciliationRecord(p.tenant.String, p.key, p.actor, p.evidence, p.result, runID, p.at))

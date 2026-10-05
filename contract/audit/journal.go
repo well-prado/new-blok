@@ -212,6 +212,22 @@ func StoredTenant(ctx context.Context, tx *sql.Tx, id string) (tenant string, fo
 	return record.Tenant, true, nil
 }
 
+// Pruned reports, inside tx, whether a record with id and kind was deleted
+// by Prune: its tombstone (the sha256 of the id, and the kind) exists. An
+// owner uses it to tell a decision whose record was pruned from one that
+// never had a record, which StoredTenant alone cannot. The audit tables
+// must exist.
+func Pruned(ctx context.Context, tx *sql.Tx, id string, kind Kind) (bool, error) {
+	if tx == nil {
+		return false, ErrRequired
+	}
+	var found int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM audit_pruned_v1 WHERE id_digest = ? AND kind = ?`, Digest([]byte(id)), string(kind)).Scan(&found); err != nil {
+		return false, unavailableErr(err)
+	}
+	return found > 0, nil
+}
+
 // Notify offers committed records to the optional Mirror. Owners call it
 // after their transaction committed. It never blocks on, fails because of,
 // or changes durable audit; a refused or panicking Mirror counts a drop.

@@ -405,8 +405,9 @@ its `ReadAuthorizer` (§3), not through re-delivery.
 (`NULL`). Opening the journal gives it one, in the schema transaction:
 the tenant of its audit record, which the original decision wrote under its
 own tenant, read through `audit.StoredTenant`, which verifies the record
-first; or the system tenant `""` when it has no record (it predates audit,
-or audit was never composed on the database). The tenant is written once and
+first; or the system tenant `""` when it has no record and no prune
+tombstone (it predates audit, or audit was never composed on the
+database). The tenant is written once and
 never derived again, so ownership does not depend on audit retention: an
 audit record that `Prune` later removes, while its run is still kept, does
 not change who owns the decision, and a restart after the prune does not
@@ -423,18 +424,42 @@ terminally, and so cannot recover through re-delivery. This is accepted
 before alpha: such a row was written before audit was mandatory, and an
 operator can still re-deliver it from the system context.
 
-**A row still without a tenant is owned by nobody.** Two rows can have
-none after an open: one whose audit record failed verification at that
-open (the row is left `NULL` rather than adopt an altered tenant, and
-`Verify` reports the record as `ErrCorrupt`), and one an older binary
-inserted afterwards, since there is no journal schema version to refuse it
-([#291](https://github.com/well-prado/new-blok/issues/291)). Every
-re-delivery of such a row, the deciding and the system tenant's included,
-is answered as for a never-reconciled operation and writes nothing. The
-next open fixes the second kind from its record, which any binary since
-#80 writes in the same transaction under the deciding tenant (one with no
-record takes `""`); the first stays unowned until its record verifies
-again.
+**A row still without a tenant is owned by nobody.** Three rows can have
+none after an open:
+
+- one whose audit record failed verification at that open: the row is left
+  `NULL` rather than adopt an altered tenant, and `Verify` reports the
+  record as `ErrCorrupt`;
+- one whose audit record was pruned before that open, by an older binary
+  before the upgrade or after it (#291): `audit.Pruned` finds its tombstone
+  (the sha256 of `reconcile:<operation>`, kind `reconciliation.decision`),
+  which proves the decision had a tenant that is now unknown, so it is not
+  given the system tenant's; compaction does not re-create its record under
+  `""` either, and `Verify` accepts the tombstone;
+- one an older binary inserted afterwards, since there is no journal schema
+  version to refuse it
+  ([#291](https://github.com/well-prado/new-blok/issues/291)).
+
+Every re-delivery of such a row, the deciding and the system tenant's
+included, is answered as for a never-reconciled operation and writes
+nothing. The next open fixes the last kind from its record, which any binary since #80
+writes in the same transaction under the deciding tenant (one with no
+record and no tombstone takes `""`); the first stays unowned until its
+record verifies again, and the second stays unowned for good.
+
+What an unowned row costs, and what an operator can do: the decision
+itself stands. The reconciliation committed its operation, with the
+provider result, in the same transaction, so the run continues and replays
+from the committed operation; only a re-delivery, which is an idempotent
+retry of the decision, can no longer be answered with the original. Its
+content is kept, unread, until compaction erases it with its run (§7). No
+API reassigns a tenant. An operator who knows the deciding tenant from its
+own records can set it directly, with the journal closed
+(`UPDATE journal_reconciliations SET tenant = ? WHERE operation_key = ? AND
+tenant IS NULL`); that is outside the framework, which does not verify the
+choice. To avoid the state, open the journal with this release before
+running `audit.Journal.Prune` on an upgraded database, and do not prune
+with an older binary afterwards.
 
 **Migration.** Opening a journal adds the nullable `tenant` column inside
 the schema transaction, after the #281 migration, and then fixes every row
@@ -513,7 +538,7 @@ The tenant of a reconciliation (#286), classified separately:
   verified record's tenant, or `""`, in the same transaction; not
   reversible, but an older binary ignores the column (#291) and a row it
   inserts is fixed on the next open.
-- **Additive**: `audit.StoredTenant`.
+- **Additive**: `audit.StoredTenant`, `audit.Pruned`.
 
 ## Evidence
 
@@ -581,7 +606,9 @@ The tenant of a reconciliation (#286), classified separately:
   fixture with a record's tenant column altered, whose row stays unowned; a
   reconciliation whose record is pruned while its run is kept, before and
   after a restart; a row an older binary writes after the migration, owned
-  by nobody until the next open). The tests are red on origin/main, and
+  by nobody until the next open; a record pruned before the upgrade, whose
+  row stays unowned, also after compaction). The tests are red on
+  origin/main, and
   the pruning case on the first revision of this change; mutations are
   listed in the PR.
 
@@ -633,7 +660,9 @@ The tenant of a reconciliation (#286), classified separately:
   (the bug #286 fixes); nothing can tell such a record from the original,
   so it keeps answering to that tenant.
 - A tenant-less row whose audit record fails verification stays unowned,
-  answered to nobody, until the record is repaired; nothing repairs it.
+  answered to nobody, until the record is repaired; nothing repairs it. One
+  whose record was pruned before the upgrade stays unowned for good, unless
+  an operator sets its tenant by hand (§8).
 - Journal operations are not tenant-scoped: any authorized caller can learn
   whether an operation key exists and is uncertain, and can reconcile an
   uncertain operation of any tenant. #286 scopes the reconciliation, not

@@ -502,3 +502,52 @@ func TestTamperedRecordDoesNotLendItsTenant(t *testing.T) {
 		t.Fatalf("verify=%v, want ErrCorrupt", err)
 	}
 }
+
+// TestRecordPrunedBeforeTheUpgradeLeavesTheRowUnowned: a reconciliation
+// from before #286 whose audit record was pruned before the journal was
+// opened by a #286 binary (or by an older binary after it, #291) has no
+// record to take its tenant from, but a prune tombstone proves it had one.
+// It must not become the system tenant's: the row stays without a tenant,
+// owned by nobody, so no re-delivery is answered and none writes anything,
+// and compaction does not re-create its record under the system tenant.
+func TestRecordPrunedBeforeTheUpgradeLeavesTheRowUnowned(t *testing.T) {
+	r := newRig(t, rigOptions{})
+	op, _ := r.decideUnder(tenantA(r.ctx), "PRUNED-EARLY")
+	settledRun, settled := r.settledEffect("settled")
+	for _, id := range []string{r.operationRun(op.Key), settledRun} {
+		if err := r.journal.CompleteRun(r.ctx, id, []byte(`{}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The state an upgrade finds: no tenant column value, record pruned.
+	r.exec(`UPDATE journal_reconciliations SET tenant = NULL`)
+	r.clock = r.clock.Add(48 * time.Hour)
+	if report, err := r.audit.Prune(r.ctx, r.clock, r.journal); err != nil || report.Removed != 1 {
+		t.Fatalf("prune=%+v err=%v", report, err)
+	}
+	next := r.reopen()
+	if n := next.count(`SELECT COUNT(*) FROM journal_reconciliations WHERE tenant IS NULL`); n != 1 {
+		t.Fatalf("a row whose record was pruned was given a tenant (unowned rows=%d)", n)
+	}
+	answeredToNobody := func(stage string) {
+		t.Helper()
+		for _, ctx := range []context.Context{tenantA(next.ctx), next.ctx, tenantB(next.ctx)} {
+			got, err := next.redeliverAs(ctx, op.Key)
+			control, controlErr := next.redeliverAs(ctx, settled.Key)
+			requireIndistinguishable(t, got, err, control, controlErr)
+		}
+		if n := next.count(`SELECT COUNT(*) FROM audit_records_v1`); n != 0 {
+			t.Fatalf("%s: re-deliveries of an unowned row wrote %d records", stage, n)
+		}
+	}
+	answeredToNobody("retained")
+	next.mustVerify(0)
+	if again := next.reopen(); again.count(`SELECT COUNT(*) FROM journal_reconciliations WHERE tenant IS NULL`) != 1 {
+		t.Fatal("reopening gave the unowned row a tenant")
+	}
+	if report, err := next.journal.Compact(next.ctx, next.clock); err != nil || report.RemovedRuns != 2 || report.ErasedReconciliations != 1 {
+		t.Fatalf("compact=%+v err=%v", report, err)
+	}
+	answeredToNobody("compacted")
+	next.mustVerify(0)
+}

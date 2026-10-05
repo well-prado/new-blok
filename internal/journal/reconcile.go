@@ -206,10 +206,11 @@ func (j *Journal) reconcileOnce(ctx context.Context, operationKey, actor, eviden
 // the one stored with it. Every row has one: every reconciliation since
 // #286 stores it, and opening a journal fixes it, once, for a row from
 // before (backfillReconciliationTenants), so ownership never depends on
-// audit retention. A row still without one (an older binary wrote it after
-// the migration, or its audit record failed verification when the journal
-// was opened) belongs to nobody until the next open fixes it: every
-// re-delivery is answered as for a never-reconciled operation.
+// audit retention. A row still without one belongs to nobody: an older
+// binary wrote it after the migration (the next open fixes it), or its
+// audit record failed verification or had been pruned when the journal was
+// opened. Every re-delivery of it is answered as for a never-reconciled
+// operation.
 func reconciliationTenant(stored sql.NullString) (tenant string, owned bool) {
 	return stored.String, stored.Valid
 }
@@ -220,10 +221,12 @@ func reconciliationTenant(stored sql.NullString) (tenant string, owned bool) {
 // tenant, or the system tenant "" when it has no record (it predates
 // audit, or audit was never composed on this database). It is written
 // once and never re-derived, so pruning the record later cannot change who
-// owns the decision. A record that fails verification is not trusted: the
-// row stays without a tenant, owned by nobody, and Verify reports the
-// record (ErrCorrupt). Rows that already have a tenant are not touched, so
-// reopening changes nothing.
+// owns the decision. Two rows stay without a tenant, owned by nobody: one
+// whose record fails verification (it is not trusted, and Verify reports
+// it, ErrCorrupt), and one whose record was pruned before this open (a
+// prune tombstone proves it had a tenant, so it is not the system
+// tenant's). Rows that already have a tenant are not touched, so reopening
+// changes nothing.
 func backfillReconciliationTenants(ctx context.Context, tx *sql.Tx) error {
 	rows, err := tx.QueryContext(ctx, `SELECT operation_key FROM journal_reconciliations WHERE tenant IS NULL ORDER BY operation_key`)
 	if err != nil {
@@ -257,6 +260,13 @@ func backfillReconciliationTenants(ctx context.Context, tx *sql.Tx) error {
 			}
 			if found {
 				tenant = stored
+			} else if pruned, err := audit.Pruned(ctx, tx, "reconcile:"+key, audit.KindReconciliation); err != nil {
+				return err
+			} else if pruned {
+				// The record existed and was pruned before this open, so
+				// the decision had a tenant that is now unknown. It is not
+				// the system tenant's: the row stays unowned.
+				continue
 			}
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE journal_reconciliations SET tenant = ? WHERE operation_key = ? AND tenant IS NULL`, tenant, key); err != nil {
