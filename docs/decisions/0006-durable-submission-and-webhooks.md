@@ -135,8 +135,10 @@ steps of about 2 ms (0.3–12.7 ms measured on the #156 host), against about
 
 The order is kept in an `enqueue_seq` column. Each enqueue sets it to one
 past the highest so far, inside its write transaction, so it follows commit
-order. It is stored rather than taken from SQLite's `rowid`, which a backup's
-`VACUUM INTO` may renumber.
+order within one `created_at`: `created_at` is read before the writer
+waits for the lock, so producers on different clock ticks are ordered by
+timestamp. It is stored rather than taken from SQLite's `rowid`, which SQLite
+documents `VACUUM` may renumber for tables without an `INTEGER PRIMARY KEY`.
 
 This is not a strict FIFO:
 - `created_at` is the enqueuing process's wall clock, so producers with
@@ -236,9 +238,12 @@ is never parsed before verification.
   crash tests instead.
 - Constant-time comparison relies on `hmac.Equal`; timing is not measured.
 - The worker sorts and de-duplicates principal roles before comparing.
-  Concurrent first opens of a pre-migration queue may fail one opener with
-  `SQLITE_BUSY` (startup fails; nothing is corrupted). This is not
-  reproduced.
+  Concurrent first opens of a queue that still needs a column added fail
+  with `SQLITE_BUSY`. The migration reads the schema before it writes, and
+  SQLite cannot wait to upgrade such a transaction. Startup fails, and a
+  restart recovers; nothing is corrupted. Six handles opening at once, 40
+  rounds: 103 of 240 opens failed adding `principal_json` on `main`, and 200
+  of 240 adding `enqueue_seq` (#217 review). Tracked as its own issue.
 - Only the Standard Webhooks scheme is built in. Provider-specific schemes
   (with their own header formats and key distribution) are written against
   `Verifier`, as the tests do for a synthetic provider.

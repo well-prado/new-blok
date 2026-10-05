@@ -380,7 +380,8 @@ func createJobs(ctx context.Context, tx *sql.Tx) error {
 		lease_until INTEGER,
 		error_text TEXT NOT NULL DEFAULT '',
 		created_at INTEGER NOT NULL,
-		updated_at INTEGER NOT NULL
+		updated_at INTEGER NOT NULL,
+		enqueue_seq INTEGER NOT NULL DEFAULT 0
 	)`)
 	return err
 }
@@ -471,8 +472,9 @@ func (q *Queue) Enqueue(ctx context.Context, request EnqueueRequest) (EnqueueRes
 	var result EnqueueResult
 	err = q.withTx(store.Writer(ctx), func(tx *sql.Tx) error {
 		// enqueue_seq is one past the highest so far, read under this
-		// transaction's write lock, so it follows commit order and survives
-		// backups, unlike SQLite's rowid (VACUUM may renumber it).
+		// transaction's write lock, so it follows commit order. It is stored
+		// rather than taken from SQLite's rowid, which SQLite documents VACUUM
+		// may renumber for tables without an INTEGER PRIMARY KEY.
 		res, err := tx.ExecContext(ctx, `INSERT INTO worker_jobs
 			(job_id, request_key, kind, payload_json, payload_digest, max_attempts, principal_json, state, available_at, created_at, updated_at, enqueue_seq)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(enqueue_seq), 0) + 1 FROM worker_jobs)) ON CONFLICT(request_key) DO NOTHING`,

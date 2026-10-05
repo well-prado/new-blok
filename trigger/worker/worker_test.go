@@ -490,9 +490,8 @@ func TestPrincipalIsPersistedAndPartOfRequestIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Jobs enqueued within one clock step tie on created_at and are claimed
-	// in job_id order, not submission order; Windows' clock steps in
-	// milliseconds, so the test must not assume which comes first.
+	// Jobs tied on created_at are claimed in enqueue order (#217); this test
+	// is about principals, so it reads them by key either way.
 	seen := map[string]trigger.Principal{}
 	for range 2 {
 		if _, err := queue.ProcessOnce(context.Background(), func(_ context.Context, _ Tx, job Job) error { seen[job.RequestKey] = job.Principal; return nil }); err != nil {
@@ -1522,9 +1521,10 @@ func TestJobsEnqueuedInOneClockStepAreClaimedInOrder(t *testing.T) {
 	}
 }
 
-// TestEnqueueOrderSurvivesBackup: the order of tied jobs is stored, not
-// inferred from SQLite's rowid, which a backup (VACUUM INTO) may renumber.
-// A queue restored from a backup claims tied jobs in enqueue order (#217).
+// TestEnqueueOrderSurvivesBackup: a queue restored from a backup (VACUUM
+// INTO) claims tied jobs in enqueue order (#217). The order is stored in
+// enqueue_seq; this test does not distinguish that from rowid, whose
+// renumbering by VACUUM is a documented SQLite caveat, not observed here.
 func TestEnqueueOrderSurvivesBackup(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
