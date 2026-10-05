@@ -569,10 +569,10 @@
     },
     "new": {
       "adapter": "trigger/worker.Queue on SQLite WAL synchronous=FULL",
-      "redelivery": "the claim, handler writes and acknowledgment share one SQLite transaction, so the kill rolls the claim back too; the fresh consumer claims the job immediately and the killed attempt leaves no durable attempt count",
-      "attemptsNote": "attempts=1 records current behaviour, not an endorsed contract: issue #245 questions whether a process-killed attempt should consume MaxAttempts; update this value with #245's decision",
+      "redelivery": "the claim commits the started attempt and a 30 s lease before the handler runs; the handler writes and acknowledgment share a second SQLite transaction, which the kill rolls back. The fresh consumer claims the job once the lease expires, as its second attempt",
+      "attemptsNote": "#245: a process-killed attempt consumes MaxAttempts, so the recovered completion is attempt 2",
       "completedByFreshConsumer": 1,
-      "attempts": 1,
+      "attempts": 2,
       "providerCalls": 2,
       "abortedByKill": 1,
       "committedEffects": 1

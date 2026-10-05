@@ -78,7 +78,10 @@ Measured with 4 workers draining 200 instant jobs, 5 samples per run
 ./trigger/worker/`, `golang:1.27.1`, linux/arm64). The write-first claim:
 0 busy errors in 148–195 ms. The same harness with the read-first claim of
 `996f184` restored: 2,720–7,516 busy errors in 161–368 ms in one run, and
-5,851–8,866 in 322–485 ms in an independent reviewer's run.
+5,851–8,866 in 322–485 ms in an independent reviewer's run. Since #245 a job
+commits two write transactions (the attempt's start, then the handler with
+its acknowledgment; ADR 0006): 29–32 ms against 22–28 ms on the same macOS
+host, 0 busy errors on both.
 
 ## Alternatives considered
 
