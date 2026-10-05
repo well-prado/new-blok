@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/well-prado/new-blok/store"
 	"github.com/well-prado/new-blok/store/sqlite"
 	"github.com/well-prado/new-blok/trigger/sse"
 	"github.com/well-prado/new-blok/trigger/webhook"
@@ -205,8 +206,39 @@ func TestMigrationsReplayUpgradeAndTeardown(t *testing.T) {
 	if queueTables != 0 {
 		t.Fatalf("worker queue tables after teardown=%d", queueTables)
 	}
+	var queueStamps int
+	if err := database.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return tx.QueryRow(`SELECT COUNT(*) FROM blok_schema_versions WHERE component = 'worker'`).Scan(&queueStamps)
+	}); err != nil || queueStamps != 0 {
+		t.Fatalf("the queue's schema stamp outlived its tables: stamps=%d err=%v", queueStamps, err)
+	}
 	if err := Migrate(context.Background(), database); err != nil {
 		t.Fatalf("clean setup after teardown: %v", err)
+	}
+}
+
+// TestMigrateRefusesANewerSchema: tables a newer release of the recipe
+// migrated past its last migration are refused, naming both versions,
+// and nothing is applied (#291).
+func TestMigrateRefusesANewerSchema(t *testing.T) {
+	database, err := (sqlite.Backend{}).Open(context.Background(), filepath.Join(t.TempDir(), "newer.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := Migrate(context.Background(), database); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.WithTx(context.Background(), func(tx *sql.Tx) error {
+		_, err := tx.Exec(`INSERT INTO shop_schema_migrations(version, applied_at) VALUES(?, 1)`, len(migrations)+1)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err = Migrate(context.Background(), database)
+	var newer *store.NewerSchemaError
+	if !errors.As(err, &newer) || *newer != (store.NewerSchemaError{Component: "shop", Version: len(migrations) + 1, Supported: len(migrations)}) {
+		t.Fatalf("err=%v; want the shop refusal", err)
 	}
 }
 

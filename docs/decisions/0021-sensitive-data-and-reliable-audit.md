@@ -7,7 +7,7 @@
   ADR 0020 (optional observability, #79) and the #49 journal retention,
   compaction, backup and restore
 - Amended by: #281 (§7, erasure of run data), #286 (§8, the tenant of a
-  reconciliation)
+  reconciliation), #291 (§9, schema versions)
 - Amends: [ADR 0008](0008-durable-tool-policy.md) (approval decisions now
   require audit), [ADR 0016](0016-versioned-inspection.md) (projection
   redaction and error labels), [ADR 0020](0020-optional-observability-export.md)
@@ -438,14 +438,15 @@ none after an open:
   `NULL` rather than adopt an altered tenant, and `Verify` reports the
   record as `ErrCorrupt`;
 - one whose audit record was pruned before that open, by an older binary
-  before the upgrade or after it (#291): `audit.Pruned` finds its tombstone
+  before the upgrade or by a pre-#291 binary after it: `audit.Pruned` finds its tombstone
   (the sha256 of `reconcile:<operation>`, kind `reconciliation.decision`),
   which proves the decision had a tenant that is now unknown, so it is not
   given the system tenant's; compaction does not re-create its record under
   `""` either, and `Verify` accepts the tombstone;
-- one an older binary inserted afterwards, since there is no journal schema
-  version to refuse it
-  ([#291](https://github.com/well-prado/new-blok/issues/291)).
+- one a binary built before #291 inserted afterwards: such a binary has no
+  schema version check. Since #291 a binary that predates #286 is refused
+  at open (§9), so only binaries built before the stamp existed can still
+  do this.
 
 Every re-delivery of such a row, the deciding and the system tenant's
 included, is answered as for a never-reconciled operation and writes
@@ -477,6 +478,33 @@ back whole by a crash. A journal rebuilt by the #281 migration gets the
 column from the rebuilt table. Every open scans the reconciliations for rows
 without a tenant; reconciliations are operator decisions, so the table is
 small.
+
+### 9. Schema versions (#291)
+
+The journal, audit, approval and worker queue tables are stamped with
+their schema version in `blok_schema_versions`, one row per component, in
+the same transaction as their migration; the contract, the versions and
+their history are in ADR 0003 ("Schema versions"). For this decision it
+means:
+
+- A journal migrated by #281 or #286 (stamp `journal` 3), an audit store
+  (`audit` 1), approvals (`approval` 1) and a queue with tombstones
+  (`worker` 2) are refused at open, with `store.NewerSchemaError` naming
+  the component and both versions, by any binary from #291 on that
+  supports an older version. Such a binary can therefore no longer insert
+  an untenanted reconciliation (§8) or recreate the legacy tombstone table
+  (§7), and an older worker can no longer accept a duplicate of a compacted
+  job (ADR 0006). A later release that changes one of these shapes raises
+  its version, and this release refuses it in turn.
+- A database written before #291 has no stamp. Its journal and queue are
+  classified by shape (journal 1 before #281, 2 after #281, 3 after #286;
+  queue 1 before #290, 2 after it), migrated as before, and stamped as
+  upgraded from that version. Shown with databases written by origin/main
+  at `ea3eec6`, `99a9228`, `8633027` and `ef330a3`.
+- The #281 and #286 migrations keep their shape guards and still run on
+  every open, so a binary built before #291, which cannot see the stamp,
+  is still repaired after: the legacy tombstone table it recreates is
+  rewritten, an untenanted row it inserts is given its record's tenant.
 
 ## Compatibility
 
@@ -543,9 +571,23 @@ The tenant of a reconciliation (#286), classified separately:
 - **Schema change, with data migration**: `journal_reconciliations` gains a
   nullable `tenant` column on open, and every row without one is given its
   verified record's tenant, or `""`, in the same transaction; not
-  reversible, but an older binary ignores the column (#291) and a row it
-  inserts is fixed on the next open.
+  reversible. A binary built before #291 ignores the column and a row it
+  inserts is fixed on the next open; from #291 on, a binary that predates
+  the column is refused at open (§9).
 - **Additive**: `audit.StoredTenant`, `audit.Pruned`.
+
+Schema versions (#291), classified separately (ADR 0003 has the full
+table):
+
+- **Behaviour change (breaking for downgrades)**: a binary from #291 on
+  refuses a database stamped newer than it supports
+  (`store.ErrNewerSchema`), where an older binary used to open it and fail
+  later or misbehave. Downgrade by restoring a pre-upgrade backup, as §7
+  already required.
+- **Schema change, additive**: `blok_schema_versions`, created and filled
+  on the first open by #291, in each component's schema transaction; an
+  unstamped database is classified by shape. No existing table changes.
+- **Additive**: `store.ErrNewerSchema`, `store.NewerSchemaError`.
 
 ## Evidence
 
@@ -619,6 +661,20 @@ The tenant of a reconciliation (#286), classified separately:
   the pruning case on the first revision of this change; mutations are
   listed in the PR.
 
+- Schema versions (#291), against real SQLite files:
+  `internal/migration/components_test.go` (every component stamps a fresh
+  database, refuses one stamped newer with the component and both
+  versions named and nothing written, migrates an older stamp forward;
+  databases written by origin/main at `ef330a3`, `ea3eec6`, `99a9228` and
+  `8633027` classified by shape, stamped and reopened unchanged; concurrent
+  first opens of an unstamped database all start),
+  `internal/journal/version_test.go` and `trigger/worker/version_test.go`
+  (a head-migrated journal and queue refused by a binary built with a
+  lower version, and opened by the same and a newer one), and
+  `contract/audit/erasure_migration_test.go` (a process killed inside the
+  migration leaves no stamp). Red on origin/main; mutations and the real
+  pre-#286 and pre-#290 binaries are in the PR.
+
 ## Limits
 
 - Journaled and cluster runs on `store/distributed` (ADR 0019) have no audit
@@ -638,9 +694,10 @@ The tenant of a reconciliation (#286), classified separately:
 - Worker queue payloads (`worker_jobs`) are kept forever; they are outside
   the journal's compaction
   ([#290](https://github.com/well-prado/new-blok/issues/290)).
-- The journal has no schema version, so an older binary opening a migrated
-  journal is not refused
-  ([#291](https://github.com/well-prado/new-blok/issues/291)).
+- Schema versions (§9) are checked only by binaries from #291 on. A binary
+  built before #291 still opens a migrated journal, audit store or queue
+  without refusal, with the effects §7, §8 and ADR 0006 describe; the next
+  open by a current binary repairs what it can.
 - Erasure stops at SQLite's files. The filesystem, an SSD's remapped
   blocks, VACUUM's temporary file, OS caches, copies an application made
   and backups taken before an erasure are outside it (§7). Compaction runs

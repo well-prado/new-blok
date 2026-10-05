@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"time"
 
@@ -24,6 +25,31 @@ type busyError struct{}
 func (busyError) Error() string { return "store: busy" }
 
 func (busyError) Is(target error) bool { return target == capacity.ErrSaturated }
+
+// ErrNewerSchema matches a refused open: a component's tables in the
+// database were migrated by a binary newer than this one, so this binary
+// does not know their shape and must not read or write them (#291). It is
+// never transient; retrying with the same binary fails the same way.
+var ErrNewerSchema = errors.New("store: database schema is newer than this binary")
+
+// NewerSchemaError is the refusal, naming the component whose stamp is
+// newer and both versions. It matches ErrNewerSchema.
+type NewerSchemaError struct {
+	// Component names the stamped schema: "journal", "audit", "worker",
+	// "approval", "cron" or "provider".
+	Component string
+	// Version is the version stamped in the database.
+	Version int
+	// Supported is the highest version this binary understands.
+	Supported int
+}
+
+func (e *NewerSchemaError) Error() string {
+	return fmt.Sprintf("store: the %s schema in this database is version %d, newer than version %d, the highest this binary supports; refusing to open it: run a binary that supports version %d, or restore a backup taken before the upgrade",
+		e.Component, e.Version, e.Supported, e.Version)
+}
+
+func (e *NewerSchemaError) Is(target error) bool { return target == ErrNewerSchema }
 
 // Backend opens a durable database without exposing its implementation to the
 // engine or journal callers.

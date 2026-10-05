@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/well-prado/new-blok/contract/audit"
+	"github.com/well-prado/new-blok/internal/migration"
 	"github.com/well-prado/new-blok/store"
 )
 
@@ -49,15 +50,30 @@ func NewJournalStore(ctx context.Context, database store.Database, cfg Config) (
 		cfg.Clock = time.Now
 	}
 	s := &JournalStore{database: database, authorizer: cfg.Authorizer, audit: cfg.Audit, clock: cfg.Clock, maxDecisions: cfg.MaxDecisions}
-	err := database.WithTx(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS approval_decisions_v1 (
+	// The stamp is read before it is written, so concurrent first opens of
+	// an existing store race; the schema transaction is retried while it
+	// loses (#235, #291).
+	err := migration.Retry(ctx, func() error {
+		return database.WithTx(ctx, func(tx *sql.Tx) error {
+			return migration.Apply(ctx, tx, migration.Schema{Component: "approval", Supported: schemaVersion, Infer: migration.Present("approval_decisions_v1")}, func(int) error {
+				_, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS approval_decisions_v1 (
 			id TEXT PRIMARY KEY, decision BLOB NOT NULL CHECK(length(decision) <= 16384),
 			proposal BLOB NOT NULL CHECK(length(proposal) <= 16384),
 			binding TEXT NOT NULL, recorded_at TEXT NOT NULL)`)
-		return err
+				return err
+			})
+		})
 	})
-	return s, err
+	if err != nil {
+		return nil, err
+	}
+	return s, nil
 }
+
+// schemaVersion is the highest approval schema version this binary
+// understands (#291). Version 1 is approval_decisions_v1 as #75 introduced
+// it. NewJournalStore refuses a store stamped with a newer one.
+const schemaVersion = 1
 
 // Record is immutable even for rejection/expiry. Changed proposals and replay
 // runs require a fresh ID and authorized review. Duplicate exact requests are
