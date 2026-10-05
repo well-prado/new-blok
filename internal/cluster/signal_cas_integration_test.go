@@ -23,35 +23,12 @@ import (
 // revision through a second real store client, making only the run comparison
 // fail while leaving the wait projection open.
 func TestSignalRetriesAWaitRunCASConflict(t *testing.T) {
-	endpoints := strings.Split(os.Getenv("BLOK_DISTRIBUTED_ENDPOINTS"), ",")
-	if endpoints[0] == "" {
-		t.Skip("set BLOK_DISTRIBUTED_ENDPOINTS to run real etcd signal CAS tests")
-	}
-	client, err := clientv3.New(clientv3.Config{Endpoints: endpoints, DialTimeout: 2 * time.Second})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = client.Close() })
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 	testID := fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
-	incarnationResponse, err := client.Get(ctx, "/blok/v1/cluster-incarnation")
-	if err != nil {
-		t.Fatalf("read existing cluster incarnation: response=%v err=%v", incarnationResponse, err)
-	}
-	incarnation := "signal-cas-test-cluster"
-	if len(incarnationResponse.Kvs) > 0 {
-		incarnation = string(incarnationResponse.Kvs[0].Value)
-	}
-	directStore, err := distributed.New(ctx, client, incarnation)
-	if err != nil {
-		t.Fatal(err)
-	}
-	barrier := &signalCASBarrierClient{Client: client}
-	wrappedStore, err := distributed.New(ctx, barrier, incarnation)
-	if err != nil {
-		t.Fatal(err)
-	}
+	directStore := integrationDistributedStore(t)
+	barrier := &signalCASBarrierClient{Client: integrationClient(t)}
+	wrappedStore := integrationStoreFor(t, barrier)
 	var prefixEffects, suffixEffects atomic.Int64
 	prefix := node.MustDefine("fixture/signal-cas-prefix", "1.0.0", func(_ context.Context, input waitInput) (integrationOutput, error) {
 		prefixEffects.Add(1)

@@ -1,0 +1,35 @@
+{
+  "fixtureVersion": 1,
+  "synthetic": true,
+  "name": "signal-timer-ownership-races",
+  "signalAcrossOwnerChange": {
+    "firstAttempt": "unavailable",
+    "waitAfterFirstAttempt": "waiting",
+    "runAfterFirstAttempt": "waiting",
+    "signaledEventsAfterFirstAttempt": 0,
+    "retry": "accepted",
+    "finalState": "completed",
+    "finalOutput": "{\"value\":1}",
+    "prefixEffects": 1,
+    "suffixEffects": 1
+  },
+  "staleOwnerTimer": {
+    "staleResult": "ownership_lost",
+    "waitAfterStaleFire": "waiting",
+    "dueTimersAfterStaleFire": 1,
+    "successorFired": 1,
+    "finalState": "completed",
+    "finalOutput": "{\"value\":2}",
+    "prefixEffects": 1,
+    "suffixEffects": 1
+  },
+  "threeWayRace": {
+    "iterations": 8,
+    "winnersPerWait": 1,
+    "staleOwnerFires": 0,
+    "prefixEffectsPerRun": 1,
+    "suffixEffectsPerRun": 1,
+    "signalOutput": "{\"value\":1}",
+    "timerOutput": "{\"value\":2}"
+  }
+}

@@ -18,7 +18,6 @@ import (
 	"github.com/well-prado/new-blok/internal/engine"
 	"github.com/well-prado/new-blok/node"
 	"github.com/well-prado/new-blok/store/distributed"
-	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 type integrationInput struct {
@@ -323,7 +322,7 @@ func TestFailoverUnderSustainedLoadPreservesFairnessAndEffectCounts(t *testing.T
 	base := fmt.Sprintf("load-%d", time.Now().UnixNano())
 	partition, err := partitionWithoutPendingRuns(ctx, store, limits.Partitions)
 	if err != nil {
-		t.Skipf("no isolated partition available for sustained-load fixture: %v", err)
+		t.Fatalf("no isolated partition available for sustained-load fixture: %v", err)
 	}
 	tenants := make([]string, 0, fixture.Tenants)
 	for candidate := 0; len(tenants) < fixture.Tenants; candidate++ {
@@ -1063,28 +1062,6 @@ func newWaitIntegrationRuntime(t *testing.T, store *distributed.Store, workflowN
 	return runtime
 }
 
-func integrationDistributedStore(t *testing.T) *distributed.Store {
-	t.Helper()
-	endpoints := strings.Split(os.Getenv("BLOK_DISTRIBUTED_ENDPOINTS"), ",")
-	if endpoints[0] == "" {
-		t.Skip("set BLOK_DISTRIBUTED_ENDPOINTS to run real etcd cluster execution tests")
-	}
-	client, err := clientv3.New(clientv3.Config{Endpoints: endpoints, DialTimeout: 2 * time.Second})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = client.Close() })
-	response, err := client.Get(context.Background(), "/blok/v1/cluster-incarnation")
-	if err != nil || len(response.Kvs) == 0 {
-		t.Fatalf("read existing cluster incarnation: response=%v err=%v", response, err)
-	}
-	store, err := distributed.New(context.Background(), client, string(response.Kvs[0].Value))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return store
-}
-
 func integrationEtcdVoters() []string {
 	voters := strings.Split(os.Getenv("BLOK_DISTRIBUTED_ETCD_VOTERS"), ",")
 	if len(voters) == 3 && voters[0] != "" && voters[1] != "" && voters[2] != "" {
@@ -1127,7 +1104,7 @@ func tenantForEmptyPartition(t *testing.T, ctx context.Context, store *distribut
 	t.Helper()
 	partition, err := partitionWithoutPendingRuns(ctx, store, runtime.limits.Partitions)
 	if err != nil {
-		t.Skipf("no isolated partition available for runtime fixture: %v", err)
+		t.Fatalf("no isolated partition available for runtime fixture: %v", err)
 	}
 	base := fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
 	for candidate := 0; ; candidate++ {

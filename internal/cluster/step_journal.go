@@ -178,8 +178,13 @@ func (j *runStepJournal) transition(ctx context.Context, attempt engine.StepAtte
 	if err := json.Unmarshal(data, &current); err != nil {
 		return err
 	}
-	if current.Identity != attempt.Identity || current.CurrentAttempt != attempt.AttemptID {
-		return errors.New("cluster: stale step attempt cannot publish")
+	if current.Identity != attempt.Identity {
+		return ErrRequestConflict
+	}
+	if current.CurrentAttempt != attempt.AttemptID {
+		// Only a successor owner re-dispatches a step, so a superseded
+		// attempt is a fenced-out result, not a retryable storage fault.
+		return fmt.Errorf("cluster: stale step attempt cannot publish: %w", distributed.ErrOwnershipLost)
 	}
 	if current.State == "committed" {
 		if state == "committed" && string(current.Output) == string(output) {

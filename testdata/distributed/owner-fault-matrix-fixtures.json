@@ -1,0 +1,86 @@
+{
+  "fixtureVersion": 1,
+  "synthetic": true,
+  "name": "owner-faults-around-every-step-transition",
+  "workflow": "prepare (pure, counted) -> effect (declared effect, counted) -> output",
+  "input": "{\"value\":40}",
+  "faults": {
+    "kill": "SIGKILL of the owner process; it never resumes",
+    "stop": "SIGSTOP of the owner process until a successor has finished the run, then SIGCONT",
+    "partition": "owner process in a container on the etcd network is disconnected until a successor has finished the run, then reconnected"
+  },
+  "stages": [
+    {
+      "name": "before-claim",
+      "transition": "T4 run claim",
+      "hook": {"pattern": "/events/claim-", "skip": 0, "after": false},
+      "expected": {
+        "state": "completed", "output": "{\"value\":42}",
+        "effects": {"kill": 1, "stop": 1, "partition": 1},
+        "pureInvocations": {"kill": 1, "stop": 1, "partition": 1},
+        "effectDispatches": 1, "pureDispatches": 1, "successorPureAttempt": 1
+      }
+    },
+    {
+      "name": "after-pure-dispatch",
+      "transition": "T7 dispatch intent of a pure step",
+      "hook": {"pattern": "/events/dispatch-", "skip": 0, "after": true},
+      "expected": {
+        "state": "completed", "output": "{\"value\":42}",
+        "effects": {"kill": 1, "stop": 1, "partition": 1},
+        "pureInvocations": {"kill": 1, "stop": 2, "partition": 2},
+        "effectDispatches": 1, "pureDispatches": 2, "successorPureAttempt": 2
+      }
+    },
+    {
+      "name": "after-effect-dispatch",
+      "transition": "T7 dispatch intent of an effectful step",
+      "hook": {"pattern": "/events/dispatch-", "skip": 1, "after": true},
+      "expected": {
+        "state": "uncertain", "output": "",
+        "effects": {"kill": 0, "stop": 1, "partition": 1},
+        "pureInvocations": {"kill": 1, "stop": 1, "partition": 1},
+        "effectDispatches": 1, "pureDispatches": 1, "successorPureAttempt": 0
+      }
+    },
+    {
+      "name": "in-effect",
+      "transition": "T8 external effect performed, result not yet committed",
+      "hook": {"pattern": "", "skip": 0, "after": false},
+      "expected": {
+        "state": "uncertain", "output": "",
+        "effects": {"kill": 1, "stop": 1, "partition": 1},
+        "pureInvocations": {"kill": 1, "stop": 1, "partition": 1},
+        "effectDispatches": 1, "pureDispatches": 1, "successorPureAttempt": 0
+      }
+    },
+    {
+      "name": "after-effect-commit",
+      "transition": "T9 effect result committed, run not finished",
+      "hook": {"pattern": "/events/committed-", "skip": 1, "after": true},
+      "expected": {
+        "state": "completed", "output": "{\"value\":42}",
+        "effects": {"kill": 1, "stop": 1, "partition": 1},
+        "pureInvocations": {"kill": 1, "stop": 1, "partition": 1},
+        "effectDispatches": 1, "pureDispatches": 1, "successorPureAttempt": 0
+      }
+    },
+    {
+      "name": "before-finish",
+      "transition": "T15 terminal state and slot release",
+      "hook": {"pattern": "/events/finish-", "skip": 0, "after": false},
+      "expected": {
+        "state": "completed", "output": "{\"value\":42}",
+        "effects": {"kill": 1, "stop": 1, "partition": 1},
+        "pureInvocations": {"kill": 1, "stop": 1, "partition": 1},
+        "effectDispatches": 1, "pureDispatches": 1, "successorPureAttempt": 0
+      }
+    }
+  ],
+  "invariants": {
+    "activeRunsAfterSuccessor": 0,
+    "staleOwnerResult": {"kill": "killed", "stop": "ownership_lost", "partition": "ownership_lost"},
+    "staleFenceEventsAfterTakeover": 0,
+    "terminalEvents": 1
+  }
+}
