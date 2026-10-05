@@ -18,7 +18,8 @@ import (
 //
 //	@expect          {"catalog": …, "digest": …} or {"diagnostics": [[code, source], …]}
 //	@links           one "link -> target" per line; $OUTSIDE is a directory
-//	                 outside the project root
+//	                 outside the project root, $PARENT the root's resolved
+//	                 parent and $ROOT the resolved root
 //	@outside/<path>  a file written under $OUTSIDE
 type fixtureCase struct {
 	name     string
@@ -109,7 +110,13 @@ func materialize(t *testing.T, c fixtureCase) string {
 	write(outside, c.outside)
 	for _, link := range c.links {
 		path := filepath.Join(root, filepath.FromSlash(link[0]))
-		target := filepath.FromSlash(strings.ReplaceAll(link[1], "$OUTSIDE", filepath.ToSlash(outside)))
+		parent, err := filepath.EvalSymlinks(base)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resolvedRoot := filepath.Join(parent, "project")
+		target := strings.NewReplacer("$OUTSIDE", filepath.ToSlash(outside), "$PARENT", filepath.ToSlash(parent), "$ROOT", filepath.ToSlash(resolvedRoot)).Replace(link[1])
+		target = filepath.FromSlash(target)
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			t.Fatal(err)
 		}

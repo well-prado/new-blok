@@ -1,4 +1,4 @@
-Symlinks that escape the root: a node directory linked to an outside directory holding a valid node, a file inside a node linked outside, and a workflow path linked outside. None is followed; following would discover shop/stolen.
+Symlinks that escape the root: a node directory linked to an outside directory holding a valid node, a file inside a node linked outside, and a workflow path linked outside, and an absolute link to exactly the root's parent. None is followed; following would discover shop/stolen.
 -- blok.json --
 {"name":"shop","module":"example.com/shop","runtime":"go","layout":"classic","triggers":["http"],"types":""}
 -- go.mod --
@@ -26,5 +26,6 @@ runtimes/go/nodes/stolen -> $OUTSIDE/stolen
 runtimes/go/nodes/quote/secret.go -> $OUTSIDE/secret.go
 workflows -> $OUTSIDE
 runtimes/go/nodes/quote/relative.go -> ../../../../../outside/secret.go
+runtimes/go/nodes/quote/parent -> $PARENT
 -- @expect --
-{"diagnostics":[["layout_symlink_escape","runtimes/go/nodes/quote/relative.go"],["layout_symlink_escape","runtimes/go/nodes/quote/secret.go"],["layout_symlink_escape","runtimes/go/nodes/stolen"],["layout_symlink_escape","workflows"]]}
+{"diagnostics":[["layout_symlink_escape","runtimes/go/nodes/quote/parent"],["layout_symlink_escape","runtimes/go/nodes/quote/relative.go"],["layout_symlink_escape","runtimes/go/nodes/quote/secret.go"],["layout_symlink_escape","runtimes/go/nodes/stolen"],["layout_symlink_escape","workflows"]]}

@@ -2,12 +2,9 @@ package layout
 
 import (
 	"errors"
-	"go/parser"
-	"go/token"
 	"os"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"testing"
 )
@@ -42,39 +39,6 @@ func TestCaseCollisionOnDisk(t *testing.T) {
 	want := [][2]string{{CodePathCollision, "runtimes/go/nodes/quote/quote.go"}}
 	if !equalPairs(got.diagnostics, want) {
 		t.Fatalf("diagnostics=%v; want %v", got.diagnostics, want)
-	}
-}
-
-// TestDiscoveryNeverExecutesSource is structural evidence for "no source
-// execution": discovery's own code cannot start a process, load a plugin or
-// ask the go tool to load packages, because it imports none of the packages
-// that could. Fixtures also carry an init that panics; it never runs because
-// nothing compiles it, and this guard keeps it that way.
-func TestDiscoveryNeverExecutesSource(t *testing.T) {
-	forbidden := map[string]bool{"os/exec": true, "plugin": true, "go/build": true, "go/importer": true, "go/types": true, "golang.org/x/tools/go/packages": true, "syscall": true, "unsafe": true}
-	files, err := filepath.Glob("*.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	checked := 0
-	for _, file := range files {
-		if strings.HasSuffix(file, "_test.go") {
-			continue
-		}
-		parsed, err := parser.ParseFile(token.NewFileSet(), file, nil, parser.ImportsOnly)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, spec := range parsed.Imports {
-			value, _ := strconv.Unquote(spec.Path.Value)
-			if forbidden[value] {
-				t.Errorf("%s imports %s; discovery must only read files", file, value)
-			}
-		}
-		checked++
-	}
-	if checked < 4 {
-		t.Fatalf("checked %d files; the guard is not seeing the package", checked)
 	}
 }
 

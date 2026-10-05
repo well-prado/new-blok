@@ -29,11 +29,9 @@ const name = "shop/calculate-quote"
 // init would panic if discovery ever executed source.
 func init() { panic("discovery executed source") }
 
-func New() (blok.Definition[Input, Output], error) {
-	return blok.Define(name, "1.0.0", func(ctx context.Context, in Input) (Output, error) {
-		return Output{TotalCents: money.Cents(int64(in.Quantity), rates.Coffee)}, nil
-	})
-}
+var Node = blok.MustDefine(name, "1.0.0", func(ctx context.Context, in Input) (Output, error) {
+	return Output{TotalCents: money.Cents(int64(in.Quantity), rates.Coffee)}, nil
+})
 -- nodes/go/calculate/types.go --
 package quote
 
@@ -50,6 +48,11 @@ package rates
 const Coffee = 1500
 -- nodes/go/calculate/quote_test.go --
 package quote
+
+import blok "github.com/well-prado/new-blok/node"
+
+// Test files are not discovered: this identity must never reach the catalog.
+var testOnly = blok.MustDefine("shop/test-only", "0.0.1", nil)
 -- nodes/nodejs/receipt/node.json --
 {"name":"shop/format-receipt","version":"2.1.0","runtime":"nodejs","description":"Formats a receipt","inputSchema":{"type":"object"},"outputSchema":{"type":"object"}}
 -- nodes/nodejs/receipt/index.mjs --
@@ -63,8 +66,10 @@ import (
 	quote "example.com/shop/nodes/go/calculate"
 )
 
-var _ = quote.New
+var _ = quote.Node
 
-func New() { _, _ = flow.Define(flow.Spec{Name: "shop/quote", Version: "1.0.0"}, nil) }
+func New() (flow.Definition[int, int], error) {
+	return flow.Define(flow.Spec{Name: "shop/quote", Version: "1.0.0"}, nil)
+}
 -- @expect --
 {"catalog":{"version":1,"nodes":[{"name":"shop/calculate-quote","version":"1.0.0","runtime":"go","files":["quote.go","quote_test.go","rates/rates.go","types.go"]},{"name":"shop/format-receipt","version":"2.1.0","runtime":"nodejs","files":["index.mjs","node.json"]}],"workflows":[{"name":"shop/quote","version":"1.0.0"}]},"digest":"sha256:1f255e6ce8145ae2eb41650fa25d97942fb321da464285443063fd71f309ca3e"}

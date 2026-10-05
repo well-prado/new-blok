@@ -19,6 +19,7 @@ import (
 	"io"
 	"path"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/well-prado/new-blok/internal/diagnostic"
@@ -46,13 +47,19 @@ const (
 // Bounds. Discovery of a project beyond them fails with
 // layout_limit_exceeded instead of reading without end.
 const (
-	MaxNodes        = 1024 // matches contract/runtime.MaxCatalogNodes
-	MaxWorkflows    = 1024
-	MaxFiles        = 10000
-	MaxDepth        = 32
-	MaxFileBytes    = 1 << 20
-	MaxDiagnostics  = 256
-	maxManifestPath = 4096
+	MaxNodes       = 1024 // matches contract/runtime.MaxCatalogNodes
+	MaxWorkflows   = 1024
+	MaxFiles       = 10000 // directory entries visited, files and directories
+	MaxDirEntries  = 4096  // entries listed from one directory
+	MaxDepth       = 32
+	MaxFileBytes   = 1 << 20
+	MaxNodeBytes   = 8 << 20  // source bytes read for one node
+	MaxTotalBytes  = 32 << 20 // source bytes read for one discovery
+	MaxDiagnostics = 256
+	// MaxWorkflowPaths bounds blok.json's workflows list, so validating it
+	// is cheap even for a manifest at the 1 MiB file bound.
+	MaxWorkflowPaths = 256
+	maxManifestPath  = 4096
 )
 
 var (
@@ -138,19 +145,42 @@ func ParseManifest(data []byte) (Manifest, []diagnostic.Diagnostic) {
 	if manifest.Types != "" && !validRel(manifest.Types) {
 		diagnostics = append(diagnostics, outsideRoot("types", manifest.Types))
 	}
-	seen := map[string]bool{}
+	if len(manifest.Workflows) > MaxWorkflowPaths {
+		diagnostics = append(diagnostics, manifestDiag("workflows", fmt.Sprintf("at most %d paths", MaxWorkflowPaths), strconv.Itoa(len(manifest.Workflows)), "blok.json lists more workflow paths than discovery accepts"))
+		return manifest, diagnostics
+	}
+	// Overlap in O(total path length): a path overlaps an earlier-listed or
+	// later-listed one exactly when one of its own "/"-prefixes is listed,
+	// or it is listed twice.
+	first := map[string]int{}
 	for index, workflow := range manifest.Workflows {
-		field := fmt.Sprintf("workflows[%d]", index)
 		if !validRel(workflow) {
-			diagnostics = append(diagnostics, outsideRoot(field, workflow))
+			diagnostics = append(diagnostics, outsideRoot(fmt.Sprintf("workflows[%d]", index), workflow))
 			continue
 		}
-		for other := range seen {
-			if workflow == other || strings.HasPrefix(workflow, other+"/") || strings.HasPrefix(other, workflow+"/") {
-				diagnostics = append(diagnostics, manifestDiag(field, "disjoint workflow paths", workflow, fmt.Sprintf("workflow path %q overlaps %q; one file would have two owners", workflow, other)))
-			}
+		if earlier, again := first[workflow]; again {
+			diagnostics = append(diagnostics, manifestDiag(fmt.Sprintf("workflows[%d]", index), "disjoint workflow paths", workflow, fmt.Sprintf("workflow path %q is also workflows[%d]", workflow, earlier)))
+			continue
 		}
-		seen[workflow] = true
+		first[workflow] = index
+	}
+	for index, workflow := range manifest.Workflows {
+		if first[workflow] != index {
+			continue
+		}
+		for cut := strings.IndexByte(workflow, '/'); cut >= 0; {
+			if owner, listed := first[workflow[:cut]]; listed {
+				// One diagnostic per path, naming its outermost listed
+				// ancestor, so the output stays linear too.
+				diagnostics = append(diagnostics, manifestDiag(fmt.Sprintf("workflows[%d]", index), "disjoint workflow paths", workflow, fmt.Sprintf("workflow path %q lies inside workflows[%d] %q; one file would have two owners", workflow, owner, workflow[:cut])))
+				break
+			}
+			next := strings.IndexByte(workflow[cut+1:], '/')
+			if next < 0 {
+				break
+			}
+			cut += 1 + next
+		}
 	}
 	return manifest, diagnostics
 }

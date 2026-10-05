@@ -16,5 +16,6 @@ package shared
 -- @links --
 nodes/go/copy -> quote
 nodes/go/quote/shared.go -> ../../../internal/shared/shared.go
+nodes/go/quote/absolute.go -> $ROOT/internal/shared/shared.go
 -- @expect --
-{"diagnostics":[["layout_symlink_alias","nodes/go/copy"],["layout_symlink_alias","nodes/go/quote/shared.go"]]}
+{"diagnostics":[["layout_symlink_alias","nodes/go/copy"],["layout_symlink_alias","nodes/go/quote/absolute.go"],["layout_symlink_alias","nodes/go/quote/shared.go"]]}

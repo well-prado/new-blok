@@ -56,7 +56,11 @@ type Workflow struct {
 // Discover reads the project at root. It returns a Project, or an *Error
 // carrying every diagnostic found, or a plain error when root itself cannot
 // be opened.
-func Discover(root string) (*Project, error) {
+func Discover(root string) (*Project, error) { return discoverWith(root, MaxFiles) }
+
+// discoverWith is Discover with an entry bound, so tests can reach the
+// bound without creating MaxFiles directories.
+func discoverWith(root string, entryLimit int) (*Project, error) {
 	absolute, err := filepath.Abs(root)
 	if err != nil {
 		return nil, fmt.Errorf("layout: %w", err)
@@ -70,7 +74,7 @@ func Discover(root string) (*Project, error) {
 		return nil, fmt.Errorf("layout: open project root: %w", err)
 	}
 	defer opened.Close()
-	d := &discoverer{root: opened, abs: resolved, c: &collector{}}
+	d := &discoverer{root: opened, abs: resolved, c: &collector{}, nodeBytes: -1, entryLimit: entryLimit}
 	project := d.discover()
 	if err := d.c.err(); err != nil {
 		return nil, err
@@ -81,12 +85,19 @@ func Discover(root string) (*Project, error) {
 
 // LoadManifest reads and validates root/blok.json alone.
 func LoadManifest(root string) (Manifest, error) {
-	opened, err := os.OpenRoot(root)
+	resolved, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return Manifest{}, fmt.Errorf("layout: open project root: %w", err)
+	}
+	if resolved, err = filepath.Abs(resolved); err != nil {
+		return Manifest{}, fmt.Errorf("layout: %w", err)
+	}
+	opened, err := os.OpenRoot(resolved)
 	if err != nil {
 		return Manifest{}, fmt.Errorf("layout: open project root: %w", err)
 	}
 	defer opened.Close()
-	d := &discoverer{root: opened, c: &collector{}}
+	d := &discoverer{root: opened, abs: resolved, c: &collector{}, nodeBytes: -1}
 	manifest, _ := d.manifest()
 	if err := d.c.err(); err != nil {
 		return Manifest{}, err
@@ -99,10 +110,15 @@ func LoadManifest(root string) (Manifest, error) {
 // read through an os.Root, which refuses to leave the project root even if
 // the tree changes during discovery.
 type discoverer struct {
-	root  *os.Root
-	abs   string
-	c     *collector
-	files int
+	root       *os.Root
+	abs        string
+	c          *collector
+	files      int // directory entries visited
+	entryLimit int
+	bytes      int64
+	// nodeBytes is the source read for the node being walked, or -1
+	// outside a node.
+	nodeBytes int64
 }
 
 func (d *discoverer) discover() *Project {
@@ -293,6 +309,8 @@ func (d *discoverer) nodeDirs(base, runtime string) []nodeRoot {
 func (d *discoverer) node(root nodeRoot) (Node, map[string][]string, bool) {
 	node := Node{Runtime: root.runtime, Dir: root.dir}
 	source := newGoSource()
+	d.nodeBytes = 0
+	defer func() { d.nodeBytes = -1 }()
 	hasDescriptorFile := false
 	before := len(d.c.items)
 	d.walk(root.dir, 0, func(rel string, info fs.FileInfo) {
@@ -303,7 +321,7 @@ func (d *discoverer) node(root nodeRoot) (Node, map[string][]string, bool) {
 		case strings.HasSuffix(rel, ".go") && !strings.HasSuffix(rel, "_test.go"):
 			if data, ok := d.read(rel, info); ok {
 				if err := source.parse(rel, data); err != nil {
-					d.c.add(CodeParseFailed, rel, "", "", "Go syntax error: "+relativeError(err, d.abs))
+					d.c.add(CodeParseFailed, rel, "", "", err.Error())
 				}
 			}
 		}
@@ -367,11 +385,7 @@ func (d *discoverer) node(root nodeRoot) (Node, map[string][]string, bool) {
 		d.c.add(CodeDescriptorInvalid, node.Descriptor, "namespace/name and major.minor.patch", node.Name+"@"+node.Version, "the node identity is not a stable name and version")
 		return Node{}, nil, false
 	}
-	fileImports := map[string][]string{}
-	for rel, file := range source.files {
-		fileImports[rel] = imports(file)
-	}
-	return node, fileImports, true
+	return node, source.imports(), true
 }
 
 func validIdentity(name, version string) bool {
@@ -427,7 +441,7 @@ func (d *discoverer) workflows(manifest Manifest, roots []nodeRoot) []Workflow {
 			}
 			if data, ok := d.read(rel, info); ok {
 				if err := source.parse(rel, data); err != nil {
-					d.c.add(CodeParseFailed, rel, "", "", "Go syntax error: "+relativeError(err, d.abs))
+					d.c.add(CodeParseFailed, rel, "", "", err.Error())
 				}
 			}
 		}
@@ -600,6 +614,9 @@ func (d *discoverer) walk(dir string, depth int, visit func(rel string, info fs.
 			if name == "testdata" || name == "vendor" || name == "node_modules" {
 				continue
 			}
+			if !d.count(rel) {
+				return
+			}
 			d.walk(rel, depth+1, visit)
 		case entry.Type().IsRegular():
 			if !d.count(rel) {
@@ -652,10 +669,10 @@ func (d *discoverer) realParents(rel string) bool {
 
 func (d *discoverer) count(rel string) bool {
 	d.files++
-	if d.files == MaxFiles+1 {
-		d.c.add(CodeLimitExceeded, rel, strconv.Itoa(MaxFiles), "", "the project has more files than discovery reads")
+	if d.files == d.entryLimit+1 {
+		d.c.add(CodeLimitExceeded, rel, strconv.Itoa(d.entryLimit), "", "the project has more files and directories than discovery visits")
 	}
-	return d.files <= MaxFiles
+	return d.files <= d.entryLimit
 }
 
 func skipped(name string) bool { return strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") }
@@ -670,117 +687,137 @@ func (d *discoverer) readDir(dir string) ([]fs.DirEntry, bool) {
 		return nil, false
 	}
 	defer file.Close()
-	entries, err := file.ReadDir(-1)
-	if err != nil {
+	entries, err := file.ReadDir(MaxDirEntries + 1)
+	if err != nil && !errors.Is(err, io.EOF) {
 		d.c.add(CodeFileUnsupported, dir, "", "", "directory cannot be read")
+		return nil, false
+	}
+	if len(entries) > MaxDirEntries {
+		d.c.add(CodeLimitExceeded, dir, strconv.Itoa(MaxDirEntries), "", "a directory lists more entries than discovery reads")
 		return nil, false
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 	return entries, true
 }
 
-// read returns a regular file's bytes through the os.Root, bounded.
-func (d *discoverer) read(rel string, info fs.FileInfo) ([]byte, bool) {
-	if !info.Mode().IsRegular() {
-		d.c.add(CodeFileUnsupported, rel, "regular file", info.Mode().String(), "discovery reads only regular files")
+// read returns a regular file's bytes through the os.Root, bounded per
+// file, per node and per discovery. The file is opened non-blocking where
+// the platform allows and its type is checked again on the open handle, so
+// a FIFO or device swapped in after the walk cannot block discovery; a
+// hard-linked file is refused because its other name may sit outside the
+// project.
+func (d *discoverer) read(rel string, listed fs.FileInfo) ([]byte, bool) {
+	if !listed.Mode().IsRegular() {
+		d.c.add(CodeFileUnsupported, rel, "regular file", listed.Mode().String(), "discovery reads only regular files")
 		return nil, false
 	}
-	if info.Size() > MaxFileBytes {
-		d.c.add(CodeLimitExceeded, rel, strconv.Itoa(MaxFileBytes), strconv.FormatInt(info.Size(), 10), "file exceeds the discovery size bound")
-		return nil, false
-	}
-	file, err := d.root.Open(filepath.FromSlash(rel))
+	file, err := d.root.OpenFile(filepath.FromSlash(rel), openFlags, 0)
 	if err != nil {
-		d.c.add(CodeFileUnsupported, rel, "", "", "file cannot be read")
+		d.c.add(CodeFileUnsupported, rel, "", "", "file cannot be opened")
 		return nil, false
 	}
 	defer file.Close()
-	data, err := io.ReadAll(io.LimitReader(file, MaxFileBytes+1))
-	if err != nil || len(data) > MaxFileBytes {
-		d.c.add(CodeLimitExceeded, rel, strconv.Itoa(MaxFileBytes), "", "file cannot be read within the discovery size bound")
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		d.c.add(CodeFileUnsupported, rel, "regular file", "changed during discovery", "the file is no longer a regular file")
 		return nil, false
+	}
+	if links, known := linkCount(file); known && links > 1 {
+		d.c.add(CodeFileUnsupported, rel, "one link", strconv.FormatUint(links, 10)+" links", "a hard-linked file may be a second name for a file outside the project")
+		return nil, false
+	}
+	size := info.Size()
+	switch {
+	case size > MaxFileBytes:
+		d.c.add(CodeLimitExceeded, rel, strconv.Itoa(MaxFileBytes), strconv.FormatInt(size, 10), "file exceeds the discovery size bound")
+		return nil, false
+	case d.nodeBytes >= 0 && d.nodeBytes+size > MaxNodeBytes:
+		if d.nodeBytes <= MaxNodeBytes {
+			d.c.add(CodeLimitExceeded, rel, strconv.Itoa(MaxNodeBytes), "", "the node's source exceeds the per-node read budget")
+		}
+		d.nodeBytes = MaxNodeBytes + 1 // report once per node
+		return nil, false
+	case d.bytes+size > MaxTotalBytes:
+		if d.bytes <= MaxTotalBytes {
+			d.c.add(CodeLimitExceeded, rel, strconv.Itoa(MaxTotalBytes), "", "the project's source exceeds the discovery read budget")
+		}
+		d.bytes = MaxTotalBytes + 1
+		return nil, false
+	}
+	data, err := io.ReadAll(io.LimitReader(file, size+1))
+	if err != nil || int64(len(data)) > size {
+		d.c.add(CodeFileUnsupported, rel, "", "", "file changed while it was read")
+		return nil, false
+	}
+	d.bytes += int64(len(data))
+	if d.nodeBytes >= 0 {
+		d.nodeBytes += int64(len(data))
 	}
 	return data, true
 }
 
 // symlink reports a link without following it.
 func (d *discoverer) symlink(rel string) {
-	code := classifyLink(d.abs, filepath.Join(d.abs, filepath.FromSlash(rel)))
+	code := d.classifyLink(rel)
 	messages := map[string]string{
 		CodeSymlinkEscape:   "a link points outside the project root",
 		CodeSymlinkAlias:    "a link is a second path to source inside the project",
-		CodeSymlinkDangling: "a link points to nothing",
+		CodeSymlinkDangling: "a link points to nothing inside the project",
 		CodeSymlinkLoop:     "a link never resolves: it is part of a cycle",
 	}
 	d.c.add(code, rel, "regular file or directory", "symlink", messages[code])
 }
 
-// maxLinkHops bounds link resolution, like the kernel's ELOOP bound.
+// maxLinkHops bounds link resolution, like the kernel's ELOOP bound; a
+// cycle exhausts it.
 const maxLinkHops = 40
 
-// classifyLink resolves link only far enough to name what it is. It checks
-// containment before every hop, so it never inspects anything reachable
-// only by leaving root, and it reads no file contents.
-func classifyLink(root, link string) string {
-	if root == "" {
-		return CodeSymlinkAlias
-	}
-	current := link
-	seen := map[string]bool{}
-	for hop := 0; ; hop++ {
-		if hop > maxLinkHops || seen[current] {
-			return CodeSymlinkLoop
+// classifyLink resolves the link at rel one path element at a time, the way
+// the kernel does, using only the os.Root's Lstat and Readlink on
+// symlink-free prefixes. A ".." above the root, or an absolute target
+// outside it, is an escape decided lexically: nothing outside the root is
+// ever stat-ed or read, so classification cannot reveal whether an outside
+// path exists.
+func (d *discoverer) classifyLink(rel string) string {
+	pending := strings.Split(rel, "/")
+	var resolved []string // symlink-free elements below the root
+	for hops := 0; len(pending) > 0; {
+		element := pending[0]
+		pending = pending[1:]
+		switch element {
+		case "", ".":
+			continue
+		case "..":
+			if len(resolved) == 0 {
+				return CodeSymlinkEscape
+			}
+			resolved = resolved[:len(resolved)-1]
+			continue
 		}
-		seen[current] = true
-		info, err := os.Lstat(current)
-		if errors.Is(err, fs.ErrNotExist) {
-			return CodeSymlinkDangling
-		}
+		candidate := path.Join(append(append([]string(nil), resolved...), element)...)
+		info, err := d.root.Lstat(filepath.FromSlash(candidate))
 		if err != nil {
-			return CodeSymlinkLoop
+			return CodeSymlinkDangling
 		}
 		if info.Mode()&fs.ModeSymlink == 0 {
-			break
+			resolved = append(resolved, element)
+			continue
 		}
-		target, err := os.Readlink(current)
+		if hops++; hops > maxLinkHops {
+			return CodeSymlinkLoop
+		}
+		target, err := d.root.Readlink(filepath.FromSlash(candidate))
 		if err != nil {
 			return CodeSymlinkDangling
 		}
-		next := target
-		if !filepath.IsAbs(target) {
-			next = filepath.Join(filepath.Dir(current), target)
+		if filepath.IsAbs(target) || filepath.VolumeName(target) != "" {
+			inside, err := filepath.Rel(d.abs, filepath.Clean(target))
+			if err != nil || d.abs == "" {
+				return CodeSymlinkEscape
+			}
+			resolved, target = nil, inside
 		}
-		next = filepath.Clean(next)
-		if !within(root, next) {
-			return CodeSymlinkEscape
-		}
-		current = next
-	}
-	real, err := filepath.EvalSymlinks(current)
-	switch {
-	case errors.Is(err, fs.ErrNotExist):
-		return CodeSymlinkDangling
-	case err != nil:
-		return CodeSymlinkLoop
-	case !within(root, real):
-		return CodeSymlinkEscape
+		pending = append(strings.Split(filepath.ToSlash(target), "/"), pending...)
 	}
 	return CodeSymlinkAlias
-}
-
-func within(root, candidate string) bool {
-	rel, err := filepath.Rel(root, candidate)
-	if err != nil {
-		return false
-	}
-	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
-}
-
-// relativeError keeps machine-specific absolute paths out of diagnostics.
-func relativeError(err error, root string) string {
-	text := err.Error()
-	if root != "" {
-		text = strings.ReplaceAll(text, root+string(filepath.Separator), "")
-	}
-	return text
 }
