@@ -2,7 +2,8 @@
 
 - Status: accepted
 - Date: 2026-10-02
-- Amended: #188 (worker nested-store diagnostics and saturation)
+- Amended: #188 (worker nested-store diagnostics and saturation), #207
+  (undetected self-submits fail after one busy wait)
 - Roadmap: E09-T02 ([#55](https://github.com/well-prado/new-blok/issues/55))
 - Amends: [ADR 0005](0005-trigger-adapter-contract.md) (webhook declaration)
 - Consumers: webhook now; cron (#56) and pubsub (#57) are expected to submit
@@ -43,13 +44,48 @@ for atomic writes; this is a failed handler result, not saturation to defer.
 The optional `store.WriteDomainProvider` capability supplies lock identity.
 SQLite compares file-backed domains using the filesystem's same-file identity,
 including separate handles and filesystem aliases to the same database file;
-its existing shared `:memory:` URI uses one stable domain token across opens.
-Wrappers that share a write lock must forward the underlying token. When a
-wrapper hides this capability, or trusted handler code discards the supplied context (for example
-by submitting with `context.Background()`), the queue cannot safely infer the
-relationship: that nested write follows the ordinary store busy timeout and
-its saturation behavior. Direct database writes that bypass `Queue.Enqueue`
-are likewise outside this diagnostic; handlers should use `worker.Tx`.
+every `:memory:` open is one shared database with one stable domain token.
+Wrappers that share a write lock must forward the underlying token.
+
+The context check cannot see a nested submission whose handler discarded the
+supplied context (for example by submitting with `context.Background()`) or
+that goes through a wrapper hiding `WriteDomainProvider`. Such a submission
+waits out the store's busy timeout once, because the claim holds the lock it
+needs, and returns saturation that names the write domain it waited on
+(#207). The store names it: SQLite annotates its busy errors with its domain
+(`store.WithWriteDomain`), which survives wrappers that pass errors through;
+`Queue.Enqueue` adds its own queue's domain when the cause carries none.
+`ProcessOnce` compares every domain the handler's error names
+(`store.ErrorWriteDomains`, which also reads each branch of an
+`errors.Join`) with its claim's while the claim is still held. Checking only
+the first would let a handler that joins another store's saturation ahead of
+its own hide the self-submit. A match means the claim itself was the
+contention, so deferring would only repeat the wait: the job fails as
+`worker.ErrNestedSubmission`, is not retried (even when joined with a
+retryable `HandlerError`, #225), and dead-letters as `nested
+submission to claimed store; use worker.Tx for atomic writes`. Saturation
+naming a different domain, or no domain, is backpressure and still defers.
+The comparison needs the claiming queue's own domain: a queue opened on a
+wrapper that hides it cannot tell its claim apart and defers, as before.
+Direct database writes that bypass `Queue.Enqueue` are likewise outside this
+diagnostic; handlers should use `worker.Tx`.
+
+SQLite opens `:memory:` on its memdb VFS (`file:/new-blok-memory?vfs=memdb`),
+not in shared-cache mode. In shared-cache mode a writer blocked by another
+connection's write transaction gets `SQLITE_LOCKED_SHAREDCACHE`, which the
+driver waits out with `sqlite3_unlock_notify`: no busy timeout applies, the
+context cannot interrupt it, and SQLite reports a deadlock only when the
+blocking connection is itself waiting for an unlock. A claim waiting for its
+handler is not, so an undetected self-submit on `:memory:` blocked forever
+(#207). memdb locks report `SQLITE_BUSY` and honor the busy timeout like a
+file, so the same submission fails after one wait. The trade-off is ordinary
+locking without WAL: while a write transaction is open (a worker claim holds
+one for its whole handler), no other connection can even start a read; it
+waits out the busy timeout and fails with `store.ErrBusy` (measured: 5.05 s,
+where shared cache answered an unrelated read in 0.3 ms). Each connection
+also refreshes its schema at the start of a transaction rather than sharing
+one cache, and memdb caps the database at 1 GiB. `:memory:` is a test store;
+deployments open a file.
 
 A worker handler writes through `worker.Tx`, the claim's own transaction,
 so its writes commit only if the job is acknowledged. SQLite can end that
@@ -89,6 +125,32 @@ reports it as processed without an error; the job's error records why.
 trusted producer (`EnqueueRequest.Principal`, `Job.Principal`) and makes it part
 of request identity. `worker.New` migrates existing queues in place by adding a
 `principal_json` column, with empty for existing jobs.
+
+**Claim order (#217).** A worker claims the available job with the oldest
+`created_at` first. Jobs that share a `created_at` are claimed in the order
+they were enqueued. Before #217 they went in `job_id` (hash) order, which was
+effectively random. Ties are common on Windows: Go's clock there advances in
+steps of about 2 ms (0.3–12.7 ms measured on the #156 host), against about
+1 µs on macOS.
+
+The order is kept in an `enqueue_seq` column. Each enqueue sets it to one
+past the highest so far, inside its write transaction, so it follows commit
+order within one `created_at`: `created_at` is read before the writer
+waits for the lock, so producers on different clock ticks are ordered by
+timestamp. It is stored rather than taken from SQLite's `rowid`, which SQLite
+documents `VACUUM` may renumber for tables without an `INTEGER PRIMARY KEY`.
+
+This is not a strict FIFO:
+- `created_at` is the enqueuing process's wall clock, so producers with
+  skewed clocks, or a clock stepped back, are ordered by timestamp, not
+  commit.
+- A retried or deferred job keeps its `created_at` and competes again once
+  `available_at` passes.
+- Concurrent workers run their handlers one at a time, but a later job can
+  finish first if an earlier one fails and is retried.
+
+Jobs enqueued before the column existed keep 0 and fall back to `job_id`
+among themselves.
 
 ### Webhook admission
 
@@ -159,7 +221,12 @@ is never parsed before verification.
 | `worker.ErrInvalidPayload` / `ErrRequestConflict` wrap the trigger sentinels | additive (error chains) | `errors.Is` on the worker sentinels keeps working |
 | `store.WriteDomainProvider` and `worker.ErrNestedSubmission` | additive | Stores/wrappers may expose lock identity; handlers should use `worker.Tx` for same-store atomic writes |
 | Worker handler receives saturation from another store | behavioral | The job is deferred within its existing deferral budget without consuming an attempt |
+| `store.WithWriteDomain` / `store.ErrorWriteDomain`; SQLite busy errors and worker saturation name their write domain | additive (error chains) | `errors.Is` on `store.ErrBusy` / `trigger.ErrSaturated` keeps working; other stores may annotate their busy errors |
+| `store.ErrorWriteDomains` reports the outermost annotation on every branch of an error tree | additive | `store.ErrorWriteDomain` is unchanged and still reports the first |
+| Worker handler returns saturation naming its own claim's domain, alone or joined with other failures in any order | behavioral | The job fails as `worker.ErrNestedSubmission` after one busy wait instead of being deferred to `deferral_budget_exhausted` |
+| SQLite `:memory:` uses the memdb VFS instead of shared cache | behavioral | Same shared database per process; writer conflicts are `store.ErrBusy` within the busy timeout instead of an unbounded wait |
 | `principal_json` column | schema | added by `worker.New` |
+| Jobs tied on `created_at` are claimed in enqueue order; `enqueue_seq` column and index | behavioral, schema | added by `worker.New`; existing jobs keep 0 and stay in `job_id` order among themselves |
 | New package `trigger/webhook` | additive | none |
 
 ## Limits
@@ -171,9 +238,14 @@ is never parsed before verification.
   crash tests instead.
 - Constant-time comparison relies on `hmac.Equal`; timing is not measured.
 - The worker sorts and de-duplicates principal roles before comparing.
-  Concurrent first opens of a pre-migration queue may fail one opener with
-  `SQLITE_BUSY` (startup fails; nothing is corrupted). This is not
-  reproduced.
+  Adding a column must read the schema before it writes, and SQLite cannot
+  make such a transaction wait for another writer. So when several
+  processes open a queue that needs a column, all but one fail busy at once:
+  50 of 60 concurrent opens failed before #233. `worker.New` therefore
+  retries the idempotent migration while it fails busy, with a short growing
+  pause, starting new attempts for up to 10 s (so `New` can take 10 s plus
+  one busy timeout), and the same probe now has no failures. An opener that
+  still loses fails startup as before; nothing is corrupted.
 - Only the Standard Webhooks scheme is built in. Provider-specific schemes
   (with their own header formats and key distribution) are written against
   `Verifier`, as the tests do for a synthetic provider.

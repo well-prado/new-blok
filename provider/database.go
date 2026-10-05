@@ -41,7 +41,7 @@ func (p *Records) Execute(ctx context.Context, in DatabaseInput) (DatabaseOutput
 		return DatabaseOutput{}, &Error{Class: Invalid, Code: "invalid_input"}
 	}
 	result := DatabaseOutput{RecordID: in.RecordID, EventID: "event:" + in.Key}
-	err := p.database.WithTx(ctx, func(tx *sql.Tx) error {
+	err := p.database.WithTx(store.Writer(ctx), func(tx *sql.Tx) error {
 		// Take the write reservation before idempotency reads. An empty UPDATE
 		// waits for concurrent writers but never changes business records.
 		if _, err := tx.ExecContext(ctx, `UPDATE provider_records SET record_id = record_id WHERE 0`); err != nil {

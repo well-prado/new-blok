@@ -4,6 +4,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 
 	"github.com/well-prado/new-blok/contract/capacity"
@@ -37,6 +38,27 @@ type Database interface {
 	Backup(context.Context, string) error
 	Integrity(context.Context) error
 	Close() error
+}
+
+type writerKey struct{}
+
+// Writer marks ctx for a WithTx that writes before anything else and holds
+// the write lock until it commits. A backend may then queue such
+// transactions first come first served instead of leaving them to contend
+// for the lock, where the longest waiters can be starved (#214). Mark only
+// a callback whose first statement writes and that does no slow work, since
+// it holds the queue as long as it holds the lock. Mark only the context
+// passed to WithTx. An unmarked transaction is not queued and behaves as it
+// always has: a read, or work done before the first write, never waits for
+// the queue.
+func Writer(ctx context.Context) context.Context {
+	return context.WithValue(ctx, writerKey{}, true)
+}
+
+// IsWriter reports whether ctx was marked by Writer.
+func IsWriter(ctx context.Context) bool {
+	marked, _ := ctx.Value(writerKey{}).(bool)
+	return marked
 }
 
 // WriteDomain identifies databases that contend for the same write lock.
@@ -83,3 +105,73 @@ func WriteDomainOf(database Database) (*WriteDomain, bool) {
 	domain := provider.WriteDomain()
 	return domain, domain != nil
 }
+
+// WithWriteDomain annotates err with the write domain it concerns, typically
+// the domain whose write lock a transaction waited for before failing with
+// ErrBusy. The result matches everything err matches. A nil err or domain
+// returns err unchanged. Stores annotate their own busy errors so a caller
+// can identify the contended domain even through a wrapper that does not
+// forward WriteDomainProvider.
+func WithWriteDomain(err error, domain *WriteDomain) error {
+	if err == nil || domain == nil {
+		return err
+	}
+	return &domainError{err: err, domain: domain}
+}
+
+// ErrorWriteDomain reports the write domain err, or an error it wraps, was
+// annotated with by WithWriteDomain. The outermost annotation wins.
+func ErrorWriteDomain(err error) (*WriteDomain, bool) {
+	var annotated *domainError
+	if !errors.As(err, &annotated) {
+		return nil, false
+	}
+	return annotated.domain, true
+}
+
+// ErrorWriteDomains reports every write domain err's tree was annotated with,
+// in the order errors.As visits them. Where ErrorWriteDomain reports only the
+// first, this also reports annotations on the other branches of a joined
+// error, such as a handler that returns errors.Join of failures from two
+// stores. Within one branch the outermost annotation wins, as it does for
+// ErrorWriteDomain.
+func ErrorWriteDomains(err error) []*WriteDomain {
+	var domains []*WriteDomain
+	var visit func(error)
+	visit = func(err error) {
+		for err != nil {
+			if e, ok := err.(*domainError); ok {
+				domains = append(domains, e.domain)
+				return
+			}
+			// errors.As consults an error's own As method before unwrapping
+			// it; a wrapper exposing its cause only that way still names it.
+			if x, ok := err.(interface{ As(any) bool }); ok {
+				var annotated *domainError
+				if x.As(&annotated) {
+					domains = append(domains, annotated.domain)
+					return
+				}
+			}
+			switch e := err.(type) {
+			case interface{ Unwrap() []error }:
+				for _, branch := range e.Unwrap() {
+					visit(branch)
+				}
+				return
+			}
+			err = errors.Unwrap(err)
+		}
+	}
+	visit(err)
+	return domains
+}
+
+type domainError struct {
+	err    error
+	domain *WriteDomain
+}
+
+func (e *domainError) Error() string { return e.err.Error() }
+
+func (e *domainError) Unwrap() error { return e.err }

@@ -17,6 +17,7 @@ import (
 	"unicode"
 
 	"github.com/well-prado/new-blok/contract/schema"
+	"github.com/well-prado/new-blok/internal/migration"
 	"github.com/well-prado/new-blok/store"
 	"github.com/well-prado/new-blok/trigger"
 )
@@ -110,9 +111,11 @@ func (e *HandlerError) Error() string { return e.Message }
 // transaction as the job's acknowledgment, so they commit only if the job
 // does. ctx is the consumer's: it is canceled when the consumer is lost. The
 // context also carries the claimed write domain when the store exposes one,
-// allowing Queue.Enqueue/Submit to reject a nested write to that same domain.
-// Preserve ctx when submitting; replacing it with context.Background loses
-// that diagnostic context.
+// allowing Queue.Enqueue/Submit to reject a nested write to that same domain
+// before it waits. Preserve ctx when submitting: a nested submission made
+// with context.Background (or through a wrapper that hides the write domain)
+// still fails the job as ErrNestedSubmission, but only after waiting out the
+// store's busy timeout once.
 type Handler func(ctx context.Context, tx Tx, job Job) error
 
 // ErrClaimLost reports that the claim's transaction ended while a handler
@@ -338,14 +341,26 @@ func New(ctx context.Context, database store.Database, clock func() time.Time) (
 	}
 	writeDomain, _ := store.WriteDomainOf(database)
 	queue := &Queue{database: database, writeDomain: writeDomain, clock: clock, schemas: map[string]schema.Schema{}}
-	if err := queue.withTx(ctx, func(tx *sql.Tx) error {
-		if err := createJobs(ctx, tx); err != nil {
+	if err := migration.Retry(ctx, func() error {
+		return queue.withTx(ctx, func(tx *sql.Tx) error {
+			if err := createJobs(ctx, tx); err != nil {
+				return err
+			}
+			if err := ensureColumn(ctx, tx, "deferrals", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+				return err
+			}
+			if err := ensureColumn(ctx, tx, "principal_json", "TEXT NOT NULL DEFAULT ''"); err != nil {
+				return err
+			}
+			// enqueue_seq orders jobs that share a created_at by when they were
+			// enqueued (#217). Jobs from before the column existed keep 0 and
+			// fall back to job_id among themselves.
+			if err := ensureColumn(ctx, tx, "enqueue_seq", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+				return err
+			}
+			_, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS worker_jobs_enqueue_seq ON worker_jobs (enqueue_seq)`)
 			return err
-		}
-		if err := ensureColumn(ctx, tx, "deferrals", "INTEGER NOT NULL DEFAULT 0"); err != nil {
-			return err
-		}
-		return ensureColumn(ctx, tx, "principal_json", "TEXT NOT NULL DEFAULT ''")
+		})
 	}); err != nil {
 		return nil, fmt.Errorf("worker: schema: %w", err)
 	}
@@ -368,7 +383,8 @@ func createJobs(ctx context.Context, tx *sql.Tx) error {
 		lease_until INTEGER,
 		error_text TEXT NOT NULL DEFAULT '',
 		created_at INTEGER NOT NULL,
-		updated_at INTEGER NOT NULL
+		updated_at INTEGER NOT NULL,
+		enqueue_seq INTEGER NOT NULL DEFAULT 0
 	)`)
 	return err
 }
@@ -457,10 +473,14 @@ func (q *Queue) Enqueue(ctx context.Context, request EnqueueRequest) (EnqueueRes
 	// ID from the clock let equal payloads collide under a coarse clock.
 	jobID := "job:" + digest([]byte(request.RequestKey))[:32]
 	var result EnqueueResult
-	err = q.withTx(ctx, func(tx *sql.Tx) error {
+	err = q.withTx(store.Writer(ctx), func(tx *sql.Tx) error {
+		// enqueue_seq is one past the highest so far, read under this
+		// transaction's write lock, so it follows commit order. It is stored
+		// rather than taken from SQLite's rowid, which SQLite documents VACUUM
+		// may renumber for tables without an INTEGER PRIMARY KEY.
 		res, err := tx.ExecContext(ctx, `INSERT INTO worker_jobs
-			(job_id, request_key, kind, payload_json, payload_digest, max_attempts, principal_json, state, available_at, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(request_key) DO NOTHING`,
+			(job_id, request_key, kind, payload_json, payload_digest, max_attempts, principal_json, state, available_at, created_at, updated_at, enqueue_seq)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(enqueue_seq), 0) + 1 FROM worker_jobs)) ON CONFLICT(request_key) DO NOTHING`,
 			jobID, request.RequestKey, request.Kind, []byte(request.Payload), payloadDigest, request.MaxAttempts, principal, StatePending, q.now(), q.now(), q.now())
 		if err != nil {
 			return err
@@ -497,7 +517,16 @@ func (q *Queue) Enqueue(ctx context.Context, request EnqueueRequest) (EnqueueRes
 			// committed (database/sql checks the deadline before COMMIT),
 			// so the submission may be retried. A caller that canceled is
 			// not saturation.
-			return EnqueueResult{}, fmt.Errorf("worker: enqueue: %w: %w", trigger.ErrSaturated, err)
+			saturated := fmt.Errorf("worker: enqueue: %w: %w", trigger.ErrSaturated, err)
+			// Name the write domain the submission waited on. A store that
+			// annotates its busy errors already did, even through a wrapper
+			// that hides WriteDomain; otherwise it is this queue's own. A
+			// handler that returns this error from inside a claim on the
+			// same domain is diagnosed by ProcessOnce (#207).
+			if _, named := store.ErrorWriteDomain(saturated); !named {
+				saturated = store.WithWriteDomain(saturated, q.writeDomain)
+			}
+			return EnqueueResult{}, saturated
 		}
 		return EnqueueResult{}, fmt.Errorf("worker: enqueue: %w", err)
 	}
@@ -524,9 +553,12 @@ type claimedWriteDomain struct {
 // effects without an idempotency key or reconciliation path.
 //
 // Only the claim statement and the handler observe ctx. The claim holds
-// nothing while it waits for the store's write lock, so a consumer canceled
-// meanwhile is reported as ErrConsumerLost; the SQLite driver does not
-// interrupt a busy wait, so that report can take up to the busy timeout.
+// nothing while it waits for its turn in the store's writer queue (#214) or
+// for the write lock, so a consumer canceled meanwhile is reported as
+// ErrConsumerLost. Neither wait is interrupted by ctx (the claim's
+// transaction deliberately is not canceled with it), so that report can
+// take up to the busy timeout, or twice that when a writer on another
+// handle then holds the lock.
 // Everything after the claim runs on a context ctx cannot cancel, so losing
 // the consumer rolls the claim back synchronously before ProcessOnce returns
 // instead of leaving database/sql to abort it in the background while the
@@ -553,7 +585,10 @@ func (q *Queue) ProcessOnce(ctx context.Context, handler Handler) (bool, error) 
 			activeDomain.active.Store(false)
 		}
 	}()
-	err := q.withTx(txCtx, func(tx *sql.Tx) error {
+	// The claim writes first (#176), so it takes its turn in the store's
+	// writer queue (#214); the handler then runs inside that turn, as it
+	// runs inside the write lock.
+	err := q.withTx(store.Writer(txCtx), func(tx *sql.Tx) error {
 		job, lease, err := q.claim(ctx, tx)
 		if errors.Is(err, ErrNotFound) {
 			return nil
@@ -610,7 +645,23 @@ func (q *Queue) ProcessOnce(ctx context.Context, handler Handler) (bool, error) 
 		}
 		// Store saturation is backpressure. Enqueue diagnoses a submission
 		// to this claim's own write domain as ErrNestedSubmission before it
-		// waits; busy errors and deadlines from other domains defer normally.
+		// waits when the handler's context reaches it. When it did not (a
+		// detached context, or a wrapper that hides WriteDomain) the
+		// submission waits out the busy timeout and names the domain it
+		// waited on: if that is this claim's, the claim itself held the
+		// lock, and deferring would only repeat the wait (#207). A handler
+		// may join that failure with saturation from another store, so the
+		// job fails if any branch of the error names this claim's domain,
+		// not only the first. Busy errors and deadlines from other domains
+		// alone defer normally.
+		if errors.Is(handlerErr, trigger.ErrSaturated) && !errors.Is(handlerErr, ErrNestedSubmission) {
+			for _, domain := range store.ErrorWriteDomains(handlerErr) {
+				if store.SameWriteDomain(domain, q.writeDomain) {
+					handlerErr = fmt.Errorf("%w: %w", ErrNestedSubmission, handlerErr)
+					break
+				}
+			}
+		}
 		if errors.Is(handlerErr, trigger.ErrSaturated) && !errors.Is(handlerErr, ErrNestedSubmission) {
 			// Saturation is backpressure, not a handler failure: the job is
 			// deferred without consuming an attempt, within its deferral budget.
@@ -635,6 +686,11 @@ func (q *Queue) ProcessOnce(ctx context.Context, handler Handler) (bool, error) 
 		// The transaction has committed or rolled back; retained handler
 		// contexts no longer represent a held write lock.
 		activeDomain.active.Store(false)
+	}
+	if err != nil && !processed && !errors.Is(err, ErrConsumerLost) && ctx.Err() != nil {
+		// The consumer was lost while this worker waited for its write
+		// turn (#214): it claimed nothing, so the job is untouched.
+		err = fmt.Errorf("%w: %w", ErrConsumerLost, errors.Join(ctx.Err(), err))
 	}
 	if errors.Is(err, ErrConsumerLost) && lost.ID != "" {
 		if deferErr := q.deferLost(txCtx, lost); deferErr != nil {
@@ -661,7 +717,7 @@ func (q *Queue) ProcessOnce(ctx context.Context, handler Handler) (bool, error) 
 // attempt: the job is retried after a backoff, or dead once its attempts
 // are spent. A crash before it commits leaves one uncounted redelivery.
 func (q *Queue) chargeLostClaim(ctx context.Context, job Job) error {
-	return q.withTx(ctx, func(tx *sql.Tx) error {
+	return q.withTx(store.Writer(ctx), func(tx *sql.Tx) error {
 		state, available := StateDead, q.now()
 		if job.Attempt < job.MaxAttempts {
 			state = StatePending
@@ -678,7 +734,7 @@ func (q *Queue) chargeLostClaim(ctx context.Context, job Job) error {
 // the claim has been rolled back. A crash between the two leaves one
 // uncounted redelivery, never an acknowledged one.
 func (q *Queue) deferLost(ctx context.Context, job Job) error {
-	return q.withTx(ctx, func(tx *sql.Tx) error {
+	return q.withTx(store.Writer(ctx), func(tx *sql.Tx) error {
 		state, message := StatePending, ""
 		if job.Deferrals+1 > MaxDeferrals {
 			state, message = StateDead, DeferralExhausted
@@ -744,7 +800,9 @@ func (q *Queue) Get(ctx context.Context, requestKey string) (Job, error) {
 	return job, err
 }
 
-// claim leases the next available job. Its first statement writes: a
+// claim leases the next available job: the oldest created_at first, and
+// among jobs that share one, the first enqueued (#217). Its first statement
+// writes: a
 // transaction that reads before writing cannot wait for a concurrent
 // writer and fails with SQLITE_BUSY once that writer commits; one that
 // writes first waits under the busy timeout (as cron's cursor writes do).
@@ -753,7 +811,7 @@ func (q *Queue) claim(ctx context.Context, tx *sql.Tx) (Job, int64, error) {
 	leaseUntil := time.Unix(0, now).Add(30 * time.Second).UnixNano()
 	job, err := scanJob(tx.QueryRowContext(ctx, `UPDATE worker_jobs SET state = ?, attempt = attempt + 1, lease_until = ?, updated_at = ?
 		WHERE job_id = (SELECT job_id FROM worker_jobs
-			WHERE (state = ? OR (state = ? AND lease_until <= ?)) AND available_at <= ? ORDER BY created_at, job_id LIMIT 1)
+			WHERE (state = ? OR (state = ? AND lease_until <= ?)) AND available_at <= ? ORDER BY created_at, enqueue_seq, job_id LIMIT 1)
 		RETURNING job_id, request_key, kind, payload_json, attempt, max_attempts, deferrals, principal_json, state, error_text`,
 		StateProcessing, leaseUntil, now, StatePending, StateProcessing, now, now))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -786,7 +844,14 @@ func (q *Queue) withTx(ctx context.Context, fn func(*sql.Tx) error) error {
 }
 func (q *Queue) now() int64     { return q.clock().UTC().UnixNano() }
 func digest(data []byte) string { sum := sha256.Sum256(data); return fmt.Sprintf("%x", sum[:]) }
+
+// retryable reports whether a failed job gets another attempt. A nested
+// submission never does, even when joined with a retryable HandlerError:
+// every attempt would submit to its own claimed store again (#225).
 func retryable(err error) bool {
+	if errors.Is(err, ErrNestedSubmission) {
+		return false
+	}
 	var target *HandlerError
 	return errors.As(err, &target) && target.Retryable
 }

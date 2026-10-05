@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha512"
 	"encoding/base64"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -158,7 +159,11 @@ func TestCaptureNativeLocksRejectsMissingOrUnsupportedNPMLocks(t *testing.T) {
 	t.Run("declared dependencies without package lock", func(t *testing.T) {
 		root := t.TempDir()
 		marker := filepath.Join(root, "lifecycle-ran")
-		writeFixtureFile(t, filepath.Join(root, "package.json"), `{"name":"fixture","version":"1.0.0","scripts":{"preinstall":"/usr/bin/touch `+marker+`"},"dependencies":{"example.test/pkg":"1.0.0"}}`)
+		script, err := json.Marshal("/usr/bin/touch " + marker)
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeFixtureFile(t, filepath.Join(root, "package.json"), `{"name":"fixture","version":"1.0.0","scripts":{"preinstall":`+string(script)+`},"dependencies":{"example.test/pkg":"1.0.0"}}`)
 		if locks, err := CaptureNativeLocks(context.Background(), root); err == nil || !strings.Contains(err.Error(), "package-lock.json is missing") {
 			t.Fatalf("declared npm dependency without a lock did not fail closed: locks=%+v err=%v", locks, err)
 		}

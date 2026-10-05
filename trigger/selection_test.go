@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -54,6 +53,9 @@ func dependencies(t *testing.T, name string) map[string]int {
 func build(t *testing.T, name string) string {
 	t.Helper()
 	binary := filepath.Join(t.TempDir(), name)
+	if runtime.GOOS == "windows" {
+		binary += ".exe"
+	}
 	if output, err := exec.Command(goTool(t), "build", "-o", binary, "./testdata/selection/"+name).CombinedOutput(); err != nil {
 		t.Fatalf("go build %s: %v\n%s", name, err, output)
 	}
@@ -126,6 +128,7 @@ func TestBinaryWithHTTPSelectedServesAndDrains(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	prepareShutdownChild(command)
 	if err := command.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +155,7 @@ func TestBinaryWithHTTPSelectedServesAndDrains(t *testing.T) {
 	if err != nil || response.StatusCode != http.StatusOK || quote.TotalCents != 3000 {
 		t.Fatalf("status=%d quote=%+v err=%v", response.StatusCode, quote, err)
 	}
-	if err := command.Process.Signal(syscall.SIGTERM); err != nil {
+	if err := requestShutdown(command); err != nil {
 		t.Fatal(err)
 	}
 	if !lines.Scan() || !strings.Contains(lines.Text(), `"stopped":true`) {

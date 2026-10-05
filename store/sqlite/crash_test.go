@@ -31,10 +31,14 @@ func TestProcessKillBeforeDuringAndAfterCommit(t *testing.T) {
 				t.Fatal(err)
 			}
 			waitForMarker(t, markerPath)
-			if err := command.Process.Kill(); err != nil {
-				t.Fatal(err)
-			}
+			// The "during" child finishes its commit and exits on its own, so
+			// it may be gone before the kill. POSIX still signals an unreaped
+			// child; Windows refuses to terminate an exited process.
+			killErr := command.Process.Kill()
 			_ = command.Wait()
+			if killErr != nil && (command.ProcessState == nil || !command.ProcessState.Exited()) {
+				t.Fatal(killErr)
+			}
 
 			database, err := (Backend{}).Open(context.Background(), databasePath)
 			if err != nil {
