@@ -85,6 +85,8 @@ schema owns integer range/wire rules. Template expansion preflights the byte
 budget before allocating output. See [ADR 0012](decisions/0012-catalog-null-and-template-bounds.md)
 for the correction, supported array limits and pending Node mirror integration.
 
+Field references select `encoding/json` object keys, so a path resolves identically on a typed node output and on its JSON-decoded form, with work bounded by the selected member; a selected field keeps its Go type. See [ADR 0001](decisions/0001-public-api-boundaries.md#field-references-select-encodingjson-keys-241).
+
 Logical values are immutable. Maps, slices and pointers require isolation between nodes and branches. Typed native fast paths must preserve this rule, and benchmarks include required validation/copies. Portable encodings serve journals and worker boundaries. Stable diagnostics name code, file/line, workflow, step, field, expected/actual and remediation.
 
 ## 5. Control flow
