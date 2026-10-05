@@ -519,6 +519,22 @@ func TestTrustedPublisherReclaimsARecoveredRunAttachedUnderAnotherOwner(t *testi
 	if stats := hub.Stats(); stats.Reowned != 1 || stats.Rejected != 0 || stats.Published != 1 {
 		t.Fatalf("stats=%+v", stats)
 	}
+	// A reader resuming from the reclaimed attachment's position is told the
+	// run was re-owned, not that retention dropped frames.
+	stale, _ := hub.Subscribe("run-1", "alice", bob.LastCursor, nil)
+	if stale.Gap == nil || stale.Gap.Reason != GapReowned {
+		t.Fatalf("old cursor gap=%+v", stale.Gap)
+	}
+	if stale.Subscriber != nil {
+		hub.Unsubscribe(stale.Subscriber, "test")
+	}
+	// A reclaim by a mid-run publication marks the loss in sequence.
+	mid := newHub(t, Config{})
+	mid.AttachRecovered("run-2", "bob", "bob", false)
+	mid.Publish("run-2", "alice", step(1))
+	if replay, _ := mid.Subscribe("run-2", "alice", "", nil); len(replay.Frames) != 2 || gapReason(t, replay.Frames[0]) != GapReowned {
+		t.Fatalf("mid-run reclaim frames=%v", names(replay.Frames))
+	}
 	// A live run's owner is never reclaimed: that is a real conflict.
 	if _, err := hub.Publish("run-1", "mallory", step(1)); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("conflicting live publisher err=%v", err)
@@ -606,5 +622,46 @@ func TestAdmissionBoundsEveryConnection(t *testing.T) {
 	}
 	if stats := hub.Stats(); stats.Readers != 0 {
 		t.Fatalf("stats=%+v", stats)
+	}
+}
+
+// TestRecoveredRunBecomesLiveOnItsOwnersFirstPublication is review finding
+// R2-1: once the trusted owner publishes, a recovered run is a live run. It
+// must stop counting against the attaching reader's recovered budget, stop
+// being displaceable by other principals' recovered reads, and stop telling
+// a fresh reader its history is unavailable.
+func TestRecoveredRunBecomesLiveOnItsOwnersFirstPublication(t *testing.T) {
+	// The reviewer's probe: alice's run, attached by bob's read, goes live;
+	// mallory's recovered reads must not displace it.
+	hub := newHub(t, Config{MaxRuns: 2})
+	if err := hub.AttachRecovered("alice-run", "alice", "bob", false); err != nil {
+		t.Fatal(err)
+	}
+	hub.Publish("alice-run", "alice", Item{Name: "run.started", Data: []byte(`{}`), Start: true})
+	hub.Publish("alice-run", "alice", step(1))
+	for _, runID := range []string{"m-1", "m-2"} {
+		if err := hub.AttachRecovered(runID, "mallory", "mallory", true); err != nil && !errors.Is(err, ErrSaturated) {
+			t.Fatalf("%s: %v", runID, err)
+		}
+	}
+	replay, err := hub.Subscribe("alice-run", "alice", "", nil)
+	if err != nil {
+		t.Fatalf("alice's now-live run was evicted by mallory's recovered reads: %v (stats %+v)", err, hub.Stats())
+	}
+	if replay.Gap != nil || replay.Recovered || len(replay.Frames) != 2 {
+		t.Fatalf("a fresh reader of a live run got gap=%+v recovered=%v frames=%v", replay.Gap, replay.Recovered, names(replay.Frames))
+	}
+	hub.Unsubscribe(replay.Subscriber, "test")
+	// bob's recovered budget is released once the run is live.
+	budget := newHub(t, Config{RecoveredPerPrincipal: 1})
+	if err := budget.AttachRecovered("alice-run", "alice", "bob", false); err != nil {
+		t.Fatal(err)
+	}
+	budget.Publish("alice-run", "alice", Item{Name: "run.started", Data: []byte(`{}`), Start: true})
+	if err := budget.AttachRecovered("bob-old", "bob", "bob", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := budget.Subscribe("alice-run", "alice", "", nil); err != nil {
+		t.Fatalf("bob's budget still covered alice's live run, which his next read recycled: %v", err)
 	}
 }

@@ -156,6 +156,7 @@ binds the id to its run.
 | this incarnation, retained | exactly the frames after it |
 | this incarnation, evicted | `gap {reason: retention, missed: n}`, then what is retained |
 | an earlier incarnation | `gap {reason: retention}` (count unknown) |
+| the recovered attachment a publisher reclaimed | `gap {reason: reowned}` |
 | another epoch | `gap {reason: restart}` |
 | ahead, a later incarnation, another run's, malformed, over 128 bytes | 400 `invalid_cursor`, no stream bytes |
 | at the end of a closed run | 204, which stops EventSource |
@@ -200,8 +201,16 @@ run once the engine publishes it. The reader never becomes the owner. As a
 second line, a publication whose trusted owner differs from a *recovered*
 run's attached owner wins: the run is replaced by a new incarnation, its
 followers are detached (`reowned`) to re-authorize, and `Stats.Reowned`
-counts it; a live run's owner is never reclaimed (a conflicting publisher is
-rejected and counted).
+counts it. A reader resuming from the old attachment's cursor gets
+`gap {reason: reowned}`; a reclaim by a mid-run publication also opens the new
+incarnation with that marker (one by the run's first observation loses
+nothing and has none). A live run's owner is never reclaimed (a conflicting
+publisher is rejected and counted).
+
+A recovered run whose trusted owner publishes is live from that moment: it
+leaves the attaching reader's recovered budget, can no longer be displaced as
+a recovered run, and a reader without a cursor no longer gets a
+`history_unavailable` gap or a durable read for it.
 
 Recovered runs have their own budget: one reader principal may hold
 `RecoveredPerPrincipal` (16) attached runs, and at the budget its own least
@@ -232,9 +241,13 @@ steps that had not yet written a journal fact are not reconstructed.
 publication continues, so stopping the stream never affects a run.
 
 **Limits.** One hub per process: a reader connected to another replica sees
-nothing from this one. Journaled execution (`RunJournaled`, ADR 0019) emits no
-inspection events, so a durably executed run produces no live frames; a
-reader with `Source` configured sees it only as its journal reconstruction. The engine serializes observation payloads whenever
+nothing from this one. Durable and cluster runs are invisible to the stream
+(#263): journaled execution (`RunJournaled`, ADR 0019, whose only caller
+writes `store/distributed`) emits no inspection events, and the only
+`inspection.Source` is `internal/journal`, which does not hold those runs, so a
+reader gets 404, with neither live frames nor a reconstruction. A followed
+recovered run that no execution in this process ever publishes stays open
+until `MaxDuration` (also #263). The engine serializes observation payloads whenever
 any observer is selected, including when the stream discards them; that costs
 CPU, not retention. Measured overhead and latency in the PR are one
 developer machine's figures, not performance claims.

@@ -83,6 +83,10 @@ const (
 	// GapLateDropped: a late observation arrived after the run's late
 	// window closed.
 	GapLateDropped = "late_dropped"
+	// GapReowned: the run had been attached from durable state under an
+	// owner its trusted publisher contradicted; it restarted under the
+	// publisher, and what the old attachment held is not carried over.
+	GapReowned = "reowned"
 )
 
 var (
@@ -263,7 +267,9 @@ type run struct {
 	recovered  bool
 	// attachedBy is the reader whose durable read attached a recovered run.
 	attachedBy string
-	element    *list.Element
+	// reownedFrom is the incarnation a publisher reclaimed this run from.
+	reownedFrom uint64
+	element     *list.Element
 }
 
 // Hub is safe for concurrent use. Its lock is held only for bounded,
@@ -358,14 +364,23 @@ func (h *Hub) Publish(runID, owner string, item Item) (string, error) {
 	}
 	now := h.cfg.Clock()
 	current := h.runs[runID]
+	var reownedFrom uint64
 	if current != nil && current.owner != owner && current.recovered {
 		// The owner of a recovered run came from a durable read; the
 		// publisher is the engine's trusted invocation. The publisher wins:
 		// followers are detached so they re-authorize against the real
 		// owner, and the new incarnation opens with a gap.
 		h.stats.Reowned++
+		reownedFrom = current.inc
 		h.removeLocked(current, "reowned")
 		current = nil
+	}
+	if current != nil && current.owner == owner && current.recovered {
+		// The trusted owner is publishing: the run is live now. It stops
+		// counting against the reader that attached it, may no longer be
+		// displaced as a recovered run, and has live history from here.
+		current.recovered = false
+		h.releaseAttachLocked(current)
 	}
 	if current != nil && current.owner != owner {
 		h.stats.Rejected++
@@ -402,7 +417,14 @@ func (h *Hub) Publish(runID, owner string, item Item) (string, error) {
 			return "", err
 		}
 		current = created
-		if !item.Start {
+		current.reownedFrom = reownedFrom
+		// Starting with the run's first observation loses nothing; otherwise
+		// the earlier observations are gone, and the marker says why.
+		switch {
+		case item.Start:
+		case reownedFrom != 0:
+			h.appendLocked(current, h.gapFrame(current, GapReowned))
+		default:
 			h.appendLocked(current, h.gapFrame(current, GapEvicted))
 		}
 	}
@@ -506,6 +528,18 @@ func (h *Hub) createLocked(runID, owner string, now time.Time, recovered bool) (
 	return item, nil
 }
 
+// releaseAttachLocked returns a recovered run's slot to the budget of the
+// reader that attached it.
+func (h *Hub) releaseAttachLocked(item *run) {
+	if item.attachedBy == "" {
+		return
+	}
+	if h.recoveredBy[item.attachedBy]--; h.recoveredBy[item.attachedBy] <= 0 {
+		delete(h.recoveredBy, item.attachedBy)
+	}
+	item.attachedBy = ""
+}
+
 // closedLocked reports a run that is finished and past its late window.
 func (h *Hub) closedLocked(item *run, now time.Time) bool {
 	return item.finished && (item.finishedAt.IsZero() || !now.Before(item.finishedAt.Add(h.cfg.LateWindow)))
@@ -515,12 +549,7 @@ func (h *Hub) removeLocked(item *run, reason string) {
 	for sub := range item.subs {
 		h.detachLocked(item, sub, reason)
 	}
-	if item.attachedBy != "" {
-		if h.recoveredBy[item.attachedBy]--; h.recoveredBy[item.attachedBy] <= 0 {
-			delete(h.recoveredBy, item.attachedBy)
-		}
-		item.attachedBy = ""
-	}
+	h.releaseAttachLocked(item)
 	h.retained -= item.bytes
 	if item.element != nil {
 		h.lru.Remove(item.element)
@@ -772,6 +801,8 @@ func (a *Admission) Subscribe(runID, cursor string, authorize Authorizer) (Repla
 		result.Gap = &Gap{Reason: GapRestart}
 	case parsed.inc > current.inc:
 		return Replay{}, ErrInvalidCursor
+	case parsed.inc < current.inc && parsed.inc == current.reownedFrom:
+		result.Gap = &Gap{Reason: GapReowned}
 	case parsed.inc < current.inc:
 		result.Gap = &Gap{Reason: GapRetention}
 	case parsed.seq >= current.next:

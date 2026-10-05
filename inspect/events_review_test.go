@@ -3,6 +3,8 @@ package inspect_test
 import (
 	"context"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -273,4 +275,91 @@ func TestErrorLabelsRequireTheErrorField(t *testing.T) {
 			t.Fatalf("%s saw error labels=%v want %v", reader, labelled, want)
 		}
 	}
+}
+
+// TestEveryHandlerExitReleasesItsAdmission is review finding R2-4: whatever
+// way a handler ends (refused before admission, refused after it, replayed
+// and ended, canceled by its client, or panicking in an application
+// callback), no reader admission outlives it.
+func TestEveryHandlerExitReleasesItsAdmission(t *testing.T) {
+	store, closeJournal := openJournal(t, filepath.Join(t.TempDir(), "admission.db"))
+	defer closeJournal()
+	gate := &gateNode{hold: "held", release: make(chan struct{}), entered: make(chan struct{}, 1)}
+	live := newLiveApp(t, liveConfig{
+		stream: inspect.EventStreamConfig{Hub: event.Config{LateWindow: 10 * time.Millisecond, SubscribersPerRun: 1}},
+		handler: inspect.EventHandlerConfig{
+			Source: panickingSource{Source: store},
+			Authorize: func(reader, owner string) error {
+				if reader == "panic-authorize" {
+					panic("synthetic authorizer panic")
+				}
+				return event.SameOwner(reader, owner)
+			},
+		},
+		nodes: map[string]node.Any{"test/gate": gate.node(t)},
+	})
+	live.server.Config.ErrorLog = log.New(io.Discard, "", 0)
+	release := sync.OnceFunc(func() { close(gate.release) })
+	t.Cleanup(release)
+	awaitResult(t, live.start("done-run", "alice", quote.Input{SKU: "coffee", Quantity: 1}))
+	held := live.start("held-run", "alice", quote.Input{SKU: "held", Quantity: 1})
+	<-gate.entered
+	hub := live.stream.Hub()
+	settled := func(path string) {
+		t.Helper()
+		waitFor(t, func() bool { return live.active.Load() == 0 })
+		if stats := hub.Stats(); stats.Readers != 0 || stats.Subscribers != 0 {
+			t.Fatalf("%s: admission outlived its handler: %+v", path, stats)
+		}
+	}
+	get := func(runID, principal, cursor string) {
+		t.Helper()
+		_, _, stream := openStream(t, context.Background(), live.eventsURL(runID), principal, cursor)
+		if stream != nil {
+			stream.rest(t, 5*time.Second)
+		}
+	}
+	get("done-run", "", "")
+	settled("unauthenticated")
+	get("done-run", "mallory", "")
+	settled("unauthorized")
+	get("done-run", "alice", "not-a-cursor")
+	settled("invalid cursor")
+	get("done-run", "alice", "")
+	settled("replay of a closed run")
+	get("unknown-run", "alice", "")
+	settled("unknown run read from the durable source")
+	// A panicking callback aborts the connection; net/http recovers it.
+	aborted := func(runID, principal string) {
+		t.Helper()
+		request, _ := http.NewRequest(http.MethodGet, live.eventsURL(runID), nil)
+		request.Header.Set("X-Principal", principal)
+		if response, err := http.DefaultClient.Do(request); err == nil {
+			_ = response.Body.Close()
+			t.Fatalf("%s: a panicking callback answered %d", runID, response.StatusCode)
+		}
+	}
+	aborted("panic-source", "alice")
+	settled("panicking durable source")
+	aborted("held-run", "panic-authorize")
+	settled("panicking authorizer")
+	ctx, cancel := context.WithCancel(context.Background())
+	follower := awaitStream(t, ctx, live.eventsURL("held-run"), "alice")
+	follower.until(t, "step.processing", 5*time.Second)
+	get("held-run", "alice", "") // over SubscribersPerRun: transient refusal
+	cancel()
+	follower.close()
+	settled("client canceled a live follow; transient refusal")
+	release()
+	awaitResult(t, held)
+}
+
+// panickingSource panics for one run, like a faulty application source.
+type panickingSource struct{ inspection.Source }
+
+func (s panickingSource) ReadInspection(ctx context.Context, principal, runID, stepID string, offset, limit int, fields map[inspection.Field]bool, maxPayload int) (inspection.Run, []inspection.Step, int, error) {
+	if runID == "panic-source" {
+		panic("synthetic source panic")
+	}
+	return s.Source.ReadInspection(ctx, principal, runID, stepID, offset, limit, fields, maxPayload)
 }
