@@ -6,13 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/well-prado/new-blok/internal/clustertest"
 	"github.com/well-prado/new-blok/store/distributed"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/client/v3/namespace"
@@ -26,13 +26,12 @@ const integrationIncarnation = "integration-incarnation-v1"
 
 var integrationNamespaces sync.Map
 
+// integrationEndpoints returns the real cluster's endpoints and holds the
+// shared cluster lock for the rest of t (see internal/clustertest), so no
+// other package's disruptive test pauses voters while t uses them.
 func integrationEndpoints(t *testing.T) []string {
 	t.Helper()
-	endpoints := strings.Split(os.Getenv("BLOK_DISTRIBUTED_ENDPOINTS"), ",")
-	if endpoints[0] == "" {
-		t.Skip("set BLOK_DISTRIBUTED_ENDPOINTS to run real etcd cluster execution tests")
-	}
-	return endpoints
+	return clustertest.Endpoints(t)
 }
 
 // integrationNamespace returns the private etcd key prefix for t. Every store
@@ -271,52 +270,6 @@ func (l effectLedger) total(kind string) int {
 		total += count
 	}
 	return total
-}
-
-// pauseQuorum pauses two of the three real voters. The returned restore
-// unpauses them and waits until a linearizable read succeeds again.
-func pauseQuorum(t *testing.T, store *distributed.Store) func() {
-	t.Helper()
-	voters := integrationEtcdVoters()
-	paused := make([]string, 0, 2)
-	restored := false
-	restore := func() {
-		if restored {
-			return
-		}
-		restored = true
-		for index := len(paused) - 1; index >= 0; index-- {
-			if output, err := exec.Command("docker", "unpause", paused[index]).CombinedOutput(); err != nil {
-				t.Errorf("restore voter %s: %v: %s", paused[index], err, output)
-			}
-		}
-		waitQuorum(t, store)
-	}
-	t.Cleanup(restore)
-	for _, container := range voters[1:] {
-		output, err := exec.Command("docker", "pause", container).CombinedOutput()
-		if err != nil {
-			t.Fatalf("pause voter %s: %v: %s", container, err, output)
-		}
-		paused = append(paused, container)
-	}
-	return restore
-}
-
-func waitQuorum(t *testing.T, store *distributed.Store) {
-	t.Helper()
-	deadline := time.Now().Add(30 * time.Second)
-	var lastErr error
-	for time.Now().Before(deadline) {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		_, _, lastErr = store.ReadState(ctx, "quorum-probe", "quorum-probe")
-		cancel()
-		if lastErr == nil {
-			return
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	t.Fatalf("quorum did not recover after restoring voters: %v", lastErr)
 }
 
 // acquireWhenFree retries until the previous owner's lease has expired or was
