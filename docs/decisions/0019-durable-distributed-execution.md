@@ -250,6 +250,24 @@ the outcome and re-admits the same run for replay/resumption. A signal arriving
 before its wait is committed is not buffered. Signal delivery still does not
 invoke an external consumer.
 
+A retried signal is a duplicate when it has the same signal ID, the same
+principal and the same payload, where "same payload" means the same JSON text
+in the form the store persists: compacted, with `<`, `>` and `&` HTML-escaped
+(#259). Both checks against a signalled wait record, on a retry and after a
+lost race, therefore encode the incoming payload that way before comparing it
+with the stored one, which is the comparison the late-signal record already
+made. A retry differing only in whitespace, or in writing `<`, `>` and `&`
+either literally or as the lowercase `\u003c`, `\u003e` and `\u0026` escapes
+the store itself produces, is acknowledged as a duplicate. Any other spelling
+difference is a 409 even when the decoded value is equal (an uppercase-hex
+escape such as `\u003C`, `\/` for `/`, `\u00e9` for `é`, `1.0` for `1`), as are
+reordered keys and any changed value, because the payload is kept as an opaque
+JSON text, not a decoded value. The HTTP body limit is checked before the
+duplicate comparison, so a retry whose added whitespace pushes a body at the
+limit over it is refused as too large rather than acknowledged. Admission is unaffected:
+it digests the typed decoder's encoding, so its retries already compare by
+value. No stored byte or digest changes.
+
 The immutable transition log has no per-event compactor in this slice. Its
 retention contract is therefore explicit but not size-bounded: events remain
 available for the lifetime of the cluster incarnation and must not be pruned
