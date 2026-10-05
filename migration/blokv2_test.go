@@ -2,6 +2,7 @@ package migration
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -83,8 +84,9 @@ func TestMigrationFixtures(t *testing.T) {
 			case "call-self-reference":
 				call := &doc.Workflow.Instructions[1]
 				call.References[0].Step = call.ID
-				if err := doc.Validate(); err != nil {
-					t.Fatalf("public document validator no longer reproduces the self-reference edge case: %v", err)
+				var validationError *contract.Error
+				if err := doc.Validate(); !errors.As(err, &validationError) || validationError.Code != "invalid_reference" {
+					t.Fatalf("public document validator error = %v, want invalid_reference", err)
 				}
 			case "extra-call-reference":
 				call := &doc.Workflow.Instructions[1]
@@ -98,6 +100,11 @@ func TestMigrationFixtures(t *testing.T) {
 			}
 			if _, err := Export(doc); err == nil {
 				t.Fatal("Export() silently dropped unsupported document semantics")
+			} else if fixture.Mutation == "call-self-reference" {
+				var validationError *contract.Error
+				if !errors.As(err, &validationError) || validationError.Code != fixture.Code {
+					t.Fatalf("Export() error = %T %v; expected contract code %q", err, err, fixture.Code)
+				}
 			} else {
 				var diagnostic Diagnostic
 				if !asDiagnostic(err, &diagnostic) || diagnostic.Code != fixture.Code || diagnostic.Remediation == "" {

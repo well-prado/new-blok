@@ -44,8 +44,9 @@ The accepted subset is deliberately structural:
 `Export` is the inverse only for the exact subset emitted by `Convert`: calls
 followed by one final output of the final call, at most one representable
 binding, and at most one reference per call. Each call reference must target
-an earlier call; Export checks this explicitly because `Document.Validate`
-currently accepts a self-reference. Earlier-call path projections are
+an earlier call. The shared `Document.Validate` boundary rejects self and
+forward references; Export also fails closed when given such a document, and
+retains its earlier-call representability check as defense in depth. Earlier-call path projections are
 retained. It rejects additional bindings,
 references, non-final/different output edges, source spans and other target-only
 metadata instead of silently dropping them. Round-trip means the represented
@@ -76,8 +77,9 @@ and updated valid/invalid fixtures under ADR 0001.
   projections, mapper/template input, nested
   unknown `$ref` metadata, duplicate keys, retry options and trigger config.
 - The same fixture contains Export mutations for output-edge changes,
-  self-references, extra call references and multiple bindings; each must fail with
-  `unsupported_export_document`.
+  self-references, extra call references and multiple bindings. A self-reference
+  must fail `Document.Validate` and `Export` with `invalid_reference`; other
+  unsupported Export mutations must fail with `unsupported_export_document`.
 - `migration/blokv2_test.go` verifies structural round-trip, schema preservation,
   size/step/inventory bounds, identity collisions, forward refs and bounded
   diagnostics.
