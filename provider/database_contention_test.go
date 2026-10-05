@@ -15,18 +15,28 @@ import (
 func TestRecordsWaitForConcurrentWriter(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	db, err := (sqlite.Backend{}).Open(ctx, filepath.Join(t.TempDir(), "records.db"))
+	path := filepath.Join(t.TempDir(), "records.db")
+	db, err := (sqlite.Backend{}).Open(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	// The contending writer holds the lock from a second handle on the same
+	// file, so Execute meets it in SQLite itself, where a read-first callback
+	// would fail at once (#179). Writers on one handle are queued before they
+	// begin instead (#214).
+	holder, err := (sqlite.Backend{}).Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close()
 	p, err := NewRecords(ctx, db)
 	if err != nil {
 		t.Fatal(err)
 	}
 	locked, release, writerDone := make(chan struct{}), make(chan struct{}), make(chan error, 1)
 	go func() {
-		writerDone <- db.WithTx(ctx, func(tx *sql.Tx) error {
+		writerDone <- holder.WithTx(ctx, func(tx *sql.Tx) error {
 			if _, err := tx.ExecContext(ctx, `UPDATE provider_records SET record_id=record_id WHERE 0`); err != nil {
 				return err
 			}

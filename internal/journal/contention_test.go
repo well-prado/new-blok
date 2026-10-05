@@ -21,11 +21,21 @@ func TestJournalTransitionsWaitForConcurrentWriter(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			db, err := (sqlite.Backend{}).Open(ctx, filepath.Join(t.TempDir(), "journal.db"))
+			path := filepath.Join(t.TempDir(), "journal.db")
+			db, err := (sqlite.Backend{}).Open(ctx, path)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer db.Close()
+			// The contending writer holds the lock from a second handle on the
+			// same file, so the transition meets it in SQLite itself, where a
+			// read-first callback would fail at once (#179). Writers on one
+			// handle are queued before they begin instead (#214).
+			holder, err := (sqlite.Backend{}).Open(ctx, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer holder.Close()
 			j, err := New(ctx, db, Config{})
 			if err != nil {
 				t.Fatal(err)
@@ -102,7 +112,7 @@ func TestJournalTransitionsWaitForConcurrentWriter(t *testing.T) {
 			reader := *j
 			started := make(chan struct{})
 			j.database = &startedTransaction{Database: db, started: started}
-			contendJournal(t, ctx, db, started, transition, func() error { _, err := reader.Run(ctx, run.RunID); return err })
+			contendJournal(t, ctx, holder, started, transition, func() error { _, err := reader.Run(ctx, run.RunID); return err })
 		})
 	}
 }
