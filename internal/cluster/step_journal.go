@@ -73,7 +73,9 @@ func (j *runStepJournal) Load(ctx context.Context, identity engine.StepIdentity)
 			encoded, _ := json.Marshal(persisted)
 			_, markErr := j.runtime.store.CommitFencedState(ctx, j.owner, stateID, revision, stepTransition("uncertain", identity.OperationKey, persisted.CurrentAttempt), "step.uncertain", encoded, encoded)
 			if markErr != nil && !errors.Is(markErr, distributed.ErrAlreadyWritten) {
-				return nil, false, markErr
+				// Unreachable as an overflow: this is the committed dispatch
+				// record with a shorter state, so it is never larger.
+				return nil, false, overflowOrErr(markErr)
 			}
 			return nil, false, ErrEffectUncertain
 		}
@@ -119,7 +121,10 @@ func (j *runStepJournal) Begin(ctx context.Context, identity engine.StepIdentity
 	encoded, _ := json.Marshal(record)
 	transitionID := stepTransition("dispatch", identity.OperationKey, attemptID)
 	if _, err := j.runtime.store.CommitFencedState(ctx, j.owner, stateID, revision, transitionID, "step.dispatched", encoded, encoded); err != nil {
-		return engine.StepAttempt{}, err
+		// The dispatch record carries the node's declared effects, which
+		// the descriptor does not bound. One that cannot be written fails
+		// the run before the node is invoked (#265).
+		return engine.StepAttempt{}, overflowOrErr(err)
 	}
 	return engine.StepAttempt{Identity: identity, AttemptID: attemptID}, nil
 }
@@ -196,7 +201,11 @@ func (j *runStepJournal) transition(ctx context.Context, attempt engine.StepAtte
 	encoded, _ := json.Marshal(current)
 	id := stepTransition(state, attempt.Identity.OperationKey, attempt.AttemptID)
 	if _, err := j.runtime.store.CommitFencedState(ctx, j.owner, stateID, revision, id, kind, encoded, encoded); err != nil && !errors.Is(err, distributed.ErrAlreadyWritten) {
-		return err
+		// A committed output over the bound can never be written, however
+		// often the node re-runs: the runtime fails the run (#265). The
+		// retryable and uncertain records carry no output and are never
+		// larger than the dispatch record they replace.
+		return overflowOrErr(err)
 	}
 	return nil
 }
