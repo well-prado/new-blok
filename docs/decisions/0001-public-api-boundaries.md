@@ -244,7 +244,8 @@ id, and the same structure written as a document fails `duplicate_id`.
 
 The id is reserved, rather than renamed to something no step can take, because
 it keeps one id grammar across flow, the canonical compiler and documents:
-document ids match `^[a-z][a-z0-9_-]{0,63}$`, flow ids are not grammar-checked,
+document ids match `^[a-z][a-z0-9_-]{0,63}$`, flow ids were not grammar-checked
+(they are since #251, below),
 and the existing `output` id is what lowered programs, engine step results and
 inspection events already carry. The rule lives in flow because only flow
 synthesizes an instruction. The canonical compiler and the document validator
@@ -270,6 +271,78 @@ Migration: rename the step.
 that resembling ids (`outputs`, `output-step`, `result`) still lower to the
 canonical compiler's program; `internal/compile` and `contract` tests prove a
 document call named `output` compiles and a repeated id is rejected.
+
+#### Flow step ids follow the document id grammar (#251)
+
+Every id-taking builder (`Call`, `ArmCall`, `If`, `Choose`, `Each`,
+`Parallel`, `TryFinally`, `Child`, `Compare`, `Default`, `Template`) checks its
+step id in one place, `Builder.reserveID`, against the document id grammar
+`^[a-z][a-z0-9_-]{0,63}$`. A violation fails as
+`flow: instruction id "<id>" does not match the id grammar ^[a-z][a-z0-9_-]{0,63}$; rename the step`,
+the same authoring-time failure as the reserved `output` id and a duplicate
+id. The grammar is not copied: `contract` exports it as `contract.IDPattern`
+with `contract.ValidID`, and document validation now uses that function too.
+
+Previously flow accepted any id except `output` (#247) and an empty `Call`
+or `ArmCall` id. The
+`.` is the defect that matters: a reference to step `a.b` is recorded as
+`$step.a.b`, and lowering splits references on `.`, so with calls `a` and
+`a.b`, returning `a.b` lowered to `{Step: a, Path: [b]}` — field `b` of step
+`a` — with no error. Other out-of-grammar ids (uppercase, a leading digit,
+`-` or `_`, `/`, `$`, `:`, spaces, non-ASCII letters, more than 64
+characters, an empty id on a construct) had no document form, so the same
+structure written as a document fails `invalid_id`. One grammar now holds in
+flow, the canonical compiler and documents. The agent catalog's workflow
+lowering reads only programs built by `flow.Define`, so its step ids now obey
+the grammar as well; its other divergences from `flow.Lower` remain #249.
+
+`flow.Define` now returns every builder violation as its error instead of
+letting it escape as a panic: the id rules above, and the construct rules
+(an `Each` concurrency outside 1–1024, a missing arm, an empty field path,
+an empty `Child` workflow name or comparison operator, a literal that cannot
+be encoded, a raw `js/` template). Tooling that loads definitions — the
+scaffold's generated `New`, the parity harness — gets a diagnostic it can
+report instead of a crash, which is what `Define` returning an error always
+promised. Builders panic with an unexported error type and `Define` recovers
+only that type, so a panic the application's own build callback raises (a
+nil dereference, a deliberate `panic`) still propagates unchanged and is
+never reported as a definition error. `MustDefine` does not recover: a
+broken rule panics at the builder call that broke it, so the crash stack
+still names the offending line. A builder called outside `Define` (a
+`*Builder` kept after the callback returns) still panics.
+
+Compatibility: a behavioral validation tightening in `flow`, a behavioral
+change to `flow.Define`, and an additive `contract` export (`IDPattern`,
+`ValidID`), linked to [#251](https://github.com/well-prado/new-blok/issues/251).
+It is not a wire-shape or document-version change, and document validation
+is unchanged. Affected definitions:
+
+- a step id outside the grammar: `MustDefine` now panics and `Define` now
+  returns an error where both used to succeed. Migration: rename the step to
+  lowercase letters, digits, `_` or `-`, starting with a letter, at most 64
+  characters (`lineItems` becomes `line-items` or `line_items`). No id in
+  this repository's examples, scaffold, benchmarks, catalog or agent code
+  needed renaming.
+- `Define` given a callback that breaks any builder rule now returns
+  `(Definition{}, err)` instead of panicking; callers that recovered that
+  panic should check the error instead.
+- the panic value raised by builders and by `MustDefine` is now an `error`
+  whose message is unchanged; code asserting it is a `string` must use
+  `fmt.Sprint` or `error` instead.
+- the empty-id panic of `Call` and `ArmCall` changed from
+  `flow: call id is required` to the grammar message for `""`.
+
+`flow/id_grammar_test.go` proves rejection of fourteen grammar-invalid ids
+for every id-taking builder through both `Define` (error) and `MustDefine`
+(panic), that ids at the grammar's edges (`a`, a 64-character id) still lower
+to the canonical compiler's program, that `Define` returns construct
+violations, that a callback's own panic propagates, and that `MustDefine`'s
+panic stack reaches the builder call. `contract/document_test.go` pins
+`ValidID` to document validation's `invalid_id`. Limits: flow still does not
+grammar-check `Choose` case keys, the `Child` workflow name or `Spec.Name`
+(document workflow ids are a separate field that a flow `Spec.Name` such as
+`shop/quote` does not map to), and `migration/blokv2.go` keeps its own copy of
+the grammar.
 
 The initial portable contract is a bounded, JSON-compatible value subset with
 explicit semantics for missing, null, optional fields, objects, arrays, string,
