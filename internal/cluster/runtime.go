@@ -371,6 +371,13 @@ func (r *Runtime) processOne(ctx context.Context, owner distributed.Owner) (RunR
 	state, _ := json.Marshal(selected)
 	claimID := transitionID("claim", selected.RunID+"\x00revision="+strconv.FormatInt(revision, 10), owner.Token)
 	if _, err := r.store.CommitFencedState(ctx, owner, selected.RunID, revision, claimID, "run.claimed", state, state); err != nil && !errors.Is(err, distributed.ErrAlreadyWritten) {
+		if errors.Is(err, distributed.ErrRecordTooLarge) {
+			// A run stored without #254's metadata headroom (for example by
+			// an older replica) that this owner's ID pushes over the bound.
+			// This owner can never claim it, so it fails instead of blocking
+			// the partition; finish drops what the terminal record cannot hold.
+			return r.finish(ctx, owner, selected, "failed", recordTooLargeCode, nil)
+		}
 		return RunRecord{}, err
 	}
 	input, err := workflow.DecodeInput(selected.Input)
@@ -394,9 +401,14 @@ func (r *Runtime) processOne(ctx context.Context, owner distributed.Owner) (RunR
 		// Accepted work is durable. A transient journal/quorum failure or
 		// cooperative cancellation must leave its admission slots intact so a
 		// later owner can replay the committed prefix; it is not a business
-		// failure and must not be acknowledged as terminal.
+		// failure and must not be acknowledged as terminal. A step record the
+		// journal could not write because it exceeds the store bound is the
+		// exception: replaying it can never fit, so it is a terminal failure
+		// (#265), and the engine's persistence class does not make it
+		// retryable.
 		var engineErr *engine.Error
-		if errors.As(runErr, &engineErr) && engineErr.Class == "persistence" {
+		overflow := errors.Is(runErr, ErrRecordOverflow)
+		if errors.As(runErr, &engineErr) && engineErr.Class == "persistence" && !overflow {
 			return RunRecord{}, runErr
 		}
 		if errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) {
@@ -412,6 +424,11 @@ func (r *Runtime) processOne(ctx context.Context, owner distributed.Owner) (RunR
 			if engineErr == nil {
 				code = "effect_outcome_uncertain"
 			}
+		}
+		if overflow {
+			// An effectful step whose result cannot be written stays
+			// uncertain: its effect ran. The code names why.
+			code = recordTooLargeCode
 		}
 		return r.finish(ctx, owner, selected, terminal, code, nil)
 	}
@@ -584,7 +601,7 @@ func (r *Runtime) finish(ctx context.Context, owner distributed.Owner, run RunRe
 	if err != nil || revision == 0 {
 		return RunRecord{}, fmt.Errorf("%w: read terminal state: %v", ErrUnavailable, err)
 	}
-	if latest.State == "completed" || latest.State == "failed" || latest.State == "uncertain" {
+	if isTerminal(latest.State) {
 		if latest.OwnerID != owner.ID || latest.Fence != owner.Token {
 			return RunRecord{}, distributed.ErrOwnershipLost
 		}
@@ -592,12 +609,25 @@ func (r *Runtime) finish(ctx context.Context, owner distributed.Owner, run RunRe
 	}
 	run.State, run.ErrorCode, run.Output = terminal, code, append(json.RawMessage(nil), output...)
 	run.OwnerID, run.Fence = owner.ID, owner.Token
-	state, _ := json.Marshal(run)
 	finishID := transitionID("finish", run.RunID, owner.Token)
-	if _, err := r.store.ReleaseAdmissionSlots(ctx, owner, run.RunID, run.Tenant, run.GlobalSlot, run.TenantSlot, revision, finishID, "run."+terminal, state, state); err != nil && !errors.Is(err, distributed.ErrAlreadyWritten) {
-		return RunRecord{}, err
+	// The terminal transition must commit, or the run keeps its slots and
+	// is retried forever (#265). A record over the bound is rejected before
+	// anything is sent, so the next, smaller record is tried in the same
+	// transition; any other error leaves the run for a later owner.
+	var lastErr error
+	for _, record := range terminalRecords(run) {
+		state, _ := json.Marshal(record)
+		_, err := r.store.ReleaseAdmissionSlots(ctx, owner, record.RunID, record.Tenant, record.GlobalSlot, record.TenantSlot, revision, finishID, "run."+record.State, state, state)
+		if errors.Is(err, distributed.ErrRecordTooLarge) {
+			lastErr = err
+			continue
+		}
+		if err != nil && !errors.Is(err, distributed.ErrAlreadyWritten) {
+			return RunRecord{}, err
+		}
+		return record, nil
 	}
-	return run, nil
+	return RunRecord{}, fmt.Errorf("%w: run %s has no terminal record that fits: %w", ErrRecordOverflow, run.RunID, lastErr)
 }
 
 func (r *Runtime) fairCandidate(ctx context.Context, owner distributed.Owner, records []RunRecord) (RunRecord, error) {

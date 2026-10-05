@@ -381,8 +381,8 @@ func TestDistributedNearLimitAdmissionStaysClaimableAndSignalable(t *testing.T) 
 			t.Fatalf("17-byte signal after takeover status=%d body=%q, want 202 accepted", response.Code, strings.TrimSpace(response.Body.String()))
 		}
 		// The signal re-admits the run and the long-ID owner claims it: the
-		// claimed record still fits. (Finishing it is #265: the terminal
-		// record adds output on top of the non-terminal headroom.)
+		// claimed record still fits. (Its terminal record adds output on top
+		// of the non-terminal headroom; #265 covers how it finishes.)
 		deadline := time.Now().Add(15 * time.Second)
 		for {
 			run, err := f.runtime.GetRun(f.ctx, f.tenant, largest)
@@ -397,9 +397,9 @@ func TestDistributedNearLimitAdmissionStaysClaimableAndSignalable(t *testing.T) 
 	})
 
 	t.Run("signal over the etcd request bound is definite", func(t *testing.T) {
-		// A fresh partition: the run signalled above cannot finish (#265) and
-		// would hold p-0000's worker. A longer request key and tenant than
-		// the probes' cost a few bytes of record, hence lo-10.
+		// A fresh partition, isolated from the runs probed above. A longer
+		// request key and tenant than the probes' cost a few bytes of
+		// record, hence lo-10.
 		f.tenant = tenantForPartition(f.runtime, "p-0001")
 		response := f.admit("near-limit-for-signal", body(lo-10))
 		var admission cluster.Admission
