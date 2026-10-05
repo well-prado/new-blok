@@ -22,9 +22,12 @@ import (
 	"bytes"
 	"container/list"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -125,32 +128,41 @@ type Config struct {
 	MetricInterval time.Duration
 	// ExportTimeout bounds every export call.
 	ExportTimeout time.Duration
-	// TenantLabels allowlists tenants used as metric labels; any other
-	// tenant is labeled "other". Tenants on spans and logs must still be
-	// valid labels. At most MaxTenantLabels.
+	// TenantLabels allowlists tenants exported as blok.tenant on metrics,
+	// spans and logs; any other tenant is exported as "other". At most
+	// MaxTenantLabels.
 	TenantLabels []string
+	// RawTenants opts in to exporting every tenant that is a valid label
+	// as-is on spans and logs (never on metrics, which always use the
+	// allowlist). Leave it false unless tenant identifiers are not
+	// personal data and the trace backend can index their cardinality.
+	RawTenants bool
 	// LogAttributes allowlists structured log attribute keys exported with
 	// a step log; all other attributes are dropped. At most MaxLogAttributes.
 	LogAttributes []string
 }
 
-// Stats counts what the pipeline did. Every event is either processed or
-// counted as dropped; every exported item is either exported or failed.
+// Stats counts what the pipeline did. Every offered event is accepted or
+// counted as dropped; after Shutdown returns, every accepted event is either
+// processed or counted in DroppedShutdown; every exported item is either
+// exported or failed.
 type Stats struct {
-	Accepted       uint64 // events queued
-	Dropped        uint64 // events refused because the queue was full
-	DroppedClosed  uint64 // events refused after Shutdown began
-	Processed      uint64 // events the export goroutine handled
-	Abandoned      uint64 // open runs evicted at MaxOpenRuns or steps left open at run end
-	Orphaned       uint64 // terminal events whose start was never observed
-	Overflowed     uint64 // metric points recorded under the overflow attribute set
-	SpansExported  uint64
-	SpansFailed    uint64
-	LogsExported   uint64
-	LogsFailed     uint64
-	MetricExports  uint64
-	MetricFailures uint64
-	Panics         uint64 // recovered SDK panics; the event is dropped
+	Accepted        uint64 // events queued
+	Dropped         uint64 // events refused because the queue was full
+	DroppedClosed   uint64 // events refused after Shutdown began
+	DroppedShutdown uint64 // accepted events discarded unprocessed because Shutdown's context expired
+	Queued          uint64 // accepted events still waiting (Accepted = Processed + Queued + DroppedShutdown, give or take one in hand)
+	Processed       uint64 // events the export goroutine handled
+	Abandoned       uint64 // open runs evicted at MaxOpenRuns or steps left open at run end
+	Orphaned        uint64 // terminal events whose start was never observed
+	Overflowed      uint64 // metric points recorded under the overflow attribute set
+	SpansExported   uint64
+	SpansFailed     uint64
+	LogsExported    uint64
+	LogsFailed      uint64
+	MetricExports   uint64
+	MetricFailures  uint64
+	Panics          uint64 // recovered SDK panics; the event is dropped
 }
 
 // Exporter is an inspection.Observer that exports to OpenTelemetry.
@@ -162,6 +174,20 @@ type Exporter struct {
 	done     chan struct{}
 	closed   atomic.Bool
 	once     sync.Once
+	// producers counts Observe calls between their closed check and their
+	// send, so Shutdown can wait them out and no event is queued after the
+	// loop has drained.
+	producers atomic.Int64
+	// exportCtx is the parent of every export call; Shutdown cancels it
+	// when its own context expires, and aborted then stops the loop from
+	// doing anything but counting what is left.
+	exportCtx     context.Context
+	cancelExports context.CancelFunc
+	aborted       atomic.Bool
+	// One in-flight call per signal: an exporter that ignores its context
+	// leaves at most one abandoned goroutine per signal, never one per
+	// batch. While it is stuck, later batches fail fast (counted).
+	traceSlot, logSlot, metricSlot chan struct{}
 
 	providersOnce sync.Once
 	shutdownErr   error
@@ -170,6 +196,7 @@ type Exporter struct {
 	tracer         oteltrace.Tracer
 	spans          *spanBuffer
 	meterProvider  *sdkmetric.MeterProvider
+	metrics        *countingMetrics
 	loggerProvider *sdklog.LoggerProvider
 	logger         otellog.Logger
 	records        *logBuffer
@@ -185,7 +212,8 @@ type Exporter struct {
 	runs  map[string]*list.Element
 	order *list.List
 
-	accepted, dropped, droppedClosed, processed, abandoned, orphaned, overflowed        atomic.Uint64
+	accepted, dropped, droppedClosed, droppedShutdown, processed, abandoned, orphaned   atomic.Uint64
+	overflowed                                                                          atomic.Uint64
 	spansExported, spansFailed, logsExported, logsFailed, metricExports, metricFailures atomic.Uint64
 	panics                                                                              atomic.Uint64
 }
@@ -228,7 +256,12 @@ func New(config Config) (*Exporter, error) {
 		tenants:  map[string]bool{},
 		runs:     map[string]*list.Element{},
 		order:    list.New(),
+
+		traceSlot:  make(chan struct{}, 1),
+		logSlot:    make(chan struct{}, 1),
+		metricSlot: make(chan struct{}, 1),
 	}
+	e.exportCtx, e.cancelExports = context.WithCancel(context.Background())
 	for _, tenant := range config.TenantLabels {
 		e.tenants[tenant] = true
 	}
@@ -239,7 +272,7 @@ func New(config Config) (*Exporter, error) {
 		}
 	}
 	if config.Traces != nil {
-		e.spans = &spanBuffer{exporter: config.Traces}
+		e.spans = &spanBuffer{exporter: config.Traces, owner: e}
 		e.tracerProvider = sdktrace.NewTracerProvider(
 			sdktrace.WithResource(res),
 			// Sampling is decided once per trace by the engine's
@@ -251,15 +284,17 @@ func New(config Config) (*Exporter, error) {
 		e.tracer = e.tracerProvider.Tracer(scopeName)
 	}
 	if config.Logs != nil {
-		e.records = &logBuffer{exporter: config.Logs}
+		e.records = &logBuffer{exporter: config.Logs, owner: e}
 		e.loggerProvider = sdklog.NewLoggerProvider(sdklog.WithResource(res), sdklog.WithProcessor(e.records))
 		e.logger = e.loggerProvider.Logger(scopeName)
 	}
 	if config.Metrics != nil {
-		reader := sdkmetric.NewPeriodicReader(&countingMetrics{Exporter: config.Metrics, owner: e}, sdkmetric.WithInterval(config.MetricInterval), sdkmetric.WithTimeout(config.ExportTimeout))
+		e.metrics = &countingMetrics{Exporter: config.Metrics, owner: e}
+		reader := sdkmetric.NewPeriodicReader(e.metrics, sdkmetric.WithInterval(config.MetricInterval), sdkmetric.WithTimeout(config.ExportTimeout))
 		e.meterProvider = sdkmetric.NewMeterProvider(sdkmetric.WithResource(res), sdkmetric.WithReader(reader))
 		if err := e.instruments(); err != nil {
 			_ = e.meterProvider.Shutdown(context.Background())
+			e.cancelExports()
 			return nil, err
 		}
 	}
@@ -352,6 +387,8 @@ func (e *Exporter) Observe(event inspection.Event) {
 	if e == nil {
 		return
 	}
+	e.producers.Add(1)
+	defer e.producers.Add(-1)
 	if e.closed.Load() {
 		e.droppedClosed.Add(1)
 		return
@@ -374,7 +411,7 @@ func (e *Exporter) Observe(event inspection.Event) {
 // Stats returns a snapshot of the pipeline counters.
 func (e *Exporter) Stats() Stats {
 	return Stats{
-		Accepted: e.accepted.Load(), Dropped: e.dropped.Load(), DroppedClosed: e.droppedClosed.Load(), Processed: e.processed.Load(),
+		Accepted: e.accepted.Load(), Dropped: e.dropped.Load(), DroppedClosed: e.droppedClosed.Load(), DroppedShutdown: e.droppedShutdown.Load(), Queued: uint64(len(e.queue)), Processed: e.processed.Load(),
 		Abandoned: e.abandoned.Load(), Orphaned: e.orphaned.Load(), Overflowed: e.overflowed.Load(),
 		SpansExported: e.spansExported.Load(), SpansFailed: e.spansFailed.Load(), LogsExported: e.logsExported.Load(), LogsFailed: e.logsFailed.Load(),
 		MetricExports: e.metricExports.Load(), MetricFailures: e.metricFailures.Load(), Panics: e.panics.Load(),
@@ -404,31 +441,66 @@ func (e *Exporter) Flush(ctx context.Context) error {
 }
 
 // Shutdown stops accepting events, exports what is queued and shuts the
-// selected providers and exporters down, bounded by ctx. Open runs are
-// abandoned, not exported as if complete. It is safe to call more than once.
+// selected providers and exporters down, all bounded by ctx. When ctx
+// expires first, in-flight exports are canceled, events still queued are
+// discarded and counted (Stats.DroppedShutdown), and the providers are shut
+// down anyway with the expired ctx; Shutdown then returns ctx's error. Open
+// runs are abandoned, not exported as if complete. An exporter call that
+// ignores its context is abandoned: its goroutine ends when the exporter
+// returns. It is safe to call more than once.
 func (e *Exporter) Shutdown(ctx context.Context) error {
 	e.once.Do(func() {
 		e.closed.Store(true)
+		// Producers past their closed check are doing a non-blocking send;
+		// wait them out so nothing is queued after the loop drains.
+		for e.producers.Load() != 0 {
+			runtime.Gosched()
+		}
 		close(e.stop)
 	})
+	var expired error
 	select {
 	case <-e.done:
 	case <-ctx.Done():
-		return ctx.Err()
+		e.aborted.Store(true)
+		e.cancelExports()
+		// After abort the loop does only in-memory work, so this is short.
+		<-e.done
+		expired = ctx.Err()
 	}
 	e.providersOnce.Do(func() {
+		// Whatever export the providers' own shutdown starts (the metric
+		// reader's final collection) is canceled when ctx expires, and each
+		// provider shutdown is abandoned at ctx rather than waited out.
+		stop := context.AfterFunc(ctx, e.cancelExports)
+		defer stop()
 		var errs []error
 		if e.tracerProvider != nil {
-			errs = append(errs, e.tracerProvider.Shutdown(ctx))
+			errs = append(errs, e.boundedCall(ctx, nil, e.tracerProvider.Shutdown))
 		}
 		if e.loggerProvider != nil {
-			errs = append(errs, e.loggerProvider.Shutdown(ctx))
+			errs = append(errs, e.boundedCall(ctx, nil, e.loggerProvider.Shutdown))
 		}
 		if e.meterProvider != nil {
-			errs = append(errs, e.meterProvider.Shutdown(ctx))
+			errs = append(errs, e.boundedCall(ctx, nil, e.meterProvider.Shutdown))
 		}
+		// The SDK skips its processors once ctx has expired; every selected
+		// exporter is still told to shut down (each at most once).
+		if e.spans != nil {
+			errs = append(errs, e.spans.Shutdown(ctx))
+		}
+		if e.records != nil {
+			errs = append(errs, e.records.Shutdown(ctx))
+		}
+		if e.metrics != nil {
+			errs = append(errs, e.metrics.Shutdown(ctx))
+		}
+		e.cancelExports()
 		e.shutdownErr = errors.Join(errs...)
 	})
+	if expired != nil {
+		return expired
+	}
 	return e.shutdownErr
 }
 
@@ -463,6 +535,10 @@ func (e *Exporter) loop() {
 
 func (e *Exporter) drain() {
 	for {
+		if e.aborted.Load() {
+			e.discardQueued()
+			return
+		}
 		select {
 		case event := <-e.queue:
 			e.handle(event)
@@ -475,10 +551,22 @@ func (e *Exporter) drain() {
 	}
 }
 
+// discardQueued counts what is left in the queue once Shutdown gave up.
+func (e *Exporter) discardQueued() {
+	for {
+		select {
+		case <-e.queue:
+			e.droppedShutdown.Add(1)
+		default:
+			return
+		}
+	}
+}
+
 func (e *Exporter) flush() {
 	if e.spans != nil {
 		if batch := e.spans.take(); len(batch) > 0 {
-			err := e.export(func(ctx context.Context) error { return e.config.Traces.ExportSpans(ctx, batch) })
+			err := e.export(e.traceSlot, context.Background(), func(ctx context.Context) error { return e.config.Traces.ExportSpans(ctx, batch) })
 			if err != nil {
 				e.spansFailed.Add(uint64(len(batch)))
 			} else {
@@ -488,7 +576,7 @@ func (e *Exporter) flush() {
 	}
 	if e.records != nil {
 		if batch := e.records.take(); len(batch) > 0 {
-			err := e.export(func(ctx context.Context) error { return e.config.Logs.Export(ctx, batch) })
+			err := e.export(e.logSlot, context.Background(), func(ctx context.Context) error { return e.config.Logs.Export(ctx, batch) })
 			if err != nil {
 				e.logsFailed.Add(uint64(len(batch)))
 			} else {
@@ -498,18 +586,56 @@ func (e *Exporter) flush() {
 	}
 }
 
-// export runs one bounded export call. A panicking exporter is contained and
-// counted: telemetry must never take the process down.
-func (e *Exporter) export(call func(context.Context) error) (err error) {
-	ctx, cancel := context.WithTimeout(context.Background(), e.config.ExportTimeout)
+var (
+	errAborted  = errors.New("otel: export abandoned at shutdown")
+	errBusy     = errors.New("otel: previous export call has not returned")
+	errPanicked = errors.New("otel: exporter panicked")
+)
+
+// export runs one export call bounded by ExportTimeout, by parent, and by
+// Shutdown giving up. The call runs on its own goroutine so the pipeline
+// never waits past those bounds, even on an exporter that ignores its
+// context; slot admits one such call per signal at a time. A panicking
+// exporter is contained and counted: telemetry never takes the process down.
+func (e *Exporter) export(slot chan struct{}, parent context.Context, call func(context.Context) error) error {
+	if e.aborted.Load() {
+		return errAborted
+	}
+	ctx, cancel := context.WithTimeout(parent, e.config.ExportTimeout)
 	defer cancel()
-	defer func() {
-		if recover() != nil {
-			e.panics.Add(1)
-			err = errors.New("otel: exporter panicked")
+	stop := context.AfterFunc(e.exportCtx, cancel)
+	defer stop()
+	return e.boundedCall(ctx, slot, call)
+}
+
+// boundedCall runs call(ctx) and returns when it does or when ctx ends.
+func (e *Exporter) boundedCall(ctx context.Context, slot chan struct{}, call func(context.Context) error) error {
+	if slot != nil {
+		select {
+		case slot <- struct{}{}:
+		default:
+			return errBusy
 		}
+	}
+	result := make(chan error, 1)
+	go func() {
+		if slot != nil {
+			defer func() { <-slot }()
+		}
+		defer func() {
+			if recover() != nil {
+				e.panics.Add(1)
+				result <- errPanicked
+			}
+		}()
+		result <- call(ctx)
 	}()
-	return call(ctx)
+	select {
+	case err := <-result:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (e *Exporter) handle(event inspection.Event) {
@@ -548,7 +674,7 @@ func (e *Exporter) runStarted(event inspection.Event) {
 	}
 	state := &runState{id: event.RunID, start: event.At, workflow: event.Workflow, tenant: event.Tenant, steps: map[string]*stepState{}}
 	if e.tracer != nil && event.Trace.Sampled() {
-		state.span = e.startSpan(event, "run "+label(event.Workflow), runAttributes(event))
+		state.span = e.startSpan(event, "run "+label(event.Workflow), e.runAttributes(event))
 	}
 	e.runs[event.RunID] = e.order.PushBack(state)
 }
@@ -566,7 +692,7 @@ func (e *Exporter) stepStarted(event inspection.Event) {
 	}
 	step := &stepState{start: event.At}
 	if e.tracer != nil && event.Trace.Sampled() {
-		step.span = e.startSpan(event, "step "+label(event.StepID), stepAttributes(event))
+		step.span = e.startSpan(event, "step "+label(event.StepID), e.stepAttributes(event))
 	}
 	state.steps[event.AttemptID] = step
 }
@@ -600,7 +726,7 @@ func (e *Exporter) stepEnded(event inspection.Event) {
 	}
 	if span == nil {
 		e.orphaned.Add(1)
-		span = e.startSpan(event, "step "+label(event.StepID), append(stepAttributes(event), attribute.Bool(AttrStartObserved, false)))
+		span = e.startSpan(event, "step "+label(event.StepID), append(e.stepAttributes(event), attribute.Bool(AttrStartObserved, false)))
 	}
 	endSpan(span, event, outcome)
 }
@@ -642,7 +768,7 @@ func (e *Exporter) runEnded(event inspection.Event) {
 	}
 	if span == nil {
 		e.orphaned.Add(1)
-		span = e.startSpan(event, "run "+label(workflow), append(runAttributes(event), attribute.Bool(AttrStartObserved, false)))
+		span = e.startSpan(event, "run "+label(workflow), append(e.runAttributes(event), attribute.Bool(AttrStartObserved, false)))
 	}
 	endSpan(span, event, outcome)
 }
@@ -658,9 +784,9 @@ func (e *Exporter) stepLog(event inspection.Event) {
 	record.SetSeverity(severity)
 	record.SetSeverityText(text)
 	record.SetBody(attribute.StringValue(observe.RedactLogMessage(truncate(event.LogMessage, maxLogBodyBytes))))
-	record.AddAttributes(attribute.String(AttrRunID, event.RunID), attribute.String(AttrWorkflow, label(event.Workflow)), attribute.String(AttrStep, label(event.StepID)))
-	if tenant := optionalLabel(event.Tenant); tenant != "" && observe.ValidLabel(event.Tenant) {
-		record.AddAttributes(attribute.String(AttrTenant, event.Tenant))
+	record.AddAttributes(attribute.String(AttrRunID, identity(event.RunID)), attribute.String(AttrWorkflow, label(event.Workflow)), attribute.String(AttrStep, label(event.StepID)))
+	if tenant := e.spanTenant(event.Tenant); tenant != "" {
+		record.AddAttributes(attribute.String(AttrTenant, tenant))
 	}
 	record.AddAttributes(e.allowedLogAttributes(event.LogAttrs)...)
 	e.logger.Emit(spanContext(event.Trace, event.Trace.SpanID, false), record)
@@ -750,6 +876,30 @@ func (e *Exporter) tenantLabel(tenant string) string {
 	return otherTenant
 }
 
+// spanTenant is the tenant on spans and logs: the allowlisted label, or the
+// raw valid label only when the application opted in with RawTenants.
+func (e *Exporter) spanTenant(tenant string) string {
+	if tenant == "" {
+		return ""
+	}
+	if e.config.RawTenants && observe.ValidLabel(tenant) {
+		return tenant
+	}
+	return e.tenantLabel(tenant)
+}
+
+// identity bounds an identifier exported on spans and logs: a value that is
+// a valid label is kept for correlation; anything else (longer than 64
+// bytes or outside the label alphabet) becomes "h:" and 16 hex digits of
+// its SHA-256, which a reader can compute from the inspection id.
+func identity(value string) string {
+	if value == "" || observe.ValidLabel(value) {
+		return value
+	}
+	sum := sha256.Sum256([]byte(value))
+	return "h:" + hex.EncodeToString(sum[:8])
+}
+
 func (e *Exporter) startSpan(event inspection.Event, name string, attrs []attribute.KeyValue) oteltrace.Span {
 	ctx := context.WithValue(spanContext(event.Trace, event.Trace.Parent, true), idsKey{}, ids{trace: oteltrace.TraceID(event.Trace.TraceID), span: oteltrace.SpanID(event.Trace.SpanID)})
 	_, span := e.tracer.Start(ctx, name, oteltrace.WithTimestamp(event.At), oteltrace.WithSpanKind(oteltrace.SpanKindInternal), oteltrace.WithAttributes(attrs...))
@@ -791,24 +941,24 @@ func endSpan(span oteltrace.Span, event inspection.Event, outcome string) {
 	span.End(oteltrace.WithTimestamp(event.At))
 }
 
-func runAttributes(event inspection.Event) []attribute.KeyValue {
-	attrs := []attribute.KeyValue{attribute.String(AttrWorkflow, label(event.Workflow)), attribute.String(AttrRunID, event.RunID)}
+func (e *Exporter) runAttributes(event inspection.Event) []attribute.KeyValue {
+	attrs := []attribute.KeyValue{attribute.String(AttrWorkflow, label(event.Workflow)), attribute.String(AttrRunID, identity(event.RunID))}
 	if event.ParentRun != "" {
-		attrs = append(attrs, attribute.String(AttrParentRun, event.ParentRun), attribute.String(AttrParentStep, label(event.ParentStep)))
+		attrs = append(attrs, attribute.String(AttrParentRun, identity(event.ParentRun)), attribute.String(AttrParentStep, label(event.ParentStep)))
 	}
-	if observe.ValidLabel(event.Tenant) {
-		attrs = append(attrs, attribute.String(AttrTenant, event.Tenant))
+	if tenant := e.spanTenant(event.Tenant); tenant != "" {
+		attrs = append(attrs, attribute.String(AttrTenant, tenant))
 	}
 	return attrs
 }
 
-func stepAttributes(event inspection.Event) []attribute.KeyValue {
-	attrs := []attribute.KeyValue{attribute.String(AttrWorkflow, label(event.Workflow)), attribute.String(AttrStep, label(event.StepID)), attribute.Int(AttrAttempt, event.Attempt), attribute.String(AttrRunID, event.RunID)}
+func (e *Exporter) stepAttributes(event inspection.Event) []attribute.KeyValue {
+	attrs := []attribute.KeyValue{attribute.String(AttrWorkflow, label(event.Workflow)), attribute.String(AttrStep, label(event.StepID)), attribute.Int(AttrAttempt, event.Attempt), attribute.String(AttrRunID, identity(event.RunID))}
 	if event.AttemptID != "" {
-		attrs = append(attrs, attribute.String(AttrAttemptID, event.AttemptID))
+		attrs = append(attrs, attribute.String(AttrAttemptID, identity(event.AttemptID)))
 	}
-	if observe.ValidLabel(event.Tenant) {
-		attrs = append(attrs, attribute.String(AttrTenant, event.Tenant))
+	if tenant := e.spanTenant(event.Tenant); tenant != "" {
+		attrs = append(attrs, attribute.String(AttrTenant, tenant))
 	}
 	return attrs
 }
@@ -907,6 +1057,19 @@ type spanBuffer struct {
 	mu       sync.Mutex
 	batch    []sdktrace.ReadOnlySpan
 	exporter sdktrace.SpanExporter
+	owner    *Exporter
+	shutdown onceErr
+}
+
+// onceErr runs a shutdown at most once and remembers its result.
+type onceErr struct {
+	once sync.Once
+	err  error
+}
+
+func (o *onceErr) do(call func() error) error {
+	o.once.Do(func() { o.err = call() })
+	return o.err
 }
 
 func (b *spanBuffer) OnStart(context.Context, sdktrace.ReadWriteSpan) {}
@@ -915,8 +1078,10 @@ func (b *spanBuffer) OnEnd(span sdktrace.ReadOnlySpan) {
 	b.batch = append(b.batch, span)
 	b.mu.Unlock()
 }
-func (b *spanBuffer) Shutdown(ctx context.Context) error { return b.exporter.Shutdown(ctx) }
-func (b *spanBuffer) ForceFlush(context.Context) error   { return nil }
+func (b *spanBuffer) Shutdown(ctx context.Context) error {
+	return b.shutdown.do(func() error { return b.owner.boundedCall(ctx, nil, b.exporter.Shutdown) })
+}
+func (b *spanBuffer) ForceFlush(context.Context) error { return nil }
 func (b *spanBuffer) pending() int {
 	if b == nil {
 		return 0
@@ -938,6 +1103,8 @@ type logBuffer struct {
 	mu       sync.Mutex
 	batch    []sdklog.Record
 	exporter sdklog.Exporter
+	owner    *Exporter
+	shutdown onceErr
 }
 
 func (b *logBuffer) Enabled(context.Context, sdklog.EnabledParameters) bool { return true }
@@ -947,8 +1114,10 @@ func (b *logBuffer) OnEmit(_ context.Context, record *sdklog.Record) error {
 	b.mu.Unlock()
 	return nil
 }
-func (b *logBuffer) Shutdown(ctx context.Context) error { return b.exporter.Shutdown(ctx) }
-func (b *logBuffer) ForceFlush(context.Context) error   { return nil }
+func (b *logBuffer) Shutdown(ctx context.Context) error {
+	return b.shutdown.do(func() error { return b.owner.boundedCall(ctx, nil, b.exporter.Shutdown) })
+}
+func (b *logBuffer) ForceFlush(context.Context) error { return nil }
 func (b *logBuffer) pending() int {
 	if b == nil {
 		return 0
@@ -969,22 +1138,24 @@ func (b *logBuffer) take() []sdklog.Record {
 // a collection exported after a failed one still carries every observation.
 type countingMetrics struct {
 	sdkmetric.Exporter
-	owner *Exporter
+	owner    *Exporter
+	shutdown onceErr
 }
 
-func (c *countingMetrics) Export(ctx context.Context, data *metricdata.ResourceMetrics) (err error) {
-	defer func() {
-		if recover() != nil {
-			c.owner.panics.Add(1)
-			c.owner.metricFailures.Add(1)
-			err = errors.New("otel: metric exporter panicked")
-		}
-	}()
-	err = c.Exporter.Export(ctx, data)
+func (c *countingMetrics) Export(ctx context.Context, data *metricdata.ResourceMetrics) error {
+	err := c.owner.export(c.owner.metricSlot, ctx, func(ctx context.Context) error { return c.Exporter.Export(ctx, data) })
 	if err != nil {
 		c.owner.metricFailures.Add(1)
 	} else {
 		c.owner.metricExports.Add(1)
 	}
 	return err
+}
+
+func (c *countingMetrics) ForceFlush(ctx context.Context) error {
+	return c.owner.boundedCall(ctx, nil, c.Exporter.ForceFlush)
+}
+
+func (c *countingMetrics) Shutdown(ctx context.Context) error {
+	return c.shutdown.do(func() error { return c.owner.boundedCall(ctx, nil, c.Exporter.Shutdown) })
 }

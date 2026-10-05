@@ -255,8 +255,14 @@ func TestActualCollectorContainerReceivesAndSurvivesOutages(t *testing.T) {
 // exporter, for callers that bring their own collector.
 func orderRunner(t *testing.T, h *harness, exporter *otel.Exporter) (*execution.Runner, contract.InternalProgram) {
 	t.Helper()
+	return orderRunnerWith(t, h, exporter)
+}
+
+// orderRunnerWith is orderRunner with any observer in front of the exporter.
+func orderRunnerWith(t *testing.T, h *harness, observer inspection.Observer) (*execution.Runner, contract.InternalProgram) {
+	t.Helper()
 	validate, charge, program := orderDefinitions(t, h)
-	application, err := app.New(app.Config{Inspection: exporter, Trace: observe.TracePolicy{Ratio: 1}})
+	application, err := app.New(app.Config{Inspection: observer, Trace: observe.TracePolicy{Ratio: 1}})
 	if err != nil {
 		t.Fatal(err)
 	}

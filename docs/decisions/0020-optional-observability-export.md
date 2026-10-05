@@ -61,15 +61,22 @@ exporter makes the OpenTelemetry SDK use exactly these ids (a custom
    `Call.traceparent`/`Call.tracestate` (proto fields 12 and 13). See the
    protocol decision below. The Node SDK exposes it as the optional,
    frozen `ctx.trace = {traceparent, tracestate}`; a malformed value is
-   dropped, never a reason to fail a call.
+   dropped, never a reason to fail a call. "Never changes the outcome" is a
+   framework guarantee: the engine, the worker adapter and the protocol make
+   no decision from trace context. A node that reads `ctx.trace` and returns
+   or acts on it (like the `fixture/trace` test node, which is therefore
+   declared non-deterministic) makes its own output depend on random trace
+   ids; that is the node's choice, not the framework's.
 3. **Child runs.** A run started through `execution.Runner` from inside a
    step (with `ParentRun`/`ParentStep`) has no explicit parent, so the engine
    takes the step's context from `ctx`: the child run span is a child of the
    step that started it, in the same trace. An explicit `Invocation.Trace`
    (for example an inbound `traceparent` the application chose to trust)
-   wins. The agent catalog's child workflow tools run an unobserved nested
-   engine; they emit no spans of their own, but the dispatching step's
-   context reaches their tools and workers unchanged.
+   wins. This boundary is met for runner child runs only. The agent
+   catalog's child workflow tools run an unobserved nested engine (#260's
+   guard deliberately keeps observers out of it); they emit no spans of
+   their own (#275), though the dispatching step's context reaches their
+   tools and workers unchanged.
 
 ### Worker protocol: additive field, no minor bump
 
@@ -91,14 +98,15 @@ dispatched.
 | --- | --- |
 | Sampling | Head sampling, decided once per trace. A root run is sampled when its trace id falls under `Ratio`, deterministically (OpenTelemetry `TraceIDRatioBased` arithmetic). A run with a parent keeps the parent's flag. Unsampled traces still propagate with flag 00. Zero disables tracing (no ids, no propagation). |
 | What sampling affects | Spans and step logs only. Metrics count every run and step. Validation, approval, journaling and outcomes never read it. |
-| Span attributes | `blok.workflow`, `blok.step`, `blok.attempt`, `blok.attempt.id`, `blok.run.id`, `blok.parent.run.id`, `blok.parent.step`, `blok.tenant` (only if a valid label), `blok.outcome`, `blok.error.code`, `blok.error.class` (bounded label shapes). Never the principal, inputs, outputs or provider messages. |
+| Span attributes | `blok.workflow`, `blok.step`, `blok.attempt`, `blok.attempt.id`, `blok.run.id`, `blok.parent.run.id`, `blok.parent.step`, `blok.tenant`, `blok.outcome`, `blok.error.code`, `blok.error.class`. Every string value is a bounded label shape: names and codes that are not valid labels become `invalid`; identifiers (run, parent run, attempt ids) are kept when they are valid labels (at most 64 bytes of `[A-Za-z0-9._/:-]`) and otherwise exported as `h:` plus 16 hex digits of their SHA-256, which a reader computes from the inspection id. Never the principal, inputs, outputs or provider messages. |
+| Tenants | One allowlist (`TenantLabels`, at most 64) for metrics, spans and logs: any other tenant is exported as `other`. `RawTenants: true` is an explicit opt-in that exports valid-label tenants as-is on spans and logs only; metrics always use the allowlist. The default is the privacy-safe one because tenant identifiers can be personal data. |
 | Metric labels | Fixed vocabulary: `blok.workflow`, `blok.step`, `blok.outcome`, `blok.error.class`, `blok.tenant`. Run, attempt and parent ids are never metric labels. `blok.tenant` is the tenant only when it is in `TenantLabels` (at most 64), otherwise `other`. Each instrument keeps at most `MaxSeries` (default 1000, hard 10000) attribute sets; later sets go to `otel.metric.overflow=true` and are counted. |
-| Logs | Exported only for sampled traces, correlated by trace/span id. Body is the message bounded to 1 KiB and passed through the shared credential redaction. Attributes are run id, workflow, step, valid tenant and only the keys in `LogAttributes` (at most 32), scalar values bounded to 256 bytes. |
+| Logs | Exported only for sampled traces, correlated by trace/span id. Body is the message bounded to 1 KiB and passed through the shared credential redaction. Attributes are the bounded run id, workflow, step, the tenant per the tenant policy, and only the keys in `LogAttributes` (at most 32), scalar values bounded to 256 bytes. |
 | Run path | `Observe` copies a bounded event into a fixed queue (`QueueSize`, default 4096, hard 65536) with a non-blocking send. It performs no I/O and never waits. |
 | Backpressure | Drop newest: a full queue drops the event and counts it (`Stats.Dropped`). Open runs are bounded by `MaxOpenRuns` (default 4096); at the bound the oldest is abandoned and counted. An abandoned span is never ended, so it is never exported as if it completed. |
-| Export | One goroutine converts events and exports span and log batches synchronously (`BatchSize` 512, `FlushInterval` 1 s), each call bounded by `ExportTimeout` (default 5 s, hard 30 s). Metrics use a periodic reader with the same timeout. |
+| Export | One goroutine converts events and exports span and log batches (`BatchSize` 512, `FlushInterval` 1 s). Each export call runs on its own goroutine and the pipeline waits for it at most `ExportTimeout` (default 5 s, hard 30 s) or until Shutdown gives up, even if the exporter ignores its context. One call per signal may be in flight: while an abandoned call is still inside an exporter, later batches of that signal fail fast and are counted, so a stuck exporter costs at most one goroutine per signal. Metrics use a periodic reader whose exports go through the same bound. |
 | Exporter failure | Optional, always: a failed or timed-out batch is dropped and counted (`SpansFailed`, `LogsFailed`, `MetricFailures`), never retried by the pipeline and never surfaced to a run. Applications should disable or bound their exporter's own retry. Cumulative metrics carry every count in the next successful export. A timed-out export may still be delivered late by the network; it is counted as failed and never resent. No configuration can make export block or fail a run. |
-| Shutdown | `Exporter.Shutdown` stops accepting (counted as `DroppedClosed`), drains the queue, abandons open runs and shuts the providers down within its context. Compose it as an `app.Dependency` `Close` so drain flushes telemetry after admitted work. |
+| Shutdown | `Exporter.Shutdown(ctx)` stops accepting (`DroppedClosed`), drains the queue, abandons open runs, then shuts the providers and every selected exporter down, all bounded by `ctx`. If `ctx` expires first, in-flight exports are canceled, the export loop exits at once, events still queued are discarded and counted (`DroppedShutdown`), the providers and exporters are still shut down (each exporter at most once, with the expired `ctx`), and `ctx`'s error is returned. After it returns, `Accepted = Processed + DroppedShutdown` and no pipeline goroutine remains except calls still inside an exporter that ignores its context, which end when that exporter returns. Compose it as an `app.Dependency` `Close` so drain flushes telemetry after admitted work. |
 
 `Stats()` reports every counter, and `blok.telemetry.dropped{reason}` exports
 the losses as a metric.
@@ -141,9 +149,20 @@ Pinned versions (`observe/otel/go.mod`, verified with `go mod verify`):
 `otel/sdk`, `otel/sdk/metric`, `otel/sdk/log` v1.47.0; test-only
 `otel/exporters/otlp/otlptrace/otlptracehttp` and
 `otlpmetric/otlpmetrichttp` v1.47.0, `otlplog/otlploghttp` v0.23.0,
-`go.opentelemetry.io/proto/otlp` v1.11.1. During development the module
-replaces the root module with `../..`; a release must tag the root first and
-require that tag.
+`go.opentelemetry.io/proto/otlp` v1.11.1.
+
+During development the module requires the root at the placeholder `v0.0.0`
+and replaces it with `../..`. That works only inside this repository: an
+external `go get` of `observe/otel` fails with `unknown revision v0.0.0`.
+`TestModuleReleaseReadiness` requires the placeholder and the replace to
+change together and fails under `BLOK_RELEASE=1` while either is present.
+Release checklist for `observe/otel`:
+
+1. Tag the root module (`vX.Y.Z`).
+2. In `observe/otel/go.mod`, require `github.com/well-prado/new-blok vX.Y.Z`
+   and delete the `replace`; `go mod tidy && go mod verify`.
+3. Run the module's gates with `BLOK_RELEASE=1` (the readiness test must pass).
+4. Tag the module as `observe/otel/vX.Y.Z`.
 
 ## Compatibility
 
@@ -173,6 +192,14 @@ digest; tests compute it from discovery.
   rejection, an uncertain effect, an unsampled run and an unlisted tenant),
   and, with `BLOK_OTEL_COLLECTOR_IMAGE`, against an actual OpenTelemetry
   Collector container that is stopped, paused and restarted.
+- Bounded shutdown (`shutdown_test.go`): a stalled exporter that honours and
+  one that ignores its context, BatchSize 8, ExportTimeout 2 s, 32 runs and a
+  100 ms Shutdown: Shutdown returns by its deadline, the loop is gone, the
+  exporter is shut down once, counters reconcile, and stack-counted pipeline
+  goroutines return to baseline (after the stuck exporter returns, for the
+  ignoring case); a stuck exporter never accumulates goroutines.
+- Tenant allowlist on spans and logs and bounded identities
+  (`privacy_test.go`), and the release-readiness check (`release_test.go`).
 - Cardinality, queue saturation and collector outage; trace lineage across Go
   steps, the actual Node worker and a child workflow; approval-gate and
   validation independence; and per-mode latency/RSS (`TestMeasureMode`) are
@@ -180,12 +207,14 @@ digest; tests compute it from discovery.
 
 ## Limits
 
-- No trigger extracts an inbound `traceparent` yet; an application that
-  trusts one passes it as `Invocation.Trace`.
+- No trigger extracts an inbound `traceparent`/`tracestate` yet (#276); an
+  application that trusts one passes it as `Invocation.Trace`.
 - Journaled and cluster runs emit no observation events (ADR 0016, #263), so
   they are neither traced nor counted by the exporter.
-- Agent catalog child workflows produce no spans of their own; only the
-  dispatching step's context reaches their tools.
+- Agent catalog child workflows produce no spans of their own (#275); only
+  the dispatching step's context reaches their tools.
+- `observe/otel` is not consumable outside this repository until the release
+  checklist above is followed.
 - The Node worker receives and exposes the context but emits no spans; Node
   logs are correlated through the Go step that dispatched the call.
 - The live event stream does not yet declare `PayloadObserver`, so selecting

@@ -40,7 +40,8 @@ var (
 	seenSchema  = []byte(`{"type":"object","properties":{"traceparent":{"type":"string"},"tracestate":{"type":"string"}},"required":["traceparent","tracestate"]}`)
 )
 
-// goTraceNode is the native equivalent of the Node fixture/trace node.
+// goTraceNode is the native equivalent of the Node fixture/trace node. Like
+// it, it is not deterministic: what it returns depends on the trace ids.
 func goTraceNode() node.Definition[labelInput, traceSeen] {
 	return node.MustDefine("fixture/trace", "1.0.0", func(ctx context.Context, in labelInput) (traceSeen, error) {
 		node.Logger(ctx).Info("trace observed", "label", in.Label)
@@ -49,7 +50,7 @@ func goTraceNode() node.Definition[labelInput, traceSeen] {
 			return traceSeen{}, nil
 		}
 		return traceSeen{Traceparent: trace.Traceparent(), Tracestate: trace.State}, nil
-	}, node.Description("Native trace context echo"), node.Schemas(labelSchema, seenSchema), node.Pure())
+	}, node.Description("Native trace context echo"), node.Schemas(labelSchema, seenSchema)) // not Pure: the output is the caller's trace context
 }
 
 // lineageResult is what the parent workflow returns: what each callee saw.

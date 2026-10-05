@@ -33,9 +33,10 @@ export const provider = defineNode<{ kind: string }, { done: boolean }, { fail(k
 export const panic = defineNode<Record<string, never>, { done: boolean }, null>({ name: "fixture/panic", version: "1.0.0", description: "Synthetic thrown error", input: empty, output: done, dependencies: null, execute() { throw new Error("synthetic-secret-do-not-leak"); } });
 const traceSchema = { type: "object", properties: { traceparent: { type: "string" }, tracestate: { type: "string" } }, required: ["traceparent", "tracestate"] } as const;
 // Reports the trace context the worker received (ADR 0020) and logs once, so
-// lineage tests can see it from Go. A call without one reports "".
+// lineage tests can see it from Go. A call without one reports "". Not
+// deterministic: its output is the caller's (random) trace context.
 export const trace = defineNode<{ label: string }, { traceparent: string; tracestate: string }, null>({
-  name: "fixture/trace", version: "1.0.0", description: "Synthetic trace context echo", deterministic: true,
+  name: "fixture/trace", version: "1.0.0", description: "Synthetic trace context echo",
   input: { type: "object", properties: { label: { type: "string" } }, required: ["label"] }, output: traceSchema, dependencies: null,
   execute(ctx, input) { ctx.logger.info("trace observed", { label: input.label }); return { traceparent: ctx.trace?.traceparent ?? "", tracestate: ctx.trace?.tracestate ?? "" }; },
 });
