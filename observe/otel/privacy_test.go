@@ -126,3 +126,40 @@ func TestExportedIdentitiesAreBoundedShapes(t *testing.T) {
 		t.Fatal("an over-long identifier reached the collector")
 	}
 }
+
+// TestDigestShapedIdentitiesCannotCollide: a run id that is literally
+// "h:<16 hex>" is a valid label, but passing it through would let it equal
+// another run's digest. Any identity starting with "h:" is hashed too, so
+// two distinct runs never share a blok.run.id.
+func TestDigestShapedIdentitiesCannotCollide(t *testing.T) {
+	h := newHarness(t, harnessOptions{ratio: 1})
+	longRun := "run-" + strings.Repeat("r", 196)
+	sum := sha256.Sum256([]byte(longRun))
+	forged := "h:" + hex.EncodeToString(sum[:8]) // what longRun is exported as
+	for _, id := range []string{longRun, forged} {
+		if _, err := h.run(t, id, "tenant-a", orderInput{SKU: "coffee", Quantity: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.flush(t)
+	spans, _, _ := h.collector.snapshot()
+	traces := map[string]map[string]bool{} // run id → trace ids
+	for _, span := range spans {
+		id := attrs(span.Attributes)[otel.AttrRunID]
+		if traces[id] == nil {
+			traces[id] = map[string]bool{}
+		}
+		traces[id][hex.EncodeToString(span.TraceId)] = true
+	}
+	if len(traces) != 2 {
+		t.Fatalf("two runs exported %d distinct run ids: %v", len(traces), traces)
+	}
+	for id, set := range traces {
+		if len(set) != 1 {
+			t.Fatalf("blok.run.id %s spans %d traces", id, len(set))
+		}
+		if !observe.ValidLabel(id) {
+			t.Fatalf("run id %q is not a bounded shape", id)
+		}
+	}
+}

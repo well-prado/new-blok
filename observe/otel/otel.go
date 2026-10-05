@@ -891,9 +891,11 @@ func (e *Exporter) spanTenant(tenant string) string {
 // identity bounds an identifier exported on spans and logs: a value that is
 // a valid label is kept for correlation; anything else (longer than 64
 // bytes or outside the label alphabet) becomes "h:" and 16 hex digits of
-// its SHA-256, which a reader can compute from the inspection id.
+// its SHA-256, which a reader can compute from the inspection id. A value
+// that itself starts with "h:" is always hashed, so a raw id can never equal
+// another id's digest.
 func identity(value string) string {
-	if value == "" || observe.ValidLabel(value) {
+	if value == "" || observe.ValidLabel(value) && !strings.HasPrefix(value, "h:") {
 		return value
 	}
 	sum := sha256.Sum256([]byte(value))

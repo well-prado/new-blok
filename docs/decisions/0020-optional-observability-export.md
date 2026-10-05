@@ -98,7 +98,7 @@ dispatched.
 | --- | --- |
 | Sampling | Head sampling, decided once per trace. A root run is sampled when its trace id falls under `Ratio`, deterministically (OpenTelemetry `TraceIDRatioBased` arithmetic). A run with a parent keeps the parent's flag. Unsampled traces still propagate with flag 00. Zero disables tracing (no ids, no propagation). |
 | What sampling affects | Spans and step logs only. Metrics count every run and step. Validation, approval, journaling and outcomes never read it. |
-| Span attributes | `blok.workflow`, `blok.step`, `blok.attempt`, `blok.attempt.id`, `blok.run.id`, `blok.parent.run.id`, `blok.parent.step`, `blok.tenant`, `blok.outcome`, `blok.error.code`, `blok.error.class`. Every string value is a bounded label shape: names and codes that are not valid labels become `invalid`; identifiers (run, parent run, attempt ids) are kept when they are valid labels (at most 64 bytes of `[A-Za-z0-9._/:-]`) and otherwise exported as `h:` plus 16 hex digits of their SHA-256, which a reader computes from the inspection id. Never the principal, inputs, outputs or provider messages. |
+| Span attributes | `blok.workflow`, `blok.step`, `blok.attempt`, `blok.attempt.id`, `blok.run.id`, `blok.parent.run.id`, `blok.parent.step`, `blok.tenant`, `blok.outcome`, `blok.error.code`, `blok.error.class`. Every string value is a bounded label shape: names and codes that are not valid labels become `invalid`; identifiers (run, parent run, attempt ids) are kept when they are valid labels (at most 64 bytes of `[A-Za-z0-9._/:-]`) and otherwise exported as `h:` plus 16 hex digits of their SHA-256, which a reader computes from the inspection id. An id that itself starts with `h:` is always hashed, so a raw id can never equal another id's digest. Never the principal, inputs, outputs or provider messages. |
 | Tenants | One allowlist (`TenantLabels`, at most 64) for metrics, spans and logs: any other tenant is exported as `other`. `RawTenants: true` is an explicit opt-in that exports valid-label tenants as-is on spans and logs only; metrics always use the allowlist. The default is the privacy-safe one because tenant identifiers can be personal data. |
 | Metric labels | Fixed vocabulary: `blok.workflow`, `blok.step`, `blok.outcome`, `blok.error.class`, `blok.tenant`. Run, attempt and parent ids are never metric labels. `blok.tenant` is the tenant only when it is in `TenantLabels` (at most 64), otherwise `other`. Each instrument keeps at most `MaxSeries` (default 1000, hard 10000) attribute sets; later sets go to `otel.metric.overflow=true` and are counted. |
 | Logs | Exported only for sampled traces, correlated by trace/span id. Body is the message bounded to 1 KiB and passed through the shared credential redaction. Attributes are the bounded run id, workflow, step, the tenant per the tenant policy, and only the keys in `LogAttributes` (at most 32), scalar values bounded to 256 bytes. |
@@ -199,7 +199,10 @@ digest; tests compute it from discovery.
   goroutines return to baseline (after the stuck exporter returns, for the
   ignoring case); a stuck exporter never accumulates goroutines.
 - Tenant allowlist on spans and logs and bounded identities
-  (`privacy_test.go`), and the release-readiness check (`release_test.go`).
+  (`privacy_test.go`, including a run id spelled as another run's digest),
+  the Observe/Shutdown race (`handshake_test.go`: four producers against
+  Shutdown with expired, 1 ms, 10 ms and unbounded deadlines, 300 times), and
+  the release-readiness check (`release_test.go`).
 - Cardinality, queue saturation and collector outage; trace lineage across Go
   steps, the actual Node worker and a child workflow; approval-gate and
   validation independence; and per-mode latency/RSS (`TestMeasureMode`) are
