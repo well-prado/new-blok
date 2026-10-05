@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/well-prado/new-blok/contract"
+	"github.com/well-prado/new-blok/contract/inspection"
 	"github.com/well-prado/new-blok/internal/engine"
 	"github.com/well-prado/new-blok/node"
 )
@@ -274,5 +275,52 @@ func TestRunNormalizesUncertainClassToExplicitMarker(t *testing.T) {
 	var classified *engine.Error
 	if !errors.As(got, &classified) || !classified.Uncertain {
 		t.Fatalf("engine error=%#v, want explicit Uncertain field", classified)
+	}
+}
+
+type recordingObserver struct {
+	mu     sync.Mutex
+	events []inspection.Event
+}
+
+func (o *recordingObserver) Observe(event inspection.Event) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.events = append(o.events, event)
+}
+
+// TestRunJournaledEmitsNoInspectionEvents pins the documented contract: a
+// suspended wait is not reported as a failed step and a replayed committed
+// step is not reported as a fresh completion, because journaled execution
+// emits no per-attempt inspection events at all.
+func TestRunJournaledEmitsNoInspectionEvents(t *testing.T) {
+	const testSchema = `{"type":"object","properties":{"value":{"type":"integer"}},"required":["value"]}`
+	write := node.MustDefine("test/write", "1.0.0", func(_ context.Context, in journalInput) (journalInput, error) {
+		return journalInput{Value: in.Value + 1}, nil
+	}, node.Description("journal fixture"), node.Schemas([]byte(testSchema), []byte(testSchema)), node.Effects("fixture:write")).Any()
+	observer := &recordingObserver{}
+	runner := engine.New(map[string]node.Any{"test/write": write}).WithObserver(observer)
+	program := contract.InternalProgram{WorkflowID: "journal-observed", Digest: "sha256:artifact-observed", Instructions: []contract.InternalInstruction{
+		{Index: 0, ID: "write", Kind: "call", Node: "test/write"},
+		{Index: 1, ID: "approval", Kind: "wait", Wait: &contract.WaitInstruction{Name: "approval"}},
+		{Index: 2, ID: "output", Kind: "output", References: []contract.Reference{{Step: "approval"}}},
+	}}
+	journal := newStepJournalFixture()
+	journal.expectRun("run-observed", program.Digest, journalInput{Value: 1})
+	if _, err := runner.RunJournaled(context.Background(), program, journalInput{Value: 1}, "run-observed", journal); err == nil {
+		t.Fatal("first execution did not suspend")
+	}
+	journal.mu.Lock()
+	journal.waitReady = true
+	journal.mu.Unlock()
+	if _, err := runner.RunJournaled(context.Background(), program, journalInput{Value: 1}, "run-observed", journal); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if len(observer.events) != 0 {
+		kinds := make([]string, 0, len(observer.events))
+		for _, event := range observer.events {
+			kinds = append(kinds, fmt.Sprintf("%s/%s", event.Kind, event.StepID))
+		}
+		t.Fatalf("journaled execution emitted inspection events %v; durable runs are inspected through their journal", kinds)
 	}
 }

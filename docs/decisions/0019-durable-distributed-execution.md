@@ -37,6 +37,11 @@ accepted-run event would not make workflow execution recoverable.
   before replay. Every completed step output is fenced and committed before
   the next step runs. A dispatched effect without a committed result becomes
   uncertain after takeover and is not automatically invoked again.
+- Journaled execution emits no engine inspection events. A durable run spans
+  several engine calls (suspension at a wait, replay of committed steps after
+  takeover), and per-attempt step events would report a suspension as a failed
+  step and a restored output as a fresh completion; durable runs are inspected
+  through their committed journal.
 - Expose typed checkpoint decoding on `node.Any`; persisted raw JSON is schema
   validated before typed decoding, and interface-valued numbers retain
   `json.Number` precision. Decoding does not invoke a node or establish trust.

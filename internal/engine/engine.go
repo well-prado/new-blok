@@ -148,6 +148,13 @@ func (e *Engine) Run(ctx context.Context, program contract.InternalProgram, inpu
 // RunJournaled executes a program through a caller-owned durable step journal.
 // A blank runID is valid only when journal is nil. Completed step outputs are
 // restored and never invoked again; a journal error fails the run closed.
+//
+// Journaled execution emits no inspection events, even when an observer is
+// attached. One durable run spans several RunJournaled calls (suspension at a
+// wait, replay of committed steps after takeover), and the step event kinds
+// describe a single attempt: a suspension would read as a failed step and a
+// restored output as a fresh completion. Durable runs are inspected through
+// their committed journal, not through per-attempt engine events.
 func (e *Engine) RunJournaled(ctx context.Context, program contract.InternalProgram, input any, runID string, journal StepJournal) (Result, error) {
 	return e.run(ctx, program, input, runID, journal, inspection.Invocation{}, false, true)
 }
