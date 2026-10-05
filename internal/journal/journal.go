@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/well-prado/new-blok/internal/migration"
 	"github.com/well-prado/new-blok/store"
 )
 
@@ -149,49 +150,54 @@ func New(ctx context.Context, database store.Database, config Config) (*Journal,
 	if j.clock == nil {
 		j.clock = time.Now
 	}
-	if err := j.withTx(ctx, "schema", func(tx *sql.Tx) error {
-		for _, statement := range schemaStatements {
-			if _, err := tx.ExecContext(ctx, statement); err != nil {
-				return fmt.Errorf("schema: %w", err)
+	// Adding a column reads the schema first, so concurrent openers of a
+	// journal that needs one race; the idempotent migration is retried
+	// while it loses (#235).
+	if err := migration.Retry(ctx, func() error {
+		return j.withTx(ctx, "schema", func(tx *sql.Tx) error {
+			for _, statement := range schemaStatements {
+				if _, err := tx.ExecContext(ctx, statement); err != nil {
+					return fmt.Errorf("schema: %w", err)
+				}
 			}
-		}
-		rows, err := tx.QueryContext(ctx, `PRAGMA table_info(journal_runs)`)
-		if err != nil {
-			return err
-		}
-		hasPrincipal := false
-		for rows.Next() {
-			var cid, notnull, pk int
-			var name, typ string
-			var def any
-			if err := rows.Scan(&cid, &name, &typ, &notnull, &def, &pk); err != nil {
-				rows.Close()
+			rows, err := tx.QueryContext(ctx, `PRAGMA table_info(journal_runs)`)
+			if err != nil {
 				return err
 			}
-			if name == "principal" {
-				hasPrincipal = true
+			hasPrincipal := false
+			for rows.Next() {
+				var cid, notnull, pk int
+				var name, typ string
+				var def any
+				if err := rows.Scan(&cid, &name, &typ, &notnull, &def, &pk); err != nil {
+					rows.Close()
+					return err
+				}
+				if name == "principal" {
+					hasPrincipal = true
+				}
 			}
-		}
-		if err := rows.Close(); err != nil {
-			return err
-		}
-		if !hasPrincipal {
-			if _, err := tx.ExecContext(ctx, `ALTER TABLE journal_runs ADD COLUMN principal TEXT NOT NULL DEFAULT ''`); err != nil {
+			if err := rows.Close(); err != nil {
 				return err
 			}
-		}
-		for _, column := range []struct{ table, name, declaration string }{
-			{"journal_runs", "error_code", `TEXT NOT NULL DEFAULT ''`},
-			{"journal_runs", "error_class", `TEXT NOT NULL DEFAULT ''`},
-			{"journal_operations", "input_json", `BLOB`},
-			{"journal_attempts", "input_json", `BLOB`},
-			{"journal_scopes", "input_json", `BLOB`},
-		} {
-			if err := ensureColumn(ctx, tx, column.table, column.name, column.declaration); err != nil {
-				return err
+			if !hasPrincipal {
+				if _, err := tx.ExecContext(ctx, `ALTER TABLE journal_runs ADD COLUMN principal TEXT NOT NULL DEFAULT ''`); err != nil {
+					return err
+				}
 			}
-		}
-		return nil
+			for _, column := range []struct{ table, name, declaration string }{
+				{"journal_runs", "error_code", `TEXT NOT NULL DEFAULT ''`},
+				{"journal_runs", "error_class", `TEXT NOT NULL DEFAULT ''`},
+				{"journal_operations", "input_json", `BLOB`},
+				{"journal_attempts", "input_json", `BLOB`},
+				{"journal_scopes", "input_json", `BLOB`},
+			} {
+				if err := ensureColumn(ctx, tx, column.table, column.name, column.declaration); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
 	}); err != nil {
 		return nil, err
 	}
