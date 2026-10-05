@@ -222,7 +222,16 @@ func New(ctx context.Context, database store.Database, config Config) (*Journal,
 					return err
 				}
 			}
-			return j.migrateErasure(ctx, tx)
+			if err := j.migrateErasure(ctx, tx); err != nil {
+				return err
+			}
+			// A reconciliation records the tenant that decided it (#286).
+			// The column is added once; every open then fixes the tenant of
+			// any row without one, from its verified audit record or "".
+			if err := ensureColumn(ctx, tx, "journal_reconciliations", "tenant", `TEXT`); err != nil {
+				return err
+			}
+			return backfillReconciliationTenants(ctx, tx)
 		})
 	}); err != nil {
 		return nil, err
@@ -359,8 +368,8 @@ var schemaStatements = []string{
 		created_at INTEGER NOT NULL
 	)`,
 	// A reconciliation's evidence, provider result and actor are kept with
-	// its run and erased with it, leaving the decision's identity and
-	// digests (#281). The table has no foreign key to journal_operations:
+	// its run and erased with it, leaving the decision's identity, tenant
+	// and digests (#281, #286). The table has no foreign key to journal_operations:
 	// the decision outlives its compacted operation.
 	reconciliationsTable("journal_reconciliations"),
 	// journal_meta holds the journal's own counters: erasure_generation
@@ -392,7 +401,8 @@ func reconciliationsTable(name string) string {
 		result_digest TEXT NOT NULL,
 		state TEXT NOT NULL,
 		created_at INTEGER NOT NULL,
-		erased_at INTEGER
+		erased_at INTEGER,
+		tenant TEXT
 	)`
 }
 

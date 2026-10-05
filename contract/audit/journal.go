@@ -190,6 +190,44 @@ func (j *Journal) Recorded(ctx context.Context, tx *sql.Tx, id string) (bool, er
 	return found > 0, nil
 }
 
+// StoredTenant reports, inside tx, the tenant of the stored record with
+// id. The record is verified first (digest, shape, indexed columns), and one
+// that fails is ErrCorrupt, so an owner never adopts an altered tenant. It
+// needs no composed Journal, so an owner can call it while migrating; the
+// audit tables must exist. An owner uses it to fix, once, the tenant of a
+// decision that predates its own tenant column.
+func StoredTenant(ctx context.Context, tx *sql.Tx, id string) (tenant string, found bool, err error) {
+	if tx == nil {
+		return "", false, ErrRequired
+	}
+	_, record, err := scanVerified(tx.QueryRowContext(ctx, `SELECT seq, id, kind, tenant, run_id, record, digest FROM audit_records_v1 WHERE id = ?`, id))
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return "", false, nil
+	case errors.Is(err, ErrCorrupt):
+		return "", false, ErrCorrupt
+	case err != nil:
+		return "", false, unavailableErr(err)
+	}
+	return record.Tenant, true, nil
+}
+
+// Pruned reports, inside tx, whether a record with id and kind was deleted
+// by Prune: its tombstone (the sha256 of the id, and the kind) exists. An
+// owner uses it to tell a decision whose record was pruned from one that
+// never had a record, which StoredTenant alone cannot. The audit tables
+// must exist.
+func Pruned(ctx context.Context, tx *sql.Tx, id string, kind Kind) (bool, error) {
+	if tx == nil {
+		return false, ErrRequired
+	}
+	var found int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM audit_pruned_v1 WHERE id_digest = ? AND kind = ?`, Digest([]byte(id)), string(kind)).Scan(&found); err != nil {
+		return false, unavailableErr(err)
+	}
+	return found > 0, nil
+}
+
 // Notify offers committed records to the optional Mirror. Owners call it
 // after their transaction committed. It never blocks on, fails because of,
 // or changes durable audit; a refused or panicking Mirror counts a drop.
