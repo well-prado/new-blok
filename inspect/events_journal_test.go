@@ -29,7 +29,7 @@ import (
 // journaledNode is a synthetic native node whose effect is recorded in the
 // real journal: intent, attempt, then commit. With block set it stops after
 // starting its attempt, the way a process dies mid-effect.
-func journaledNode(t testing.TB, store *journal.Journal, name, step, digest string, runID func() string, before <-chan struct{}, logs int, block bool) node.Any {
+func journaledNode(t testing.TB, store *journal.Journal, name, step, digest string, runID func() string, before <-chan struct{}, logs int, pace time.Duration, block bool) node.Any {
 	definition, err := node.Define(name, "1.0.0", func(ctx context.Context, input quote.Input) (quote.Input, error) {
 		if before != nil {
 			select {
@@ -49,6 +49,9 @@ func journaledNode(t testing.TB, store *journal.Journal, name, step, digest stri
 		logger := node.Logger(ctx)
 		for i := 0; i < logs; i++ {
 			logger.Info("flood", "n", i, "a", strings.Repeat("a", 250), "b", strings.Repeat("b", 250), "c", strings.Repeat("c", 250), "d", strings.Repeat("d", 250))
+			if pace > 0 {
+				time.Sleep(pace)
+			}
 		}
 		if block {
 			<-ctx.Done()
@@ -103,14 +106,17 @@ func stalledClient(t *testing.T, address, path, principal string) net.Conn {
 func TestStalledSubscribersCannotBlockRunOrJournalTransitions(t *testing.T) {
 	store, closeJournal := openJournal(t, filepath.Join(t.TempDir(), "stalled.db"))
 	defer closeJournal()
-	const logs, stalled = 4000, 4
+	const logs, stalled = 2000, 4
 	measure := func(name string, readers int) time.Duration {
 		admission, err := store.Admit(context.Background(), journal.AdmissionRequest{Principal: "alice", RequestKey: name, Workflow: "quote", ArtifactDigest: "sha256:" + name, Input: []byte(`{"sku":"coffee","quantity":1}`)})
 		if err != nil {
 			t.Fatal(err)
 		}
 		begin := make(chan struct{})
-		flood := journaledNode(t, store, "test/gate", "flood", "sha256:"+name, func() string { return admission.RunID }, begin, logs, false)
+		// Paced so a reader that is draining keeps up: the stalled
+		// readers' handlers then fill their sockets and block in a write
+		// before the hub cuts them off.
+		flood := journaledNode(t, store, "test/gate", "flood", "sha256:"+name, func() string { return admission.RunID }, begin, logs, 100*time.Microsecond, false)
 		live := newLiveApp(t, liveConfig{
 			stream:   inspect.EventStreamConfig{Capture: inspect.Capture{Logs: true}, Hub: event.Config{QueueDepth: 4, LateWindow: 10 * time.Millisecond}},
 			handler:  inspect.EventHandlerConfig{WriteTimeout: time.Minute},
@@ -301,8 +307,8 @@ func runEventsCrashChild(t *testing.T) {
 		t.Fatal(err)
 	}
 	runner := execution.NewRunner(application, map[string]node.Any{
-		"test/reserve": journaledNode(t, store, "test/reserve", "reserve", "sha256:crash", runID, nil, 0, false),
-		"test/charge":  journaledNode(t, store, "test/charge", "charge", "sha256:crash", runID, nil, 0, true),
+		"test/reserve": journaledNode(t, store, "test/reserve", "reserve", "sha256:crash", runID, nil, 0, 0, false),
+		"test/charge":  journaledNode(t, store, "test/charge", "charge", "sha256:crash", runID, nil, 0, 0, true),
 	})
 	program := contract.InternalProgram{WorkflowID: "checkout", Instructions: []contract.InternalInstruction{
 		{Index: 0, ID: "reserve", Kind: "call", Node: "test/reserve"},

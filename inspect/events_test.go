@@ -197,8 +197,19 @@ func TestAuthorizationAndCaptureArePolicyChecked(t *testing.T) {
 			t.Fatalf("zero capture exposed content: %s %s", frame.Event, frame.Data)
 		}
 	}
-	if stats := defaults.stream.Hub().Stats(); stats.RetainedBytes > 4096 {
-		t.Fatalf("zero capture retained %d bytes for one small run", stats.RetainedBytes)
+	// Not merely withheld on the wire: never retained. Read the hub's own
+	// frames, beneath any reader projection.
+	retained, err := defaults.stream.Hub().Subscribe("cap-run", "alice", "", nil)
+	if err != nil || len(retained.Frames) == 0 {
+		t.Fatalf("retained=%+v err=%v", retained, err)
+	}
+	for _, frame := range retained.Frames {
+		if frame.Name() == "step.log" || strings.Contains(string(frame.Data()), "coffee") || strings.Contains(string(frame.Data()), `"input"`) || strings.Contains(string(frame.Data()), `"output"`) {
+			t.Fatalf("zero capture retained content: %s %s", frame.Name(), frame.Data())
+		}
+	}
+	if retained.Subscriber != nil {
+		defaults.stream.Hub().Unsubscribe(retained.Subscriber, "test")
 	}
 
 	readers := map[string]inspection.Policy{
