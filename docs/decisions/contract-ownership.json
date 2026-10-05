@@ -161,6 +161,14 @@
       "status": "implemented",
       "decision": "inspection/v1 exposes immutable app-composed Go and Node outcomes, a bounded process-local recorder, and a principal-authorized SQL journal read port for actual waits, attempts, uncertain effects and child lineage; payloads and blobs are separately bounded and redacted/authorized (ADR 0016).",
       "evidence": ["inspection-actual-go-engine-golden", "inspection-actual-node-success-failure-cancellation-uncertain", "inspection-two-principal-isolation", "inspection-redaction-bounds-pagination", "inspection-recorder-saturation", "inspection-journal-wait-resume-uncertain-lineage", "inspection-authenticated-bounded-blob", "inspection-version-rejection", "inspection-immutable-projection"]
+    },
+    {
+      "id": "live-dev-event-stream",
+      "question": "How does a development reader follow a run live without being able to slow it, see what it may not, or miss a loss without knowing?",
+      "owner": "E15-T02",
+      "status": "implemented",
+      "decision": "An application-selected inspection observer feeds a bounded process-local hub (observe/event, standard library only) served as Server-Sent Events by inspect.NewEventHandler; publication never waits on a reader (a full queue disconnects it), capture of inputs/outputs/logs is off by default and policy-gated per reader, every loss is an in-sequence or cursor-derived gap, late worker logs are followed for a bounded window after the terminal frame, every connection is admitted against reader limits before any replay or durable read, and a run without live history is reconstructed from the journal as the reader and followed live only under its durable owner, within a per-principal recovered budget that never evicts live runs (ADR 0016).",
+      "evidence": ["events-actual-http-live-run", "events-disconnect-resume", "events-cursor-gaps-and-rejection", "events-authorization-and-capture", "events-saturation-transient-refusal", "events-stalled-readers-journal-unaffected", "events-late-log-window", "events-actual-node-late-logs", "events-crash-journal-reconstruction", "events-lifetime-bound", "events-fixture-cases", "events-overhead-latency-leak-memory", "events-engine-dependency-boundary", "events-recovered-run-durable-owner", "events-recovered-budget", "events-admission-before-durable-read", "events-error-field-policy"]
     }
   ]
 }
