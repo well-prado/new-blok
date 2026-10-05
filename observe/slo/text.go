@@ -141,6 +141,22 @@ func WriteText(w io.Writer, s Snapshot) error {
 			}
 		}
 	}
+	if takeover := slicesFilter(s.Work); len(takeover) > 0 {
+		family(MetricCensusTakeover)
+		for _, work := range takeover {
+			sample(MetricCensusTakeover, []string{AttrSource, work.Source}, seconds(work.Takeover))
+		}
+	}
+	if len(s.Sources) > 0 {
+		family(MetricSourceUp)
+		for _, st := range s.Sources {
+			sample(MetricSourceUp, []string{AttrSource, st.Name, AttrPages, fmt.Sprint(st.Pages)}, boolValue(st.Up))
+		}
+		family(MetricSourceAge)
+		for _, st := range s.Sources {
+			sample(MetricSourceAge, []string{AttrSource, st.Name, AttrPages, fmt.Sprint(st.Pages)}, seconds(st.Age))
+		}
+	}
 	family(MetricSampleFailures)
 	sample(MetricSampleFailures, nil, float64(s.SampleFailures))
 	return out.Flush()
@@ -163,3 +179,14 @@ func boolValue(b bool) float64 {
 }
 
 func seconds(d time.Duration) float64 { return d.Seconds() }
+
+// slicesFilter returns the work censuses that declare a takeover window.
+func slicesFilter(work []Work) []Work {
+	var out []Work
+	for _, w := range work {
+		if w.Takeover > 0 {
+			out = append(out, w)
+		}
+	}
+	return out
+}

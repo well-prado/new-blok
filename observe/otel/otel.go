@@ -227,6 +227,7 @@ type Exporter struct {
 	externalDuration metric.Float64Histogram
 	sampler          *slo.Sampler
 	series           map[string]map[string]struct{}
+	zeroed           map[string]struct{}
 	tenants          map[string]bool
 	logAttributes    map[string]bool
 
@@ -274,6 +275,7 @@ func New(config Config) (*Exporter, error) {
 		flushReq: make(chan chan struct{}),
 		done:     make(chan struct{}),
 		series:   map[string]map[string]struct{}{},
+		zeroed:   map[string]struct{}{},
 		tenants:  map[string]bool{},
 		runs:     map[string]*list.Element{},
 		order:    list.New(),
@@ -716,6 +718,7 @@ func (e *Exporter) runStarted(event inspection.Event) {
 		e.order.Remove(oldest)
 		delete(e.runs, state.id)
 	}
+	e.zeroRuns(event.Workflow, event.Tenant)
 	state := &runState{id: event.RunID, start: event.At, workflow: event.Workflow, tenant: event.Tenant, steps: map[string]*stepState{}}
 	if e.tracer != nil && event.Trace.Sampled() {
 		state.span = e.startSpan(event, "run "+label(event.Workflow), e.runAttributes(event))
@@ -733,6 +736,9 @@ func (e *Exporter) stepStarted(event inspection.Event) {
 			e.abandonStep(step)
 			delete(state.steps, key)
 		}
+	}
+	if event.External {
+		e.zeroExternal(state.workflow, event.StepID)
 	}
 	step := &stepState{start: event.At}
 	if e.tracer != nil && event.Trace.Sampled() {
@@ -761,7 +767,8 @@ func (e *Exporter) stepEnded(event inspection.Event) {
 			e.stepDuration.Record(context.Background(), event.At.Sub(step.start).Seconds(), metric.WithAttributeSet(e.bounded(MetricStepDuration, attrs)))
 		}
 		if event.External {
-			e.externalCounter.Add(context.Background(), 1, metric.WithAttributeSet(e.bounded(MetricExternalCalls, counted)))
+			e.zeroExternal(workflow, event.StepID)
+			e.externalCounter.Add(context.Background(), 1, metric.WithAttributeSet(e.bounded(MetricExternalCalls, attrs)))
 			if step != nil && !step.start.IsZero() && !event.At.Before(step.start) {
 				e.externalDuration.Record(context.Background(), event.At.Sub(step.start).Seconds(), metric.WithAttributeSet(e.bounded(MetricExternalDuration, attrs)))
 			}
@@ -779,6 +786,51 @@ func (e *Exporter) stepEnded(event inspection.Event) {
 		span = e.startSpan(event, "step "+label(event.StepID), append(e.stepAttributes(event), attribute.Bool(AttrStartObserved, false)))
 	}
 	endSpan(span, event, outcome)
+}
+
+// zeroRuns creates every run outcome of a workflow and tenant at zero the
+// first time it is seen, and zeroExternal every outcome of an external call.
+// A counter series born at its first increment has no increase() in
+// Prometheus, so without the zeros the first uncertain run of a workflow
+// that already ran would not be seen by a rate rule (ADR 0022). The created
+// sets count towards MaxSeries like any other.
+func (e *Exporter) zeroRuns(workflow, tenant string) {
+	if e.runsCounter == nil {
+		return
+	}
+	key := "runs|" + label(workflow) + "|"
+	var tenantAttr []attribute.KeyValue
+	if tenant != "" {
+		tenantAttr = []attribute.KeyValue{attribute.String(AttrTenant, e.tenantLabel(tenant))}
+		key += e.tenantLabel(tenant)
+	}
+	if !e.markZeroed(key) {
+		return
+	}
+	for _, outcome := range slo.RunOutcomes {
+		attrs := append([]attribute.KeyValue{attribute.String(AttrWorkflow, label(workflow)), attribute.String(AttrOutcome, outcome)}, tenantAttr...)
+		e.runsCounter.Add(context.Background(), 0, metric.WithAttributeSet(e.bounded(MetricRuns, attrs)))
+	}
+}
+
+func (e *Exporter) zeroExternal(workflow, step string) {
+	if e.externalCounter == nil || !e.markZeroed("external|"+label(workflow)+"|"+label(step)) {
+		return
+	}
+	for _, outcome := range slo.StepOutcomes {
+		attrs := []attribute.KeyValue{attribute.String(AttrWorkflow, label(workflow)), attribute.String(AttrStep, label(step)), attribute.String(AttrOutcome, outcome)}
+		e.externalCounter.Add(context.Background(), 0, metric.WithAttributeSet(e.bounded(MetricExternalCalls, attrs)))
+	}
+}
+
+// markZeroed records key and reports whether it is new; the record is
+// bounded by MaxSeries.
+func (e *Exporter) markZeroed(key string) bool {
+	if _, ok := e.zeroed[key]; ok || len(e.zeroed) >= e.config.MaxSeries {
+		return false
+	}
+	e.zeroed[key] = struct{}{}
+	return true
 }
 
 func (e *Exporter) runEnded(event inspection.Event) {

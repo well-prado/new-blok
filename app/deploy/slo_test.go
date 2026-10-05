@@ -45,6 +45,11 @@ func parse(t *testing.T, text string) []promrule.ExpositionSample {
 // them as the fixture the monitoring rules are validated on.
 func checkScenario(t *testing.T, id, source, before, after string) {
 	t.Helper()
+	checkScenarioDown(t, id, source, before, after, false)
+}
+
+func checkScenarioDown(t *testing.T, id, source, before, after string, down bool) {
+	t.Helper()
 	scenarios, err := promrule.LoadScenarios(filepath.Join(monitoring, "scenarios.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -58,7 +63,7 @@ func checkScenario(t *testing.T, id, source, before, after string) {
 	}
 	if os.Getenv("BLOK_RECORD_FIXTURES") == "1" {
 		path := filepath.Join(monitoring, "recorded", id+".prom")
-		if err := promrule.WriteRecording(path, promrule.Recording{Scenario: id, Source: source, Before: before, After: after}); err != nil {
+		if err := promrule.WriteRecording(path, promrule.Recording{Scenario: id, Source: source, Before: before, After: after, AfterDown: down}); err != nil {
 			t.Fatal(err)
 		}
 		t.Logf("recorded %s", path)
@@ -146,11 +151,11 @@ func TestMetricsEndpointRendersOperationalSources(t *testing.T) {
 	stuck := make(chan struct{})
 	defer close(stuck)
 	sources := []slo.Source{
-		func(context.Context) (slo.Snapshot, error) {
+		slo.Func("node", func(context.Context) (slo.Snapshot, error) {
 			return slo.Snapshot{Workers: []slo.Worker{{Name: "node", Ready: true, InFlight: 3, Capacity: 64}}, Storage: []slo.Storage{{Name: "journal", Used: 4096, Budget: 1 << 30}}}, nil
-		},
-		func(context.Context) (slo.Snapshot, error) { return slo.Snapshot{}, errors.New("private-token") },
-		func(ctx context.Context) (slo.Snapshot, error) { <-stuck; return slo.Snapshot{}, nil },
+		}),
+		slo.Func("broken", func(context.Context) (slo.Snapshot, error) { return slo.Snapshot{}, errors.New("private-token") }),
+		slo.Func("stuck", func(ctx context.Context) (slo.Snapshot, error) { <-stuck; return slo.Snapshot{}, nil }),
 	}
 	d, err := NewDeployment(a, deployment.Config{ListenerAddress: "127.0.0.1:0", MaxAdmission: 1, DrainTimeout: time.Second, StoreRequired: true},
 		DeploymentChecks{Artifact: func(context.Context) error { return nil }, Store: func(context.Context) error { return errors.New("private-token") }, Operational: sources}, http.NotFoundHandler())
@@ -189,6 +194,7 @@ func TestMetricsEndpointRendersOperationalSources(t *testing.T) {
 		"blok_ready": 0, "blok_dependency_ready,store": 0, "blok_dependency_ready,artifact": 1,
 		"blok_worker_in_flight,node": 3, "blok_worker_capacity,node": 64, "blok_storage_used_bytes,journal": 4096,
 		"blok_storage_budget_bytes,journal": 1 << 30, "blok_operational_sample_failures_total": 2,
+		"blok_source_up,deployment,true": 1, "blok_source_up,node,true": 1, "blok_source_up,broken,true": 0, "blok_source_up,stuck,true": 0,
 	} {
 		if got, ok := values[key]; !ok || got != want {
 			t.Errorf("%s = %v (present %v), want %v", key, got, ok, want)
@@ -202,4 +208,111 @@ func TestMetricsEndpointRendersOperationalSources(t *testing.T) {
 	if failures := d.sampler.Failures(); failures != 4 {
 		t.Fatalf("sample failures %d, want 4 (two per scrape)", failures)
 	}
+}
+
+// TestNotReadyRejectionsAreNotCapacity: a request refused because a
+// required dependency is not ready is counted as not_ready, never capacity.
+func TestNotReadyRejectionsAreNotCapacity(t *testing.T) {
+	a, _ := app.New(app.Config{})
+	_ = a.Start(context.Background())
+	defer a.Shutdown(context.Background())
+	d, err := NewDeployment(a, deployment.Config{ListenerAddress: "127.0.0.1:0", MaxAdmission: 4, DrainTimeout: time.Second, StoreRequired: true},
+		DeploymentChecks{Artifact: func(context.Context) error { return nil }, Store: func(context.Context) error { return errors.New("store down") }}, http.NotFoundHandler())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		w := httptest.NewRecorder()
+		d.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/orders", nil))
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("request %d: %d", i, w.Code)
+		}
+	}
+	got := map[string]float64{}
+	for _, s := range parse(t, scrape(t, d)) {
+		if s.Labels["__name__"] == "blok_admission_requests_total" {
+			got[s.Labels["blok_reason"]] = s.Value
+		}
+	}
+	if got["not_ready"] != 3 || got["capacity"] != 0 || got["none"] != 0 {
+		t.Fatalf("admission by reason %v, want 3 not_ready and nothing else", got)
+	}
+}
+
+// TestReadinessCheckIgnoringItsContextReportsNotReady: a check that never
+// returns cannot make blok_ready vanish. The deployment source answers within
+// its budget with explicit not-ready, and a second scrape does not start a
+// second evaluation behind the stuck one.
+func TestReadinessCheckIgnoringItsContextReportsNotReady(t *testing.T) {
+	a, _ := app.New(app.Config{})
+	_ = a.Start(context.Background())
+	defer a.Shutdown(context.Background())
+	hang := make(chan struct{})
+	defer close(hang)
+	entered := 0
+	var mu sync.Mutex
+	d, err := NewDeployment(a, deployment.Config{ListenerAddress: "127.0.0.1:0", MaxAdmission: 1, DrainTimeout: time.Second, StoreRequired: true},
+		DeploymentChecks{Artifact: func(context.Context) error { return nil }, Store: func(context.Context) error {
+			mu.Lock()
+			entered++
+			mu.Unlock()
+			<-hang
+			return nil
+		}}, http.NotFoundHandler())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for round := 0; round < 2; round++ {
+		start := time.Now()
+		values := map[string]float64{}
+		for _, s := range parse(t, scrape(t, d)) {
+			values[s.Labels["__name__"]+","+s.Labels["blok_dependency"]+s.Labels["blok_source"]] = s.Value
+		}
+		if elapsed := time.Since(start); elapsed > operationalSampleTimeout {
+			t.Fatalf("scrape took %v", elapsed)
+		}
+		if v, ok := values["blok_ready,"]; !ok || v != 0 {
+			t.Fatalf("round %d: blok_ready %v (present %v), want an explicit 0", round, v, ok)
+		}
+		if values["blok_dependency_ready,store"] != 0 || values["blok_source_up,deployment"] != 1 {
+			t.Fatalf("round %d: %v", round, values)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if entered != 1 {
+		t.Fatalf("a stuck check was entered %d times; want once", entered)
+	}
+}
+
+// TestTargetDownScenarioSignals scrapes a real listener, then stops it: the
+// next scrape fails, which is the target-down fault.
+func TestTargetDownScenarioSignals(t *testing.T) {
+	a, _ := app.New(app.Config{})
+	_ = a.Start(context.Background())
+	defer a.Shutdown(context.Background())
+	d, err := NewDeployment(a, deployment.Config{ListenerAddress: "127.0.0.1:0", MaxAdmission: 2, DrainTimeout: time.Second}, DeploymentChecks{Artifact: func(context.Context) error { return nil }}, http.NotFoundHandler())
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(d)
+	get := func() (string, error) {
+		client := &http.Client{Timeout: 2 * time.Second}
+		response, err := client.Get(server.URL + "/metrics")
+		if err != nil {
+			return "", err
+		}
+		defer response.Body.Close()
+		body, err := io.ReadAll(response.Body)
+		return string(body), err
+	}
+	before, err := get()
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.Close()
+	if after, err := get(); err == nil {
+		t.Fatalf("a stopped target answered:\n%s", after)
+	}
+	checkScenarioDown(t, "target-down", "app/deploy /metrics over HTTP, then the listener stopped", before, "", true)
 }

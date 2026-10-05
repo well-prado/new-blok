@@ -24,7 +24,7 @@ func TestCardinalityBudgetHoldsForEveryInstrument(t *testing.T) {
 		Workers: []slo.Worker{{Name: "node"}}, Partitions: &slo.Partitions{Total: 2, Owned: 2}, Storage: []slo.Storage{{Name: "journal", Budget: 1}},
 	}
 	h := newHarness(t, harnessOptions{signals: signals{metrics: true}, tune: func(c *otel.Config) {
-		c.Operational = []slo.Source{func(context.Context) (slo.Snapshot, error) { return full, nil }}
+		c.Operational = []slo.Source{slo.Func("static", func(context.Context) (slo.Snapshot, error) { return full, nil })}
 	}})
 	skus := []string{"coffee", "declined", "uncertain"}
 	for i := 0; i < 300; i++ {
@@ -64,7 +64,7 @@ func TestCardinalityBudgetHoldsForEveryInstrument(t *testing.T) {
 			t.Errorf("%s has %d series, over the default MaxSeries", name, len(sets))
 		}
 	}
-	if len(series[otel.MetricExternalCalls]) == 0 || len(series[slo.MetricWorkItems]) != 2*len(slo.Livenesses) {
+	if len(series[otel.MetricExternalCalls]) != len(slo.StepOutcomes) || len(series[slo.MetricWorkItems]) != 2*len(slo.Livenesses) {
 		t.Fatalf("external calls %d series, work items %d series", len(series[otel.MetricExternalCalls]), len(series[slo.MetricWorkItems]))
 	}
 }
@@ -117,11 +117,11 @@ func TestOperationalSourcesAreSampledPerCollection(t *testing.T) {
 	h := newHarness(t, harnessOptions{signals: signals{metrics: true}, tune: func(c *otel.Config) {
 		c.SampleTimeout = 100 * time.Millisecond
 		c.Operational = []slo.Source{
-			func(context.Context) (slo.Snapshot, error) {
+			slo.Func("orders", func(context.Context) (slo.Snapshot, error) {
 				calls++
 				return slo.Snapshot{Work: []slo.Work{{Source: "orders", Stalled: 2, Waiting: 5}}}, nil
-			},
-			func(context.Context) (slo.Snapshot, error) { return slo.Snapshot{}, errors.New("census unavailable") },
+			}),
+			slo.Func("cluster", func(context.Context) (slo.Snapshot, error) { return slo.Snapshot{}, errors.New("census unavailable") }),
 		}
 	}})
 	h.flush(t)
@@ -144,10 +144,44 @@ func TestOperationalSourcesAreSampledPerCollection(t *testing.T) {
 			t.Fatalf("exported sample failures %v", p.value)
 		}
 	}
+	// The failing census is reported down, not dropped: a rule can page on it.
+	up := map[string]float64{}
+	for _, p := range h.collector.latest(slo.MetricSourceUp) {
+		up[p.attrs[slo.AttrSource]+","+p.attrs[slo.AttrPages]] = p.value
+	}
+	if up["orders,true"] != 1 || up["cluster,true"] != 0 || len(up) != 2 {
+		t.Fatalf("source up %v", up)
+	}
 	c := newCollector(t)
 	config := c.exporters(t, signals{traces: true})
-	config.Operational = []slo.Source{func(context.Context) (slo.Snapshot, error) { return slo.Snapshot{}, nil }}
+	config.Operational = []slo.Source{slo.Func("empty", func(context.Context) (slo.Snapshot, error) { return slo.Snapshot{}, nil })}
 	if _, err := otel.New(config); !errors.Is(err, otel.ErrConfig) {
 		t.Fatalf("Operational without Metrics: %v", err)
+	}
+}
+
+// TestOutcomeSeriesAreCreatedAtZero: a workflow's first run creates every run
+// outcome at zero, and an external step's first call every external-call
+// outcome, so the first uncertain outcome after them is an increase a rate
+// rule sees, not a series born at one.
+func TestOutcomeSeriesAreCreatedAtZero(t *testing.T) {
+	h := newHarness(t, harnessOptions{signals: signals{metrics: true}})
+	if _, err := h.run(t, "run-zero-1", "tenant-a", orderInput{SKU: "coffee", Quantity: 1}); err != nil {
+		t.Fatal(err)
+	}
+	h.flush(t)
+	runs := map[string]float64{}
+	for _, p := range h.collector.latest(otel.MetricRuns) {
+		runs[p.attrs[otel.AttrOutcome]] = p.value
+	}
+	external := map[string]float64{}
+	for _, p := range h.collector.latest(otel.MetricExternalCalls) {
+		external[p.attrs[otel.AttrOutcome]] = p.value
+	}
+	if len(runs) != len(slo.RunOutcomes) || runs["uncertain"] != 0 || runs["completed"] != 1 {
+		t.Fatalf("run outcomes after one run: %v", runs)
+	}
+	if len(external) != len(slo.StepOutcomes) || external["uncertain"] != 0 || external["completed"] != 1 {
+		t.Fatalf("external outcomes after one call: %v", external)
 	}
 }

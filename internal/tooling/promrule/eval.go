@@ -57,10 +57,12 @@ func (l Labels) String() string {
 	return l["__name__"] + "{" + strings.Join(parts, ",") + "}"
 }
 
-// Point is one sample of a series.
+// Point is one sample of a series. A stale point is a staleness marker: the
+// series ended at T.
 type Point struct {
-	T time.Time
-	V float64
+	T     time.Time
+	V     float64
+	Stale bool
 }
 
 type series struct {
@@ -78,6 +80,16 @@ func NewStore() *Store { return &Store{series: map[string]*series{}} }
 
 // Add appends one sample. Samples of a series must be added in time order.
 func (s *Store) Add(labels Labels, t time.Time, v float64) error {
+	return s.add(labels, Point{T: t, V: v})
+}
+
+// AddStale appends a staleness marker: from t the series has no value.
+func (s *Store) AddStale(labels Labels, t time.Time) error {
+	return s.add(labels, Point{T: t, V: math.NaN(), Stale: true})
+}
+
+func (s *Store) add(labels Labels, p Point) error {
+	t := p.T
 	if labels["__name__"] == "" {
 		return fmt.Errorf("sample without a metric name")
 	}
@@ -90,8 +102,19 @@ func (s *Store) Add(labels Labels, t time.Time, v float64) error {
 	if n := len(existing.points); n > 0 && !t.After(existing.points[n-1].T) {
 		return fmt.Errorf("out-of-order sample for %s", labels)
 	}
-	existing.points = append(existing.points, Point{T: t, V: v})
+	existing.points = append(existing.points, p)
 	return nil
+}
+
+// fresh drops staleness markers from points.
+func fresh(points []Point) []Point {
+	out := points[:0:0]
+	for _, p := range points {
+		if !p.Stale {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // Sample is one element of an instant vector.
@@ -183,8 +206,8 @@ func (s *Store) eval(expr Expr, t time.Time) (value, error) {
 		}
 		var vector Vector
 		for _, candidate := range matched {
-			points := window(candidate.points, t, Lookback)
-			if len(points) > 0 {
+			points := window(candidate.points, t.Add(-e.offset), Lookback)
+			if len(points) > 0 && !points[len(points)-1].Stale {
 				vector = append(vector, Sample{Labels: candidate.labels.clone(), V: points[len(points)-1].V})
 			}
 		}
@@ -250,21 +273,22 @@ func (s *Store) call(e callExpr, t time.Time) (value, error) {
 		}
 		var vector Vector
 		for _, candidate := range matched {
-			points := window(candidate.points, t, sel.window)
+			at := t.Add(-sel.offset)
+			points := fresh(window(candidate.points, at, sel.window))
 			var result float64
 			ok := true
 			switch e.fn {
 			case "rate":
-				result, ok = extrapolated(points, t, sel.window, true, true)
+				result, ok = extrapolated(points, at, sel.window, true, true)
 			case "increase":
-				result, ok = extrapolated(points, t, sel.window, true, false)
+				result, ok = extrapolated(points, at, sel.window, true, false)
 			case "delta":
-				result, ok = extrapolated(points, t, sel.window, false, false)
+				result, ok = extrapolated(points, at, sel.window, false, false)
 			case "deriv":
-				result, _, ok = regression(points, t)
+				result, _, ok = regression(points, at)
 			case "predict_linear":
 				var slope, intercept float64
-				slope, intercept, ok = regression(points, t)
+				slope, intercept, ok = regression(points, at)
 				result = intercept + slope*horizon
 			case "max_over_time", "min_over_time":
 				ok = len(points) > 0
@@ -309,6 +333,26 @@ func (s *Store) call(e callExpr, t time.Time) (value, error) {
 			out = append(out, Sample{Labels: dropName(sample.Labels), V: v})
 		}
 		return value{vector: out}, nil
+	case "absent":
+		inner, err := s.eval(e.args[0], t)
+		if err != nil {
+			return value{}, err
+		}
+		if inner.isScalar {
+			return value{}, fmt.Errorf("absent needs a vector")
+		}
+		if len(inner.vector) > 0 {
+			return value{}, nil
+		}
+		labels := Labels{}
+		if sel, ok := e.args[0].(selectorExpr); ok {
+			for _, m := range sel.matchers {
+				if m.op == "=" {
+					labels[m.name] = m.value
+				}
+			}
+		}
+		return value{vector: Vector{{Labels: labels, V: 1}}}, nil
 	case "abs":
 		inner, err := s.eval(e.args[0], t)
 		if err != nil {

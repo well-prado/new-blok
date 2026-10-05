@@ -209,11 +209,30 @@
         {
           "name": "blok.source",
           "prometheus": "blok_source",
+          "bound": 32,
+          "note": "a work source or a timer source"
+        }
+      ],
+      "description": "1 when the census hit its read bound; counts are lower bounds",
+      "seriesBound": 32
+    },
+    {
+      "name": "blok.census.takeover",
+      "prometheus": "blok_census_takeover_seconds",
+      "kind": "gauge",
+      "unit": "s",
+      "signal": "queue_depth",
+      "counts": "state",
+      "path": "snapshot",
+      "labels": [
+        {
+          "name": "blok.source",
+          "prometheus": "blok_source",
           "bound": 16,
           "note": "census source declared by the application (a queue name, cluster)"
         }
       ],
-      "description": "1 when the census hit its read bound; counts are lower bounds",
+      "description": "longest normal takeover or reclaim before the census reports lost ownership; the stall alert window must cover it",
       "seriesBound": 16
     },
     {
@@ -383,6 +402,61 @@
       "seriesBound": 1
     },
     {
+      "name": "blok.source.up",
+      "prometheus": "blok_source_up",
+      "kind": "gauge",
+      "unit": "",
+      "signal": "freshness",
+      "counts": "telemetry",
+      "path": "snapshot",
+      "labels": [
+        {
+          "name": "blok.source",
+          "prometheus": "blok_source",
+          "bound": 32,
+          "note": "operational source name"
+        },
+        {
+          "name": "blok.pages",
+          "prometheus": "blok_pages",
+          "values": [
+            "true",
+            "false"
+          ],
+          "note": "false only for informational sources"
+        }
+      ],
+      "description": "1 when the source answered this sample; every source is always reported",
+      "seriesBound": 64
+    },
+    {
+      "name": "blok.source.age",
+      "prometheus": "blok_source_age_seconds",
+      "kind": "gauge",
+      "unit": "s",
+      "signal": "freshness",
+      "counts": "telemetry",
+      "path": "snapshot",
+      "labels": [
+        {
+          "name": "blok.source",
+          "prometheus": "blok_source",
+          "bound": 32,
+          "note": "operational source name"
+        },
+        {
+          "name": "blok.pages",
+          "prometheus": "blok_pages",
+          "values": [
+            "true",
+            "false"
+          ]
+        }
+      ],
+      "description": "seconds since the source last answered; 0 while it answers",
+      "seriesBound": 64
+    },
+    {
       "name": "blok.runs",
       "prometheus": "blok_runs_total",
       "kind": "counter",
@@ -406,7 +480,7 @@
             "uncertain",
             "suspended"
           ],
-          "note": "uncertain is never folded into failed"
+          "note": "uncertain is never folded into failed; every outcome is created at zero on a workflow and tenant's first run"
         },
         {
           "name": "blok.tenant",
@@ -553,15 +627,10 @@
             "canceled",
             "uncertain"
           ],
-          "note": "uncertain: the effect may have happened"
-        },
-        {
-          "name": "blok.error.class",
-          "prometheus": "blok_error_class",
-          "note": "node error class; empty when the step did not fail"
+          "note": "uncertain: the effect may have happened; every outcome is created at zero on the step's first call"
         }
       ],
-      "description": "attempts of steps whose node declares effects",
+      "description": "attempts of steps whose node declares effects (error classes are on blok.steps)",
       "seriesBound": 0
     },
     {

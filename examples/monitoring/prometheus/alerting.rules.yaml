@@ -11,6 +11,18 @@
 # Work WAITING on a signal, a timer or a retry backoff never alerts. Work
 # whose effect outcome is UNCERTAIN alerts as a ticket, never as STALLED and
 # never as an error. Thresholds marked "example" are application choices.
+#
+# Every page above is only as good as the series it reads. A census that
+# times out, a source that is no longer configured, or a target that no
+# longer answers would otherwise silence BlokRunsStalled exactly when it is
+# needed, so each of those pages too (freshness alerts below).
+#
+# The stall window (for: 2m on BlokRunsStalled and BlokPartitionUnowned)
+# must be at least the longest normal takeover, which each census exports as
+# blok_census_takeover_seconds (owner TTL plus the acquire interval for the
+# cluster; lease plus handler budget for a queue, which the queue census
+# already waits out). BlokStallWindowTooShort tickets a deployment whose
+# takeover is longer: raise both for: values to at least that value.
 groups:
   - name: blok-slo-alerts
     interval: 30s
@@ -67,13 +79,63 @@ groups:
           description: The oldest unfired timer of {{ $labels.blok_source }} is {{ $value }}s past due.
 
       - alert: BlokUncertainOutcomes
-        expr: blok:runs_uncertain:increase15m > 0 or blok:external_calls_uncertain:increase15m > 0 or blok:work_uncertain:max > 0
+        expr: >-
+          blok:runs_uncertain:increase15m > 0 or blok:runs_uncertain:new15m > 0
+          or blok:external_calls_uncertain:increase15m > 0 or blok:external_calls_uncertain:new15m > 0
+          or blok:work_uncertain:max > 0
         labels:
           severity: ticket
           blok_alert_class: uncertain
         annotations:
           summary: Effects with unknown outcomes await reconciliation
           description: These are not failures and must not be retried blindly; reconcile them with the effect provider.
+
+      - alert: BlokOperationalSourceStale
+        expr: blok:source_age_seconds:max > 120
+        labels:
+          severity: page
+          blok_alert_class: freshness
+        annotations:
+          summary: An operational source has not answered for longer than the stall window
+          description: >-
+            {{ $labels.blok_source }} last answered {{ $value }}s ago. Its
+            stalled, partition, timer and worker alerts cannot fire while it
+            is silent.
+
+      - alert: BlokOperationalSourceVanished
+        expr: max by (job, blok_source) (max_over_time(blok_source_up{blok_pages="true"}[1h])) unless max by (job, blok_source) (blok_source_up{blok_pages="true"})
+        for: 2m
+        labels:
+          severity: page
+          blok_alert_class: freshness
+        annotations:
+          summary: An operational source that reported in the last hour no longer reports at all
+
+      - alert: BlokTargetDown
+        expr: max by (job, instance) (up{job=~"blok.*"}) == 0
+        for: 2m
+        labels:
+          severity: page
+          blok_alert_class: freshness
+        annotations:
+          summary: A Blok scrape target does not answer (job names must start with blok)
+
+      - alert: BlokTargetAbsent
+        expr: absent(up{job=~"blok.*"})
+        for: 5m
+        labels:
+          severity: page
+          blok_alert_class: freshness
+        annotations:
+          summary: No Blok scrape target exists at all
+
+      - alert: BlokStallWindowTooShort
+        expr: blok:census_takeover_seconds:max > 120
+        labels:
+          severity: ticket
+          blok_alert_class: stalled
+        annotations:
+          summary: A census's normal takeover is longer than the 2m stall window; raise the stall alerts' for
 
       - alert: BlokRunErrorRatioHigh
         expr: blok:runs_failed:ratio_rate5m > 0.05

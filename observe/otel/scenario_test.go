@@ -292,6 +292,27 @@ func runEventScenarios(t *testing.T, target scenarioTarget, recorder *scenarioRe
 	t.Run("errors", func(t *testing.T) {
 		order(t, "errors", append(repeat("coffee", 15), repeat("declined", 5)...))
 	})
+	t.Run("uncertain-single-run", func(t *testing.T) {
+		exporter := scenarioExporter(t, target, "blok-uncertain-single-run", nil)
+		h := &harness{exporter: exporter}
+		runner, program := orderRunnerWith(t, h, exporter)
+		orderRuns(t, runner, program, "single-ok", repeat("coffee", 5))
+		flushed(t, exporter)
+		before := target.scrape(t, "blok-uncertain-single-run")
+		orderRuns(t, runner, program, "single-uncertain", []string{"uncertain"})
+		flushed(t, exporter)
+		recorder.check(t, "uncertain-single-run", before, target.scrape(t, "blok-uncertain-single-run"))
+	})
+	t.Run("uncertain-first-run", func(t *testing.T) {
+		exporter := scenarioExporter(t, target, "blok-uncertain-first-run", nil)
+		h := &harness{exporter: exporter}
+		runner, program := orderRunnerWith(t, h, exporter)
+		flushed(t, exporter)
+		before := target.scrape(t, "blok-uncertain-first-run")
+		orderRuns(t, runner, program, "first-uncertain", []string{"uncertain"})
+		flushed(t, exporter)
+		recorder.check(t, "uncertain-first-run", before, target.scrape(t, "blok-uncertain-first-run"))
+	})
 	t.Run("collector-outage", func(t *testing.T) {
 		exporter := scenarioExporter(t, target, "blok-collector-outage", func(c *otel.Config) { c.MetricInterval = 100 * time.Millisecond })
 		h := &harness{exporter: exporter}
@@ -475,7 +496,7 @@ func TestScenarioSignalsThroughActualCollector(t *testing.T) {
 			Storage:    []slo.Storage{{Name: "journal", Used: 10, Budget: 100}},
 		}
 		exporter := scenarioExporter(t, collector, "blok-snapshot", func(c *otel.Config) {
-			c.Operational = []slo.Source{func(context.Context) (slo.Snapshot, error) { return full, nil }}
+			c.Operational = []slo.Source{slo.Func("static", func(context.Context) (slo.Snapshot, error) { return full, nil })}
 		})
 		flushed(t, exporter)
 		scraped, err := promrule.ParseText(strings.NewReader(collector.scrape(t, "blok-snapshot")))
@@ -483,7 +504,9 @@ func TestScenarioSignalsThroughActualCollector(t *testing.T) {
 			t.Fatal(err)
 		}
 		var text strings.Builder
-		if err := slo.WriteText(&text, full); err != nil {
+		expected := full
+		expected.Sources = []slo.SourceStatus{{Name: "static", Up: true, Pages: true}}
+		if err := slo.WriteText(&text, expected); err != nil {
 			t.Fatal(err)
 		}
 		written, _ := promrule.ParseText(strings.NewReader(text.String()))

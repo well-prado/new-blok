@@ -2,145 +2,631 @@
   "schemaVersion": 1,
   "roadmap": "E16-T03",
   "purpose": "Synthetic operational scenarios with predeclared metric deltas and alert outcomes (ADR 0022). The producing test drives real components, records the exposition before and after the fault, and asserts the deltas; examples/monitoring replays the recording as a steady state and asserts the alerts.",
-  "timeline": {"scrapeSeconds": 15, "baselineMinutes": 10, "faultMinutes": 20, "evaluateSeconds": 30},
+  "timeline": {
+    "scrapeSeconds": 15,
+    "baselineMinutes": 10,
+    "faultMinutes": 20,
+    "evaluateSeconds": 30
+  },
   "scenarios": [
     {
       "id": "overload",
       "producer": "app/deploy TestOverloadScenarioSignals",
       "fault": "MaxAdmission 2, two requests held in the handler, four more offered",
-      "target": {"job": "blok-app", "instance": "app-0"},
+      "target": {
+        "job": "blok-app",
+        "instance": "app-0"
+      },
       "expect": [
-        {"metric": "blok_admission_active", "value": 2},
-        {"metric": "blok_admission_capacity", "value": 2},
-        {"metric": "blok_admission_requests_total", "labels": {"blok_result": "accepted"}, "delta": 2},
-        {"metric": "blok_admission_requests_total", "labels": {"blok_result": "rejected", "blok_reason": "capacity"}, "delta": 4},
-        {"metric": "blok_admission_requests_total", "labels": {"blok_result": "rejected", "blok_reason": "not_ready"}, "delta": 0},
-        {"metric": "blok_ready", "value": 1}
+        {
+          "metric": "blok_admission_active",
+          "value": 2
+        },
+        {
+          "metric": "blok_admission_capacity",
+          "value": 2
+        },
+        {
+          "metric": "blok_admission_requests_total",
+          "labels": {
+            "blok_result": "accepted"
+          },
+          "delta": 2
+        },
+        {
+          "metric": "blok_admission_requests_total",
+          "labels": {
+            "blok_result": "rejected",
+            "blok_reason": "capacity"
+          },
+          "delta": 4
+        },
+        {
+          "metric": "blok_admission_requests_total",
+          "labels": {
+            "blok_result": "rejected",
+            "blok_reason": "not_ready"
+          },
+          "delta": 0
+        },
+        {
+          "metric": "blok_ready",
+          "value": 1
+        }
       ],
-      "fires": ["BlokAdmissionSaturated", "BlokAdmissionShedding"],
-      "silent": ["BlokNotReady", "BlokRunsStalled", "BlokQueueBacklog"]
+      "fires": [
+        "BlokAdmissionSaturated",
+        "BlokAdmissionShedding"
+      ],
+      "silent": [
+        "BlokNotReady",
+        "BlokRunsStalled",
+        "BlokQueueBacklog"
+      ]
     },
     {
       "id": "worker-death",
       "producer": "trigger/worker TestWorkerDeathScenarioSignals",
       "fault": "a worker claims a job and dies; its 30s lease expires; one more job waits behind it with no live worker",
-      "target": {"job": "blok-app", "instance": "app-0"},
+      "target": {
+        "job": "blok-app",
+        "instance": "app-0"
+      },
       "expect": [
-        {"metric": "blok_work_items", "labels": {"blok_source": "orders", "blok_liveness": "stalled"}, "value": 1},
-        {"metric": "blok_work_items", "labels": {"blok_source": "orders", "blok_liveness": "active"}, "value": 0},
-        {"metric": "blok_work_items", "labels": {"blok_source": "orders", "blok_liveness": "pending"}, "value": 1},
-        {"metric": "blok_work_oldest_pending_age_seconds", "labels": {"blok_source": "orders"}, "min": 400}
+        {
+          "metric": "blok_work_items",
+          "labels": {
+            "blok_source": "orders",
+            "blok_liveness": "stalled"
+          },
+          "value": 1
+        },
+        {
+          "metric": "blok_work_items",
+          "labels": {
+            "blok_source": "orders",
+            "blok_liveness": "active"
+          },
+          "value": 0
+        },
+        {
+          "metric": "blok_work_items",
+          "labels": {
+            "blok_source": "orders",
+            "blok_liveness": "pending"
+          },
+          "value": 1
+        },
+        {
+          "metric": "blok_work_oldest_pending_age_seconds",
+          "labels": {
+            "blok_source": "orders"
+          },
+          "min": 400
+        }
       ],
-      "fires": ["BlokRunsStalled", "BlokQueueBacklog"],
-      "silent": ["BlokUncertainOutcomes", "BlokPartitionUnowned"]
+      "fires": [
+        "BlokRunsStalled",
+        "BlokQueueBacklog"
+      ],
+      "silent": [
+        "BlokUncertainOutcomes",
+        "BlokPartitionUnowned"
+      ],
+      "advance": [
+        "blok_work_oldest_pending_age_seconds"
+      ],
+      "mustPage": true
     },
     {
       "id": "suspended-not-stalled",
       "producer": "trigger/worker TestWorkerDeathScenarioSignals (negative phase)",
       "fault": "jobs delayed by a retry backoff and no worker running: waiting, not stalled",
-      "target": {"job": "blok-app", "instance": "app-0"},
+      "target": {
+        "job": "blok-app",
+        "instance": "app-0"
+      },
       "expect": [
-        {"metric": "blok_work_items", "labels": {"blok_source": "orders", "blok_liveness": "waiting"}, "value": 3},
-        {"metric": "blok_work_items", "labels": {"blok_source": "orders", "blok_liveness": "stalled"}, "value": 0},
-        {"metric": "blok_work_items", "labels": {"blok_source": "orders", "blok_liveness": "pending"}, "value": 0}
+        {
+          "metric": "blok_work_items",
+          "labels": {
+            "blok_source": "orders",
+            "blok_liveness": "waiting"
+          },
+          "value": 3
+        },
+        {
+          "metric": "blok_work_items",
+          "labels": {
+            "blok_source": "orders",
+            "blok_liveness": "stalled"
+          },
+          "value": 0
+        },
+        {
+          "metric": "blok_work_items",
+          "labels": {
+            "blok_source": "orders",
+            "blok_liveness": "pending"
+          },
+          "value": 0
+        }
       ],
       "fires": [],
-      "silent": ["BlokRunsStalled", "BlokQueueBacklog", "BlokUncertainOutcomes"]
+      "silent": [
+        "BlokRunsStalled",
+        "BlokQueueBacklog",
+        "BlokUncertainOutcomes",
+        "BlokOperationalSourceStale",
+        "BlokTargetDown"
+      ]
     },
     {
       "id": "cluster-owner-death",
       "producer": "internal/cluster TestCensusOwnerDeathWaitingAndTimerLag",
       "fault": "the partition owner of a running run dies (lease expiry); a second run waits on a signal in another, owned partition",
-      "target": {"job": "blok-cluster", "instance": "replica-0"},
+      "target": {
+        "job": "blok-cluster",
+        "instance": "replica-0"
+      },
       "expect": [
-        {"metric": "blok_work_items", "labels": {"blok_source": "cluster", "blok_liveness": "stalled"}, "value": 1},
-        {"metric": "blok_work_items", "labels": {"blok_source": "cluster", "blok_liveness": "waiting"}, "value": 1},
-        {"metric": "blok_partitions", "labels": {"blok_owned": "false"}, "min": 1}
+        {
+          "metric": "blok_work_items",
+          "labels": {
+            "blok_source": "cluster",
+            "blok_liveness": "stalled"
+          },
+          "value": 1
+        },
+        {
+          "metric": "blok_work_items",
+          "labels": {
+            "blok_source": "cluster",
+            "blok_liveness": "waiting"
+          },
+          "value": 1
+        },
+        {
+          "metric": "blok_partitions",
+          "labels": {
+            "blok_owned": "false"
+          },
+          "min": 1
+        }
       ],
-      "fires": ["BlokRunsStalled", "BlokPartitionUnowned"],
-      "silent": ["BlokTimerLag", "BlokUncertainOutcomes"]
+      "fires": [
+        "BlokRunsStalled",
+        "BlokPartitionUnowned"
+      ],
+      "silent": [
+        "BlokTimerLag",
+        "BlokUncertainOutcomes"
+      ],
+      "mustPage": true
     },
     {
       "id": "cluster-waiting-owner-died",
       "producer": "internal/cluster TestCensusOwnerDeathWaitingAndTimerLag (negative phase)",
       "fault": "a run waiting on a signal whose partition owner died: the partition pages, the waiting run does not",
-      "target": {"job": "blok-cluster", "instance": "replica-0"},
+      "target": {
+        "job": "blok-cluster",
+        "instance": "replica-0"
+      },
       "expect": [
-        {"metric": "blok_work_items", "labels": {"blok_source": "cluster", "blok_liveness": "waiting"}, "value": 1},
-        {"metric": "blok_work_items", "labels": {"blok_source": "cluster", "blok_liveness": "stalled"}, "value": 0}
+        {
+          "metric": "blok_work_items",
+          "labels": {
+            "blok_source": "cluster",
+            "blok_liveness": "waiting"
+          },
+          "value": 1
+        },
+        {
+          "metric": "blok_work_items",
+          "labels": {
+            "blok_source": "cluster",
+            "blok_liveness": "stalled"
+          },
+          "value": 0
+        }
       ],
-      "fires": ["BlokPartitionUnowned"],
-      "silent": ["BlokRunsStalled", "BlokTimerLag"]
+      "fires": [
+        "BlokPartitionUnowned"
+      ],
+      "silent": [
+        "BlokRunsStalled",
+        "BlokTimerLag"
+      ],
+      "mustPage": true
     },
     {
       "id": "timer-lag",
       "producer": "internal/cluster TestCensusOwnerDeathWaitingAndTimerLag (timer phase)",
       "fault": "a timer due 90s ago in a partition without an owner to fire it",
-      "target": {"job": "blok-cluster", "instance": "replica-0"},
+      "target": {
+        "job": "blok-cluster",
+        "instance": "replica-0"
+      },
       "expect": [
-        {"metric": "blok_timers_overdue", "labels": {"blok_source": "cluster"}, "value": 1},
-        {"metric": "blok_timer_lag_seconds", "labels": {"blok_source": "cluster"}, "min": 89},
-        {"metric": "blok_work_items", "labels": {"blok_source": "cluster", "blok_liveness": "stalled"}, "value": 0}
+        {
+          "metric": "blok_timers_overdue",
+          "labels": {
+            "blok_source": "cluster"
+          },
+          "value": 1
+        },
+        {
+          "metric": "blok_timer_lag_seconds",
+          "labels": {
+            "blok_source": "cluster"
+          },
+          "min": 89
+        },
+        {
+          "metric": "blok_work_items",
+          "labels": {
+            "blok_source": "cluster",
+            "blok_liveness": "stalled"
+          },
+          "value": 0
+        }
       ],
-      "fires": ["BlokTimerLag", "BlokPartitionUnowned"],
-      "silent": ["BlokRunsStalled"]
+      "fires": [
+        "BlokTimerLag",
+        "BlokPartitionUnowned"
+      ],
+      "silent": [
+        "BlokRunsStalled"
+      ],
+      "advance": [
+        "blok_timer_lag_seconds"
+      ],
+      "mustPage": true
     },
     {
       "id": "slow-store",
       "producer": "observe/otel TestScenarioSignalsThroughActualCollector",
       "fault": "the charge step's store takes 1.2s per transaction",
-      "target": {},
+      "target": {
+        "job": "blok-collector",
+        "instance": "collector-0"
+      },
       "expect": [
-        {"metric": "blok_runs_total", "labels": {"blok_outcome": "completed"}, "delta": 8},
-        {"metric": "blok_steps_total", "labels": {"blok_step": "charge", "blok_outcome": "completed"}, "delta": 8},
-        {"metric": "blok_external_calls_total", "labels": {"blok_step": "charge", "blok_outcome": "completed"}, "delta": 8},
-        {"metric": "blok_external_calls_total", "labels": {"blok_step": "validate"}, "delta": 0},
-        {"metric": "blok_step_duration_seconds_bucket", "labels": {"blok_step": "charge", "le": "1"}, "delta": 0},
-        {"metric": "blok_step_duration_seconds_count", "labels": {"blok_step": "charge"}, "delta": 8}
+        {
+          "metric": "blok_runs_total",
+          "labels": {
+            "blok_outcome": "completed"
+          },
+          "delta": 8
+        },
+        {
+          "metric": "blok_steps_total",
+          "labels": {
+            "blok_step": "charge",
+            "blok_outcome": "completed"
+          },
+          "delta": 8
+        },
+        {
+          "metric": "blok_external_calls_total",
+          "labels": {
+            "blok_step": "charge",
+            "blok_outcome": "completed"
+          },
+          "delta": 8
+        },
+        {
+          "metric": "blok_external_calls_total",
+          "labels": {
+            "blok_step": "validate"
+          },
+          "delta": 0
+        },
+        {
+          "metric": "blok_step_duration_seconds_bucket",
+          "labels": {
+            "blok_step": "charge",
+            "le": "1"
+          },
+          "delta": 0
+        },
+        {
+          "metric": "blok_step_duration_seconds_count",
+          "labels": {
+            "blok_step": "charge"
+          },
+          "delta": 8
+        }
       ],
-      "fires": ["BlokStepLatencyHigh", "BlokExternalCallLatencyHigh"],
-      "silent": ["BlokRunErrorRatioHigh", "BlokUncertainOutcomes", "BlokRunsStalled"]
+      "fires": [
+        "BlokStepLatencyHigh",
+        "BlokExternalCallLatencyHigh"
+      ],
+      "silent": [
+        "BlokRunErrorRatioHigh",
+        "BlokUncertainOutcomes",
+        "BlokRunsStalled"
+      ]
     },
     {
       "id": "uncertain-distinct",
       "producer": "observe/otel TestScenarioSignalsThroughActualCollector",
       "fault": "18 runs complete and 2 end with an unconfirmed charge: uncertain, not failed",
-      "target": {},
+      "target": {
+        "job": "blok-collector",
+        "instance": "collector-0"
+      },
       "expect": [
-        {"metric": "blok_runs_total", "labels": {"blok_outcome": "uncertain"}, "delta": 2},
-        {"metric": "blok_runs_total", "labels": {"blok_outcome": "failed"}, "delta": 0},
-        {"metric": "blok_runs_total", "labels": {"blok_outcome": "completed"}, "delta": 18},
-        {"metric": "blok_external_calls_total", "labels": {"blok_outcome": "uncertain"}, "delta": 2},
-        {"metric": "blok_steps_total", "labels": {"blok_outcome": "failed"}, "delta": 0}
+        {
+          "metric": "blok_runs_total",
+          "labels": {
+            "blok_outcome": "uncertain"
+          },
+          "delta": 2
+        },
+        {
+          "metric": "blok_runs_total",
+          "labels": {
+            "blok_outcome": "failed"
+          },
+          "delta": 0
+        },
+        {
+          "metric": "blok_runs_total",
+          "labels": {
+            "blok_outcome": "completed"
+          },
+          "delta": 18
+        },
+        {
+          "metric": "blok_external_calls_total",
+          "labels": {
+            "blok_outcome": "uncertain"
+          },
+          "delta": 2
+        },
+        {
+          "metric": "blok_steps_total",
+          "labels": {
+            "blok_outcome": "failed"
+          },
+          "delta": 0
+        }
       ],
-      "fires": ["BlokUncertainOutcomes"],
-      "silent": ["BlokRunErrorRatioHigh", "BlokRunsStalled", "BlokStepLatencyHigh"]
+      "fires": [
+        "BlokUncertainOutcomes"
+      ],
+      "silent": [
+        "BlokRunErrorRatioHigh",
+        "BlokRunsStalled",
+        "BlokStepLatencyHigh"
+      ]
     },
     {
       "id": "errors",
       "producer": "observe/otel TestScenarioSignalsThroughActualCollector",
       "fault": "5 of 20 runs fail with a declined charge",
-      "target": {},
+      "target": {
+        "job": "blok-collector",
+        "instance": "collector-0"
+      },
       "expect": [
-        {"metric": "blok_runs_total", "labels": {"blok_outcome": "failed"}, "delta": 5},
-        {"metric": "blok_runs_total", "labels": {"blok_outcome": "completed"}, "delta": 15},
-        {"metric": "blok_runs_total", "labels": {"blok_outcome": "uncertain"}, "delta": 0},
-        {"metric": "blok_external_calls_total", "labels": {"blok_outcome": "failed"}, "delta": 5}
+        {
+          "metric": "blok_runs_total",
+          "labels": {
+            "blok_outcome": "failed"
+          },
+          "delta": 5
+        },
+        {
+          "metric": "blok_runs_total",
+          "labels": {
+            "blok_outcome": "completed"
+          },
+          "delta": 15
+        },
+        {
+          "metric": "blok_runs_total",
+          "labels": {
+            "blok_outcome": "uncertain"
+          },
+          "delta": 0
+        },
+        {
+          "metric": "blok_external_calls_total",
+          "labels": {
+            "blok_outcome": "failed"
+          },
+          "delta": 5
+        }
       ],
-      "fires": ["BlokRunErrorRatioHigh"],
-      "silent": ["BlokUncertainOutcomes", "BlokRunsStalled"]
+      "fires": [
+        "BlokRunErrorRatioHigh"
+      ],
+      "silent": [
+        "BlokUncertainOutcomes",
+        "BlokRunsStalled"
+      ]
     },
     {
       "id": "collector-outage",
       "producer": "observe/otel TestScenarioSignalsThroughActualCollector",
       "fault": "the collector is stopped for three metric exports, then restarted",
-      "target": {},
+      "target": {
+        "job": "blok-collector",
+        "instance": "collector-0"
+      },
       "expect": [
-        {"metric": "blok_telemetry_dropped_total", "labels": {"reason": "metric_exports_failed"}, "min": 3},
-        {"metric": "blok_runs_total", "labels": {"blok_outcome": "completed"}, "delta": 4}
+        {
+          "metric": "blok_telemetry_dropped_total",
+          "labels": {
+            "reason": "metric_exports_failed"
+          },
+          "min": 3
+        },
+        {
+          "metric": "blok_runs_total",
+          "labels": {
+            "blok_outcome": "completed"
+          },
+          "delta": 4
+        }
       ],
-      "fires": ["BlokTelemetryLoss"],
-      "silent": ["BlokRunsStalled", "BlokRunErrorRatioHigh"]
+      "fires": [
+        "BlokTelemetryLoss"
+      ],
+      "silent": [
+        "BlokRunsStalled",
+        "BlokRunErrorRatioHigh"
+      ]
+    },
+    {
+      "id": "census-timeout-during-stall",
+      "producer": "trigger/worker TestWorkerDeathScenarioSignals (census timeout phase)",
+      "fault": "a worker dies holding a job while the store slows to 3s per transaction: the census times out, so the stall cannot be seen; the stale census must page instead",
+      "target": {
+        "job": "blok-app",
+        "instance": "app-0"
+      },
+      "replay": "once",
+      "advance": [
+        "blok_source_age_seconds"
+      ],
+      "mustPage": true,
+      "expect": [
+        {
+          "metric": "blok_source_up",
+          "labels": {
+            "blok_source": "orders",
+            "blok_pages": "true"
+          },
+          "value": 0
+        },
+        {
+          "metric": "blok_source_age_seconds",
+          "labels": {
+            "blok_source": "orders"
+          },
+          "min": 0.5
+        },
+        {
+          "metric": "blok_operational_sample_failures_total",
+          "delta": 1
+        }
+      ],
+      "fires": [
+        "BlokOperationalSourceStale"
+      ],
+      "silent": [
+        "BlokRunsStalled",
+        "BlokTargetDown"
+      ]
+    },
+    {
+      "id": "census-vanished",
+      "producer": "trigger/worker TestWorkerDeathScenarioSignals (census removed phase)",
+      "fault": "the process restarts without its queue census configured: the census's series disappear entirely",
+      "target": {
+        "job": "blok-app",
+        "instance": "app-0"
+      },
+      "replay": "once",
+      "mustPage": true,
+      "expect": [
+        {
+          "metric": "blok_source_up",
+          "labels": {
+            "blok_source": "journal"
+          },
+          "value": 1
+        }
+      ],
+      "fires": [
+        "BlokOperationalSourceVanished"
+      ],
+      "silent": [
+        "BlokRunsStalled",
+        "BlokTargetDown"
+      ]
+    },
+    {
+      "id": "target-down",
+      "producer": "app/deploy TestTargetDownScenarioSignals",
+      "fault": "the deployment process stops answering: every scrape fails",
+      "target": {
+        "job": "blok-app",
+        "instance": "app-0"
+      },
+      "down": true,
+      "mustPage": true,
+      "expect": [],
+      "fires": [
+        "BlokTargetDown",
+        "BlokOperationalSourceVanished"
+      ],
+      "silent": [
+        "BlokNotReady",
+        "BlokRunsStalled"
+      ]
+    },
+    {
+      "id": "uncertain-single-run",
+      "producer": "observe/otel TestScenarioSignalsThroughActualCollector",
+      "fault": "after five completed runs, exactly one run ends with an unconfirmed charge",
+      "target": {
+        "job": "blok-collector",
+        "instance": "collector-0"
+      },
+      "replay": "once",
+      "expect": [
+        {
+          "metric": "blok_runs_total",
+          "labels": {
+            "blok_outcome": "uncertain"
+          },
+          "delta": 1
+        },
+        {
+          "metric": "blok_runs_total",
+          "labels": {
+            "blok_outcome": "failed"
+          },
+          "delta": 0
+        }
+      ],
+      "fires": [
+        "BlokUncertainOutcomes"
+      ],
+      "silent": [
+        "BlokRunErrorRatioHigh",
+        "BlokRunsStalled"
+      ]
+    },
+    {
+      "id": "uncertain-first-run",
+      "producer": "observe/otel TestScenarioSignalsThroughActualCollector",
+      "fault": "a fresh process's very first run ends uncertain: its series is born at one",
+      "target": {
+        "job": "blok-collector",
+        "instance": "collector-0"
+      },
+      "replay": "once",
+      "expect": [
+        {
+          "metric": "blok_runs_total",
+          "labels": {
+            "blok_outcome": "uncertain"
+          },
+          "delta": 1
+        }
+      ],
+      "fires": [
+        "BlokUncertainOutcomes"
+      ],
+      "silent": [
+        "BlokRunErrorRatioHigh",
+        "BlokRunsStalled"
+      ]
     }
   ]
 }

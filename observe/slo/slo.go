@@ -130,6 +130,8 @@ type Snapshot struct {
 	Workers    []Worker
 	Partitions *Partitions
 	Storage    []Storage
+	// Sources is filled by a Sampler only: every source's freshness.
+	Sources []SourceStatus
 	// SampleFailures counts sources that failed, timed out or reported an
 	// invalid or conflicting snapshot, cumulatively per Sampler.
 	SampleFailures uint64
@@ -164,7 +166,13 @@ type Work struct {
 	DeadLetters int
 	// OldestPending is the age of the oldest pending item: backlog lag.
 	OldestPending time.Duration
-	Truncated     bool
+	// Takeover is how long a normal takeover can leave work reported as
+	// stalled before a successor claims it (for the cluster, the owner TTL
+	// plus the acquire interval). The stall alert's window must be at least
+	// this long (blok.census.takeover). Zero when the census already waits
+	// out ownership changes itself, as the queue census does.
+	Takeover  time.Duration
+	Truncated bool
 }
 
 // Add counts one unit of work of liveness l.
@@ -283,7 +291,7 @@ func (s Snapshot) Validate() error {
 		return err
 	}
 	for _, w := range s.Work {
-		if w.Pending < 0 || w.Active < 0 || w.Waiting < 0 || w.Uncertain < 0 || w.Stalled < 0 || w.DeadLetters < 0 || w.OldestPending < 0 {
+		if w.Pending < 0 || w.Active < 0 || w.Waiting < 0 || w.Uncertain < 0 || w.Stalled < 0 || w.DeadLetters < 0 || w.OldestPending < 0 || w.Takeover < 0 {
 			return fmt.Errorf("%w: negative work count for %q", ErrInvalid, w.Source)
 		}
 	}
@@ -308,6 +316,19 @@ func (s Snapshot) Validate() error {
 	}
 	if err := checkNames("store", s.Storage, func(st Storage) string { return st.Name }); err != nil {
 		return err
+	}
+	if len(s.Sources) > MaxSources {
+		return fmt.Errorf("%w: %d source statuses, at most %d", ErrInvalid, len(s.Sources), MaxSources)
+	}
+	seenSources := map[string]bool{}
+	for _, st := range s.Sources {
+		if err := validName("source", st.Name); err != nil {
+			return err
+		}
+		if seenSources[st.Name] || st.Age < 0 {
+			return fmt.Errorf("%w: source status %q duplicate or negative age", ErrInvalid, st.Name)
+		}
+		seenSources[st.Name] = true
 	}
 	for _, st := range s.Storage {
 		if st.Used < 0 || st.Budget < 0 {
@@ -350,28 +371,75 @@ func (s *Snapshot) merge(part Snapshot) error {
 	return nil
 }
 
-// Source reports one component's part of the snapshot. It must honour ctx;
-// a Sampler abandons it at its timeout either way.
-type Source func(context.Context) (Snapshot, error)
+// Source is one component's part of the snapshot.
+type Source struct {
+	// Name identifies the source on blok.source.up and blok.source.age: a
+	// bounded label, unique within a Sampler. A census source reports its
+	// Work and Timers under the same name, so a rule can tell "zero stalled"
+	// from "the census that would report stalled is not answering".
+	Name string
+	// Read reports the part. It must honour ctx; the Sampler abandons it at
+	// its timeout either way.
+	Read func(context.Context) (Snapshot, error)
+	// Timeout bounds Read; zero means the Sampler's timeout. At most
+	// MaxSampleTimeout.
+	Timeout time.Duration
+	// Informational marks a source whose staleness must not page (a store
+	// size, say). Every other source feeds a paging alert, which would go
+	// silent with it, so its staleness pages (ADR 0022).
+	Informational bool
+}
+
+// Func is a source named name that reads with read.
+func Func(name string, read func(context.Context) (Snapshot, error)) Source {
+	return Source{Name: name, Read: read}
+}
+
+// SourceStatus is the Sampler's account of one source at a sample: Up when
+// this sample succeeded, Age since its last successful sample (or since the
+// Sampler was created, if it never succeeded). The Sampler always reports
+// every source, so a failing or stuck source is visible as stale instead of
+// vanishing with the series it would have reported.
+type SourceStatus struct {
+	Name  string
+	Up    bool
+	Age   time.Duration
+	Pages bool
+}
 
 // Sampler merges sources into one snapshot. Each source runs on its own
-// goroutine bounded by the timeout; a source still running from an earlier
+// goroutine bounded by its timeout; a source still running from an earlier
 // sample is skipped (counted) rather than started again, so a stuck source
 // costs at most one goroutine. A failed, timed-out, invalid or conflicting
-// source contributes nothing and is counted in SampleFailures. Sampling
-// never fails as a whole.
+// source contributes nothing, is counted in SampleFailures and is reported
+// down, with its age growing, in Snapshot.Sources. Sampling never fails as
+// a whole.
 type Sampler struct {
 	sources  []Source
 	busy     []atomic.Bool
+	last     []atomic.Int64 // unix nanos of the last successful sample
 	timeout  time.Duration
+	clock    func() time.Time
 	failures atomic.Uint64
 }
 
-// NewSampler bounds each source's sample by timeout (zero means
-// DefaultSampleTimeout).
+// NewSampler bounds each source's sample by its own timeout, or by timeout
+// (zero means DefaultSampleTimeout).
 func NewSampler(timeout time.Duration, sources ...Source) (*Sampler, error) {
+	return newSampler(time.Now, timeout, sources)
+}
+
+// NewSamplerWithClock is NewSampler with the clock that ages sources.
+func NewSamplerWithClock(clock func() time.Time, timeout time.Duration, sources ...Source) (*Sampler, error) {
+	return newSampler(clock, timeout, sources)
+}
+
+func newSampler(clock func() time.Time, timeout time.Duration, sources []Source) (*Sampler, error) {
 	if timeout == 0 {
 		timeout = DefaultSampleTimeout
+	}
+	if clock == nil {
+		return nil, fmt.Errorf("%w: nil clock", ErrInvalid)
 	}
 	if timeout < time.Millisecond || timeout > MaxSampleTimeout {
 		return nil, fmt.Errorf("%w: sample timeout %v outside 1ms..%v", ErrInvalid, timeout, MaxSampleTimeout)
@@ -379,12 +447,28 @@ func NewSampler(timeout time.Duration, sources ...Source) (*Sampler, error) {
 	if len(sources) > MaxSources {
 		return nil, fmt.Errorf("%w: %d sources, at most %d", ErrInvalid, len(sources), MaxSources)
 	}
+	names := map[string]bool{}
 	for _, source := range sources {
-		if source == nil {
-			return nil, fmt.Errorf("%w: nil source", ErrInvalid)
+		if source.Read == nil {
+			return nil, fmt.Errorf("%w: source %q has no Read", ErrInvalid, source.Name)
+		}
+		if err := validName("source", source.Name); err != nil {
+			return nil, err
+		}
+		if names[source.Name] {
+			return nil, fmt.Errorf("%w: duplicate source %q", ErrInvalid, source.Name)
+		}
+		names[source.Name] = true
+		if source.Timeout < 0 || source.Timeout > MaxSampleTimeout {
+			return nil, fmt.Errorf("%w: source %q timeout %v", ErrInvalid, source.Name, source.Timeout)
 		}
 	}
-	return &Sampler{sources: slices.Clone(sources), busy: make([]atomic.Bool, len(sources)), timeout: timeout}, nil
+	s := &Sampler{sources: slices.Clone(sources), busy: make([]atomic.Bool, len(sources)), last: make([]atomic.Int64, len(sources)), timeout: timeout, clock: clock}
+	now := clock().UnixNano()
+	for i := range s.last {
+		s.last[i].Store(now)
+	}
+	return s, nil
 }
 
 type sampled struct {
@@ -398,36 +482,53 @@ func (s *Sampler) Sample(ctx context.Context) Snapshot {
 	if s == nil {
 		return Snapshot{}
 	}
-	results := make([]chan sampled, len(s.sources))
-	ctx, cancel := context.WithTimeout(ctx, s.timeout)
-	defer cancel()
+	type pending struct {
+		result chan sampled
+		ctx    context.Context
+		cancel context.CancelFunc
+	}
+	waits := make([]*pending, len(s.sources))
 	for i, source := range s.sources {
 		if !s.busy[i].CompareAndSwap(false, true) {
-			s.failures.Add(1)
 			continue
 		}
-		result := make(chan sampled, 1)
-		results[i] = result
+		timeout := source.Timeout
+		if timeout == 0 {
+			timeout = s.timeout
+		}
+		sourceCtx, cancel := context.WithTimeout(ctx, timeout)
+		w := &pending{result: make(chan sampled, 1), ctx: sourceCtx, cancel: cancel}
+		waits[i] = w
 		go func() {
 			defer s.busy[i].Store(false)
 			defer func() {
 				if recover() != nil {
-					result <- sampled{err: errors.New("slo: source panicked")}
+					w.result <- sampled{err: errors.New("slo: source panicked")}
 				}
 			}()
-			part, err := source(ctx)
-			result <- sampled{part: part, err: err}
+			part, err := source.Read(sourceCtx)
+			w.result <- sampled{part: part, err: err}
 		}()
 	}
 	var snapshot Snapshot
-	for _, result := range results {
-		if result == nil {
-			continue
+	for i, w := range waits {
+		up := false
+		if w != nil {
+			r, ok := receive(w.ctx, w.result)
+			w.cancel()
+			up = ok && r.err == nil && len(r.part.Sources) == 0 && r.part.Validate() == nil && snapshot.merge(r.part) == nil
 		}
-		r, ok := receive(ctx, result)
-		if !ok || r.err != nil || r.part.Validate() != nil || snapshot.merge(r.part) != nil {
+		now := s.clock()
+		if up {
+			s.last[i].Store(now.UnixNano())
+		} else {
 			s.failures.Add(1)
 		}
+		age := time.Duration(0)
+		if !up {
+			age = max(now.Sub(time.Unix(0, s.last[i].Load())), 0)
+		}
+		snapshot.Sources = append(snapshot.Sources, SourceStatus{Name: s.sources[i].Name, Up: up, Age: age, Pages: !s.sources[i].Informational})
 	}
 	snapshot.SampleFailures = s.failures.Load()
 	return snapshot
@@ -461,7 +562,7 @@ func (s *Sampler) Failures() uint64 {
 // zero bytes; any other stat error fails the sample. budget is the
 // operator's declared limit in bytes (zero for none).
 func FileStorage(name string, budget int64, paths ...string) Source {
-	return func(ctx context.Context) (Snapshot, error) {
+	return Source{Name: name, Informational: true, Read: func(ctx context.Context) (Snapshot, error) {
 		var used int64
 		for _, path := range paths {
 			if err := ctx.Err(); err != nil {
@@ -477,5 +578,5 @@ func FileStorage(name string, budget int64, paths ...string) Source {
 			used += info.Size()
 		}
 		return Snapshot{Storage: []Storage{{Name: name, Used: used, Budget: budget}}}, nil
-	}
+	}}
 }

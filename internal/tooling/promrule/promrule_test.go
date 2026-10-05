@@ -215,7 +215,7 @@ func TestRecordingRuleOutputIsVisibleToLaterRules(t *testing.T) {
 }
 
 func TestUnsupportedSyntaxIsRefused(t *testing.T) {
-	for _, query := range []string{`a * on (x) group_left b`, `rate(a[5m] offset 1m)`, `quantile_over_time(0.9, a[5m])`, `a > 1 >`, `{}`} {
+	for _, query := range []string{`a * on (x) group_left b`, `a @ 100`, `quantile_over_time(0.9, a[5m])`, `a > 1 >`, `{}`} {
 		if _, err := Parse(query); err == nil {
 			t.Errorf("Parse(%q) accepted unsupported syntax", query)
 		}
@@ -247,5 +247,122 @@ esc{a="x\"y\\z"} +Inf 1700000000000
 	}
 	if _, err := ParseText(strings.NewReader("bad{a=1} 2\n")); err == nil {
 		t.Fatal("malformed labels accepted")
+	}
+}
+
+func scrapeOf(at time.Time, down bool, samples ...ExpositionSample) Scrape {
+	return Scrape{At: at, Target: Labels{"job": "blok", "instance": "a"}, Samples: samples, Down: down}
+}
+
+func sample(name string, v float64) ExpositionSample {
+	return ExpositionSample{Labels: Labels{"__name__": name}, Value: v}
+}
+
+// TestVanishedSeriesIsStaleImmediately is the Prometheus staleness rule: a
+// series scraped for 90s and then missing from the next scrape has no value
+// from that scrape on, so an alert with for: 2m over it never fires. Without
+// markers the five-minute lookback would keep it firing.
+func TestVanishedSeriesIsStaleImmediately(t *testing.T) {
+	var scrapes []Scrape
+	for i := 0; i <= 40; i++ {
+		if i <= 6 {
+			scrapes = append(scrapes, scrapeOf(at(i*15), false, sample("stalled", 1), sample("other", 0)))
+		} else {
+			scrapes = append(scrapes, scrapeOf(at(i*15), false, sample("other", 0)))
+		}
+	}
+	s := NewStore()
+	if err := s.Load(scrapes); err != nil {
+		t.Fatal(err)
+	}
+	if v := eval1(t, s, `stalled`, at(7*15)); len(v) != 0 {
+		t.Fatalf("a vanished series still has a value at its next scrape: %+v", v)
+	}
+	if v := eval1(t, s, `stalled`, at(6*15+10)); len(v) != 1 {
+		t.Fatalf("before the next scrape the series still has its value: %+v", v)
+	}
+	if v := eval1(t, s, `max_over_time(stalled[5m])`, at(8*15)); len(v) != 1 || v[0].V != 1 {
+		t.Fatalf("range functions still see the samples before the marker: %+v", v)
+	}
+	rules, err := ParseRules([]byte("groups:\n  - name: g\n    rules:\n      - alert: Stalled\n        expr: stalled > 0\n        for: 2m\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Evaluate(rules, at(0), at(600), 15*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.FiredAlerts()["Stalled"] {
+		t.Fatalf("a series present for 90s fired a for: 2m alert: %+v", result.Fired)
+	}
+}
+
+// TestFailedScrapeRecordsUpAndStalesEverySeries: a failed scrape writes up=0
+// and ends every series of the target; absent() then sees nothing.
+func TestFailedScrapeRecordsUpAndStalesEverySeries(t *testing.T) {
+	s := NewStore()
+	if err := s.Load([]Scrape{scrapeOf(at(0), false, sample("blok_ready", 1)), scrapeOf(at(15), true), scrapeOf(at(30), true)}); err != nil {
+		t.Fatal(err)
+	}
+	if v := eval1(t, s, `up`, at(0)); len(v) != 1 || v[0].V != 1 || v[0].Labels["job"] != "blok" {
+		t.Fatalf("up after a good scrape = %+v", v)
+	}
+	if v := eval1(t, s, `up == 0`, at(30)); len(v) != 1 {
+		t.Fatalf("up after a failed scrape = %+v", v)
+	}
+	if v := eval1(t, s, `blok_ready`, at(15)); len(v) != 0 {
+		t.Fatalf("a failed scrape left blok_ready readable: %+v", v)
+	}
+	if v := eval1(t, s, `absent(blok_ready{job="blok"})`, at(30)); len(v) != 1 || v[0].Labels["job"] != "blok" || v[0].V != 1 {
+		t.Fatalf("absent = %+v, want one sample with the equality labels", v)
+	}
+	if v := eval1(t, s, `absent(up)`, at(30)); len(v) != 0 {
+		t.Fatalf("absent(up) with a target = %+v", v)
+	}
+}
+
+// TestRecordingRuleSeriesGoStaleWithTheirSource: a recorded series the rule
+// stops producing is marked stale at that evaluation.
+func TestRecordingRuleSeriesGoStaleWithTheirSource(t *testing.T) {
+	s := NewStore()
+	if err := s.Load([]Scrape{scrapeOf(at(0), false, sample("x", 1)), scrapeOf(at(30), false), scrapeOf(at(60), false)}); err != nil {
+		t.Fatal(err)
+	}
+	rules, err := ParseRules([]byte("groups:\n  - name: g\n    rules:\n      - record: job:x:max\n        expr: max by (job) (x)\n      - alert: X\n        expr: job:x:max > 0\n        for: 1m\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Evaluate(rules, at(0), at(300), 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.FiredAlerts()["X"] {
+		t.Fatal("a recorded series kept firing after its source went stale")
+	}
+}
+
+// TestOffsetFindsANewSeries: the new-series idiom x unless x offset 15m
+// finds a counter born at its first value, which increase() cannot.
+func TestOffsetFindsANewSeries(t *testing.T) {
+	var scrapes []Scrape
+	for i := 0; i <= 150; i++ {
+		samples := []ExpositionSample{sample("other_total", 0)}
+		if i >= 80 {
+			samples = append(samples, sample("uncertain_total", 1))
+		}
+		scrapes = append(scrapes, scrapeOf(at(i*15), false, samples...))
+	}
+	s := NewStore()
+	if err := s.Load(scrapes); err != nil {
+		t.Fatal(err)
+	}
+	if v := eval1(t, s, `increase(uncertain_total[15m])`, at(90*15)); len(v) != 1 || v[0].V != 0 {
+		t.Fatalf("increase over a series born at 1 = %+v, want 0", v)
+	}
+	if v := eval1(t, s, `uncertain_total > 0 unless uncertain_total offset 15m`, at(90*15)); len(v) != 1 {
+		t.Fatalf("new series not found: %+v", v)
+	}
+	if v := eval1(t, s, `uncertain_total > 0 unless uncertain_total offset 15m`, at(150*15)); len(v) != 0 {
+		t.Fatalf("a series 17.5 minutes old is still new: %+v", v)
 	}
 }

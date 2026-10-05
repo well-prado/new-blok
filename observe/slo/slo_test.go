@@ -78,22 +78,23 @@ func TestSamplerBoundsEverySource(t *testing.T) {
 	stuck := make(chan struct{})
 	defer close(stuck)
 	var stuckCalls atomic.Int32
-	sampler, err := slo.NewSampler(50*time.Millisecond,
-		func(context.Context) (slo.Snapshot, error) {
+	var now atomic.Int64
+	now.Store(time.Date(2026, 10, 5, 0, 0, 0, 0, time.UTC).UnixNano())
+	clock := func() time.Time { return time.Unix(0, now.Load()) }
+	sampler, err := slo.NewSamplerWithClock(clock, 50*time.Millisecond,
+		slo.Func("healthy", func(context.Context) (slo.Snapshot, error) {
 			return slo.Snapshot{Readiness: &slo.Readiness{Ready: true}, Work: []slo.Work{{Source: "orders", Pending: 2}}}, nil
-		},
-		func(context.Context) (slo.Snapshot, error) { stuckCalls.Add(1); <-stuck; return slo.Snapshot{}, nil },
-		func(context.Context) (slo.Snapshot, error) { panic("source bug") },
-		func(context.Context) (slo.Snapshot, error) { return slo.Snapshot{}, errors.New("store down") },
-		func(context.Context) (slo.Snapshot, error) {
+		}),
+		slo.Func("stuck", func(context.Context) (slo.Snapshot, error) { stuckCalls.Add(1); <-stuck; return slo.Snapshot{}, nil }),
+		slo.Func("panics", func(context.Context) (slo.Snapshot, error) { panic("source bug") }),
+		slo.Func("fails", func(context.Context) (slo.Snapshot, error) { return slo.Snapshot{}, errors.New("store down") }),
+		slo.Func("invalid", func(context.Context) (slo.Snapshot, error) {
 			return slo.Snapshot{Work: []slo.Work{{Source: "bad source"}}}, nil
-		},
-		func(context.Context) (slo.Snapshot, error) {
+		}),
+		slo.Func("conflicts", func(context.Context) (slo.Snapshot, error) {
 			return slo.Snapshot{Readiness: &slo.Readiness{}}, nil // a second readiness
-		},
-		func(context.Context) (slo.Snapshot, error) {
-			return slo.Snapshot{Storage: []slo.Storage{{Name: "journal", Used: 10}}}, nil
-		},
+		}),
+		slo.FileStorage("journal", 0, filepath.Join(t.TempDir(), "missing.db")),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -109,15 +110,61 @@ func TestSamplerBoundsEverySource(t *testing.T) {
 	if s.SampleFailures != 5 {
 		t.Fatalf("failures = %d, want 5 (stuck, panic, error, invalid, conflict)", s.SampleFailures)
 	}
+	now.Add(int64(90 * time.Second))
 	again := sampler.Sample(context.Background())
 	if again.SampleFailures != 10 || stuckCalls.Load() != 1 {
 		t.Fatalf("second sample failures = %d, stuck source started %d times; want 10 and once: it is skipped, not restarted", again.SampleFailures, stuckCalls.Load())
 	}
+	// Every source is reported, failing ones down with their age growing
+	// from their last success (here, the Sampler's creation).
+	status := map[string]slo.SourceStatus{}
+	for _, st := range again.Sources {
+		status[st.Name] = st
+	}
+	if len(again.Sources) != 7 {
+		t.Fatalf("source statuses %+v", again.Sources)
+	}
+	for name, want := range map[string]bool{"healthy": true, "journal": true, "stuck": false, "panics": false, "fails": false, "invalid": false, "conflicts": false} {
+		st := status[name]
+		if st.Up != want || want && st.Age != 0 || !want && st.Age != 90*time.Second {
+			t.Errorf("%s status %+v, want up=%v", name, st, want)
+		}
+		if st.Pages == (name == "journal") {
+			t.Errorf("%s pages=%v; only the informational storage source does not page", name, st.Pages)
+		}
+	}
 	if _, err := slo.NewSampler(time.Hour); err == nil {
 		t.Fatal("an unbounded sample timeout was accepted")
 	}
-	if _, err := slo.NewSampler(0, nil); err == nil {
-		t.Fatal("a nil source was accepted")
+	if _, err := slo.NewSampler(0, slo.Source{Name: "x"}); err == nil {
+		t.Fatal("a source without Read was accepted")
+	}
+	if _, err := slo.NewSampler(0, slo.Func("x", nil), slo.Func("x", nil)); err == nil {
+		t.Fatal("a duplicate source name was accepted")
+	}
+	if _, err := slo.NewSampler(0, slo.Func("orders queue", func(context.Context) (slo.Snapshot, error) { return slo.Snapshot{}, nil })); err == nil {
+		t.Fatal("an unbounded source name was accepted")
+	}
+}
+
+// TestSourceTimeoutIsPerSource: a slow source with its own longer budget
+// answers while the default budget would have abandoned it.
+func TestSourceTimeoutIsPerSource(t *testing.T) {
+	slow := func(ctx context.Context) (slo.Snapshot, error) {
+		select {
+		case <-time.After(150 * time.Millisecond):
+			return slo.Snapshot{Work: []slo.Work{{Source: "cluster", Stalled: 1}}}, nil
+		case <-ctx.Done():
+			return slo.Snapshot{}, ctx.Err()
+		}
+	}
+	short, _ := slo.NewSampler(50*time.Millisecond, slo.Func("cluster", slow))
+	long, _ := slo.NewSampler(50*time.Millisecond, slo.Source{Name: "cluster", Read: slow, Timeout: time.Second})
+	if s := short.Sample(context.Background()); len(s.Work) != 0 || s.Sources[0].Up {
+		t.Fatalf("default budget: %+v", s)
+	}
+	if s := long.Sample(context.Background()); len(s.Work) != 1 || !s.Sources[0].Up {
+		t.Fatalf("own budget: %+v", s)
 	}
 }
 
@@ -125,11 +172,12 @@ func fullSnapshot() slo.Snapshot {
 	return slo.Snapshot{
 		Readiness:  &slo.Readiness{Ready: true, Dependencies: []slo.Dependency{{Name: "artifact", Ready: true}, {Name: "store", Ready: false}}},
 		Admission:  &slo.Admission{Active: 3, Capacity: 4, Accepted: 10, Rejected: map[slo.RejectReason]uint64{slo.RejectCapacity: 2}},
-		Work:       []slo.Work{{Source: "orders", Pending: 1, Stalled: 1, DeadLetters: 2, OldestPending: 1500 * time.Millisecond}, {Source: "cluster", Waiting: 4, Truncated: true}},
+		Work:       []slo.Work{{Source: "orders", Pending: 1, Stalled: 1, DeadLetters: 2, OldestPending: 1500 * time.Millisecond, Takeover: 60 * time.Second}, {Source: "cluster", Waiting: 4, Truncated: true}},
 		Timers:     []slo.Timers{{Source: "cluster", Overdue: 1, Lag: 2 * time.Second}},
 		Workers:    []slo.Worker{{Name: "node", Ready: true, InFlight: 3, Capacity: 64}},
 		Partitions: &slo.Partitions{Total: 8, Owned: 7},
 		Storage:    []slo.Storage{{Name: "journal", Used: 4096, Budget: 8192}, {Name: "queue", Used: 1}},
+		Sources:    []slo.SourceStatus{{Name: "orders", Up: false, Age: 3 * time.Second, Pages: true}, {Name: "journal", Up: true, Pages: false}},
 	}
 }
 
@@ -175,6 +223,7 @@ func TestWriteTextIsTheCatalogue(t *testing.T) {
 		"blok_work_oldest_pending_age_seconds,orders": 1.5, "blok_work_dead_letters,orders": 2, "blok_census_truncated,cluster": 1,
 		"blok_timers_overdue,cluster": 1, "blok_timer_lag_seconds,cluster": 2, "blok_worker_capacity,node": 64,
 		"blok_partitions,false": 1, "blok_partitions,true": 7, "blok_storage_budget_bytes,journal": 8192, "blok_operational_sample_failures_total": 0,
+		"blok_source_up,orders,true": 0, "blok_source_age_seconds,orders,true": 3, "blok_source_up,journal,false": 1, "blok_census_takeover_seconds,orders": 60,
 	} {
 		if got, ok := values[key]; !ok || got != want {
 			t.Errorf("%s = %v (present %v), want %v", key, got, ok, want)
@@ -272,7 +321,8 @@ func TestFileStorageSumsFiles(t *testing.T) {
 	dir := t.TempDir()
 	_ = os.WriteFile(filepath.Join(dir, "db"), make([]byte, 100), 0o600)
 	_ = os.WriteFile(filepath.Join(dir, "db-wal"), make([]byte, 20), 0o600)
-	s, err := slo.FileStorage("journal", 1000, filepath.Join(dir, "db"), filepath.Join(dir, "db-wal"), filepath.Join(dir, "db-shm"))(context.Background())
+	source := slo.FileStorage("journal", 1000, filepath.Join(dir, "db"), filepath.Join(dir, "db-wal"), filepath.Join(dir, "db-shm"))
+	s, err := source.Read(context.Background())
 	if err != nil || len(s.Storage) != 1 || s.Storage[0].Used != 120 || s.Storage[0].Budget != 1000 {
 		t.Fatalf("storage %+v %v", s, err)
 	}
@@ -333,5 +383,51 @@ func TestNoOptInFootprint(t *testing.T) {
 		if strings.Contains(string(mod), forbidden) {
 			t.Errorf("the root go.mod requires %s", forbidden)
 		}
+	}
+}
+
+// TestRenderedSeriesStayWithinTheCatalogueBounds renders the largest valid
+// snapshot (every named list full, work and timer sources disjoint) and
+// checks every metric's series count against its catalogued bound.
+func TestRenderedSeriesStayWithinTheCatalogueBounds(t *testing.T) {
+	var s slo.Snapshot
+	s.Readiness = &slo.Readiness{}
+	s.Admission = &slo.Admission{}
+	s.Partitions = &slo.Partitions{Total: 1}
+	for i := 0; i < slo.MaxNamed; i++ {
+		s.Readiness.Dependencies = append(s.Readiness.Dependencies, slo.Dependency{Name: fmt.Sprintf("d%d", i)})
+		s.Work = append(s.Work, slo.Work{Source: fmt.Sprintf("work%d", i), Takeover: time.Second})
+		s.Timers = append(s.Timers, slo.Timers{Source: fmt.Sprintf("timer%d", i)})
+		s.Workers = append(s.Workers, slo.Worker{Name: fmt.Sprintf("w%d", i)})
+		s.Storage = append(s.Storage, slo.Storage{Name: fmt.Sprintf("s%d", i), Budget: 1})
+	}
+	for i := 0; i < slo.MaxSources; i++ {
+		s.Sources = append(s.Sources, slo.SourceStatus{Name: fmt.Sprintf("src%d", i), Pages: i%2 == 0})
+	}
+	var b bytes.Buffer
+	if err := slo.WriteText(&b, s); err != nil {
+		t.Fatal(err)
+	}
+	samples, err := promrule.ParseText(&b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	counts := map[string]int{}
+	for _, sample := range samples {
+		counts[sample.Labels["__name__"]]++
+	}
+	for _, m := range slo.Catalogue() {
+		if m.Path != slo.PathSnapshot {
+			continue
+		}
+		if counts[m.Prometheus] == 0 {
+			t.Errorf("%s not rendered by the largest snapshot", m.Prometheus)
+		}
+		if counts[m.Prometheus] > m.SeriesBound {
+			t.Errorf("%s renders %d series, catalogue bound %d", m.Prometheus, counts[m.Prometheus], m.SeriesBound)
+		}
+	}
+	if counts["blok_census_truncated"] != 2*slo.MaxNamed {
+		t.Fatalf("truncated series %d, want %d", counts["blok_census_truncated"], 2*slo.MaxNamed)
 	}
 }

@@ -94,6 +94,9 @@ const (
 	MetricStorageUsed      = "blok.storage.used"
 	MetricStorageBudget    = "blok.storage.budget"
 	MetricSampleFailures   = "blok.operational.sample.failures"
+	MetricSourceUp         = "blok.source.up"
+	MetricSourceAge        = "blok.source.age"
+	MetricCensusTakeover   = "blok.census.takeover"
 	MetricRuns             = "blok.runs"
 	MetricRunDuration      = "blok.run.duration"
 	MetricSteps            = "blok.steps"
@@ -113,6 +116,7 @@ const (
 	AttrOwned      = "blok.owned"
 	AttrResult     = "blok.result"
 	AttrReason     = "blok.reason"
+	AttrPages      = "blok.pages"
 	AttrWorkflow   = "blok.workflow"
 	AttrStep       = "blok.step"
 	AttrOutcome    = "blok.outcome"
@@ -167,7 +171,8 @@ func Catalogue() []Metric {
 		{Name: MetricWorkItems, Kind: Gauge, Unit: "{item}", Signal: "queue_depth", Counts: CountsState, Path: PathSnapshot, Labels: []Label{source, liveness}, Description: "unfinished work by liveness; stalled pages, waiting never does"},
 		{Name: MetricWorkOldest, Kind: Gauge, Unit: "s", Signal: "queue_depth", Counts: CountsState, Path: PathSnapshot, Labels: []Label{source}, Description: "age of the oldest pending item (backlog lag)"},
 		{Name: MetricWorkDead, Kind: Gauge, Unit: "{item}", Signal: "errors", Counts: CountsState, Path: PathSnapshot, Labels: []Label{source}, Description: "dead-lettered work retained for an operator"},
-		{Name: MetricCensusTruncated, Kind: Gauge, Signal: "queue_depth", Counts: CountsState, Path: PathSnapshot, Labels: []Label{source}, Description: "1 when the census hit its read bound; counts are lower bounds"},
+		{Name: MetricCensusTruncated, Kind: Gauge, Signal: "queue_depth", Counts: CountsState, Path: PathSnapshot, Labels: []Label{label(AttrSource, nil, 2*MaxNamed, "a work source or a timer source")}, Description: "1 when the census hit its read bound; counts are lower bounds"},
+		{Name: MetricCensusTakeover, Kind: Gauge, Unit: "s", Signal: "queue_depth", Counts: CountsState, Path: PathSnapshot, Labels: []Label{source}, Description: "longest normal takeover or reclaim before the census reports lost ownership; the stall alert window must cover it"},
 		{Name: MetricTimersOverdue, Kind: Gauge, Unit: "{timer}", Signal: "timer_lag", Counts: CountsState, Path: PathSnapshot, Labels: []Label{source}, Description: "timers past their due time and not yet fired"},
 		{Name: MetricTimerLag, Kind: Gauge, Unit: "s", Signal: "timer_lag", Counts: CountsState, Path: PathSnapshot, Labels: []Label{source}, Description: "how far past due the oldest unfired timer is"},
 		{Name: MetricWorkerReady, Kind: Gauge, Signal: "worker_availability", Counts: CountsState, Path: PathSnapshot, Labels: []Label{worker}, Description: "1 when the worker runtime is negotiated and accepting calls"},
@@ -177,11 +182,13 @@ func Catalogue() []Metric {
 		{Name: MetricStorageUsed, Kind: Gauge, Unit: "By", Signal: "storage_growth", Counts: CountsState, Path: PathSnapshot, Labels: []Label{store}, Description: "bytes used by the durable store"},
 		{Name: MetricStorageBudget, Kind: Gauge, Unit: "By", Signal: "storage_growth", Counts: CountsState, Path: PathSnapshot, Labels: []Label{store}, Description: "operator-declared storage budget; absent when none was declared"},
 		{Name: MetricSampleFailures, Kind: Counter, Unit: "{sample}", Signal: "exporter_loss", Counts: CountsTelemetry, Path: PathSnapshot, Description: "operational source samples that failed, timed out or were invalid"},
-		{Name: MetricRuns, Kind: Counter, Unit: "{run}", Signal: "errors", Counts: CountsCompletion, Path: PathEvents, Labels: []Label{workflow, label(AttrOutcome, RunOutcomes, 0, "uncertain is never folded into failed"), tenant}, Description: "workflow runs by outcome"},
+		{Name: MetricSourceUp, Kind: Gauge, Signal: "freshness", Counts: CountsTelemetry, Path: PathSnapshot, Labels: []Label{label(AttrSource, nil, MaxSources, "operational source name"), label(AttrPages, []string{"true", "false"}, 0, "false only for informational sources")}, Description: "1 when the source answered this sample; every source is always reported"},
+		{Name: MetricSourceAge, Kind: Gauge, Unit: "s", Signal: "freshness", Counts: CountsTelemetry, Path: PathSnapshot, Labels: []Label{label(AttrSource, nil, MaxSources, "operational source name"), label(AttrPages, []string{"true", "false"}, 0, "")}, Description: "seconds since the source last answered; 0 while it answers"},
+		{Name: MetricRuns, Kind: Counter, Unit: "{run}", Signal: "errors", Counts: CountsCompletion, Path: PathEvents, Labels: []Label{workflow, label(AttrOutcome, RunOutcomes, 0, "uncertain is never folded into failed; every outcome is created at zero on a workflow and tenant's first run"), tenant}, Description: "workflow runs by outcome"},
 		{Name: MetricRunDuration, Kind: Histogram, Unit: "s", Signal: "latency", Counts: CountsCompletion, Path: PathEvents, Labels: []Label{workflow, label(AttrOutcome, RunOutcomes, 0, ""), tenant}, Description: "observed run duration"},
 		{Name: MetricSteps, Kind: Counter, Unit: "{step}", Signal: "errors", Counts: CountsSteps, Path: PathEvents, Labels: []Label{workflow, step, label(AttrOutcome, StepOutcomes, 0, "uncertain is never folded into failed"), errorClass}, Description: "step attempts by outcome"},
 		{Name: MetricStepDuration, Kind: Histogram, Unit: "s", Signal: "latency", Counts: CountsSteps, Path: PathEvents, Labels: []Label{workflow, step, label(AttrOutcome, StepOutcomes, 0, "")}, Description: "observed step attempt duration"},
-		{Name: MetricExternalCalls, Kind: Counter, Unit: "{call}", Signal: "uncertainty", Counts: CountsExternal, Path: PathEvents, Labels: []Label{workflow, step, label(AttrOutcome, StepOutcomes, 0, "uncertain: the effect may have happened"), errorClass}, Description: "attempts of steps whose node declares effects"},
+		{Name: MetricExternalCalls, Kind: Counter, Unit: "{call}", Signal: "uncertainty", Counts: CountsExternal, Path: PathEvents, Labels: []Label{workflow, step, label(AttrOutcome, StepOutcomes, 0, "uncertain: the effect may have happened; every outcome is created at zero on the step's first call")}, Description: "attempts of steps whose node declares effects (error classes are on blok.steps)"},
 		{Name: MetricExternalDuration, Kind: Histogram, Unit: "s", Signal: "latency", Counts: CountsExternal, Path: PathEvents, Labels: []Label{workflow, step, label(AttrOutcome, StepOutcomes, 0, "")}, Description: "external call duration"},
 		{Name: MetricTelemetryDropped, Kind: Counter, Unit: "{event}", Signal: "exporter_loss", Counts: CountsTelemetry, Path: PathEvents, Labels: []Label{label(AttrDropReason, DropReasons, 0, "")}, Description: "telemetry the exporter discarded, by reason"},
 	}

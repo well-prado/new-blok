@@ -41,6 +41,15 @@ type DeploymentChecks struct {
 // inside it have their own one-second bound.
 const operationalSampleTimeout = 2 * time.Second
 
+// readinessBudget bounds the deployment's own source. A readiness check that
+// ignores its context cannot outlast it: the source then reports not ready,
+// every dependency not ready, instead of letting blok_ready vanish from the
+// scrape (ADR 0022).
+const readinessBudget = 1500 * time.Millisecond
+
+// OperationalSourceName names the deployment's own operational source.
+const OperationalSourceName = "deployment"
+
 type Deployment struct {
 	application *app.Application
 	config      deployment.Config
@@ -49,6 +58,7 @@ type Deployment struct {
 	handler     http.Handler
 	rejected    atomic.Uint64
 	accepted    atomic.Uint64
+	statusBusy  atomic.Bool
 	// rejectedBy counts rejections by reason: capacity, draining, not_ready.
 	rejectedBy  [3]atomic.Uint64
 	sampler     *slo.Sampler
@@ -138,33 +148,64 @@ func NewDeployment(a *app.Application, c deployment.Config, checks DeploymentChe
 // configured, and cumulative accepted and rejected requests by reason. Pass
 // it to observe/otel to export the same state over OTLP.
 func (d *Deployment) Operational() slo.Source {
-	return func(ctx context.Context) (slo.Snapshot, error) {
-		s := d.status(ctx)
-		missing := map[string]bool{}
-		secrets := true
-		for _, name := range s.Missing {
-			if strings.HasPrefix(name, "secret:") {
-				secrets = false
-				continue
-			}
-			missing[name] = true
+	return slo.Source{Name: OperationalSourceName, Read: d.operational}
+}
+
+func (d *Deployment) operational(ctx context.Context) (slo.Snapshot, error) {
+	s, ok := d.boundedStatus(ctx)
+	if !ok {
+		// A check outlived the budget (or is still running from the last
+		// scrape): report explicitly not ready, every dependency not ready,
+		// rather than let blok_ready vanish.
+		active, draining := d.limiter.Snapshot()
+		s = deployment.Status{Ready: false, Health: true, Active: active, Draining: draining, Missing: []string{"artifact", "store", "worker", "secret:"}}
+	}
+	missing := map[string]bool{}
+	secrets := true
+	for _, name := range s.Missing {
+		if strings.HasPrefix(name, "secret:") {
+			secrets = false
+			continue
 		}
-		dependencies := []slo.Dependency{{Name: "artifact", Ready: !missing["artifact"]}}
-		if d.config.StoreRequired {
-			dependencies = append(dependencies, slo.Dependency{Name: "store", Ready: !missing["store"]})
-		}
-		if d.config.WorkerRequired {
-			dependencies = append(dependencies, slo.Dependency{Name: "worker", Ready: !missing["worker"]})
-		}
-		if len(d.config.RequiredSecrets) > 0 {
-			dependencies = append(dependencies, slo.Dependency{Name: "secrets", Ready: secrets})
-		}
-		return slo.Snapshot{
-			Readiness: &slo.Readiness{Ready: s.Ready, Draining: s.Draining, Dependencies: dependencies},
-			Admission: &slo.Admission{Active: s.Active, Capacity: d.config.MaxAdmission, Accepted: d.accepted.Load(), Rejected: map[slo.RejectReason]uint64{
-				slo.RejectCapacity: d.rejectedBy[rejectCapacity].Load(), slo.RejectDraining: d.rejectedBy[rejectDraining].Load(), slo.RejectNotReady: d.rejectedBy[rejectNotReady].Load(),
-			}},
-		}, nil
+		missing[name] = true
+	}
+	dependencies := []slo.Dependency{{Name: "artifact", Ready: !missing["artifact"]}}
+	if d.config.StoreRequired {
+		dependencies = append(dependencies, slo.Dependency{Name: "store", Ready: !missing["store"]})
+	}
+	if d.config.WorkerRequired {
+		dependencies = append(dependencies, slo.Dependency{Name: "worker", Ready: !missing["worker"]})
+	}
+	if len(d.config.RequiredSecrets) > 0 {
+		dependencies = append(dependencies, slo.Dependency{Name: "secrets", Ready: secrets})
+	}
+	return slo.Snapshot{
+		Readiness: &slo.Readiness{Ready: s.Ready, Draining: s.Draining, Dependencies: dependencies},
+		Admission: &slo.Admission{Active: s.Active, Capacity: d.config.MaxAdmission, Accepted: d.accepted.Load(), Rejected: map[slo.RejectReason]uint64{
+			slo.RejectCapacity: d.rejectedBy[rejectCapacity].Load(), slo.RejectDraining: d.rejectedBy[rejectDraining].Load(), slo.RejectNotReady: d.rejectedBy[rejectNotReady].Load(),
+		}},
+	}, nil
+}
+
+// boundedStatus runs the readiness checks for at most readinessBudget. At
+// most one such evaluation runs at a time, so a check that ignores its
+// context costs one goroutine, not one per scrape.
+func (d *Deployment) boundedStatus(ctx context.Context) (deployment.Status, bool) {
+	if !d.statusBusy.CompareAndSwap(false, true) {
+		return deployment.Status{}, false
+	}
+	ctx, cancel := context.WithTimeout(ctx, readinessBudget)
+	defer cancel()
+	result := make(chan deployment.Status, 1)
+	go func() {
+		defer d.statusBusy.Store(false)
+		result <- d.status(ctx)
+	}()
+	select {
+	case s := <-result:
+		return s, true
+	case <-ctx.Done():
+		return deployment.Status{}, false
 	}
 }
 

@@ -196,6 +196,9 @@ func (s *Store) Evaluate(file RuleFile, start, end time.Time, step time.Duration
 		lastSeen time.Time
 	}
 	alerts := map[string]map[string]*active{}
+	// recorded holds each recording rule's series from its last evaluation,
+	// so a series the rule stops producing is marked stale, as in Prometheus.
+	recorded := map[string]map[string]Labels{}
 	for t := start; !t.After(end); t = t.Add(step) {
 		for _, group := range file.Groups {
 			for _, rule := range group.Rules {
@@ -207,6 +210,7 @@ func (s *Store) Evaluate(file RuleFile, start, end time.Time, step time.Duration
 					vector = Vector{{Labels: Labels{}, V: scalar}}
 				}
 				if rule.Record != "" {
+					written := map[string]Labels{}
 					for _, sample := range vector {
 						if math.IsNaN(sample.V) {
 							continue
@@ -219,7 +223,16 @@ func (s *Store) Evaluate(file RuleFile, start, end time.Time, step time.Duration
 						if err := s.Add(labels, t, sample.V); err != nil {
 							return Evaluation{}, fmt.Errorf("record %s: %w", rule.Record, err)
 						}
+						written[labels.key()] = labels
 					}
+					for key, labels := range recorded[rule.Record] {
+						if _, ok := written[key]; !ok {
+							if err := s.AddStale(labels, t); err != nil {
+								return Evaluation{}, fmt.Errorf("record %s: %w", rule.Record, err)
+							}
+						}
+					}
+					recorded[rule.Record] = written
 					continue
 				}
 				instances := alerts[rule.Alert]
@@ -372,28 +385,52 @@ func parseValue(text string) (float64, error) {
 	return strconv.ParseFloat(text, 64)
 }
 
-// Scrape is one recorded exposition at a time.
+// Scrape is one recorded exposition at a time. Down records a failed
+// scrape: the target answered nothing.
 type Scrape struct {
 	At      time.Time
 	Target  Labels
 	Samples []ExpositionSample
+	Down    bool
 }
 
-// Load adds scrapes in time order, adding each scrape's target labels (job,
-// instance) to its samples as a Prometheus scrape would.
+// Load adds scrapes in time order the way a Prometheus scrape loop does:
+// each scrape's target labels (job, instance) are added to its samples, up is
+// 1 for a successful scrape and 0 for a failed one, and every series of the
+// target's previous scrape that is missing from this one (all of them, for a
+// failed scrape) gets a staleness marker at this scrape's time.
 func (s *Store) Load(scrapes []Scrape) error {
 	sort.SliceStable(scrapes, func(i, j int) bool { return scrapes[i].At.Before(scrapes[j].At) })
+	previous := map[string]map[string]Labels{}
 	for _, scrape := range scrapes {
-		for _, sample := range scrape.Samples {
-			labels := sample.Labels.clone()
-			for k, v := range scrape.Target {
-				if _, ok := labels[k]; !ok {
-					labels[k] = v
+		target := scrape.Target.key()
+		current := map[string]Labels{}
+		if !scrape.Down {
+			for _, sample := range scrape.Samples {
+				labels := sample.Labels.clone()
+				for k, v := range scrape.Target {
+					if _, ok := labels[k]; !ok {
+						labels[k] = v
+					}
+				}
+				if err := s.Add(labels, scrape.At, sample.Value); err != nil {
+					return err
+				}
+				current[labels.key()] = labels
+			}
+		}
+		for key, labels := range previous[target] {
+			if _, ok := current[key]; !ok {
+				if err := s.AddStale(labels, scrape.At); err != nil {
+					return err
 				}
 			}
-			if err := s.Add(labels, scrape.At, sample.Value); err != nil {
-				return err
-			}
+		}
+		previous[target] = current
+		up := scrape.Target.clone()
+		up["__name__"] = "up"
+		if err := s.Add(up, scrape.At, boolFloat(!scrape.Down)); err != nil {
+			return err
 		}
 	}
 	return nil

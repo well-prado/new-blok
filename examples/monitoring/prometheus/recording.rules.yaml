@@ -27,8 +27,15 @@ groups:
         expr: |
           sum by (job, blok_workflow) (rate(blok_runs_total{blok_outcome="failed"}[5m]))
             / sum by (job, blok_workflow) (rate(blok_runs_total{blok_outcome!="suspended"}[5m]))
+      # A counter series born at its first increment has no increase(), so
+      # each uncertainty count has a second rule for a series that did not
+      # exist 15 minutes ago (the exporter creates outcome series at zero on
+      # a workflow's first run, but a fresh process's first run can still be
+      # uncertain before that zero is ever exported).
       - record: blok:runs_uncertain:increase15m
         expr: sum by (job, blok_workflow) (increase(blok_runs_total{blok_outcome="uncertain"}[15m]))
+      - record: blok:runs_uncertain:new15m
+        expr: sum by (job, blok_workflow) (blok_runs_total{blok_outcome="uncertain"} > 0 unless blok_runs_total{blok_outcome="uncertain"} offset 15m)
       - record: blok:run_duration_seconds:p99_5m
         expr: histogram_quantile(0.99, sum by (job, blok_workflow, le) (rate(blok_run_duration_seconds_bucket[5m])))
 
@@ -43,6 +50,8 @@ groups:
         expr: sum by (job, blok_workflow, blok_step, blok_outcome) (rate(blok_external_calls_total[5m]))
       - record: blok:external_calls_uncertain:increase15m
         expr: sum by (job, blok_workflow, blok_step) (increase(blok_external_calls_total{blok_outcome="uncertain"}[15m]))
+      - record: blok:external_calls_uncertain:new15m
+        expr: sum by (job, blok_workflow, blok_step) (blok_external_calls_total{blok_outcome="uncertain"} > 0 unless blok_external_calls_total{blok_outcome="uncertain"} offset 15m)
       - record: blok:external_call_duration_seconds:p99_5m
         expr: histogram_quantile(0.99, sum by (job, blok_workflow, blok_step, le) (rate(blok_external_call_duration_seconds_bucket[5m])))
 
@@ -63,6 +72,12 @@ groups:
         expr: max by (job, blok_worker) (blok_worker_in_flight) / max by (job, blok_worker) (blok_worker_capacity > 0)
       - record: blok:partitions_unowned:max
         expr: max by (job) (blok_partitions{blok_owned="false"})
+
+      # Freshness of the sources the paging alerts read.
+      - record: blok:source_age_seconds:max
+        expr: max by (job, instance, blok_source) (blok_source_age_seconds{blok_pages="true"})
+      - record: blok:census_takeover_seconds:max
+        expr: max by (job, blok_source) (blok_census_takeover_seconds)
 
       # Storage growth and the monitoring pipeline itself.
       - record: blok:storage_used_bytes:deriv1h

@@ -7,12 +7,18 @@
 // It implements a documented PromQL subset, and refuses everything else
 // rather than guess:
 //
-//   - instant and range selectors with =, !=, =~ and !~ matchers, a five
-//     minute lookback for instant selectors, and no offset or @;
+//   - instant and range selectors with =, !=, =~ and !~ matchers and an
+//     optional offset (no @); an instant selector takes a series' latest
+//     sample within five minutes unless that sample is a staleness marker,
+//     and range functions ignore staleness markers, as in Prometheus;
+//   - staleness: Store.Load writes a marker for every series that vanishes
+//     from its target's next scrape and for every series of a failed scrape,
+//     and records up=1 or up=0 per scrape; a recording rule's series that
+//     the rule stops producing are marked stale too;
 //   - rate, increase (Prometheus' extrapolated counter algorithm with reset
 //     handling), delta, deriv and predict_linear (least squares),
 //     max_over_time, min_over_time, histogram_quantile (linear interpolation
-//     within buckets), clamp_min, clamp_max and abs;
+//     within buckets), clamp_min, clamp_max, abs and absent;
 //   - sum, min, max, avg and count with by or without;
 //   - + - * / and comparisons (with bool) between scalars and vectors,
 //     one-to-one vector matching with on or ignoring, and the set operators
@@ -153,6 +159,7 @@ type selectorExpr struct {
 	name     string
 	matchers []matcher
 	window   time.Duration // zero for an instant selector
+	offset   time.Duration
 }
 
 type callExpr struct {
@@ -189,6 +196,9 @@ func (e selectorExpr) String() string {
 	if e.window > 0 {
 		s += "[" + e.window.String() + "]"
 	}
+	if e.offset > 0 {
+		s += " offset " + e.offset.String()
+	}
 	return s
 }
 func (e callExpr) String() string {
@@ -209,7 +219,7 @@ func (e binaryExpr) String() string { return fmt.Sprintf("(%s %s %s)", e.left, e
 func (e parenExpr) String() string  { return "(" + e.inner.String() + ")" }
 
 var (
-	functions  = map[string]int{"rate": 1, "increase": 1, "delta": 1, "deriv": 1, "predict_linear": 2, "max_over_time": 1, "min_over_time": 1, "histogram_quantile": 2, "clamp_min": 2, "clamp_max": 2, "abs": 1}
+	functions  = map[string]int{"rate": 1, "increase": 1, "delta": 1, "deriv": 1, "predict_linear": 2, "max_over_time": 1, "min_over_time": 1, "histogram_quantile": 2, "clamp_min": 2, "clamp_max": 2, "abs": 1, "absent": 1}
 	aggregates = map[string]bool{"sum": true, "min": true, "max": true, "avg": true, "count": true}
 )
 
@@ -477,8 +487,22 @@ func (p *parser) selector(name string) (Expr, error) {
 			return nil, err
 		}
 	}
-	if t := p.peek(); t.kind == tokIdent && (t.text == "offset" || t.text == "@") {
-		return nil, fmt.Errorf("offset is not supported")
+	if t := p.peek(); t.kind == tokIdent && t.text == "offset" {
+		p.next()
+		number, err := p.expect(tokNumber, "offset duration")
+		if err != nil {
+			return nil, err
+		}
+		unit, err := p.expect(tokIdent, "offset unit")
+		if err != nil {
+			return nil, err
+		}
+		if s.offset, err = ParseDuration(number.text + unit.text); err != nil {
+			return nil, err
+		}
+	}
+	if t := p.peek(); t.kind == tokOp && t.text == "@" || t.kind == tokIdent && t.text == "@" {
+		return nil, fmt.Errorf("@ is not supported")
 	}
 	return s, nil
 }

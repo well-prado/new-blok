@@ -557,6 +557,59 @@
           }
         }
       ]
+    },
+    {
+      "id": 17,
+      "title": "Operational source freshness (stale pages)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 56
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "blok:source_age_seconds:max",
+          "legendFormat": "age {{blok_source}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "max by (job, blok_source) (blok_source_up)",
+          "legendFormat": "up {{blok_source}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "max by (job, instance) (up{job=~\"blok.*\"})",
+          "legendFormat": "target {{instance}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "D",
+          "expr": "blok:census_takeover_seconds:max",
+          "legendFormat": "takeover {{blok_source}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
     }
   ]
 }

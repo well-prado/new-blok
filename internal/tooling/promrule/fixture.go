@@ -34,6 +34,19 @@ type Scenario struct {
 	Expect   []Expectation     `json:"expect"`
 	Fires    []string          `json:"fires"`
 	Silent   []string          `json:"silent"`
+	// MustPage requires some page-severity alert to fire, whatever its
+	// name: the scenario is one a person must be woken for.
+	MustPage bool `json:"mustPage,omitempty"`
+	// Down declares that the scrape after the fault fails.
+	Down bool `json:"down,omitempty"`
+	// Replay is "steady" (default: the measured interval repeats, counters
+	// keep growing at the measured rate) or "once" (the fault happened once:
+	// counters hold their after value).
+	Replay string `json:"replay,omitempty"`
+	// Advance lists gauges that measure elapsed time (a source's age, a
+	// backlog age, a timer's lag): during the fault they grow with the
+	// replay clock from their after value, as they would in reality.
+	Advance []string `json:"advance,omitempty"`
 }
 
 // Timeline is how a recording is replayed for rule evaluation.
@@ -70,10 +83,13 @@ func LoadScenarios(path string) (Scenarios, error) {
 	}
 	seen := map[string]bool{}
 	for _, sc := range s.Scenarios {
-		if sc.ID == "" || seen[sc.ID] || len(sc.Expect) == 0 {
+		if sc.ID == "" || seen[sc.ID] || len(sc.Expect) == 0 && !sc.Down {
 			return Scenarios{}, fmt.Errorf("scenario %q: missing or duplicate id, or no expectations", sc.ID)
 		}
 		seen[sc.ID] = true
+		if sc.Replay != "" && sc.Replay != "steady" && sc.Replay != "once" {
+			return Scenarios{}, fmt.Errorf("scenario %s: replay %q", sc.ID, sc.Replay)
+		}
 		for _, e := range sc.Expect {
 			set := 0
 			for _, p := range []*float64{e.Value, e.Delta, e.Min} {
@@ -127,6 +143,15 @@ func selectSum(samples []ExpositionSample, metric string, labels map[string]stri
 // a counter that was never incremented may not exist yet.
 func (sc Scenario) Check(before, after []ExpositionSample) error {
 	var errs []error
+	if sc.Down {
+		if len(after) != 0 {
+			return fmt.Errorf("%s: the scrape after the fault answered", sc.ID)
+		}
+		return nil
+	}
+	if len(sc.Expect) > 0 && len(after) == 0 {
+		return fmt.Errorf("%s: nothing after the fault", sc.ID)
+	}
 	for _, e := range sc.Expect {
 		if _, named := selectSum(after, e.Metric, nil); !named {
 			errs = append(errs, fmt.Errorf("%s: no %s series after the fault", sc.ID, e.Metric))
@@ -159,6 +184,9 @@ type Recording struct {
 	Source   string
 	Before   string
 	After    string
+	// AfterDown records that the scrape after the fault failed: the target
+	// answered nothing.
+	AfterDown bool
 }
 
 const recordingHeader = "# blok-fixture v1"
@@ -169,7 +197,11 @@ const recordingHeader = "# blok-fixture v1"
 func WriteRecording(path string, r Recording) error {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s\n# scenario: %s\n# source: %s\n# phase: before\n%s", recordingHeader, r.Scenario, r.Source, ensureNewline(r.Before))
-	fmt.Fprintf(&b, "# phase: after\n%s", ensureNewline(r.After))
+	if r.AfterDown {
+		fmt.Fprintf(&b, "# phase: after\n# scrape: down\n")
+	} else {
+		fmt.Fprintf(&b, "# phase: after\n%s", ensureNewline(r.After))
+	}
 	return os.WriteFile(path, []byte(b.String()), 0o644)
 }
 
@@ -208,6 +240,8 @@ func ReadRecording(path string) (Recording, error) {
 			r.Source = strings.TrimPrefix(line, "# source: ")
 		case strings.HasPrefix(line, "# phase: "):
 			phase = strings.TrimPrefix(line, "# phase: ")
+		case line == "# scrape: down" && phase == "after":
+			r.AfterDown = true
 		case phase == "before":
 			before.WriteString(line + "\n")
 		case phase == "after":
@@ -215,7 +249,7 @@ func ReadRecording(path string) (Recording, error) {
 		}
 	}
 	r.Before, r.After = before.String(), after.String()
-	if r.Scenario == "" || r.After == "" {
+	if r.Scenario == "" || r.After == "" && !r.AfterDown {
 		return Recording{}, fmt.Errorf("%s: incomplete fixture", path)
 	}
 	return r, scanner.Err()
@@ -242,12 +276,16 @@ func counterFamilies(text string) map[string]bool {
 	return out
 }
 
-// Replay turns a recording into scrapes: the "before" exposition held for
-// the baseline, then the measured interval replayed as a steady state for
-// the fault window. At the k-th fault scrape a cumulative series is
-// before + k*(after-before) (so its rate stays what was measured) and a gauge
-// is its after value. Series only present after the fault start from zero.
-func Replay(r Recording, target Labels, t Timeline, start time.Time) ([]Scrape, error) {
+// Replay turns a recording into scrapes the way a scrape loop would have
+// seen the fault: the "before" exposition held for the baseline, then the
+// fault window. A failed "after" scrape is replayed as failed scrapes. Under
+// the steady replay the k-th fault scrape of a cumulative series is
+// before + k*(after-before), so its rate stays what was measured; under the
+// once replay it holds its after value. A series absent before is born at
+// its after value; a series absent after ends at the first fault scrape
+// (Store.Load writes its staleness marker). Gauges hold their after value,
+// except the Advance gauges, which grow with the replay clock.
+func Replay(r Recording, scenario Scenario, target Labels, t Timeline, start time.Time) ([]Scrape, error) {
 	before, err := ParseText(strings.NewReader(r.Before))
 	if err != nil {
 		return nil, fmt.Errorf("before: %w", err)
@@ -258,6 +296,10 @@ func Replay(r Recording, target Labels, t Timeline, start time.Time) ([]Scrape, 
 	}
 	cumulative := counterFamilies(r.Before + "\n" + r.After)
 	isCounter := func(name string) bool { return cumulative[name] || strings.HasSuffix(name, "_total") }
+	advance := map[string]bool{}
+	for _, name := range scenario.Advance {
+		advance[name] = true
+	}
 	was := map[string]float64{}
 	for _, s := range before {
 		was[s.Labels.key()] = s.Value
@@ -270,12 +312,21 @@ func Replay(r Recording, target Labels, t Timeline, start time.Time) ([]Scrape, 
 		at = at.Add(step)
 	}
 	for k := 1; k <= t.FaultMinutes*60/t.ScrapeSeconds; k++ {
+		if r.AfterDown {
+			scrapes = append(scrapes, Scrape{At: at, Target: target, Down: true})
+			at = at.Add(step)
+			continue
+		}
 		samples := make([]ExpositionSample, 0, len(after))
 		for _, s := range after {
 			v := s.Value
-			if isCounter(s.Labels["__name__"]) && !math.IsInf(v, 0) && !math.IsNaN(v) {
+			name := s.Labels["__name__"]
+			switch {
+			case isCounter(name) && scenario.Replay != "once" && !math.IsInf(v, 0) && !math.IsNaN(v):
 				base := was[s.Labels.key()]
 				v = base + float64(k)*(s.Value-base)
+			case advance[name] && v > 0:
+				v += float64(k-1) * step.Seconds()
 			}
 			samples = append(samples, ExpositionSample{Labels: s.Labels, Value: v})
 		}

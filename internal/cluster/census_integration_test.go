@@ -29,7 +29,10 @@ func censusExposition(t *testing.T, ctx context.Context, runtime *Runtime, now t
 		t.Fatal(err)
 	}
 	var b bytes.Buffer
-	if err := slo.WriteText(&b, snapshot); err != nil {
+	// As a Sampler reports it: the census answered.
+	reported := snapshot
+	reported.Sources = []slo.SourceStatus{{Name: CensusName, Up: true, Pages: true}}
+	if err := slo.WriteText(&b, reported); err != nil {
 		t.Fatal(err)
 	}
 	return snapshot, b.String()
@@ -163,6 +166,9 @@ func TestCensusOwnerDeathWaitingAndTimerLag(t *testing.T) {
 	}()
 	<-blocked
 	snapshot, before := censusExposition(t, ctx, runtime, time.Now().UTC())
+	if w := snapshot.Work[0]; w.Takeover != 5*time.Second+acquireRetryInterval {
+		t.Fatalf("takeover window %v, want the owner TTL plus the acquire interval", w.Takeover)
+	}
 	if w := snapshot.Work[0]; w.Active != 1 || w.Waiting != 1 || w.Stalled != 0 || snapshot.Partitions.Owned != 8 {
 		t.Fatalf("live owners: %+v %+v", w, *snapshot.Partitions)
 	}

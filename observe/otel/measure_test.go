@@ -192,20 +192,20 @@ func measureSources() []slo.Source {
 		items[i] = slo.Observation{Claimed: i%3 == 0, OwnerLive: i%50 != 0, Waiting: i%7 == 0}
 	}
 	return []slo.Source{
-		func(context.Context) (slo.Snapshot, error) {
+		slo.Func("deployment", func(context.Context) (slo.Snapshot, error) {
 			return slo.Snapshot{
 				Readiness: &slo.Readiness{Ready: true, Dependencies: []slo.Dependency{{Name: "artifact", Ready: true}, {Name: "store", Ready: true}}},
 				Admission: &slo.Admission{Active: 1, Capacity: 32, Accepted: 10, Rejected: map[slo.RejectReason]uint64{slo.RejectCapacity: 1}},
 				Workers:   []slo.Worker{{Name: "node", Ready: true, InFlight: 1, Capacity: 64}},
 				Storage:   []slo.Storage{{Name: "journal", Used: 1 << 20, Budget: 1 << 30}},
 			}, nil
-		},
-		func(context.Context) (slo.Snapshot, error) {
+		}),
+		slo.Func("orders", func(context.Context) (slo.Snapshot, error) {
 			work := slo.Work{Source: "orders"}
 			for _, item := range items {
 				work.Add(slo.Classify(item))
 			}
 			return slo.Snapshot{Work: []slo.Work{work}, Timers: []slo.Timers{{Source: "orders"}}, Partitions: &slo.Partitions{Total: 8, Owned: 8}}, nil
-		},
+		}),
 	}
 }

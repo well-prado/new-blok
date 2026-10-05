@@ -11,13 +11,19 @@ blok_work_items{blok_source="orders",blok_liveness="uncertain"} 0
 blok_work_items{blok_source="orders",blok_liveness="stalled"} 0
 # HELP blok_work_oldest_pending_age_seconds age of the oldest pending item (backlog lag)
 # TYPE blok_work_oldest_pending_age_seconds gauge
-blok_work_oldest_pending_age_seconds{blok_source="orders"} 0.000297
+blok_work_oldest_pending_age_seconds{blok_source="orders"} 0.000469
 # HELP blok_work_dead_letters dead-lettered work retained for an operator
 # TYPE blok_work_dead_letters gauge
 blok_work_dead_letters{blok_source="orders"} 0
 # HELP blok_census_truncated 1 when the census hit its read bound; counts are lower bounds
 # TYPE blok_census_truncated gauge
 blok_census_truncated{blok_source="orders"} 0
+# HELP blok_source_up 1 when the source answered this sample; every source is always reported
+# TYPE blok_source_up gauge
+blok_source_up{blok_source="orders",blok_pages="true"} 1
+# HELP blok_source_age_seconds seconds since the source last answered; 0 while it answers
+# TYPE blok_source_age_seconds gauge
+blok_source_age_seconds{blok_source="orders",blok_pages="true"} 0
 # HELP blok_operational_sample_failures_total operational source samples that failed, timed out or were invalid
 # TYPE blok_operational_sample_failures_total counter
 blok_operational_sample_failures_total 0
@@ -38,6 +44,12 @@ blok_work_dead_letters{blok_source="orders"} 0
 # HELP blok_census_truncated 1 when the census hit its read bound; counts are lower bounds
 # TYPE blok_census_truncated gauge
 blok_census_truncated{blok_source="orders"} 0
+# HELP blok_source_up 1 when the source answered this sample; every source is always reported
+# TYPE blok_source_up gauge
+blok_source_up{blok_source="orders",blok_pages="true"} 1
+# HELP blok_source_age_seconds seconds since the source last answered; 0 while it answers
+# TYPE blok_source_age_seconds gauge
+blok_source_age_seconds{blok_source="orders",blok_pages="true"} 0
 # HELP blok_operational_sample_failures_total operational source samples that failed, timed out or were invalid
 # TYPE blok_operational_sample_failures_total counter
 blok_operational_sample_failures_total 0

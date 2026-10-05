@@ -138,5 +138,15 @@ func observeSnapshot(s slo.Snapshot, gauge, counter func(string, float64, ...att
 			gauge(slo.MetricStorageBudget, float64(st.Budget), store)
 		}
 	}
+	for _, w := range s.Work {
+		if w.Takeover > 0 {
+			gauge(slo.MetricCensusTakeover, w.Takeover.Seconds(), attribute.String(slo.AttrSource, w.Source))
+		}
+	}
+	for _, st := range s.Sources {
+		attrs := []attribute.KeyValue{attribute.String(slo.AttrSource, st.Name), attribute.Bool(slo.AttrPages, st.Pages)}
+		gauge(slo.MetricSourceUp, flag(st.Up), attrs...)
+		gauge(slo.MetricSourceAge, st.Age.Seconds(), attrs...)
+	}
 	counter(slo.MetricSampleFailures, float64(s.SampleFailures))
 }

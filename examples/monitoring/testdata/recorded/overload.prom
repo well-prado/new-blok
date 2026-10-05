@@ -28,6 +28,12 @@ blok_admission_requests_total{blok_result="rejected",blok_reason="not_ready"} 0
 blok_admission_requests_total{blok_result="rejected",blok_reason="unavailable"} 0
 blok_admission_requests_total{blok_result="rejected",blok_reason="invalid"} 0
 blok_admission_requests_total{blok_result="rejected",blok_reason="conflict"} 0
+# HELP blok_source_up 1 when the source answered this sample; every source is always reported
+# TYPE blok_source_up gauge
+blok_source_up{blok_source="deployment",blok_pages="true"} 1
+# HELP blok_source_age_seconds seconds since the source last answered; 0 while it answers
+# TYPE blok_source_age_seconds gauge
+blok_source_age_seconds{blok_source="deployment",blok_pages="true"} 0
 # HELP blok_operational_sample_failures_total operational source samples that failed, timed out or were invalid
 # TYPE blok_operational_sample_failures_total counter
 blok_operational_sample_failures_total 0
@@ -58,6 +64,12 @@ blok_admission_requests_total{blok_result="rejected",blok_reason="not_ready"} 0
 blok_admission_requests_total{blok_result="rejected",blok_reason="unavailable"} 0
 blok_admission_requests_total{blok_result="rejected",blok_reason="invalid"} 0
 blok_admission_requests_total{blok_result="rejected",blok_reason="conflict"} 0
+# HELP blok_source_up 1 when the source answered this sample; every source is always reported
+# TYPE blok_source_up gauge
+blok_source_up{blok_source="deployment",blok_pages="true"} 1
+# HELP blok_source_age_seconds seconds since the source last answered; 0 while it answers
+# TYPE blok_source_age_seconds gauge
+blok_source_age_seconds{blok_source="deployment",blok_pages="true"} 0
 # HELP blok_operational_sample_failures_total operational source samples that failed, timed out or were invalid
 # TYPE blok_operational_sample_failures_total counter
 blok_operational_sample_failures_total 0

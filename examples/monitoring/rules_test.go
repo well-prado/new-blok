@@ -64,6 +64,7 @@ func TestRulesReadOnlyCataloguedSeries(t *testing.T) {
 			case ok:
 				signals[m.Signal] = true
 			case recorded[name]:
+			case name == "up": // written by the scraper itself for every target
 			default:
 				t.Errorf("rule %s%s reads %s, which is neither catalogued nor recorded earlier", rule.Record, rule.Alert, name)
 			}
@@ -103,6 +104,16 @@ func TestAlertSemantics(t *testing.T) {
 	want := map[string]string{
 		"BlokRunsStalled": "page", "BlokPartitionUnowned": "page", "BlokWorkerUnavailable": "page", "BlokNotReady": "page", "BlokTimerLag": "page",
 		"BlokUncertainOutcomes": "ticket", "BlokTelemetryLoss": "ticket", "BlokOperationalSamplingFailing": "ticket", "BlokRunErrorRatioHigh": "warn",
+		"BlokOperationalSourceStale": "page", "BlokOperationalSourceVanished": "page", "BlokTargetDown": "page", "BlokTargetAbsent": "page", "BlokStallWindowTooShort": "ticket",
+	}
+	seen := map[string]bool{}
+	for _, rule := range file.Rules() {
+		seen[rule.Alert] = true
+	}
+	for name := range want {
+		if !seen[name] {
+			t.Errorf("alert %s is missing", name)
+		}
 	}
 	for _, rule := range file.Rules() {
 		if rule.Alert != "" {
@@ -158,7 +169,7 @@ func TestAlertsOnRecordedScenarios(t *testing.T) {
 			if err := scenario.Check(before, after); err != nil {
 				t.Fatalf("recording no longer matches its predeclared deltas: %v", err)
 			}
-			scrapes, err := promrule.Replay(recording, promrule.Labels(scenario.Target), timeline, start)
+			scrapes, err := promrule.Replay(recording, scenario, promrule.Labels(scenario.Target), timeline, start)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -187,13 +198,21 @@ func TestAlertsOnRecordedScenarios(t *testing.T) {
 					t.Errorf("%s fired but the scenario declares it silent", name)
 				}
 			}
+			paged := false
 			for name := range fired {
-				if severity[name] == "page" && !contains(scenario.Fires, name) {
-					t.Errorf("undeclared page %s", name)
+				if severity[name] == "page" {
+					paged = true
+					if !contains(scenario.Fires, name) {
+						t.Errorf("undeclared page %s", name)
+					}
 				}
 			}
+			if scenario.MustPage && !paged {
+				t.Errorf("no page fired; this scenario must wake someone")
+			}
 			for _, f := range result.Fired {
-				if !f.FiredAt.After(start.Add(time.Duration(timeline.BaselineMinutes) * time.Minute)) {
+				// The first fault scrape is at the end of the baseline.
+				if f.FiredAt.Before(start.Add(time.Duration(timeline.BaselineMinutes) * time.Minute)) {
 					t.Errorf("%s fired during the baseline, before the fault", f.Alert)
 				}
 			}
@@ -254,7 +273,7 @@ func TestDashboardQueriesAreCatalogued(t *testing.T) {
 			}
 			queries++
 			for _, name := range promrule.MetricNames(expr) {
-				if _, ok := catalogue[name]; !ok && !recorded[name] {
+				if _, ok := catalogue[name]; !ok && !recorded[name] && name != "up" {
 					t.Errorf("panel %q reads %s", panel.Title, name)
 				}
 			}
@@ -262,5 +281,173 @@ func TestDashboardQueriesAreCatalogued(t *testing.T) {
 	}
 	if queries < 10 {
 		t.Fatalf("dashboard has %d queries", queries)
+	}
+}
+
+func syntheticScrapes(start time.Time, target promrule.Labels, minutes int, at func(minute float64) []promrule.ExpositionSample) []promrule.Scrape {
+	var scrapes []promrule.Scrape
+	for i := 0; i <= minutes*4; i++ {
+		scrapes = append(scrapes, promrule.Scrape{At: start.Add(time.Duration(i) * 15 * time.Second), Target: target, Samples: at(float64(i) / 4)})
+	}
+	return scrapes
+}
+
+func series1(name string, value float64, labels ...string) promrule.ExpositionSample {
+	l := promrule.Labels{"__name__": name}
+	for i := 0; i+1 < len(labels); i += 2 {
+		l[labels[i]] = labels[i+1]
+	}
+	return promrule.ExpositionSample{Labels: l, Value: value}
+}
+
+// TestUncertainOutcomesEachClauseAlone: every input of BlokUncertainOutcomes
+// raises it on its own, so dropping any clause is caught: a run or an
+// external call that becomes uncertain on a series created at zero
+// (increase), one whose series is born at one (new series), and an uncertain
+// item in a census.
+func TestUncertainOutcomesEachClauseAlone(t *testing.T) {
+	file := loadRules(t)
+	start := time.Date(2026, 10, 5, 0, 0, 0, 0, time.UTC)
+	target := promrule.Labels{"job": "blok-app", "instance": "app-0"}
+	run := func(outcome string, v float64) promrule.ExpositionSample {
+		return series1("blok_runs_total", v, "blok_workflow", "shop/order", "blok_outcome", outcome)
+	}
+	call := func(outcome string, v float64) promrule.ExpositionSample {
+		return series1("blok_external_calls_total", v, "blok_workflow", "shop/order", "blok_step", "charge", "blok_outcome", outcome)
+	}
+	cases := map[string]func(m float64) []promrule.ExpositionSample{
+		"run on a zero series": func(m float64) []promrule.ExpositionSample {
+			return []promrule.ExpositionSample{run("completed", 10), run("uncertain", boolFloat(m >= 20))}
+		},
+		"run born at one": func(m float64) []promrule.ExpositionSample {
+			out := []promrule.ExpositionSample{run("completed", 10)}
+			if m >= 20 {
+				out = append(out, run("uncertain", 1))
+			}
+			return out
+		},
+		"external call on a zero series": func(m float64) []promrule.ExpositionSample {
+			return []promrule.ExpositionSample{call("completed", 10), call("uncertain", boolFloat(m >= 20))}
+		},
+		"external call born at one": func(m float64) []promrule.ExpositionSample {
+			out := []promrule.ExpositionSample{call("completed", 10)}
+			if m >= 20 {
+				out = append(out, call("uncertain", 1))
+			}
+			return out
+		},
+		"census": func(m float64) []promrule.ExpositionSample {
+			return []promrule.ExpositionSample{series1("blok_work_items", boolFloat(m >= 20), "blok_source", "journal", "blok_liveness", "uncertain")}
+		},
+	}
+	for name, at := range cases {
+		t.Run(name, func(t *testing.T) {
+			store := promrule.NewStore()
+			if err := store.Load(syntheticScrapes(start, target, 40, at)); err != nil {
+				t.Fatal(err)
+			}
+			result, err := store.Evaluate(file, start, start.Add(40*time.Minute), 30*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fired := result.FiredAlerts()
+			if !fired["BlokUncertainOutcomes"] {
+				t.Fatalf("one uncertain outcome (%s) was not ticketed", name)
+			}
+			if fired["BlokRunErrorRatioHigh"] || fired["BlokRunsStalled"] {
+				t.Fatalf("uncertain counted as an error or a stall: %v", fired)
+			}
+			for _, f := range result.Fired {
+				if f.Alert == "BlokUncertainOutcomes" && f.FiredAt.Before(start.Add(20*time.Minute)) {
+					t.Fatalf("fired before the outcome: %+v", f)
+				}
+			}
+		})
+	}
+}
+
+func boolFloat(b bool) float64 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// TestTargetAbsentPagesWhenNoBlokTargetExists: a Prometheus that scrapes no
+// blok target at all pages after five minutes; one that scrapes a healthy
+// target does not.
+func TestTargetAbsentPagesWhenNoBlokTargetExists(t *testing.T) {
+	file := loadRules(t)
+	start := time.Date(2026, 10, 5, 0, 0, 0, 0, time.UTC)
+	for _, c := range []struct {
+		job   string
+		pages bool
+	}{{"node-exporter", true}, {"blok-app", false}} {
+		store := promrule.NewStore()
+		if err := store.Load(syntheticScrapes(start, promrule.Labels{"job": c.job, "instance": "x"}, 20, func(float64) []promrule.ExpositionSample { return nil })); err != nil {
+			t.Fatal(err)
+		}
+		result, err := store.Evaluate(file, start, start.Add(20*time.Minute), 30*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.FiredAlerts()["BlokTargetAbsent"] != c.pages {
+			t.Fatalf("job %s: BlokTargetAbsent fired=%v, want %v", c.job, result.FiredAlerts()["BlokTargetAbsent"], c.pages)
+		}
+	}
+}
+
+// TestStallWindowTooShortTickets: a census whose normal takeover is longer
+// than the 2m stall window (a cluster with a long owner TTL) is ticketed so
+// the stall alerts' for can be raised; a short one is not.
+func TestStallWindowTooShortTickets(t *testing.T) {
+	file := loadRules(t)
+	start := time.Date(2026, 10, 5, 0, 0, 0, 0, time.UTC)
+	for _, c := range []struct {
+		takeover float64
+		tickets  bool
+	}{{300.25, true}, {5.25, false}} {
+		store := promrule.NewStore()
+		if err := store.Load(syntheticScrapes(start, promrule.Labels{"job": "blok-cluster", "instance": "r0"}, 10, func(float64) []promrule.ExpositionSample {
+			return []promrule.ExpositionSample{series1("blok_census_takeover_seconds", c.takeover, "blok_source", "cluster")}
+		})); err != nil {
+			t.Fatal(err)
+		}
+		result, err := store.Evaluate(file, start, start.Add(10*time.Minute), 30*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.FiredAlerts()["BlokStallWindowTooShort"] != c.tickets {
+			t.Fatalf("takeover %vs: ticket=%v, want %v", c.takeover, result.FiredAlerts()["BlokStallWindowTooShort"], c.tickets)
+		}
+	}
+}
+
+// TestNormalTakeoverDoesNotPage: a partition unowned for one minute while a
+// successor takes over, with its running run stalled meanwhile, is a normal
+// takeover inside the 2m stall window and pages nobody.
+func TestNormalTakeoverDoesNotPage(t *testing.T) {
+	file := loadRules(t)
+	start := time.Date(2026, 10, 5, 0, 0, 0, 0, time.UTC)
+	store := promrule.NewStore()
+	if err := store.Load(syntheticScrapes(start, promrule.Labels{"job": "blok-cluster", "instance": "r0"}, 30, func(m float64) []promrule.ExpositionSample {
+		lost := boolFloat(m >= 10 && m < 11)
+		return []promrule.ExpositionSample{
+			series1("blok_partitions", 8-lost, "blok_owned", "true"), series1("blok_partitions", lost, "blok_owned", "false"),
+			series1("blok_work_items", lost, "blok_source", "cluster", "blok_liveness", "stalled"),
+			series1("blok_source_up", 1, "blok_source", "cluster", "blok_pages", "true"), series1("blok_source_age_seconds", 0, "blok_source", "cluster", "blok_pages", "true"),
+		}
+	})); err != nil {
+		t.Fatal(err)
+	}
+	result, err := store.Evaluate(file, start, start.Add(30*time.Minute), 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fired := result.FiredAlerts(); len(fired) != 0 {
+		t.Fatalf("a one-minute takeover paged: %v", keys(fired))
+	}
+	if !result.Pending["BlokRunsStalled"] || !result.Pending["BlokPartitionUnowned"] {
+		t.Fatalf("the takeover was not even pending: %+v", result.Pending)
 	}
 }
