@@ -4,12 +4,15 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 
 	"github.com/well-prado/new-blok/internal/generate"
@@ -47,13 +50,16 @@ func writeHelp(out io.Writer) error {
 
 func runNew(args []string, out io.Writer, in io.Reader) error {
 	if hasHelp(args) {
-		_, err := fmt.Fprintln(out, "Usage: blok new [options] <directory>\n\nOptions:\n  --module PATH       Go module path (default: example.com/<name>)\n  --name NAME         executable name\n  --runtime go        native runtime\n  --layout classic|unified\n  --trigger http      selected trigger\n  --interactive       prompt for choices\n  --non-interactive   fail instead of prompting")
+		_, err := fmt.Fprintln(out, "Usage: blok new [options] <directory>\n\nOptions:\n  --module PATH       Go module path (default: example.com/<name>)\n  --name NAME         executable name\n  --runtime go        native runtime\n  --layout classic|unified\n  --trigger http      selected trigger\n  --framework V|DIR   framework version, or a local checkout to use through replace\n                      (default: the version this blok was built from)\n  --skip-tidy         do not run go mod tidy in the new application\n  --interactive       prompt for choices\n  --non-interactive   fail instead of prompting")
 		return err
 	}
 	flags := flag.NewFlagSet("new", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	module, name, runtime, layout, trigger := "", "", "go", "classic", "http"
-	interactive, nonInteractive := false, false
+	interactive, nonInteractive, skipTidy := false, false, false
+	framework := ""
+	flags.StringVar(&framework, "framework", "", "framework version or local checkout")
+	flags.BoolVar(&skipTidy, "skip-tidy", false, "do not run go mod tidy")
 	flags.StringVar(&module, "module", "", "Go module path")
 	flags.StringVar(&name, "name", "", "application executable name")
 	flags.StringVar(&runtime, "runtime", "go", "native runtime")
@@ -61,7 +67,7 @@ func runNew(args []string, out io.Writer, in io.Reader) error {
 	flags.StringVar(&trigger, "trigger", "http", "comma-separated selected triggers")
 	flags.BoolVar(&interactive, "interactive", false, "ask for missing project choices")
 	flags.BoolVar(&nonInteractive, "non-interactive", false, "fail instead of prompting")
-	if err := flags.Parse(reorderFlags(args, map[string]bool{"module": true, "name": true, "runtime": true, "layout": true, "trigger": true, "interactive": false, "non-interactive": false})); err != nil {
+	if err := flags.Parse(reorderFlags(args, map[string]bool{"module": true, "name": true, "runtime": true, "layout": true, "trigger": true, "framework": true, "skip-tidy": false, "interactive": false, "non-interactive": false})); err != nil {
 		return fmt.Errorf("new: %w", err)
 	}
 	positionals := flags.Args()
@@ -76,30 +82,37 @@ func runNew(args []string, out io.Writer, in io.Reader) error {
 		interactive = true
 	}
 	if interactive {
+		// One reader for the whole session: a reader per prompt would read
+		// ahead piped answers and discard them with itself.
+		reader := bufio.NewReader(in)
 		var err error
-		if directory, err = prompt(in, out, "Target directory", directory); err != nil {
+		if directory, err = prompt(reader, out, "Target directory", directory); err != nil {
 			return err
 		}
-		if module, err = prompt(in, out, "Module path", module); err != nil {
+		if module, err = prompt(reader, out, "Module path", module); err != nil {
 			return err
 		}
-		if name, err = prompt(in, out, "Executable name", name); err != nil {
+		if name, err = prompt(reader, out, "Executable name", name); err != nil {
 			return err
 		}
-		if runtime, err = prompt(in, out, "Runtime [go]", runtime); err != nil {
+		if runtime, err = prompt(reader, out, "Runtime", runtime); err != nil {
 			return err
 		}
-		if layout, err = prompt(in, out, "Layout [classic]", layout); err != nil {
+		if layout, err = prompt(reader, out, "Layout (classic or unified)", layout); err != nil {
 			return err
 		}
-		if trigger, err = prompt(in, out, "Triggers [http]", trigger); err != nil {
+		if trigger, err = prompt(reader, out, "Triggers", trigger); err != nil {
 			return err
 		}
 	}
 	if directory == "" {
 		return fmt.Errorf("new: target directory is required (pass a path or use --interactive)")
 	}
-	paths, err := scaffold.Create(scaffold.Options{Directory: directory, Module: module, Name: name, Runtime: runtime, Layout: layout, Triggers: splitChoices(trigger)})
+	selected, err := frameworkFor(framework)
+	if err != nil {
+		return err
+	}
+	paths, err := scaffold.Create(scaffold.Options{Directory: directory, Module: module, Name: name, Runtime: runtime, Layout: layout, Triggers: splitChoices(trigger), Framework: selected})
 	if err != nil {
 		return err
 	}
@@ -108,14 +121,52 @@ func runNew(args []string, out io.Writer, in io.Reader) error {
 			return err
 		}
 	}
+	if skipTidy {
+		_, err := fmt.Fprintln(out, "skipped go mod tidy; run it in "+filepath.ToSlash(directory)+" before building")
+		return err
+	}
+	if _, err := fmt.Fprintln(out, "running go mod tidy in "+filepath.ToSlash(directory)); err != nil {
+		return err
+	}
+	tidy := exec.Command("go", "mod", "tidy")
+	tidy.Dir = directory
+	if output, err := tidy.CombinedOutput(); err != nil {
+		return fmt.Errorf("new: go mod tidy failed in %s (the files were created; fix the cause and rerun it): %v\n%s", directory, err, bytes.TrimSpace(output))
+	}
 	return nil
 }
 
-func prompt(in io.Reader, out io.Writer, label, current string) (string, error) {
+// buildVersion is this binary's module version, stamped by the go command.
+var buildVersion = func() string {
+	if info, ok := debug.ReadBuildInfo(); ok {
+		return info.Main.Version
+	}
+	return ""
+}
+
+// frameworkFor resolves --framework: a local framework checkout (used
+// through a replace directive) or a module version. Without it the starter
+// depends on the version this blok was built from, which only works when
+// that build came from a published module version.
+func frameworkFor(value string) (scaffold.Framework, error) {
+	if value != "" {
+		if info, err := os.Stat(value); err == nil && info.IsDir() {
+			return scaffold.Framework{Dir: value}, nil
+		}
+		return scaffold.Framework{Version: value}, nil
+	}
+	version := buildVersion()
+	if version == "" || version == "(devel)" || strings.Contains(version, "+dirty") {
+		return scaffold.Framework{}, fmt.Errorf("new: this blok was built from a local or modified checkout (version %q), so the starter cannot depend on it from the module proxy; pass --framework with a framework version or the path of a framework checkout", version)
+	}
+	return scaffold.Framework{Version: version}, nil
+}
+
+func prompt(in *bufio.Reader, out io.Writer, label, current string) (string, error) {
 	if _, err := fmt.Fprintf(out, "%s%s: ", label, valueSuffix(current)); err != nil {
 		return "", err
 	}
-	line, err := bufio.NewReader(in).ReadString('\n')
+	line, err := in.ReadString('\n')
 	if errors.Is(err, io.EOF) && strings.TrimSpace(line) == "" {
 		return "", scaffold.ErrCancelled
 	}
@@ -166,7 +217,7 @@ func runGenerate(args []string, out io.Writer) error {
 		return fmt.Errorf("generate: expected input and optional output")
 	}
 	if input == "" {
-		input = "internal/app/types.go"
+		input = defaultTypes()
 	}
 	source, err := os.ReadFile(input)
 	if err != nil {
@@ -198,6 +249,20 @@ func runGenerate(args []string, out io.Writer) error {
 	}
 	_, err = fmt.Fprintln(out, "generated "+filepath.ToSlash(output))
 	return err
+}
+
+// defaultTypes is the types file the application's blok.json names, so a
+// bare blok generate run in the application regenerates its bindings.
+func defaultTypes() string {
+	raw, err := os.ReadFile("blok.json")
+	if err != nil {
+		return "internal/app/types.go"
+	}
+	var manifest scaffold.Manifest
+	if json.Unmarshal(raw, &manifest) != nil || manifest.Types == "" {
+		return "internal/app/types.go"
+	}
+	return filepath.FromSlash(manifest.Types)
 }
 
 func writeAtomic(path string, data []byte) error {
