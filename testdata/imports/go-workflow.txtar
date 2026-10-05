@@ -1,0 +1,35 @@
+A node reaches a workflow package through a shared helper. Workflows
+import every node they compose, so a node reaching one would reach them
+all; the walk stops at the workflow and fails the node.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":"","workflows":["flows"]}
+-- go.mod --
+module example.com/shop
+-- flows/checkout/checkout.go --
+package checkout
+
+import (
+	"github.com/well-prado/new-blok/flow"
+
+	"example.com/shop/nodes/go/a"
+)
+
+var _ = a.Node
+
+var Workflow = flow.MustDefine(flow.Spec{Name: "shop/checkout", Version: "1.0.0"}, nil)
+-- internal/start/start.go --
+package start
+
+import _ "example.com/shop/flows/checkout"
+-- nodes/go/a/a.go --
+package a
+
+import (
+	"github.com/well-prado/new-blok/node"
+
+	_ "example.com/shop/internal/start"
+)
+
+var Node = node.MustDefine("shop/a", "1.0.0", nil)
+-- @expect --
+{"nodes":[["nodes/go/a","violation"]],"diagnostics":[["ownership_node_imports_workflow","nodes/go/a/a.go:6"]]}

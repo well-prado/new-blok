@@ -1,0 +1,46 @@
+Import cycles are reported, whether among shared packages a node reaches
+or inside one node. Node c reaches neither cycle and stays verified.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+-- internal/p/p.go --
+package p
+
+import _ "example.com/shop/internal/q"
+-- internal/q/q.go --
+package q
+
+import _ "example.com/shop/internal/p"
+-- nodes/go/a/a.go --
+package a
+
+import (
+	"github.com/well-prado/new-blok/node"
+
+	_ "example.com/shop/internal/p"
+)
+
+var Node = node.MustDefine("shop/a", "1.0.0", nil)
+-- nodes/go/b/b.go --
+package b
+
+import (
+	"github.com/well-prado/new-blok/node"
+
+	_ "example.com/shop/nodes/go/b/inner"
+)
+
+var Node = node.MustDefine("shop/b", "1.0.0", nil)
+-- nodes/go/b/inner/inner.go --
+package inner
+
+import _ "example.com/shop/nodes/go/b"
+-- nodes/go/c/c.go --
+package c
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/c", "1.0.0", nil)
+-- @expect --
+{"nodes":[["nodes/go/a","violation"],["nodes/go/b","violation"],["nodes/go/c","verified"]],"diagnostics":[["ownership_import_cycle","internal/p"],["ownership_import_cycle","nodes/go/b"]]}

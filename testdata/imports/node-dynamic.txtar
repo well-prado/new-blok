@@ -1,0 +1,41 @@
+Computed and evaluating forms never receive verified status: import of a
+variable, require of an expression, a template with a substitution, eval,
+createRequire, the vm module and require passed as a value. Each is a
+stable diagnostic at its line.
+Node e's static dynamic import of its own file stays verified.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+-- nodes/nodejs/a/node.json --
+{"name":"shop/a","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/a/index.ts --
+export async function load(name: string) {
+  return import(name);
+}
+-- nodes/nodejs/b/node.json --
+{"name":"shop/b","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/b/index.cjs --
+const which = process.env.WHICH;
+module.exports = require("../" + which);
+-- nodes/nodejs/c/node.json --
+{"name":"shop/c","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/c/index.mjs --
+const target = "b";
+export const c = await import(`../${target}/index.cjs`);
+eval("1");
+-- nodes/nodejs/d/node.json --
+{"name":"shop/d","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/d/index.mjs --
+import { createRequire } from "node:module";
+import vm from "vm";
+const require = createRequire(import.meta.url);
+export const d = [require, vm];
+-- nodes/nodejs/e/node.json --
+{"name":"shop/e","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/e/index.ts --
+export const e = () => import("./own.js");
+-- nodes/nodejs/e/own.ts --
+export const own = 1;
+-- @expect --
+{"nodes":[["nodes/nodejs/a","unverified"],["nodes/nodejs/b","unverified"],["nodes/nodejs/c","unverified"],["nodes/nodejs/d","unverified"],["nodes/nodejs/e","verified"]],"diagnostics":[["ownership_dynamic_import","nodes/nodejs/a/index.ts:2"],["ownership_dynamic_import","nodes/nodejs/b/index.cjs:2"],["ownership_dynamic_import","nodes/nodejs/c/index.mjs:2"],["ownership_unsupported_form","nodes/nodejs/c/index.mjs:3"],["ownership_unsupported_form","nodes/nodejs/d/index.mjs:1"],["ownership_unsupported_form","nodes/nodejs/d/index.mjs:2"],["ownership_unsupported_form","nodes/nodejs/d/index.mjs:3"],["ownership_unsupported_form","nodes/nodejs/d/index.mjs:4"]]}

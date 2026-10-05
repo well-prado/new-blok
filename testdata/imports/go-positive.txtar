@@ -1,0 +1,83 @@
+Go nodes that stay independent: a node imports its own nested package, a
+shared domain package (which itself imports a shared helper), the standard
+library and another module. A workflow and the composition root import
+both nodes, which is how nodes are composed. Test files may import
+anything; they are not part of a node.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+
+go 1.27.0
+-- internal/money/money.go --
+package money
+
+import "example.com/shop/internal/round"
+
+func Cents(units, price int64) int64 { return round.Even(units * price) }
+-- internal/round/round.go --
+package round
+
+func Even(v int64) int64 { return v }
+-- nodes/go/quote/quote.go --
+package quote
+
+import (
+	"context"
+	"strings"
+
+	"github.com/well-prado/new-blok/node"
+
+	"example.com/shop/internal/money"
+	"example.com/shop/nodes/go/quote/rates"
+)
+
+// init would panic if the check ever executed source.
+func init() { panic("ownership executed source") }
+
+var Node = node.MustDefine("shop/quote", "1.0.0", func(ctx context.Context, in string) (int64, error) {
+	return money.Cents(int64(len(strings.TrimSpace(in))), rates.Coffee), nil
+})
+-- nodes/go/quote/rates/rates.go --
+package rates
+
+const Coffee = 1500
+-- nodes/go/quote/quote_test.go --
+package quote
+
+import _ "example.com/shop/nodes/go/receipt"
+-- nodes/go/receipt/receipt.go --
+package receipt
+
+import (
+	"github.com/well-prado/new-blok/node"
+
+	"example.com/shop/internal/money"
+)
+
+var _ = money.Cents
+
+var Node = node.MustDefine("shop/receipt", "1.0.0", nil)
+-- workflows/checkout/checkout.go --
+package checkout
+
+import (
+	"github.com/well-prado/new-blok/flow"
+
+	"example.com/shop/nodes/go/quote"
+	"example.com/shop/nodes/go/receipt"
+)
+
+var _, _ = quote.Node, receipt.Node
+
+var Workflow = flow.MustDefine(flow.Spec{Name: "shop/checkout", Version: "1.0.0"}, nil)
+-- internal/app/app.go --
+package app
+
+import (
+	_ "example.com/shop/nodes/go/quote"
+	_ "example.com/shop/nodes/go/receipt"
+	_ "example.com/shop/workflows/checkout"
+)
+-- @expect --
+{"nodes":[["nodes/go/quote","verified"],["nodes/go/receipt","verified"]],"diagnostics":[],"units":{"nodes/go/quote":4,"nodes/go/receipt":3}}

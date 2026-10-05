@@ -1,0 +1,40 @@
+Package evasion: node b is also a package. Node a imports it by its
+package name (its exports select the file; every condition counts, so the
+runtime and declaration targets are both checked). Node c declares it as
+a file: dependency under another name and imports an exported pattern
+subpath. Node d maps a package.json imports specifier to the package.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+-- nodes/nodejs/a/node.json --
+{"name":"shop/a","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/a/index.ts --
+import { b } from "@shop/b";
+export const a = b;
+-- nodes/nodejs/b/node.json --
+{"name":"shop/b","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/b/package.json --
+{"name":"@shop/b","exports":{".":{"types":"./types.d.ts","import":"./index.js"},"./tools/*":"./tools/*.js"}}
+-- nodes/nodejs/b/index.js --
+export const b = 1;
+-- nodes/nodejs/b/types.d.ts --
+export declare const b: number;
+-- nodes/nodejs/b/tools/fmt.js --
+export const fmt = String;
+-- nodes/nodejs/c/node.json --
+{"name":"shop/c","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/c/package.json --
+{"name":"@shop/c","dependencies":{"billing":"file:../b"}}
+-- nodes/nodejs/c/index.ts --
+import { fmt } from "billing/tools/fmt";
+export const c = fmt;
+-- nodes/nodejs/d/node.json --
+{"name":"shop/d","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/d/package.json --
+{"name":"@shop/d","imports":{"#billing":"billing"},"dependencies":{"billing":"file:../b"}}
+-- nodes/nodejs/d/index.ts --
+import { b } from "#billing";
+export const d = b;
+-- @expect --
+{"nodes":[["nodes/nodejs/a","violation"],["nodes/nodejs/b","verified"],["nodes/nodejs/c","violation"],["nodes/nodejs/d","violation"]],"diagnostics":[["ownership_node_imports_node","nodes/nodejs/a/index.ts:1"],["ownership_node_imports_node","nodes/nodejs/c/index.ts:1"],["ownership_node_imports_node","nodes/nodejs/d/index.ts:1"]]}

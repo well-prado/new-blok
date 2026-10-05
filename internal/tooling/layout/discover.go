@@ -711,21 +711,20 @@ func (d *discoverer) read(rel string, listed fs.FileInfo) ([]byte, bool) {
 		d.c.add(CodeFileUnsupported, rel, "regular file", listed.Mode().String(), "discovery reads only regular files")
 		return nil, false
 	}
-	file, err := d.root.OpenFile(filepath.FromSlash(rel), openFlags, 0)
-	if err != nil {
+	file, info, err := OpenRegular(d.root, rel)
+	var hardLink *HardLinkError
+	switch {
+	case errors.As(err, &hardLink):
+		d.c.add(CodeFileUnsupported, rel, "one link", strconv.FormatUint(hardLink.Links, 10)+" links", "a hard-linked file may be a second name for a file outside the project")
+		return nil, false
+	case errors.Is(err, ErrNotRegular):
+		d.c.add(CodeFileUnsupported, rel, "regular file", "changed during discovery", "the file is no longer a regular file")
+		return nil, false
+	case err != nil:
 		d.c.add(CodeFileUnsupported, rel, "", "", "file cannot be opened")
 		return nil, false
 	}
 	defer file.Close()
-	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() {
-		d.c.add(CodeFileUnsupported, rel, "regular file", "changed during discovery", "the file is no longer a regular file")
-		return nil, false
-	}
-	if links, known := linkCount(file); known && links > 1 {
-		d.c.add(CodeFileUnsupported, rel, "one link", strconv.FormatUint(links, 10)+" links", "a hard-linked file may be a second name for a file outside the project")
-		return nil, false
-	}
 	size := info.Size()
 	switch {
 	case size > MaxFileBytes:
@@ -772,13 +771,57 @@ func (d *discoverer) symlink(rel string) {
 // cycle exhausts it.
 const maxLinkHops = 40
 
-// classifyLink resolves the link at rel one path element at a time, the way
-// the kernel does, using only the os.Root's Lstat and Readlink on
-// symlink-free prefixes. A ".." above the root, or an absolute target
-// outside it, is an escape decided lexically: nothing outside the root is
-// ever stat-ed or read, so classification cannot reveal whether an outside
-// path exists.
+// classifyLink classifies the link at rel; see ClassifyLink.
 func (d *discoverer) classifyLink(rel string) string {
+	code, _ := ClassifyLink(d.root, d.abs, rel)
+	return code
+}
+
+// ErrNotRegular reports a path that is not, or is no longer, a regular file
+// once opened.
+var ErrNotRegular = errors.New("layout: not a regular file")
+
+// HardLinkError reports a regular file with more than one hard link: its
+// other name may be outside the project.
+type HardLinkError struct{ Links uint64 }
+
+func (e *HardLinkError) Error() string {
+	return fmt.Sprintf("layout: file has %d hard links", e.Links)
+}
+
+// OpenRegular opens rel through root the way discovery reads every file:
+// read-only and, on Unix, non-blocking, so a FIFO or device swapped in for a
+// listed regular file returns at once; the type is checked again on the open
+// handle (ErrNotRegular), and a hard-linked file is refused
+// (*HardLinkError). Other tools that read project source (the ownership
+// check, ADR 0025) use it so every reader follows ADR 0023's file rules.
+func OpenRegular(root *os.Root, rel string) (*os.File, fs.FileInfo, error) {
+	file, err := root.OpenFile(filepath.FromSlash(rel), openFlags, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		file.Close()
+		return nil, nil, ErrNotRegular
+	}
+	if links, known := linkCount(file); known && links > 1 {
+		file.Close()
+		return nil, nil, &HardLinkError{Links: links}
+	}
+	return file, info, nil
+}
+
+// ClassifyLink resolves the link at the project-relative, slash-separated
+// path rel one path element at a time, the way the kernel does, using only
+// root's Lstat and Readlink on symlink-free prefixes. A ".." above the root,
+// or an absolute target outside absRoot (the root's absolute,
+// symlink-resolved path), is an escape decided lexically: nothing outside
+// the root is ever stat-ed or read, so classification cannot reveal whether
+// an outside path exists. It returns the layout_symlink_* code and, for
+// CodeSymlinkAlias, the symlink-free project-relative path the link
+// resolves to; the link itself is never followed for reading.
+func ClassifyLink(root *os.Root, absRoot, rel string) (code, target string) {
 	pending := strings.Split(rel, "/")
 	var resolved []string // symlink-free elements below the root
 	for hops := 0; len(pending) > 0; {
@@ -789,35 +832,35 @@ func (d *discoverer) classifyLink(rel string) string {
 			continue
 		case "..":
 			if len(resolved) == 0 {
-				return CodeSymlinkEscape
+				return CodeSymlinkEscape, ""
 			}
 			resolved = resolved[:len(resolved)-1]
 			continue
 		}
 		candidate := path.Join(append(append([]string(nil), resolved...), element)...)
-		info, err := d.root.Lstat(filepath.FromSlash(candidate))
+		info, err := root.Lstat(filepath.FromSlash(candidate))
 		if err != nil {
-			return CodeSymlinkDangling
+			return CodeSymlinkDangling, ""
 		}
 		if info.Mode()&fs.ModeSymlink == 0 {
 			resolved = append(resolved, element)
 			continue
 		}
 		if hops++; hops > maxLinkHops {
-			return CodeSymlinkLoop
+			return CodeSymlinkLoop, ""
 		}
-		target, err := d.root.Readlink(filepath.FromSlash(candidate))
+		linkTarget, err := root.Readlink(filepath.FromSlash(candidate))
 		if err != nil {
-			return CodeSymlinkDangling
+			return CodeSymlinkDangling, ""
 		}
-		if filepath.IsAbs(target) || filepath.VolumeName(target) != "" {
-			inside, err := filepath.Rel(d.abs, filepath.Clean(target))
-			if err != nil || d.abs == "" {
-				return CodeSymlinkEscape
+		if filepath.IsAbs(linkTarget) || filepath.VolumeName(linkTarget) != "" {
+			inside, err := filepath.Rel(absRoot, filepath.Clean(linkTarget))
+			if err != nil || absRoot == "" {
+				return CodeSymlinkEscape, ""
 			}
-			resolved, target = nil, inside
+			resolved, linkTarget = nil, inside
 		}
-		pending = append(strings.Split(filepath.ToSlash(target), "/"), pending...)
+		pending = append(strings.Split(filepath.ToSlash(linkTarget), "/"), pending...)
 	}
-	return CodeSymlinkAlias
+	return CodeSymlinkAlias, path.Join(resolved...)
 }

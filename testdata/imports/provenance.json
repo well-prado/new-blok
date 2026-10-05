@@ -1,0 +1,133 @@
+{
+  "source": "synthetic import-graph fixtures authored for E12-T02 (#68); no application, customer or private data",
+  "license": "Apache-2.0",
+  "privateData": false,
+  "expected": {
+    "go-case": {
+      "runtime": "go",
+      "outputRecords": 2,
+      "errorRecords": 3,
+      "effectRecords": 0
+    },
+    "go-cycle": {
+      "runtime": "go",
+      "outputRecords": 3,
+      "errorRecords": 2,
+      "effectRecords": 0
+    },
+    "go-direct": {
+      "runtime": "go",
+      "outputRecords": 0,
+      "errorRecords": 1,
+      "effectRecords": 0
+    },
+    "go-generated": {
+      "runtime": "go",
+      "outputRecords": 3,
+      "errorRecords": 2,
+      "effectRecords": 0
+    },
+    "go-positive": {
+      "runtime": "go",
+      "outputRecords": 2,
+      "errorRecords": 0,
+      "effectRecords": 0
+    },
+    "go-replace-alias": {
+      "runtime": "go",
+      "outputRecords": 2,
+      "errorRecords": 1,
+      "effectRecords": 0
+    },
+    "go-symlink": {
+      "runtime": "go",
+      "outputRecords": 3,
+      "errorRecords": 3,
+      "effectRecords": 0
+    },
+    "go-transitive": {
+      "runtime": "go",
+      "outputRecords": 2,
+      "errorRecords": 1,
+      "effectRecords": 0
+    },
+    "go-unverified": {
+      "runtime": "go",
+      "outputRecords": 4,
+      "errorRecords": 4,
+      "effectRecords": 0
+    },
+    "go-workflow": {
+      "runtime": "go",
+      "outputRecords": 1,
+      "errorRecords": 1,
+      "effectRecords": 0
+    },
+    "node-alias": {
+      "runtime": "nodejs",
+      "outputRecords": 4,
+      "errorRecords": 3,
+      "effectRecords": 0
+    },
+    "node-case": {
+      "runtime": "nodejs",
+      "outputRecords": 3,
+      "errorRecords": 3,
+      "effectRecords": 0
+    },
+    "node-dynamic": {
+      "runtime": "nodejs",
+      "outputRecords": 5,
+      "errorRecords": 8,
+      "effectRecords": 0
+    },
+    "node-generated": {
+      "runtime": "nodejs",
+      "outputRecords": 3,
+      "errorRecords": 2,
+      "effectRecords": 0
+    },
+    "node-package": {
+      "runtime": "nodejs",
+      "outputRecords": 4,
+      "errorRecords": 3,
+      "effectRecords": 0
+    },
+    "node-positive": {
+      "runtime": "nodejs",
+      "outputRecords": 2,
+      "errorRecords": 0,
+      "effectRecords": 0
+    },
+    "node-relative": {
+      "runtime": "nodejs",
+      "outputRecords": 3,
+      "errorRecords": 2,
+      "effectRecords": 0
+    },
+    "node-symlink": {
+      "runtime": "nodejs",
+      "outputRecords": 4,
+      "errorRecords": 5,
+      "effectRecords": 0
+    },
+    "node-transitive": {
+      "runtime": "nodejs",
+      "outputRecords": 2,
+      "errorRecords": 1,
+      "effectRecords": 0
+    },
+    "node-unresolved": {
+      "runtime": "nodejs",
+      "outputRecords": 2,
+      "errorRecords": 5,
+      "effectRecords": 0
+    },
+    "node-workflow-unsupported": {
+      "runtime": "nodejs",
+      "outputRecords": 3,
+      "errorRecords": 3,
+      "effectRecords": 0
+    }
+  }
+}
