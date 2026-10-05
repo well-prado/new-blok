@@ -309,7 +309,9 @@ is never parsed before verification.
   on both. macOS `fsync` does not flush the drive cache; on a host where it
   does, the second commit costs one more durable flush per job.
 - Recovery after a crash waits for the lease: up to 30 s, where it was
-  immediate. The lease is not configurable and is not renewed; a handler
+  immediate. The parity mid-execution kill sample
+  (`testdata/parity/raw/mid-execution-kill.json`) went from 11 ms to
+  30.04 s kill-to-completion, recovering as attempt 2. The lease is not configurable and is not renewed; a handler
   holds the write lock, so no other worker can claim its job while it
   runs, however long the handler takes.
 - An attempt counts from its start, so a crash charges every job whose
