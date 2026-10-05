@@ -7,18 +7,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"regexp"
 	"strings"
 	"sync"
 
 	"github.com/well-prado/new-blok/contract/inspection"
+	"github.com/well-prado/new-blok/contract/observe"
 )
 
 var ErrNotFound = errors.New("inspection: run not found")
 
 const maxCursorEncodedBytes = 1024
-
-var sensitiveLogText = regexp.MustCompile(`(?i)(\b(password|passwd|secret|token|authorization|credential|api[_-]?key|private[_-]?key)\b\s*[:=]\s*\S+|\bbearer\s+\S+|\bAKIA[0-9A-Z]{16}\b|\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b)`)
 
 type runRecord struct {
 	owner     string
@@ -237,12 +235,7 @@ func boundedText(value string, max int) string {
 	return value
 }
 
-func redactLogMessage(message string) string {
-	if sensitiveLogText.MatchString(message) {
-		return "[redacted: sensitive-looking log message]"
-	}
-	return message
-}
+func redactLogMessage(message string) string { return observe.RedactLogMessage(message) }
 
 func safeLabel(value string, max int) string {
 	if value == "" {

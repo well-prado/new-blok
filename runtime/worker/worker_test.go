@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/well-prado/new-blok/contract/observe"
+	contract "github.com/well-prado/new-blok/contract/runtime"
 	"github.com/well-prado/new-blok/contract/schema"
 	"strings"
 	"testing"
@@ -50,5 +52,35 @@ func TestNativeJSONConvertsInt64InsideNestedUnion(t *testing.T) {
 		if string(raw) != `{"amount":`+value+`}` {
 			t.Fatalf("lost exact integer: %s", raw)
 		}
+	}
+}
+
+func TestTracePropagationNeverChangesWhetherACallFits(t *testing.T) {
+	parent, err := observe.ParseTraceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent.State = "vendor=" + strings.Repeat("v", 200)
+	base := contract.Call{CallID: "call", AttemptID: "attempt", Node: "fixture/echo", NodeVersion: "1.0.0", Generation: 1, Input: []byte(`{}`)}
+
+	untraced := base
+	propagateTrace(context.Background(), &untraced, contract.MaxFrameBytes)
+	if untraced.Traceparent != "" || untraced.Tracestate != "" {
+		t.Fatalf("a call without a trace context gained one: %+v", untraced)
+	}
+
+	traced := base
+	propagateTrace(observe.WithTrace(context.Background(), parent), &traced, contract.MaxFrameBytes)
+	if traced.Traceparent != parent.Traceparent() || traced.Tracestate != parent.State {
+		t.Fatalf("trace context not propagated: %+v", traced)
+	}
+
+	// A call that fits only without the trace context keeps fitting: the
+	// optional context is omitted rather than the call refused.
+	edge := base
+	limit := contract.EncodedCallBytes(edge)
+	propagateTrace(observe.WithTrace(context.Background(), parent), &edge, limit)
+	if edge.Traceparent != "" || edge.Tracestate != "" || contract.EncodedCallBytes(edge) > limit {
+		t.Fatalf("trace context pushed an admissible call over the frame bound: %+v", edge)
 	}
 }

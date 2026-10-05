@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/well-prado/new-blok/contract/observe"
 	contract "github.com/well-prado/new-blok/contract/runtime"
 	"github.com/well-prado/new-blok/contract/schema"
 	"github.com/well-prado/new-blok/contract/tool"
@@ -126,7 +127,9 @@ func DefineScoped[I, O any](supervisor *Supervisor, descriptor node.Descriptor, 
 		if !ok {
 			deadline = time.Now().Add(30 * time.Second)
 		}
-		result, err := supervisor.Call(ctx, contract.Call{CallID: id.CallID, AttemptID: id.AttemptID, IdempotencyKey: id.OperationKey, Generation: ready.Generation, Node: descriptor.Name, NodeVersion: descriptor.Version, Deadline: deadline, Input: payload, Capabilities: capabilities, OnLog: func(entry contract.Log) { emitWorkerLog(ctx, entry) }})
+		call := contract.Call{CallID: id.CallID, AttemptID: id.AttemptID, IdempotencyKey: id.OperationKey, Generation: ready.Generation, Node: descriptor.Name, NodeVersion: descriptor.Version, Deadline: deadline, Input: payload, Capabilities: capabilities, OnLog: func(entry contract.Log) { emitWorkerLog(ctx, entry) }}
+		propagateTrace(ctx, &call, ready.Limits.MaxFrameBytes)
+		result, err := supervisor.Call(ctx, call)
 		if err != nil {
 			if len(descriptor.Effects) > 0 {
 				return zero, transportFailure(ctx, err)
@@ -157,6 +160,23 @@ func DefineScoped[I, O any](supervisor *Supervisor, descriptor node.Descriptor, 
 		}
 		return output, nil
 	}, opts...)
+}
+
+// propagateTrace hands the dispatching step's trace context to the worker
+// (ADR 0020). Trace context is optional correlation: when adding it would push
+// an otherwise admissible call over the negotiated frame ceiling it is
+// omitted, so tracing never changes whether a call is dispatched.
+func propagateTrace(ctx context.Context, call *contract.Call, maxFrameBytes int) {
+	trace, ok := observe.TraceFrom(ctx)
+	if !ok {
+		return
+	}
+	traced := *call
+	traced.Traceparent, traced.Tracestate = trace.Traceparent(), trace.State
+	if contract.EncodedCallBytes(traced) > maxFrameBytes && contract.EncodedCallBytes(*call) <= maxFrameBytes {
+		return
+	}
+	call.Traceparent, call.Tracestate = traced.Traceparent, traced.Tracestate
 }
 
 func emitWorkerLog(ctx context.Context, entry contract.Log) {

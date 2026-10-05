@@ -43,12 +43,14 @@ func TestNoStreamOrUIDependencyEntersTheEngine(t *testing.T) {
 		t.Fatal("inspect does not reach observe/event; the check is not seeing the stream")
 	}
 	forbidden := func(path string) bool {
-		if path == module+"/observe/event" || path == module+"/inspect" || strings.HasPrefix(path, "net/http") {
+		// observe/* holds observation adapters (this hub, exporters); the
+		// engine reaches only the narrow contract/observe port (ADR 0020).
+		if path == module+"/observe" || strings.HasPrefix(path, module+"/observe/") || path == module+"/inspect" || strings.HasPrefix(path, "net/http") {
 			return true
 		}
 		for _, part := range strings.Split(strings.TrimPrefix(path, module+"/"), "/") {
 			switch part {
-			case "ui", "frontend", "studio", "trigger", "observe":
+			case "ui", "frontend", "studio", "trigger":
 				return true
 			}
 		}

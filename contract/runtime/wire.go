@@ -40,7 +40,7 @@ func callWire(c Call, copyPayload bool) *wire.Call {
 	if copyPayload {
 		input = append([]byte(nil), input...)
 	}
-	out := &wire.Call{CallId: c.CallID, AttemptId: c.AttemptID, Generation: c.Generation, Node: c.Node, NodeVersion: c.NodeVersion, IdempotencyKey: c.IdempotencyKey, DeadlineUnixNanos: c.Deadline.UnixNano(), Input: input, Principal: c.Principal, Capabilities: caps}
+	out := &wire.Call{CallId: c.CallID, AttemptId: c.AttemptID, Generation: c.Generation, Node: c.Node, NodeVersion: c.NodeVersion, IdempotencyKey: c.IdempotencyKey, DeadlineUnixNanos: c.Deadline.UnixNano(), Input: input, Principal: c.Principal, Capabilities: caps, Traceparent: c.Traceparent, Tracestate: c.Tracestate}
 	for _, b := range c.Blobs {
 		out.Blobs = append(out.Blobs, &wire.BlobRef{Digest: b.Digest, Size: uint64(b.Size)})
 	}
@@ -59,7 +59,7 @@ func CallFromWire(c *wire.Call) Call {
 	if c == nil {
 		return Call{}
 	}
-	out := Call{CallID: c.CallId, AttemptID: c.AttemptId, Generation: c.Generation, Node: c.Node, NodeVersion: c.NodeVersion, IdempotencyKey: c.IdempotencyKey, Deadline: time.Unix(0, c.DeadlineUnixNanos), Input: append([]byte(nil), c.Input...), Principal: c.Principal}
+	out := Call{CallID: c.CallId, AttemptID: c.AttemptId, Generation: c.Generation, Node: c.Node, NodeVersion: c.NodeVersion, IdempotencyKey: c.IdempotencyKey, Deadline: time.Unix(0, c.DeadlineUnixNanos), Input: append([]byte(nil), c.Input...), Principal: c.Principal, Traceparent: c.Traceparent, Tracestate: c.Tracestate}
 	for _, v := range c.Capabilities {
 		out.Capabilities = append(out.Capabilities, Capability(v))
 	}

@@ -351,8 +351,14 @@ type Call struct {
 	Blobs             []*BlobRef             `protobuf:"bytes,9,rep,name=blobs,proto3" json:"blobs,omitempty"`
 	Principal         string                 `protobuf:"bytes,10,opt,name=principal,proto3" json:"principal,omitempty"`
 	Capabilities      []string               `protobuf:"bytes,11,rep,name=capabilities,proto3" json:"capabilities,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// Optional W3C trace context of the step attempt that dispatched this call
+	// (ADR 0020). Correlation only: it never changes the call's outcome, a
+	// worker that ignores it is conformant, and tracestate is at most 256
+	// bytes. Additive within protocol 1.1: proto3 peers ignore unknown fields.
+	Traceparent   string `protobuf:"bytes,12,opt,name=traceparent,proto3" json:"traceparent,omitempty"`
+	Tracestate    string `protobuf:"bytes,13,opt,name=tracestate,proto3" json:"tracestate,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Call) Reset() {
@@ -460,6 +466,20 @@ func (x *Call) GetCapabilities() []string {
 		return x.Capabilities
 	}
 	return nil
+}
+
+func (x *Call) GetTraceparent() string {
+	if x != nil {
+		return x.Traceparent
+	}
+	return ""
+}
+
+func (x *Call) GetTracestate() string {
+	if x != nil {
+		return x.Tracestate
+	}
+	return ""
 }
 
 type Cancel struct {
@@ -990,7 +1010,7 @@ const file_runtime_proto_rawDesc = "" +
 	"\bcontract\x18\x01 \x01(\v2\x16.blok.runtime.v1.HelloR\bcontract\"5\n" +
 	"\aBlobRef\x12\x16\n" +
 	"\x06digest\x18\x01 \x01(\tR\x06digest\x12\x12\n" +
-	"\x04size\x18\x02 \x01(\x04R\x04size\"\xf6\x02\n" +
+	"\x04size\x18\x02 \x01(\x04R\x04size\"\xb8\x03\n" +
 	"\x04Call\x12\x17\n" +
 	"\acall_id\x18\x01 \x01(\tR\x06callId\x12\x1d\n" +
 	"\n" +
@@ -1006,7 +1026,11 @@ const file_runtime_proto_rawDesc = "" +
 	"\x05blobs\x18\t \x03(\v2\x18.blok.runtime.v1.BlobRefR\x05blobs\x12\x1c\n" +
 	"\tprincipal\x18\n" +
 	" \x01(\tR\tprincipal\x12\"\n" +
-	"\fcapabilities\x18\v \x03(\tR\fcapabilities\"`\n" +
+	"\fcapabilities\x18\v \x03(\tR\fcapabilities\x12 \n" +
+	"\vtraceparent\x18\f \x01(\tR\vtraceparent\x12\x1e\n" +
+	"\n" +
+	"tracestate\x18\r \x01(\tR\n" +
+	"tracestate\"`\n" +
 	"\x06Cancel\x12\x17\n" +
 	"\acall_id\x18\x01 \x01(\tR\x06callId\x12\x1d\n" +
 	"\n" +

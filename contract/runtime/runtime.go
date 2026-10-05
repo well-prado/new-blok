@@ -16,6 +16,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/well-prado/new-blok/contract/observe"
 	"github.com/well-prado/new-blok/contract/schema"
 )
 
@@ -194,6 +195,11 @@ type Call struct {
 	Blobs          []BlobRef    `json:"blobs,omitempty"`
 	Principal      string       `json:"principal"`
 	Capabilities   []Capability `json:"capabilities,omitempty"`
+	// Traceparent and Tracestate optionally carry the dispatching step's W3C
+	// trace context (ADR 0020). Validate requires a canonical version-00
+	// traceparent and a bounded tracestate; neither can affect the outcome.
+	Traceparent string `json:"traceparent,omitempty"`
+	Tracestate  string `json:"tracestate,omitempty"`
 	// OnLog receives best-effort logs asynchronously on a bounded per-connection
 	// dispatcher. It must return promptly; blocking it drops later logs but
 	// cannot block result-frame processing or change call outcomes. A log may
@@ -231,6 +237,9 @@ func (c Call) Validate(limits Limits, generation uint64) error {
 	if !utf8.ValidString(c.IdempotencyKey) {
 		return fmt.Errorf("%w: invalid key encoding", ErrLimitExceeded)
 	}
+	if err := validateTrace(c.Traceparent, c.Tracestate); err != nil {
+		return err
+	}
 	if c.Principal != "" && !identityPattern.MatchString(c.Principal) {
 		return ErrCapabilityDenied
 	}
@@ -253,6 +262,23 @@ func (c Call) Validate(limits Limits, generation uint64) error {
 	}
 	if EncodedCallBytes(c) > limits.MaxFrameBytes {
 		return fmt.Errorf("%w: complete frame", ErrLimitExceeded)
+	}
+	return nil
+}
+
+// validateTrace accepts an absent trace context or a canonical version-00
+// traceparent (what TraceContext.Traceparent formats) with a bounded
+// printable tracestate. A tracestate without a traceparent is rejected.
+func validateTrace(traceparent, tracestate string) error {
+	if traceparent == "" {
+		if tracestate != "" {
+			return fmt.Errorf("%w: tracestate without traceparent", observe.ErrInvalidTraceContext)
+		}
+		return nil
+	}
+	parsed, err := observe.ParseTraceparent(traceparent)
+	if err != nil || parsed.Traceparent() != traceparent || !observe.ValidTracestate(tracestate) {
+		return fmt.Errorf("%w: call trace context", observe.ErrInvalidTraceContext)
 	}
 	return nil
 }
