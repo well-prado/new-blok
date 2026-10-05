@@ -20,6 +20,7 @@ import (
 	"github.com/well-prado/new-blok/contract/tool"
 	runtime "github.com/well-prado/new-blok/internal/runtime"
 	"github.com/well-prado/new-blok/node"
+	"github.com/well-prado/new-blok/observe/redact"
 )
 
 type Config = runtime.Config
@@ -215,10 +216,12 @@ func emitWorkerLog(ctx context.Context, entry contract.Log) {
 		}
 		value := attrs[key]
 		if sensitiveLogKey(key) {
-			value = "[redacted]"
+			value = redact.Marker
 		} else {
-			switch value.(type) {
-			case nil, bool, string, json.Number, float64:
+			switch typed := value.(type) {
+			case string:
+				value = redact.String(typed)
+			case nil, bool, json.Number, float64:
 			default:
 				continue
 			}
@@ -242,25 +245,11 @@ func validLogAttrKey(key string) bool {
 	return true
 }
 
-func sensitiveLogKey(key string) bool {
-	key = strings.ToLower(strings.NewReplacer("_", "", "-", "", ".", "").Replace(key))
-	for _, marker := range []string{"password", "passwd", "secret", "token", "authorization", "credential", "apikey", "privatekey"} {
-		if strings.Contains(key, marker) {
-			return true
-		}
-	}
-	return false
-}
+// sensitiveLogKey and safeLogMessage are the worker log enforcement points;
+// they use the framework's single redaction boundary (ADR 0021).
+func sensitiveLogKey(key string) bool { return redact.Key(key) }
 
-func safeLogMessage(message string) string {
-	lower := strings.ToLower(message)
-	for _, marker := range []string{"password=", "password:", "passwd=", "secret=", "secret:", "token=", "token:", "authorization=", "authorization:", "api_key=", "api-key=", "credential=", "private_key=", "private-key=", "bearer "} {
-		if strings.Contains(lower, marker) {
-			return "[redacted: sensitive-looking log message]"
-		}
-	}
-	return message
-}
+func safeLogMessage(message string) string { return redact.Message(message) }
 
 func transportFailure(ctx context.Context, err error) *node.DomainError {
 	failure := &node.DomainError{Class: "uncertain", Code: "worker_transport", Uncertain: true}

@@ -126,7 +126,7 @@ func newApprovalRig(t *testing.T) *approvalRig {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r.store, err = approval.NewJournalStore(ctx, db, approval.Config{Authorizer: reviewer(func(context.Context, approval.Proposal, []string) (string, error) {
+	r.store, err = approval.NewJournalStore(ctx, db, approval.Config{Audit: testAudit(t, db), Authorizer: reviewer(func(context.Context, approval.Proposal, []string) (string, error) {
 		return "reviewer:synthetic", nil
 	}), Clock: func() time.Time { return r.clock }, MaxDecisions: 16})
 	if err != nil {

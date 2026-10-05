@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/well-prado/new-blok/contract/audit"
 	"github.com/well-prado/new-blok/internal/migration"
 	"github.com/well-prado/new-blok/store"
 )
@@ -56,12 +57,26 @@ type Hooks struct {
 type Config struct {
 	Clock func() time.Time
 	Hooks Hooks
+	// Audit is the durable audit journal (ADR 0021). Reconcile and
+	// DecideUpgrade require it and refuse without it. It must write to the
+	// same database, so each decision and its record commit together.
+	Audit *audit.Journal
+	// Hold is the application's legal-hold policy for run data: Compact
+	// keeps a completed run for which it returns true.
+	Hold func(RetainedRun) bool
+}
+
+// RetainedRun identifies a completed run Compact is about to delete.
+type RetainedRun struct {
+	RunID, Workflow, Principal string
 }
 
 type Journal struct {
 	database store.Database
 	clock    func() time.Time
 	hooks    Hooks
+	audit    *audit.Journal
+	hold     func(RetainedRun) bool
 }
 
 type AdmissionRequest struct {
@@ -146,7 +161,10 @@ func New(ctx context.Context, database store.Database, config Config) (*Journal,
 	if err := database.Integrity(ctx); err != nil {
 		return nil, fmt.Errorf("journal: integrity check: %w", err)
 	}
-	j := &Journal{database: database, clock: config.Clock, hooks: config.Hooks}
+	if config.Audit != nil && !config.Audit.Shares(database) {
+		return nil, errors.New("journal: audit must write to the journal's database")
+	}
+	j := &Journal{database: database, clock: config.Clock, hooks: config.Hooks, audit: config.Audit, hold: config.Hold}
 	if j.clock == nil {
 		j.clock = time.Now
 	}

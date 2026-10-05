@@ -280,8 +280,15 @@ func ValidLabel(value string) bool {
 }
 
 // sensitiveLogText matches credential-shaped free text. It is the single
-// pattern shared by inspection projections and telemetry exporters.
-var sensitiveLogText = regexp.MustCompile(`(?i)(\b(password|passwd|secret|token|authorization|credential|api[_-]?key|private[_-]?key)\b\s*[:=]\s*\S+|\bbearer\s+\S+|\bAKIA[0-9A-Z]{16}\b|\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b)`)
+// pattern shared by inspection projections, worker logs and telemetry
+// exporters; observe/redact adds the structured and encoded layers on top of
+// it (ADR 0021). A sensitive key may carry a prefix or suffix
+// ("client_secret", "access_token") and may be quoted, as in JSON text.
+var sensitiveLogText = regexp.MustCompile(`(?i)([a-z0-9_.-]*(password|passwd|secret|token|authorization|credential|api[_-]?key|private[_-]?key)[a-z0-9_.-]*["']?\s*[:=]\s*\S+|\bbearer\s+\S+|\bAKIA[0-9A-Z]{16}\b|\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b|\b[a-z][a-z0-9+.-]*://[^/\s:@]+:[^/\s@]+@|-----BEGIN [A-Z ]*PRIVATE KEY-----)`)
+
+// SensitiveText reports whether text contains a credential-shaped fragment.
+// It inspects the text as written; observe/redact also inspects encoded forms.
+func SensitiveText(text string) bool { return sensitiveLogText.MatchString(text) }
 
 // RedactLogMessage replaces a log message that contains credential-shaped
 // text with a fixed marker. Pattern matching cannot find every secret in

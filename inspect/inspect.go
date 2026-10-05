@@ -7,11 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 
 	"github.com/well-prado/new-blok/contract/inspection"
-	"github.com/well-prado/new-blok/contract/observe"
+	"github.com/well-prado/new-blok/observe/redact"
 )
 
 var ErrNotFound = errors.New("inspection: run not found")
@@ -235,7 +234,20 @@ func boundedText(value string, max int) string {
 	return value
 }
 
-func redactLogMessage(message string) string { return observe.RedactLogMessage(message) }
+// redactLogMessage applies the shared credential pattern and its encoded
+// forms (ADR 0021) to a free-form message.
+func redactLogMessage(message string) string { return redact.Message(message) }
+
+// projectLabel is the error-label enforcement point for every projection,
+// including labels a durable source supplies: an unsafe or credential-shaped
+// label (an encoded one included) is never shown as written.
+func projectLabel(value string) string {
+	value = safeLabel(value, 64)
+	if value != "" && value != "untrusted_label" && redact.Sensitive(value) {
+		return "redacted_label"
+	}
+	return value
+}
 
 func safeLabel(value string, max int) string {
 	if value == "" {
@@ -354,6 +366,7 @@ func projectRun(value inspection.Run, policy inspection.Policy) inspection.Run {
 	if !policy.Fields[inspection.FieldError] {
 		value.ErrorCode, value.ErrorClass = "", ""
 	}
+	value.ErrorCode, value.ErrorClass = projectLabel(value.ErrorCode), projectLabel(value.ErrorClass)
 	value.Input = bound(value.Input, policy.MaxPayloadBytes)
 	value.Output = bound(value.Output, policy.MaxPayloadBytes)
 	return value
@@ -388,7 +401,7 @@ func projectStep(item inspection.Step, policy inspection.Policy) inspection.Step
 		out.Output = bound(item.Output, policy.MaxPayloadBytes)
 	}
 	if policy.Fields[inspection.FieldError] {
-		out.ErrorCode, out.ErrorClass = item.ErrorCode, item.ErrorClass
+		out.ErrorCode, out.ErrorClass = projectLabel(item.ErrorCode), projectLabel(item.ErrorClass)
 	}
 	out.Attempts = make([]inspection.Attempt, len(item.Attempts))
 	for i, attempt := range item.Attempts {
@@ -405,13 +418,15 @@ func projectStep(item inspection.Step, policy inspection.Policy) inspection.Step
 		}
 		if !policy.Fields[inspection.FieldError] {
 			out.Attempts[i].ErrorCode, out.Attempts[i].ErrorClass = "", ""
+		} else {
+			out.Attempts[i].ErrorCode, out.Attempts[i].ErrorClass = projectLabel(attempt.ErrorCode), projectLabel(attempt.ErrorClass)
 		}
 	}
 	if policy.Fields[inspection.FieldLogs] {
 		out.Logs = make([]inspection.Log, len(item.Logs))
 		for i, log := range item.Logs {
 			out.Logs[i] = log
-			out.Logs[i].Message = boundedText(log.Message, min(1024, policy.MaxPayloadBytes))
+			out.Logs[i].Message = redactLogMessage(boundedText(log.Message, min(1024, policy.MaxPayloadBytes)))
 			out.Logs[i].Attrs = bound(log.Attrs, policy.MaxPayloadBytes)
 		}
 	}
@@ -459,7 +474,7 @@ func bound(raw json.RawMessage, maxBytes int) json.RawMessage {
 	if err != nil {
 		return json.RawMessage(`"[redacted: invalid payload]"`)
 	}
-	value = redact(value)
+	value = redact.Value(value) // payload enforcement point (ADR 0021)
 	encoded, err := json.Marshal(value)
 	if err != nil {
 		return json.RawMessage(`"[redacted: unencodable payload]"`)
@@ -481,7 +496,7 @@ func sanitizeRaw(raw json.RawMessage) json.RawMessage {
 	if err != nil {
 		return json.RawMessage(`"[redacted: invalid payload]"`)
 	}
-	encoded, err := json.Marshal(redact(value))
+	encoded, err := json.Marshal(redact.Value(value))
 	if err != nil {
 		return json.RawMessage(`"[redacted: unencodable payload]"`)
 	}
@@ -496,39 +511,6 @@ func decode(raw []byte) (any, error) {
 		return nil, err
 	}
 	return value, nil
-}
-
-func redact(value any) any {
-	switch item := value.(type) {
-	case map[string]any:
-		out := make(map[string]any, len(item))
-		for key, child := range item {
-			if sensitive(key) {
-				out[key] = "[redacted]"
-			} else {
-				out[key] = redact(child)
-			}
-		}
-		return out
-	case []any:
-		out := make([]any, len(item))
-		for index, child := range item {
-			out[index] = redact(child)
-		}
-		return out
-	default:
-		return value
-	}
-}
-
-func sensitive(key string) bool {
-	key = strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(key, "_", ""), "-", ""))
-	for _, marker := range []string{"password", "secret", "token", "authorization", "credential", "apikey", "privatekey"} {
-		if strings.Contains(key, marker) {
-			return true
-		}
-	}
-	return false
 }
 
 type cursor struct {

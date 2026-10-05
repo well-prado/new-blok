@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Synthetic ADR 0021 inspection redaction fixtures run through the real Go engine and the SQLite journal source. Every SYNTHETIC string is secret-shaped and must never appear in any projection. The node logs a base64 credential in its message, a sensitive attribute and an encoded attribute value, returns an output holding encoded credentials, and on failure returns a label-shaped base64url credential as its error code and a credential in its Go error text.",
+  "secretMarker": "SYNTHETIC",
+  "errorCodeSecret": "c2VjcmV0PVNZTlRIRVRJQy1jb2Rl",
+  "cases": [
+    {
+      "name": "success-secret-inputs-outputs-logs",
+      "input": {
+        "sku": "coffee",
+        "password": "SYNTHETIC-input-0001",
+        "note": "Bearer SYNTHETIC-input-0002",
+        "payload": "{\"api_key\": \"SYNTHETIC-input-0003\"}",
+        "blob": "c2VjcmV0PVNZTlRIRVRJQy1pbnB1dC0wMDA0",
+        "query": "access_token%3DSYNTHETIC-input-0005",
+        "fail": false
+      },
+      "expected": {
+        "status": "completed",
+        "errorCode": "",
+        "effects": 1,
+        "steps": 2,
+        "logs": 1,
+        "redactedInputValues": 5,
+        "redactedOutputValues": 2,
+        "logMessageRedacted": true,
+        "redactedLogAttrs": 2
+      }
+    },
+    {
+      "name": "failure-encoded-error-code",
+      "input": {
+        "sku": "declined",
+        "password": "SYNTHETIC-input-0001",
+        "note": "Bearer SYNTHETIC-input-0002",
+        "payload": "{\"api_key\": \"SYNTHETIC-input-0003\"}",
+        "blob": "c2VjcmV0PVNZTlRIRVRJQy1pbnB1dC0wMDA0",
+        "query": "access_token%3DSYNTHETIC-input-0005",
+        "fail": true
+      },
+      "expected": {
+        "status": "failed",
+        "errorCode": "redacted_label",
+        "effects": 1,
+        "steps": 1,
+        "logs": 1,
+        "redactedInputValues": 5,
+        "redactedOutputValues": 0,
+        "logMessageRedacted": true,
+        "redactedLogAttrs": 2
+      }
+    }
+  ]
+}
