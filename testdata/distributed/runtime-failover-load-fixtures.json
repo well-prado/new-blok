@@ -1,0 +1,11 @@
+{
+  "tenants": 4,
+  "runsPerTenant": 2,
+  "expectedInitialAccepted": 8,
+  "expectedAccepted": 12,
+  "expectedUncertain": 1,
+  "expectedCompleted": 11,
+  "expectedExternalEffects": 12,
+  "expectedFirstRoundDistinctTenants": 4,
+  "expectedStaleResult": "ownership_lost"
+}

@@ -1,0 +1,6 @@
+[
+  {"name":"typed_uint64_max","target":"uint64","json":"18446744073709551615","valid":true,"expected":"18446744073709551615"},
+  {"name":"typed_uint64_overflow","target":"uint64","json":"18446744073709551616","valid":false},
+  {"name":"interface_integer_precision","target":"interface","json":"9007199254740993","valid":true,"expected":"9007199254740993"},
+  {"name":"multiple_json_values","target":"interface","json":"{} {}","valid":false}
+]
