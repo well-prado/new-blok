@@ -187,6 +187,11 @@ func RegisterWorkflow[I, O any](c *Catalog, wf flow.Definition[I, O], inputSchem
 		if instruction.Kind == "call" && (!bytes.Equal(instruction.Node.InputSchema, child.listing.InputSchema) || !bytes.Equal(instruction.Node.OutputSchema, child.listing.OutputSchema)) {
 			return ErrNotAgentSafe
 		}
+		if literal, ok := lowered.Literals[instruction.ID]; ok {
+			if err := checkLiteral(instruction.Kind, instruction.ID, key, child, literal); err != nil {
+				return err
+			}
+		}
 		children[key] = child
 		steps[instruction.ID] = child
 		calls += child.calls
@@ -222,6 +227,27 @@ func RegisterWorkflow[I, O any](c *Catalog, wf flow.Definition[I, O], inputSchem
 	}{p, childDigests(children)})
 	b.listing.ArtifactDigest = hash(append([]byte(b.listing.ArtifactDigest), raw...))
 	return c.register(b)
+}
+
+// checkLiteral runs, at registration, the admission dispatch will run on a
+// literal call input (#261): the input-size bound, then the tool's own
+// Normalize. A literal no budget can admit — over the 1 MiB payload limit
+// tool.Budget caps MaxInputBytes at, before or after normalization — is
+// ErrBudget; a literal the tool's schema refuses is ErrNotAgentSafe. Both
+// name the step. The check only validates: the catalog keeps the literal as
+// flow recorded it, and dispatch normalizes it exactly as it did before.
+func checkLiteral(kind, id, key string, child binding, literal []byte) error {
+	if len(literal) > schema.MaxPayloadBytes {
+		return fmt.Errorf("%w: %s %q: literal input is %d bytes, over the %d-byte input limit", ErrBudget, kind, id, len(literal), schema.MaxPayloadBytes)
+	}
+	normal, err := child.in.Normalize(literal)
+	if err != nil {
+		return fmt.Errorf("%w: %s %q: literal input does not satisfy the input schema of %s: %w", ErrNotAgentSafe, kind, id, key, err)
+	}
+	if len(normal) > schema.MaxPayloadBytes {
+		return fmt.Errorf("%w: %s %q: literal input normalizes to %d bytes, over the %d-byte input limit", ErrBudget, kind, id, len(normal), schema.MaxPayloadBytes)
+	}
+	return nil
 }
 
 func prepare(name, version, description string, input, output []byte, m Manifest, metadata tool.Metadata) (binding, error) {
