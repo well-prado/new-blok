@@ -4,6 +4,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -11,12 +12,14 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime/debug"
 	"strings"
 
 	"github.com/well-prado/new-blok/internal/generate"
 	"github.com/well-prado/new-blok/internal/scaffold"
+	"github.com/well-prado/new-blok/internal/tooling/devtool"
 	"github.com/well-prado/new-blok/internal/tooling/layout"
 )
 
@@ -45,7 +48,7 @@ func runWithIO(args []string, out io.Writer, in io.Reader) error {
 }
 
 func writeHelp(out io.Writer) error {
-	_, err := fmt.Fprintln(out, "New Blok — Go application framework\n\nUsage: blok <command>\n\nCommands:\n  new       Create a conventional Go application\n  generate  Generate deterministic typed bindings\n  version   Print the development version\n  help      Show this help\n\nUse blok new --help or blok generate --help for command options.")
+	_, err := fmt.Fprintln(out, "New Blok — Go application framework\n\nUsage: blok <command>\n\nCommands:\n  new       Create a conventional Go application\n  generate  Generate deterministic typed bindings\n  check     Validate the application without running it\n  test      Run the application's tests with go test\n  inspect   Describe the application's nodes, workflows and triggers\n  version   Print the development version\n  help      Show this help\n\nUse blok <command> --help for command options.")
 	return err
 }
 
@@ -357,8 +360,111 @@ func reorderFlags(args []string, valueFlags map[string]bool) []string {
 }
 
 func main() {
-	if err := run(os.Args[1:], os.Stdout); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+	os.Exit(execute(os.Args[1:], os.Stdout, os.Stderr, os.Stdin))
+}
+
+// execute runs one command and returns the process exit code. check, test
+// and inspect follow the exit-code contract in ADR 0024; every other command
+// exits 1 on any error, as before.
+func execute(args []string, stdout, stderr io.Writer, stdin io.Reader) int {
+	if len(args) > 0 && toolCommands[args[0]] {
+		// Signals are caught only for these commands, so Ctrl+C still ends
+		// an interactive blok new at once. Until stop, a further signal is
+		// absorbed: the first one already stops the go command, bounded by
+		// devtool.InterruptGrace. If blok is killed outright, devtool's
+		// process guard stops the go command instead.
+		ctx, stop := signal.NotifyContext(context.Background(), toolSignals...)
+		defer stop()
+		ignoreBrokenPipe()
+		return guarded(args[0], stderr, func() int { return runTool(ctx, args[0], args[1:], stdout, stderr) })
 	}
+	if err := runWithIO(args, stdout, stdin); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	return 0
+}
+
+var toolCommands = map[string]bool{"check": true, "test": true, "inspect": true}
+
+// guarded turns a panic into exit 3 with the panic on stderr. devtool has
+// already killed any go command the panic interrupted.
+func guarded(command string, stderr io.Writer, run func() int) (code int) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			fmt.Fprintf(stderr, "blok %s: internal error: %v\n%s", command, recovered, debug.Stack())
+			code = devtool.ExitTool
+		}
+	}()
+	return run()
+}
+
+var toolUsage = map[string]string{
+	"check":   "Usage: blok check [--json] [directory]\n\nValidates the application without running any of its code: blok.json and\ngo.mod, node import independence, generated bindings, workflow step ids and\ngo vet (which type-checks every package).\n\nOptions:\n  --json   write the versioned machine-readable report\n\nExit codes: 0 passed, 1 problems found, 2 usage, 3 tool unavailable,\n4 output not written, 130 interrupted.",
+	"test":    "Usage: blok test [--json] [--run REGEXP] [--race] [directory]\n\nRuns the application's tests with go test and reports every package, test\nand failure.\n\nOptions:\n  --json         write the versioned machine-readable report\n  --run REGEXP   run only the tests go test -run selects\n  --race         enable the race detector\n\nExit codes: 0 passed, 1 failures, 2 usage, 3 tool unavailable,\n4 output not written, 130 interrupted.",
+	"inspect": "Usage: blok inspect [--json] [--fields LIST] [directory]\n\nDescribes the application's nodes, workflows and HTTP routes from its source,\nwithout running it, with source, test and example references.\n\nOptions:\n  --json          write the versioned machine-readable report\n  --fields LIST   comma-separated: " + strings.Join(devtool.AllFields, ",") + "\n                  (default " + strings.Join(devtool.DefaultFields, ",") + ")\n\nExit codes: 0 described, 1 project invalid, 2 usage, 4 output not written,\n130 interrupted.",
+}
+
+// runTool parses a check, test or inspect command line, runs it and writes
+// its one report.
+func runTool(ctx context.Context, command string, args []string, stdout, stderr io.Writer) int {
+	if hasHelp(args) {
+		if _, err := fmt.Fprintln(stdout, toolUsage[command]); err != nil {
+			fmt.Fprintf(stderr, "blok %s: write output: %v\n", command, err)
+			return devtool.ExitOutput
+		}
+		return devtool.ExitOK
+	}
+	flags := flag.NewFlagSet(command, flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	asJSON, race := false, false
+	run, fields := "", ""
+	valueFlags := map[string]bool{"json": false}
+	flags.BoolVar(&asJSON, "json", false, "machine-readable report")
+	switch command {
+	case "test":
+		flags.StringVar(&run, "run", "", "go test -run pattern")
+		flags.BoolVar(&race, "race", false, "race detector")
+		valueFlags["run"], valueFlags["race"] = true, false
+	case "inspect":
+		flags.StringVar(&fields, "fields", "", "projected fields")
+		valueFlags["fields"] = true
+	}
+	usage := func(err error) int {
+		fmt.Fprintf(stderr, "blok %s: %v; run blok %s --help\n", command, err, command)
+		return devtool.ExitUsage
+	}
+	if err := flags.Parse(reorderFlags(args, valueFlags)); err != nil {
+		return usage(err)
+	}
+	if flags.NArg() > 1 {
+		return usage(fmt.Errorf("expected at most one project directory"))
+	}
+	root := "."
+	if flags.NArg() == 1 {
+		root = flags.Arg(0)
+	}
+	options := devtool.Options{Root: root}
+	var report devtool.Report
+	switch command {
+	case "check":
+		report = devtool.Check(ctx, options)
+	case "test":
+		report = devtool.Test(ctx, devtool.TestOptions{Options: options, Run: run, Race: race})
+	case "inspect":
+		selected, err := devtool.ParseFields(fields)
+		if err != nil {
+			return usage(err)
+		}
+		report = devtool.Inspect(ctx, devtool.InspectOptions{Options: options, Fields: selected})
+	}
+	write := devtool.WriteHuman
+	if asJSON {
+		write = devtool.WriteJSON
+	}
+	if err := write(stdout, report); err != nil {
+		fmt.Fprintf(stderr, "blok %s: write output: %v\n", command, err)
+		return devtool.ExitOutput
+	}
+	return report.ExitCode
 }

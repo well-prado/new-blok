@@ -1,0 +1,74 @@
+{
+  "version": "blok-cli/v1",
+  "command": "inspect",
+  "status": "passed",
+  "exitCode": 0,
+  "project": {
+    "name": "shop",
+    "module": "example.com/shop",
+    "runtime": "go",
+    "layout": "unified",
+    "triggers": [
+      "http"
+    ]
+  },
+  "catalog": {
+    "fields": [
+      "nodes",
+      "workflows",
+      "triggers",
+      "descriptions",
+      "sources",
+      "tests",
+      "examples"
+    ],
+    "nodes": [
+      {
+        "id": "app/calculate-quote",
+        "version": "1.0.0",
+        "runtime": "go",
+        "package": "nodes/go/quote",
+        "description": "Calculates a quote from an injected catalog",
+        "deterministic": false,
+        "source": "nodes/go/quote/quote.go:19:9",
+        "tests": [
+          {
+            "name": "TestQuoteOverHTTP",
+            "source": "internal/app/app_test.go:13:6"
+          }
+        ]
+      }
+    ],
+    "workflows": [
+      {
+        "name": "quote",
+        "version": "1.0.0",
+        "package": "workflows/quotes",
+        "steps": [
+          {
+            "id": "calculate",
+            "kind": "call",
+            "source": "workflows/quotes/quotes.go:17:13"
+          }
+        ],
+        "source": "workflows/quotes/quotes.go:16:9",
+        "tests": [
+          {
+            "name": "TestQuoteOverHTTP",
+            "source": "internal/app/app_test.go:13:6"
+          }
+        ]
+      }
+    ],
+    "triggers": [
+      {
+        "kind": "http",
+        "method": "POST",
+        "path": "/quotes",
+        "workflow": "app/quote",
+        "source": "internal/app/app.go:39:26"
+      }
+    ]
+  },
+  "diagnostics": []
+}

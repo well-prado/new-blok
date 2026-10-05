@@ -1,0 +1,80 @@
+{
+  "version": "blok-cli/v1",
+  "command": "test",
+  "status": "failed",
+  "exitCode": 1,
+  "project": {
+    "name": "shop",
+    "module": "example.com/shop",
+    "runtime": "go",
+    "layout": "classic",
+    "triggers": [
+      "http"
+    ]
+  },
+  "tests": {
+    "packages": [
+      {
+        "importPath": "example.com/shop/cmd/shop",
+        "dir": "cmd/shop",
+        "status": "no-tests"
+      },
+      {
+        "importPath": "example.com/shop/internal/app",
+        "dir": "internal/app",
+        "status": "fail",
+        "tests": [
+          {
+            "name": "TestQuoteOverHTTP",
+            "status": "fail"
+          },
+          {
+            "name": "TestQuoteOverHTTP/malformed_json",
+            "status": "pass"
+          },
+          {
+            "name": "TestQuoteOverHTTP/quantity_out_of_range",
+            "status": "pass"
+          },
+          {
+            "name": "TestQuoteOverHTTP/quote",
+            "status": "fail",
+            "source": "internal/app/app_test.go:42",
+            "output": [
+              "    app_test.go:42: status=200 body={\"totalCents\":3000}",
+              "        ; want 200 containing \"\\\"totalCents\\\":3001\""
+            ]
+          },
+          {
+            "name": "TestQuoteOverHTTP/unknown_sku",
+            "status": "pass"
+          }
+        ]
+      },
+      {
+        "importPath": "example.com/shop/runtimes/go/nodes/quote",
+        "dir": "runtimes/go/nodes/quote",
+        "status": "no-tests"
+      },
+      {
+        "importPath": "example.com/shop/workflows/quotes",
+        "dir": "workflows/quotes",
+        "status": "no-tests"
+      }
+    ],
+    "passed": 3,
+    "failed": 2,
+    "skipped": 0,
+    "incomplete": 0
+  },
+  "diagnostics": [
+    {
+      "code": "test_failed",
+      "source": "internal/app/app_test.go:42",
+      "expected": "pass",
+      "actual": "status=200 body={\"totalCents\":3000} ; want 200 containing \"\\\"totalCents\\\":3001\"",
+      "remediation": "fix the failing assertion or the code under test, then rerun blok test",
+      "message": "test TestQuoteOverHTTP/quote in example.com/shop/internal/app failed"
+    }
+  ]
+}
