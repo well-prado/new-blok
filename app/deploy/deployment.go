@@ -10,11 +10,13 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/well-prado/new-blok/contract/deployment"
+	"github.com/well-prado/new-blok/observe/slo"
 )
 
 // DeploymentChecks must verify compatibility, not merely process presence.
@@ -27,7 +29,26 @@ type DeploymentChecks struct {
 	Store    func(context.Context) error
 	Worker   func(context.Context) error
 	Secret   func(string) bool
+	// Operational lists optional state sources (a queue census, worker
+	// availability, storage size) rendered on /metrics after the
+	// deployment's own readiness and admission (ADR 0022). Each is sampled
+	// per scrape with a bounded wait; a failing source is counted, never
+	// fatal.
+	Operational []slo.Source
 }
+
+// operationalSampleTimeout bounds each /metrics source; readiness probes
+// inside it have their own one-second bound.
+const operationalSampleTimeout = 2 * time.Second
+
+// readinessBudget bounds the deployment's own source. A readiness check that
+// ignores its context cannot outlast it: the source then reports not ready,
+// every dependency not ready, instead of letting blok_ready vanish from the
+// scrape (ADR 0022).
+const readinessBudget = 1500 * time.Millisecond
+
+// OperationalSourceName names the deployment's own operational source.
+const OperationalSourceName = "deployment"
 
 type Deployment struct {
 	application *app.Application
@@ -36,8 +57,19 @@ type Deployment struct {
 	limiter     *deployment.Limiter
 	handler     http.Handler
 	rejected    atomic.Uint64
+	accepted    atomic.Uint64
+	statusBusy  atomic.Bool
+	// rejectedBy counts rejections by reason: capacity, draining, not_ready.
+	rejectedBy  [3]atomic.Uint64
+	sampler     *slo.Sampler
 	unrequested unrequestedConns
 }
+
+const (
+	rejectCapacity = iota
+	rejectDraining
+	rejectNotReady
+)
 
 // unrequestedConns tracks accepted connections that have not yet delivered a
 // request (http.StateNew). They hold no admitted work, yet http.Server.Shutdown
@@ -100,7 +132,81 @@ func NewDeployment(a *app.Application, c deployment.Config, checks DeploymentChe
 		checks.Secret = func(ref string) bool { v, ok := os.LookupEnv(ref); return ok && v != "" }
 	}
 	l, _ := deployment.NewLimiter(c.MaxAdmission)
-	return &Deployment{application: a, config: c, checks: checks, limiter: l, handler: handler}, nil
+	checks.Operational = append([]slo.Source(nil), checks.Operational...)
+	d := &Deployment{application: a, config: c, checks: checks, limiter: l, handler: handler}
+	sampler, err := slo.NewSampler(operationalSampleTimeout, append([]slo.Source{d.Operational()}, checks.Operational...)...)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", deployment.ErrInvalid, err)
+	}
+	d.sampler = sampler
+	return d, nil
+}
+
+// Operational reports the deployment's readiness and bounded admission as an
+// operational source (ADR 0022): ready and draining, each readiness
+// dependency (secrets aggregated, never named), admission slots in use and
+// configured, and cumulative accepted and rejected requests by reason. Pass
+// it to observe/otel to export the same state over OTLP.
+func (d *Deployment) Operational() slo.Source {
+	return slo.Source{Name: OperationalSourceName, Read: d.operational}
+}
+
+func (d *Deployment) operational(ctx context.Context) (slo.Snapshot, error) {
+	s, ok := d.boundedStatus(ctx)
+	if !ok {
+		// A check outlived the budget (or is still running from the last
+		// scrape): report explicitly not ready, every dependency not ready,
+		// rather than let blok_ready vanish.
+		active, draining := d.limiter.Snapshot()
+		s = deployment.Status{Ready: false, Health: true, Active: active, Draining: draining, Missing: []string{"artifact", "store", "worker", "secret:"}}
+	}
+	missing := map[string]bool{}
+	secrets := true
+	for _, name := range s.Missing {
+		if strings.HasPrefix(name, "secret:") {
+			secrets = false
+			continue
+		}
+		missing[name] = true
+	}
+	dependencies := []slo.Dependency{{Name: "artifact", Ready: !missing["artifact"]}}
+	if d.config.StoreRequired {
+		dependencies = append(dependencies, slo.Dependency{Name: "store", Ready: !missing["store"]})
+	}
+	if d.config.WorkerRequired {
+		dependencies = append(dependencies, slo.Dependency{Name: "worker", Ready: !missing["worker"]})
+	}
+	if len(d.config.RequiredSecrets) > 0 {
+		dependencies = append(dependencies, slo.Dependency{Name: "secrets", Ready: secrets})
+	}
+	return slo.Snapshot{
+		Readiness: &slo.Readiness{Ready: s.Ready, Draining: s.Draining, Dependencies: dependencies},
+		Admission: &slo.Admission{Active: s.Active, Capacity: d.config.MaxAdmission, Accepted: d.accepted.Load(), Rejected: map[slo.RejectReason]uint64{
+			slo.RejectCapacity: d.rejectedBy[rejectCapacity].Load(), slo.RejectDraining: d.rejectedBy[rejectDraining].Load(), slo.RejectNotReady: d.rejectedBy[rejectNotReady].Load(),
+		}},
+	}, nil
+}
+
+// boundedStatus runs the readiness checks for at most readinessBudget. At
+// most one such evaluation runs at a time, so a check that ignores its
+// context costs one goroutine, not one per scrape.
+func (d *Deployment) boundedStatus(ctx context.Context) (deployment.Status, bool) {
+	if !d.statusBusy.CompareAndSwap(false, true) {
+		return deployment.Status{}, false
+	}
+	ctx, cancel := context.WithTimeout(ctx, readinessBudget)
+	defer cancel()
+	result := make(chan deployment.Status, 1)
+	go func() {
+		defer d.statusBusy.Store(false)
+		result <- d.status(ctx)
+	}()
+	select {
+	case s := <-result:
+		return s, true
+	case <-ctx.Done():
+		return deployment.Status{}, false
+	}
 }
 
 func (d *Deployment) status(ctx context.Context) deployment.Status {
@@ -138,19 +244,22 @@ func (d *Deployment) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write([]byte(`{"health":true}`))
 			return
 		}
-		s := d.status(r.Context())
 		if r.URL.Path == "/metrics" {
-			w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-			ready, draining := 0, 0
-			if s.Ready {
-				ready = 1
+			// blok_active and blok_admission_rejected_total predate the
+			// ADR 0022 catalogue and are kept for existing scrapes;
+			// blok_admission_active and blok_admission_requests_total are
+			// their catalogued forms.
+			snapshot := d.sampler.Sample(r.Context())
+			active := 0
+			if snapshot.Admission != nil {
+				active = snapshot.Admission.Active
 			}
-			if s.Draining {
-				draining = 1
-			}
-			_, _ = fmt.Fprintf(w, "blok_ready %d\nblok_active %d\nblok_draining %d\nblok_admission_rejected_total %d\n", ready, s.Active, draining, d.rejected.Load())
+			w.Header().Set("Content-Type", slo.TextContentType)
+			_, _ = fmt.Fprintf(w, "blok_active %d\nblok_admission_rejected_total %d\n", active, d.rejected.Load())
+			_ = slo.WriteText(w, snapshot)
 			return
 		}
+		s := d.status(r.Context())
 		w.Header().Set("Content-Type", "application/json")
 		if !s.Ready {
 			w.WriteHeader(http.StatusServiceUnavailable)
@@ -160,13 +269,17 @@ func (d *Deployment) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	release, err := d.limiter.Admit()
 	if err != nil {
-		d.reject(w)
+		reason := rejectCapacity
+		if errors.Is(err, deployment.ErrDraining) {
+			reason = rejectDraining
+		}
+		d.reject(w, reason)
 		return
 	}
 	defer release()
 	lease, err := d.application.Begin()
 	if err != nil {
-		d.reject(w)
+		d.reject(w, rejectDraining)
 		return
 	}
 	defer lease.Release()
@@ -174,14 +287,16 @@ func (d *Deployment) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer unbind()
 	r = r.WithContext(ctx)
 	if !d.status(ctx).Ready {
-		d.reject(w)
+		d.reject(w, rejectNotReady)
 		return
 	}
+	d.accepted.Add(1)
 	d.handler.ServeHTTP(w, r)
 }
 
-func (d *Deployment) reject(w http.ResponseWriter) {
+func (d *Deployment) reject(w http.ResponseWriter, reason int) {
 	d.rejected.Add(1)
+	d.rejectedBy[reason].Add(1)
 	w.Header().Set("Retry-After", "1")
 	http.Error(w, "deployment unavailable", http.StatusServiceUnavailable)
 }

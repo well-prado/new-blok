@@ -1,0 +1,71 @@
+# OpenTelemetry Collector configuration for the Blok operational SLO
+# catalogue (ADR 0022). Vendor-neutral: it receives OTLP/HTTP from
+# observe/otel and exposes metrics for any Prometheus-compatible scraper
+# under the names in catalogue.json. Traces and logs go to the debug
+# exporter here; point them at the backend you run.
+#
+# Validated with otel/opentelemetry-collector:0.162.0 (core distribution):
+#   otelcol validate --config=otel-collector.yaml
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Refuse data before the collector runs out of memory. The Blok exporter
+  # counts a refused batch as failed and never retries it into a run.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+  batch:
+    send_batch_size: 1024
+    timeout: 5s
+
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    # blok.timer.lag (unit s) becomes blok_timer_lag_seconds, a counter gets
+    # _total, units in braces are dropped. catalogue.json records the result.
+    translation_strategy: UnderscoreEscapingWithSuffixes
+    # Keep only service.name/service.instance.id as job/instance; never
+    # promote resource attributes to labels (cardinality budget).
+    resource_to_telemetry_conversion:
+      enabled: false
+    # A series nobody reports for this long disappears instead of holding
+    # its last value (for example a deleted queue source).
+    metric_expiration: 5m
+  debug:
+    verbosity: basic
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  telemetry:
+    # The collector's own counters (otelcol_*) show what it refused or
+    # failed to send: the collector side of exporter loss.
+    metrics:
+      level: detailed
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [prometheus]
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [debug]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [debug]
