@@ -106,6 +106,7 @@ type txnHook struct {
 	skip    int32
 	after   bool
 	run     func()
+	runKeys func([]string)
 	seen    atomic.Int32
 	fired   atomic.Bool
 }
@@ -114,6 +115,22 @@ func (c *hookedClient) arm(pattern string, skip int, after bool, run func()) *tx
 	hook := &txnHook{pattern: pattern, skip: int32(skip), after: after, run: run}
 	c.hook.Store(hook)
 	return hook
+}
+
+// armKeys is arm with a hook that receives the keys the selected
+// transaction writes, e.g. to learn which admission slots it chose.
+func (c *hookedClient) armKeys(pattern string, skip int, after bool, run func([]string)) *txnHook {
+	hook := &txnHook{pattern: pattern, skip: int32(skip), after: after, runKeys: run}
+	c.hook.Store(hook)
+	return hook
+}
+
+func (h *txnHook) fire(keys []string) {
+	if h.runKeys != nil {
+		h.runKeys(append([]string(nil), keys...))
+		return
+	}
+	h.run()
 }
 
 func (c *hookedClient) Grant(ctx context.Context, ttl int64) (*clientv3.LeaseGrantResponse, error) {
@@ -163,11 +180,11 @@ func (t *hookedTxn) Commit() (*clientv3.TxnResponse, error) {
 		}
 	}
 	if selected && !hook.after && hook.fired.CompareAndSwap(false, true) {
-		hook.run()
+		hook.fire(t.puts)
 	}
 	response, err := t.Txn.Commit()
 	if selected && hook.after && err == nil && response.Succeeded && hook.fired.CompareAndSwap(false, true) {
-		hook.run()
+		hook.fire(t.puts)
 	}
 	return response, err
 }

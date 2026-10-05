@@ -1053,3 +1053,103 @@ func TestConcurrentAdmissionWithFreeCapacityIsNeverRejected(t *testing.T) {
 		})
 	}
 }
+
+// TestTenantSlotTakenBetweenCapacityReadAndCommit drives one exact
+// interleaving: admission A has read the tenant's only free slot and is about
+// to commit; before its transaction is sent, a competing admission of the same
+// tenant commits that tenant slot with a different partition slot. A must not
+// share the tenant slot: it re-reads, sees the tenant bound exhausted, and is
+// rejected, and the competitor's run finishes and frees its slots.
+func TestTenantSlotTakenBetweenCapacityReadAndCommit(t *testing.T) {
+	var fixture struct {
+		FixtureVersion int    `json:"fixtureVersion"`
+		Synthetic      bool   `json:"synthetic"`
+		Name           string `json:"name"`
+		Limits         struct {
+			Partitions          int `json:"partitions"`
+			PartitionAdmissions int `json:"partitionAdmissions"`
+			TenantAdmissions    int `json:"tenantAdmissions"`
+		} `json:"limits"`
+		Expected struct {
+			Interleaved        string `json:"interleavedAdmission"`
+			Scope              string `json:"rejectionScope"`
+			ActiveAfter        int    `json:"activeRunsAfterInterleaving"`
+			TenantSlotHolder   string `json:"tenantSlotHolder"`
+			CompetitorFinished string `json:"competitorFinished"`
+			ActiveAfterFinish  int    `json:"activeRunsAfterFinish"`
+			ExternalEffects    int    `json:"externalEffects"`
+		} `json:"expected"`
+	}
+	readDistributedFixture(t, "tenant-slot-interleaving-fixtures.json", &fixture)
+	limits := Limits{Partitions: fixture.Limits.Partitions, PartitionAdmissions: fixture.Limits.PartitionAdmissions, TenantAdmissions: fixture.Limits.TenantAdmissions, OwnerTTL: 2 * time.Second}
+	ledger := effectLedger(filepath.Join(t.TempDir(), "ledger"))
+	direct := integrationDistributedStore(t)
+	hooked := &hookedClient{Client: integrationClient(t)}
+	ingress := newCountedEffectRuntime(t, integrationStoreFor(t, hooked), ledger, limits)
+	owners := newCountedEffectRuntime(t, direct, ledger, limits)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := owners.Check(ctx); err != nil {
+		t.Fatal(err)
+	}
+	const partition = "p-0000"
+	tenant := tenantsInPartition(owners, partition, "slot-interleaving", 1)[0]
+	competitorID := admissionRunID(tenant, "competitor")
+	var hookErr error
+	hooked.armKeys("/events/accepted-", 0, false, func(keys []string) {
+		chosen := ""
+		for _, key := range keys {
+			if index := strings.Index(key, "/admission-slots/global/"); index >= 0 {
+				chosen = key[index+len("/admission-slots/global/"):]
+			}
+		}
+		other := ""
+		for slot := 0; slot < limits.PartitionAdmissions; slot++ {
+			if candidate := fmt.Sprint(slot); candidate != chosen {
+				other = candidate
+				break
+			}
+		}
+		input := json.RawMessage(`{"value":7}`)
+		competitor := RunRecord{RunID: competitorID, Tenant: tenant, RequestKey: "competitor", Workflow: "acceptance-effect", ArtifactDigest: "sha256:" + strings.Repeat("1", 64), InputDigest: digest(input), Input: input, State: "accepted", GlobalSlot: other, TenantSlot: "0"}
+		encoded, _ := json.Marshal(competitor)
+		hookErr = direct.CommitAdmission(ctx, partition, tenant, other, "0", competitorID, encoded, encoded)
+		t.Logf("interleaving: A chose global slot %q and tenant slot 0; competitor committed global slot %q and tenant slot 0 first (err=%v)", chosen, other, hookErr)
+	})
+	admission, err := ingress.Admit(ctx, Submission{Tenant: tenant, RequestKey: "interleaved", Workflow: "acceptance-effect", Input: json.RawMessage(`{"value":1}`)})
+	if hookErr != nil {
+		t.Fatalf("competing admission: %v", hookErr)
+	}
+	outcome := admissionOutcome(admission, err)
+	scope := ""
+	var capacity *CapacityError
+	if errors.As(err, &capacity) {
+		outcome, scope = "admission_full", capacity.Scope
+	}
+	active, err := direct.ListActiveRunIDs(ctx, partition, limits.PartitionAdmissions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	holder := "none"
+	if response, err := hooked.Client.Get(ctx, "/blok/v1/partitions/"+partition+"/admission-slots/tenants/"+tenant+"/0"); err == nil && len(response.Kvs) == 1 {
+		switch string(response.Kvs[0].Value) {
+		case competitorID:
+			holder = "competitor"
+		case admissionRunID(tenant, "interleaved"):
+			holder = "interleaved"
+		}
+	}
+	t.Logf("interleaved admission=%s scope=%s active=%v tenant slot holder=%s", outcome, scope, active, holder)
+	if outcome != fixture.Expected.Interleaved || scope != fixture.Expected.Scope || len(active) != fixture.Expected.ActiveAfter || holder != fixture.Expected.TenantSlotHolder {
+		t.Fatalf("interleaved=%s scope=%s active=%v holder=%s; fixture %+v", outcome, scope, active, holder, fixture.Expected)
+	}
+	owner := acquireWhenFree(t, ctx, direct, partition, "slot-interleaving-owner", 30*time.Second)
+	finished, err := owners.processOne(ctx, owner)
+	if err != nil || finished.RunID != competitorID || finished.State != fixture.Expected.CompetitorFinished {
+		t.Fatalf("competitor finish=%+v err=%v, fixture %s", finished, err, fixture.Expected.CompetitorFinished)
+	}
+	active, err = direct.ListActiveRunIDs(ctx, partition, limits.PartitionAdmissions)
+	if err != nil || len(active) != fixture.Expected.ActiveAfterFinish || ledger.total("effect") != fixture.Expected.ExternalEffects {
+		t.Fatalf("after finish active=%v err=%v effects=%d; fixture %d/%d", active, err, ledger.total("effect"), fixture.Expected.ActiveAfterFinish, fixture.Expected.ExternalEffects)
+	}
+}
