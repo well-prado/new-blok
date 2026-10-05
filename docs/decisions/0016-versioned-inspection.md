@@ -1,8 +1,8 @@
 # ADR 0016: Versioned run and step inspection projections
 
-- Status: accepted for the application-composed Go and journal inspection slices
+- Status: accepted for the application-composed Go and journal inspection slices and the live development event stream
 - Date: 2026-10-03
-- Roadmap: E15-T01 (#76)
+- Roadmap: E15-T01 (#76); live event stream E15-T02 (#77)
 
 ## Context
 
@@ -101,6 +101,112 @@ the lease is released. If terminal persistence fails after execution, the
 runner returns an explicit uncertain result with the run ID for reconciliation;
 it never presents the completed effect as a safely retryable generic failure.
 
+## Live development event stream (E15-T02, #77)
+
+A page answers "what happened"; a live stream answers "what is happening",
+as a browser would follow it. It is telemetry: best effort, bounded, and
+unable to affect the run or the journal.
+
+**Composition.** `inspect.NewEventStream` is an ordinary
+`inspection.Observer` the application selects (alone or with the recorder
+through `inspect.CombineObservers`). `inspect.NewEventHandler` serves it as
+Server-Sent Events at `GET .../runs/{run}/events`. The engine, the inspection
+contract and `execution` import neither; `observe/event`, the hub, imports
+only the standard library. An application that selects no stream has no
+stream.
+
+**Never blocks the run.** The engine calls observers synchronously on the
+run's goroutine, so `Observe` does bounded in-memory work under one short
+lock and no I/O. Each reader has a queue of `QueueDepth` (32) frames; a
+publication that finds it full disconnects that reader (`slow_subscriber`)
+instead of waiting, and the reader's blocked socket write is interrupted at
+once rather than at its write deadline. The run, its journaled effects and
+its terminal outcome (`RunOutcomePort`) are therefore never held by a
+reader; the outcome is written before the terminal frame, as before.
+
+**Capture is opt-in, at the source.** `inspect.Capture{Inputs, Outputs,
+Logs}` defaults to false: the zero configuration keeps transitions, timing,
+attempts and classified error labels only, and discards payloads and logs
+before anything is retained. A reader then sees a field only if the stream
+captured it **and** the application's `Policy(principal)` grants it; error
+labels are policy-gated but not capture-gated. Captured content gets the
+recorder's key redaction and credential-shaped log redaction. The owner
+principal never appears on the wire.
+
+**Authorization.** The application's `Authenticate` yields the reader
+(401 otherwise). `Authorize(reader, owner)` defaults to the owner only; a
+refused reader gets the same 404 as an unknown run. Run IDs and principals
+are at most 256 bytes.
+
+**Frames and cursors.** Each frame is `id`, `event` (the inspection kind,
+`gap`, `snapshot` or `end`) and one line of compact JSON. Ids are
+`<epoch>.<incarnation>.<run hash>:<seq>`: a process restart is a new epoch;
+a run the hub forgot and later re-created is a new incarnation; the hash
+binds the id to its run.
+
+| Last-Event-ID | Outcome |
+| --- | --- |
+| none | everything retained; a `gap` first if early frames were evicted |
+| this incarnation, retained | exactly the frames after it |
+| this incarnation, evicted | `gap {reason: retention, missed: n}`, then what is retained |
+| an earlier incarnation | `gap {reason: retention}` (count unknown) |
+| another epoch | `gap {reason: restart}` |
+| ahead, a later incarnation, another run's, malformed, over 128 bytes | 400 `invalid_cursor`, no stream bytes |
+| at the end of a closed run | 204, which stops EventSource |
+
+A gap's id is the position just before the first replayed frame, so
+reconnecting from it adds no second gap. **Loss is never silent:** an
+observation that cannot be represented (invalid, over `MaxEventBytes`) is
+replaced in sequence by `gap {reason: dropped}`; a run re-created after
+eviction opens with `gap {reason: evicted}`; a late log after the late window
+appends `gap {reason: late_dropped}`. Every drop, eviction, rejection and
+slow reader is counted in `Hub.Stats`.
+
+**Late worker logs.** A worker log can reach inspection after its step and
+its run completed (above, #226). A stream does not stop at the terminal
+frame: for a reader allowed to see logs it keeps following for `LateWindow`
+(2 s, at most 30 s) after it, delivers any step log published meanwhile, then
+sends `end` (`{"lateWindowMs": …}`) with the id of the last frame it passed.
+A log after the window is dropped and marked (`late_dropped`); a reader
+without log access ends at the terminal frame. `RunSuspended` is not
+terminal. A worker log the runtime receives after its call's result is still
+dropped by the runtime, as before; the window cannot recover it.
+
+**Recovery.** The hub is memory. With `Source` configured (the journal's
+`inspection.Source`), a run this process has no history of is read from
+durable state *as the reader*, so the journal authorizes again; the reader
+gets a `gap` (`restart` for an old cursor, `history_unavailable` without one)
+and a `snapshot` frame `{source: journal, reconstructed: true, page,
+unavailable: [...]}` built by `InspectSource` with the same field policy and
+a 64 KiB bound. A non-terminal recovered run is then followed live, so a
+resumed execution in this process streams normally. The snapshot holds
+journal facts only: transient transitions, logs, and steps that had not yet
+written a journal fact are not reconstructed.
+
+**Bounds** (zero takes the default; above the hard limit `New` refuses):
+
+| Bound | Default | Hard limit | Saturation |
+| --- | --- | --- | --- |
+| retained runs `MaxRuns` | 256 | 16,384 | evict least recently used unfollowed run; all followed: drop and count |
+| frames / bytes per run | 1,024 / 256 KiB | 16,384 / 16 MiB | evict oldest; reader sees `retention` gap |
+| `MaxRuns × RunBytes` | 64 MiB | 1 GiB | refused at `New` |
+| frame `MaxEventBytes` | 32 KiB | 1 MiB | payloads → `{"$truncated":true}`, else `dropped` gap |
+| readers total / per run / per principal | 64 / 8 / 16 | 4,096 each | empty stream with `retry:` and `: saturated` |
+| reader queue `QueueDepth` | 32 | 1,024 | disconnect `slow_subscriber`; resume from cursor |
+| `MaxSubscribers × QueueDepth × MaxEventBytes` | 64 MiB | 256 MiB | refused at `New` |
+| subscription `MaxDuration` | 30 min | 2 h | ends; client resumes from cursor |
+| heartbeat / write timeout | 15 s / 5 s | 1 min / 1 min | write timeout ends the subscription |
+| durable snapshot read / size | 5 s / 64 KiB | 1 min / 1 MiB | no snapshot; the gap is still sent |
+
+`Hub.Close` ends every subscription (`shutdown`) and refuses new ones while
+publication continues, so stopping the stream never affects a run.
+
+**Limits.** One hub per process: a reader connected to another replica sees
+nothing from this one. The engine serializes observation payloads whenever
+any observer is selected, including when the stream discards them; that costs
+CPU, not retention. Measured overhead and latency in the PR are one
+developer machine's figures, not performance claims.
+
 ## Compatibility and limits
 
 The contract is additive. Unsupported versions and malformed/cross-query
@@ -127,9 +233,9 @@ step and appears in later projections, with the time it was delivered rather
 than the time it was emitted. A log frame received after the result, or one
 that arrives while the log queue is full, is dropped as before. A reader
 that needs a step's logs therefore reads after its completion rather than at
-it (#226). A consumer that stops at a run's terminal event,
-such as a live stream (#77), can miss such logs unless it keeps reading for
-a bound after that event.
+it (#226). A consumer that stops at a run's terminal event can miss such
+logs unless it keeps reading for a bound after that event; the live stream
+(#77) does, for its late window.
 
 ## Evidence
 
@@ -142,3 +248,17 @@ child-lineage facts; and assert an actual Node worker log appears in an
 authorized projection with its synthetic token attribute redacted. Node
 integration requires `BLOK_NODE_INTEGRATION_ROOT` and the built runtime worker.
 This evidence does not imply durable retention for recorder data.
+
+Live stream evidence (#77): actual `trigger/http` runs streamed over real
+HTTP connections, followed mid-run, resumed after disconnect without loss or
+duplicates, and refused for unauthenticated, foreign and malformed-cursor
+readers; synthetic fixture cases in `testdata/inspection/events/cases.json`
+with predeclared frames, error codes, effect and payload counts; readers that
+never read, attached to a run moving a journaled effect through intent,
+attempt and commit and persisting its terminal outcome through the journal
+port, with the run and journal unaffected and the readers' blocked handlers
+interrupted; a real process killed mid-effect and its run reconstructed from
+the SQLite journal under the old cursor; late logs after `run.completed`, both
+from the engine's logger and from the actual Node worker; and measured run
+overhead, delivery latency, goroutine and retained-heap figures. Each guarded
+behavior was shown to fail under a deliberate mutation before it was trusted.
