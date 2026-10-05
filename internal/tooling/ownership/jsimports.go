@@ -238,7 +238,44 @@ func (r *recognizer) computedKey(i int) bool {
 // indexSignature reports a TypeScript index signature or mapped type,
 // [k: T] or [K in T]: a type, never a property read.
 func (r *recognizer) indexSignature(i int) bool {
-	return r.at(i+1).kind == tokIdent && (isPunct(r.at(i+2), ":") || isIdent(r.at(i+2), "in"))
+	if r.at(i+1).kind != tokIdent {
+		return false
+	}
+	if isPunct(r.at(i+2), ":") {
+		return true
+	}
+	return isIdent(r.at(i+2), "in") && r.inKeyIsBoolean(i)
+}
+
+// selecting operators can make an expression evaluate to one of its
+// operands rather than to the boolean an "in" test yields.
+var selecting = setOf(`? || && ?? ,`)
+
+// inKeyIsBoolean reports that the bracket opened at open holds no selecting
+// operator at its own depth. At run time [k in o] is a boolean key ("true"
+// or "false"), which cannot name a sensitive property, but [k in o ? a : b]
+// or [k in o || a] evaluates to a or b, so it is a computed key like any
+// other. A mapped type whose "as" clause holds a conditional type is not
+// told apart from it and stays unverified.
+func (r *recognizer) inKeyIsBoolean(open int) bool {
+	depth := 0
+	for j := open + 1; j < len(r.toks); j++ {
+		t := r.toks[j]
+		switch {
+		case isPunct(t, "(") || isPunct(t, "[") || isPunct(t, "{") || t.kind == tokTemplateHead:
+			depth++
+		case isPunct(t, "]") && depth == 0:
+			return true
+		case isPunct(t, ")") || isPunct(t, "]") || isPunct(t, "}") || t.kind == tokTemplateTail:
+			if depth == 0 {
+				return false
+			}
+			depth--
+		case depth == 0 && t.kind == tokPunct && selecting[t.text]:
+			return false
+		}
+	}
+	return false
 }
 
 // operandEnd reports whether a token ends an operand, so a "[" after it is

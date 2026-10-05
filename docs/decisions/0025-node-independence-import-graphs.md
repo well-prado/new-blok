@@ -222,7 +222,7 @@ called bare). The safe forms, the complete list, are:
 | `import.meta.url`, `import.meta.dirname`, `import.meta.filename` | data |
 | `module.exports` | the module's exports |
 | `process.env argv cwd platform arch version versions pid exit exitCode nextTick hrtime stdout stderr stdin uptime memoryUsage emitWarning on once` (one of these, after a dot) | process data and control that do not reach the loader |
-| `this.<name>`, `this?.<name>`, `this.#name` | a property read; a sensitive `<name>` is still flagged as a property |
+| `this.<name>`, `this?.<name>`, `this.#name` | a property read; a sensitive `<name>` is still flagged as a property. `this[…]` and `this?.[…]` are not this form |
 | `constructor(…) {` / `constructor(…);` | a method definition, not an access |
 | `/// <reference path="…">` / `<reference types="…">` | edge |
 
@@ -248,7 +248,11 @@ string literal):
   f`), an object literal or a class body alike, since they are not told
   apart — whose key is not a number or a non-sensitive string literal
   (TypeScript index signatures `[k: T]` and mapped types `[K in T]` are
-  types, not keys);
+  types, not keys). A `[k in …]` key is let through only when it holds no
+  `?`, `||`, `&&`, `??` or comma at its own depth: at run time `[k in o]`
+  is a boolean key, but `{ [k in o ? a : a]: F } = f` selects `a`, so it is
+  a computed key like any other. A mapped type whose `as` clause holds a
+  conditional type is not told apart from it and is unverified;
 - every computed member access (`x[…]` after an operand, including `?.[`)
   whose key is not empty (a TypeScript array type), a number, a string
   literal of a non-sensitive word, or an arithmetic expression built only
