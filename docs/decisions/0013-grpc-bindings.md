@@ -112,6 +112,7 @@ same on every trigger.
 | the client canceled | Canceled | `canceled` |
 | `trigger.ErrSaturated` | ResourceExhausted | `saturated` |
 | classified `validation` | InvalidArgument | its code |
+| classified `not_found` (#306) | NotFound | its code |
 | classified `admission` | ResourceExhausted | its code |
 | classified `cancellation` | Canceled | its code |
 | classified `configuration` | Internal | `internal` |
@@ -183,6 +184,7 @@ regenerating, run `git diff --exit-code trigger/grpc/internal/orderpb`.
 | New package `trigger/grpc` | additive | none |
 | `genproto/googleapis/rpc` moves from indirect to direct | module metadata | none |
 | The HTTP selection binary must not link `trigger/grpc` or gRPC-Go | test | none |
+| Classified `not_found` answers NotFound instead of FailedPrecondition (#306, [ADR 0005](0005-trigger-adapter-contract.md)) | behavioral | the reason is unchanged; a client that matched FailedPrecondition for it matches NotFound |
 
 ## Limits
 

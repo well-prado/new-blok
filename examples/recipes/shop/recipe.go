@@ -137,15 +137,15 @@ type RecordEvent struct {
 	EventID string `json:"eventId"`
 }
 
-// hiddenRecord keeps missing and another-owner rows indistinguishable. The
-// current HTTP adapter maps classified validation failures to 400; when it
-// adds a not-found class this recipe can switch to that status without
-// changing the authorization predicate or public error code.
+// hiddenRecord keeps missing and another-owner rows indistinguishable: both
+// fail with this one error, of class node.ClassNotFound, which the HTTP
+// adapter answers 404 with the code only (#306). The owner is in the
+// database predicate, so the recipe never learns which case it is.
 type hiddenRecord struct{}
 
 func (hiddenRecord) Error() string      { return "record not found" }
 func (hiddenRecord) ErrorCode() string  { return "not_found" }
-func (hiddenRecord) ErrorClass() string { return "validation" }
+func (hiddenRecord) ErrorClass() string { return node.ClassNotFound }
 
 type Application struct {
 	Database       store.Database

@@ -393,7 +393,7 @@ func TestAuthenticationSnapshotsCallerOwnedTokenMap(t *testing.T) {
 	}
 	for range 8 {
 		response := request(t, server.Client(), http.MethodGet, server.URL+"/records/no-such-record", aliceToken, "")
-		if response.StatusCode != http.StatusBadRequest {
+		if response.StatusCode != http.StatusNotFound {
 			t.Fatalf("concurrent map mutation changed authentication status to %d", response.StatusCode)
 		}
 		_ = response.Body.Close()

@@ -221,6 +221,10 @@ func statusFor(err error) int {
 		switch class {
 		case "validation":
 			return http.StatusBadRequest
+		case trigger.ClassNotFound:
+			// A missing record and another principal's record share this
+			// answer: the status and the error's code, nothing else.
+			return http.StatusNotFound
 		case "cancellation":
 			return http.StatusGatewayTimeout
 		}
