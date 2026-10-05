@@ -1,0 +1,636 @@
+{
+  "adr": "docs/decisions/0022-operational-slo-metrics.md",
+  "durationBuckets": [
+    0.001,
+    0.0025,
+    0.005,
+    0.01,
+    0.025,
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1,
+    2.5,
+    5,
+    10,
+    30,
+    60,
+    300
+  ],
+  "generated": "by go test ./observe/slo -run TestCatalogueFileHasNoDrift -update; do not edit",
+  "livenesses": [
+    "pending",
+    "active",
+    "waiting",
+    "uncertain",
+    "stalled"
+  ],
+  "metrics": [
+    {
+      "name": "blok.ready",
+      "prometheus": "blok_ready",
+      "kind": "gauge",
+      "unit": "",
+      "signal": "readiness",
+      "counts": "state",
+      "path": "snapshot",
+      "labels": [],
+      "description": "1 when the deployment is ready for admission",
+      "seriesBound": 1
+    },
+    {
+      "name": "blok.draining",
+      "prometheus": "blok_draining",
+      "kind": "gauge",
+      "unit": "",
+      "signal": "readiness",
+      "counts": "state",
+      "path": "snapshot",
+      "labels": [],
+      "description": "1 while the deployment drains; not-ready while draining is expected",
+      "seriesBound": 1
+    },
+    {
+      "name": "blok.dependency.ready",
+      "prometheus": "blok_dependency_ready",
+      "kind": "gauge",
+      "unit": "",
+      "signal": "readiness",
+      "counts": "state",
+      "path": "snapshot",
+      "labels": [
+        {
+          "name": "blok.dependency",
+          "prometheus": "blok_dependency",
+          "bound": 16,
+          "note": "artifact, store, worker, secrets"
+        }
+      ],
+      "description": "1 when the readiness dependency is ready",
+      "seriesBound": 16
+    },
+    {
+      "name": "blok.admission.active",
+      "prometheus": "blok_admission_active",
+      "kind": "gauge",
+      "unit": "{request}",
+      "signal": "admission_saturation",
+      "counts": "state",
+      "path": "snapshot",
+      "labels": [],
+      "description": "requests holding an admission slot",
+      "seriesBound": 1
+    },
+    {
+      "name": "blok.admission.capacity",
+      "prometheus": "blok_admission_capacity",
+      "kind": "gauge",
+      "unit": "{request}",
+      "signal": "admission_saturation",
+      "counts": "state",
+      "path": "snapshot",
+      "labels": [],
+      "description": "admission slots configured",
+      "seriesBound": 1
+    },
+    {
+      "name": "blok.admission.requests",
+      "prometheus": "blok_admission_requests_total",
+      "kind": "counter",
+      "unit": "{request}",
+      "signal": "admission_saturation",
+      "counts": "admission",
+      "path": "snapshot",
+      "labels": [
+        {
+          "name": "blok.result",
+          "prometheus": "blok_result",
+          "values": [
+            "accepted",
+            "rejected"
+          ]
+        },
+        {
+          "name": "blok.reason",
+          "prometheus": "blok_reason",
+          "values": [
+            "none",
+            "capacity",
+            "draining",
+            "not_ready",
+            "unavailable",
+            "invalid",
+            "conflict"
+          ],
+          "note": "none when accepted"
+        }
+      ],
+      "description": "requests offered at the edge, by admission result",
+      "seriesBound": 14
+    },
+    {
+      "name": "blok.work.items",
+      "prometheus": "blok_work_items",
+      "kind": "gauge",
+      "unit": "{item}",
+      "signal": "queue_depth",
+      "counts": "state",
+      "path": "snapshot",
+      "labels": [
+        {
+          "name": "blok.source",
+          "prometheus": "blok_source",
+          "bound": 16,
+          "note": "census source declared by the application (a queue name, cluster)"
+        },
+        {
+          "name": "blok.liveness",
+          "prometheus": "blok_liveness",
+          "values": [
+            "pending",
+            "active",
+            "waiting",
+            "uncertain",
+            "stalled"
+          ]
+        }
+      ],
+      "description": "unfinished work by liveness; stalled pages, waiting never does",
+      "seriesBound": 80
+    },
+    {
+      "name": "blok.work.oldest_pending.age",
+      "prometheus": "blok_work_oldest_pending_age_seconds",
+      "kind": "gauge",
+      "unit": "s",
+      "signal": "queue_depth",
+      "counts": "state",
+      "path": "snapshot",
+      "labels": [
+        {
+          "name": "blok.source",
+          "prometheus": "blok_source",
+          "bound": 16,
+          "note": "census source declared by the application (a queue name, cluster)"
+        }
+      ],
+      "description": "age of the oldest pending item (backlog lag)",
+      "seriesBound": 16
+    },
+    {
+      "name": "blok.work.dead_letters",
+      "prometheus": "blok_work_dead_letters",
+      "kind": "gauge",
+      "unit": "{item}",
+      "signal": "errors",
+      "counts": "state",
+      "path": "snapshot",
+      "labels": [
+        {
+          "name": "blok.source",
+          "prometheus": "blok_source",
+          "bound": 16,
+          "note": "census source declared by the application (a queue name, cluster)"
+        }
+      ],
+      "description": "dead-lettered work retained for an operator",
+      "seriesBound": 16
+    },
+    {
+      "name": "blok.census.truncated",
+      "prometheus": "blok_census_truncated",
+      "kind": "gauge",
+      "unit": "",
+      "signal": "queue_depth",
+      "counts": "state",
+      "path": "snapshot",
+      "labels": [
+        {
+          "name": "blok.source",
+          "prometheus": "blok_source",
+          "bound": 16,
+          "note": "census source declared by the application (a queue name, cluster)"
+        }
+      ],
+      "description": "1 when the census hit its read bound; counts are lower bounds",
+      "seriesBound": 16
+    },
+    {
+      "name": "blok.timers.overdue",
+      "prometheus": "blok_timers_overdue",
+      "kind": "gauge",
+      "unit": "{timer}",
+      "signal": "timer_lag",
+      "counts": "state",
+      "path": "snapshot",
+      "labels": [
+        {
+          "name": "blok.source",
+          "prometheus": "blok_source",
+          "bound": 16,
+          "note": "census source declared by the application (a queue name, cluster)"
+        }
+      ],
+      "description": "timers past their due time and not yet fired",
+      "seriesBound": 16
+    },
+    {
+      "name": "blok.timer.lag",
+      "prometheus": "blok_timer_lag_seconds",
+      "kind": "gauge",
+      "unit": "s",
+      "signal": "timer_lag",
+      "counts": "state",
+      "path": "snapshot",
+      "labels": [
+        {
+          "name": "blok.source",
+          "prometheus": "blok_source",
+          "bound": 16,
+          "note": "census source declared by the application (a queue name, cluster)"
+        }
+      ],
+      "description": "how far past due the oldest unfired timer is",
+      "seriesBound": 16
+    },
+    {
+      "name": "blok.worker.ready",
+      "prometheus": "blok_worker_ready",
+      "kind": "gauge",
+      "unit": "",
+      "signal": "worker_availability",
+      "counts": "state",
+      "path": "snapshot",
+      "labels": [
+        {
+          "name": "blok.worker",
+          "prometheus": "blok_worker",
+          "bound": 16,
+          "note": "worker runtime name declared by the application"
+        }
+      ],
+      "description": "1 when the worker runtime is negotiated and accepting calls",
+      "seriesBound": 16
+    },
+    {
+      "name": "blok.worker.in_flight",
+      "prometheus": "blok_worker_in_flight",
+      "kind": "gauge",
+      "unit": "{call}",
+      "signal": "worker_availability",
+      "counts": "state",
+      "path": "snapshot",
+      "labels": [
+        {
+          "name": "blok.worker",
+          "prometheus": "blok_worker",
+          "bound": 16,
+          "note": "worker runtime name declared by the application"
+        }
+      ],
+      "description": "worker calls in flight",
+      "seriesBound": 16
+    },
+    {
+      "name": "blok.worker.capacity",
+      "prometheus": "blok_worker_capacity",
+      "kind": "gauge",
+      "unit": "{call}",
+      "signal": "worker_availability",
+      "counts": "state",
+      "path": "snapshot",
+      "labels": [
+        {
+          "name": "blok.worker",
+          "prometheus": "blok_worker",
+          "bound": 16,
+          "note": "worker runtime name declared by the application"
+        }
+      ],
+      "description": "worker concurrent-call capacity",
+      "seriesBound": 16
+    },
+    {
+      "name": "blok.partitions",
+      "prometheus": "blok_partitions",
+      "kind": "gauge",
+      "unit": "{partition}",
+      "signal": "worker_availability",
+      "counts": "state",
+      "path": "snapshot",
+      "labels": [
+        {
+          "name": "blok.owned",
+          "prometheus": "blok_owned",
+          "values": [
+            "true",
+            "false"
+          ]
+        }
+      ],
+      "description": "durable partitions by live ownership; an unowned partition claims nothing and fires no timer",
+      "seriesBound": 2
+    },
+    {
+      "name": "blok.storage.used",
+      "prometheus": "blok_storage_used_bytes",
+      "kind": "gauge",
+      "unit": "By",
+      "signal": "storage_growth",
+      "counts": "state",
+      "path": "snapshot",
+      "labels": [
+        {
+          "name": "blok.store",
+          "prometheus": "blok_store",
+          "bound": 16,
+          "note": "store name declared by the application"
+        }
+      ],
+      "description": "bytes used by the durable store",
+      "seriesBound": 16
+    },
+    {
+      "name": "blok.storage.budget",
+      "prometheus": "blok_storage_budget_bytes",
+      "kind": "gauge",
+      "unit": "By",
+      "signal": "storage_growth",
+      "counts": "state",
+      "path": "snapshot",
+      "labels": [
+        {
+          "name": "blok.store",
+          "prometheus": "blok_store",
+          "bound": 16,
+          "note": "store name declared by the application"
+        }
+      ],
+      "description": "operator-declared storage budget; absent when none was declared",
+      "seriesBound": 16
+    },
+    {
+      "name": "blok.operational.sample.failures",
+      "prometheus": "blok_operational_sample_failures_total",
+      "kind": "counter",
+      "unit": "{sample}",
+      "signal": "exporter_loss",
+      "counts": "telemetry",
+      "path": "snapshot",
+      "labels": [],
+      "description": "operational source samples that failed, timed out or were invalid",
+      "seriesBound": 1
+    },
+    {
+      "name": "blok.runs",
+      "prometheus": "blok_runs_total",
+      "kind": "counter",
+      "unit": "{run}",
+      "signal": "errors",
+      "counts": "completion",
+      "path": "events",
+      "labels": [
+        {
+          "name": "blok.workflow",
+          "prometheus": "blok_workflow",
+          "note": "registered workflow name; invalid names are exported as invalid"
+        },
+        {
+          "name": "blok.outcome",
+          "prometheus": "blok_outcome",
+          "values": [
+            "completed",
+            "failed",
+            "canceled",
+            "uncertain",
+            "suspended"
+          ],
+          "note": "uncertain is never folded into failed"
+        },
+        {
+          "name": "blok.tenant",
+          "prometheus": "blok_tenant",
+          "bound": 65,
+          "note": "allowlisted tenant (at most 64) or other; never a raw tenant on metrics"
+        }
+      ],
+      "description": "workflow runs by outcome",
+      "seriesBound": 0
+    },
+    {
+      "name": "blok.run.duration",
+      "prometheus": "blok_run_duration_seconds",
+      "kind": "histogram",
+      "unit": "s",
+      "signal": "latency",
+      "counts": "completion",
+      "path": "events",
+      "labels": [
+        {
+          "name": "blok.workflow",
+          "prometheus": "blok_workflow",
+          "note": "registered workflow name; invalid names are exported as invalid"
+        },
+        {
+          "name": "blok.outcome",
+          "prometheus": "blok_outcome",
+          "values": [
+            "completed",
+            "failed",
+            "canceled",
+            "uncertain",
+            "suspended"
+          ]
+        },
+        {
+          "name": "blok.tenant",
+          "prometheus": "blok_tenant",
+          "bound": 65,
+          "note": "allowlisted tenant (at most 64) or other; never a raw tenant on metrics"
+        }
+      ],
+      "description": "observed run duration",
+      "seriesBound": 0
+    },
+    {
+      "name": "blok.steps",
+      "prometheus": "blok_steps_total",
+      "kind": "counter",
+      "unit": "{step}",
+      "signal": "errors",
+      "counts": "steps",
+      "path": "events",
+      "labels": [
+        {
+          "name": "blok.workflow",
+          "prometheus": "blok_workflow",
+          "note": "registered workflow name; invalid names are exported as invalid"
+        },
+        {
+          "name": "blok.step",
+          "prometheus": "blok_step",
+          "note": "step id within the workflow"
+        },
+        {
+          "name": "blok.outcome",
+          "prometheus": "blok_outcome",
+          "values": [
+            "completed",
+            "failed",
+            "canceled",
+            "uncertain"
+          ],
+          "note": "uncertain is never folded into failed"
+        },
+        {
+          "name": "blok.error.class",
+          "prometheus": "blok_error_class",
+          "note": "node error class; empty when the step did not fail"
+        }
+      ],
+      "description": "step attempts by outcome",
+      "seriesBound": 0
+    },
+    {
+      "name": "blok.step.duration",
+      "prometheus": "blok_step_duration_seconds",
+      "kind": "histogram",
+      "unit": "s",
+      "signal": "latency",
+      "counts": "steps",
+      "path": "events",
+      "labels": [
+        {
+          "name": "blok.workflow",
+          "prometheus": "blok_workflow",
+          "note": "registered workflow name; invalid names are exported as invalid"
+        },
+        {
+          "name": "blok.step",
+          "prometheus": "blok_step",
+          "note": "step id within the workflow"
+        },
+        {
+          "name": "blok.outcome",
+          "prometheus": "blok_outcome",
+          "values": [
+            "completed",
+            "failed",
+            "canceled",
+            "uncertain"
+          ]
+        }
+      ],
+      "description": "observed step attempt duration",
+      "seriesBound": 0
+    },
+    {
+      "name": "blok.external.calls",
+      "prometheus": "blok_external_calls_total",
+      "kind": "counter",
+      "unit": "{call}",
+      "signal": "uncertainty",
+      "counts": "external_calls",
+      "path": "events",
+      "labels": [
+        {
+          "name": "blok.workflow",
+          "prometheus": "blok_workflow",
+          "note": "registered workflow name; invalid names are exported as invalid"
+        },
+        {
+          "name": "blok.step",
+          "prometheus": "blok_step",
+          "note": "step id within the workflow"
+        },
+        {
+          "name": "blok.outcome",
+          "prometheus": "blok_outcome",
+          "values": [
+            "completed",
+            "failed",
+            "canceled",
+            "uncertain"
+          ],
+          "note": "uncertain: the effect may have happened"
+        },
+        {
+          "name": "blok.error.class",
+          "prometheus": "blok_error_class",
+          "note": "node error class; empty when the step did not fail"
+        }
+      ],
+      "description": "attempts of steps whose node declares effects",
+      "seriesBound": 0
+    },
+    {
+      "name": "blok.external.call.duration",
+      "prometheus": "blok_external_call_duration_seconds",
+      "kind": "histogram",
+      "unit": "s",
+      "signal": "latency",
+      "counts": "external_calls",
+      "path": "events",
+      "labels": [
+        {
+          "name": "blok.workflow",
+          "prometheus": "blok_workflow",
+          "note": "registered workflow name; invalid names are exported as invalid"
+        },
+        {
+          "name": "blok.step",
+          "prometheus": "blok_step",
+          "note": "step id within the workflow"
+        },
+        {
+          "name": "blok.outcome",
+          "prometheus": "blok_outcome",
+          "values": [
+            "completed",
+            "failed",
+            "canceled",
+            "uncertain"
+          ]
+        }
+      ],
+      "description": "external call duration",
+      "seriesBound": 0
+    },
+    {
+      "name": "blok.telemetry.dropped",
+      "prometheus": "blok_telemetry_dropped_total",
+      "kind": "counter",
+      "unit": "{event}",
+      "signal": "exporter_loss",
+      "counts": "telemetry",
+      "path": "events",
+      "labels": [
+        {
+          "name": "reason",
+          "prometheus": "reason",
+          "values": [
+            "queue_full",
+            "closed",
+            "abandoned",
+            "orphaned",
+            "series_overflow",
+            "spans_failed",
+            "logs_failed",
+            "metric_exports_failed"
+          ]
+        }
+      ],
+      "description": "telemetry the exporter discarded, by reason",
+      "seriesBound": 8
+    }
+  ],
+  "rejectReasons": [
+    "capacity",
+    "draining",
+    "not_ready",
+    "unavailable",
+    "invalid",
+    "conflict"
+  ]
+}

@@ -1,0 +1,43 @@
+# blok-fixture v1
+# scenario: worker-death
+# source: trigger/worker Queue.Census over SQLite, slo.WriteText
+# phase: before
+# HELP blok_work_items unfinished work by liveness; stalled pages, waiting never does
+# TYPE blok_work_items gauge
+blok_work_items{blok_source="orders",blok_liveness="pending"} 2
+blok_work_items{blok_source="orders",blok_liveness="active"} 0
+blok_work_items{blok_source="orders",blok_liveness="waiting"} 0
+blok_work_items{blok_source="orders",blok_liveness="uncertain"} 0
+blok_work_items{blok_source="orders",blok_liveness="stalled"} 0
+# HELP blok_work_oldest_pending_age_seconds age of the oldest pending item (backlog lag)
+# TYPE blok_work_oldest_pending_age_seconds gauge
+blok_work_oldest_pending_age_seconds{blok_source="orders"} 0.00471
+# HELP blok_work_dead_letters dead-lettered work retained for an operator
+# TYPE blok_work_dead_letters gauge
+blok_work_dead_letters{blok_source="orders"} 0
+# HELP blok_census_truncated 1 when the census hit its read bound; counts are lower bounds
+# TYPE blok_census_truncated gauge
+blok_census_truncated{blok_source="orders"} 0
+# HELP blok_operational_sample_failures_total operational source samples that failed, timed out or were invalid
+# TYPE blok_operational_sample_failures_total counter
+blok_operational_sample_failures_total 0
+# phase: after
+# HELP blok_work_items unfinished work by liveness; stalled pages, waiting never does
+# TYPE blok_work_items gauge
+blok_work_items{blok_source="orders",blok_liveness="pending"} 1
+blok_work_items{blok_source="orders",blok_liveness="active"} 0
+blok_work_items{blok_source="orders",blok_liveness="waiting"} 0
+blok_work_items{blok_source="orders",blok_liveness="uncertain"} 0
+blok_work_items{blok_source="orders",blok_liveness="stalled"} 1
+# HELP blok_work_oldest_pending_age_seconds age of the oldest pending item (backlog lag)
+# TYPE blok_work_oldest_pending_age_seconds gauge
+blok_work_oldest_pending_age_seconds{blok_source="orders"} 420.015741
+# HELP blok_work_dead_letters dead-lettered work retained for an operator
+# TYPE blok_work_dead_letters gauge
+blok_work_dead_letters{blok_source="orders"} 0
+# HELP blok_census_truncated 1 when the census hit its read bound; counts are lower bounds
+# TYPE blok_census_truncated gauge
+blok_census_truncated{blok_source="orders"} 0
+# HELP blok_operational_sample_failures_total operational source samples that failed, timed out or were invalid
+# TYPE blok_operational_sample_failures_total counter
+blok_operational_sample_failures_total 0

@@ -6,6 +6,9 @@
   ADR 0004 (worker protocol, hardened by E08-T04 #53)
 - Owners: observation port (`contract/observe`), engine instrumentation
   (`internal/engine`), OpenTelemetry exporter module (`observe/otel`)
+- Extended by: [ADR 0022](0022-operational-slo-metrics.md) (#105): operational
+  snapshot metrics, external-call instruments, second-based duration buckets
+  and the `metric_exports_failed` drop reason
 - Amended by: [ADR 0021](0021-sensitive-data-and-reliable-audit.md) (#80):
   allowlisted log attributes with a sensitive key or a credential-shaped
   value are exported as `[redacted]`; the shared credential pattern is wider

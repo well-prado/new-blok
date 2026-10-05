@@ -1,0 +1,71 @@
+# Recording rules for the Blok operational SLO catalogue (ADR 0022).
+#
+# Vendor-neutral Prometheus rules. Every series they read is catalogued in
+# ../catalogue.json; labels are blok_* (the OpenTelemetry attribute blok.x
+# becomes the Prometheus label blok_x). Aggregations keep job (and instance
+# where it matters) so one Prometheus can watch several deployments.
+#
+# Admission, completion, steps and external calls are recorded separately on
+# purpose: one accepted request completes one run made of many steps, only
+# some of which call out of the process.
+groups:
+  - name: blok-slo-recording
+    interval: 30s
+    rules:
+      # Admission: requests offered at the edge.
+      - record: blok:admission_saturation:ratio
+        expr: max by (job, instance) (blok_admission_active) / max by (job, instance) (blok_admission_capacity > 0)
+      - record: blok:admission_accepted:rate5m
+        expr: sum by (job) (rate(blok_admission_requests_total{blok_result="accepted"}[5m]))
+      - record: blok:admission_rejected:rate5m
+        expr: sum by (job, blok_reason) (rate(blok_admission_requests_total{blok_result="rejected"}[5m]))
+
+      # Completion: runs reaching an outcome. Uncertain is never failed.
+      - record: blok:runs:rate5m
+        expr: sum by (job, blok_workflow, blok_outcome) (rate(blok_runs_total[5m]))
+      - record: blok:runs_failed:ratio_rate5m
+        expr: |
+          sum by (job, blok_workflow) (rate(blok_runs_total{blok_outcome="failed"}[5m]))
+            / sum by (job, blok_workflow) (rate(blok_runs_total{blok_outcome!="suspended"}[5m]))
+      - record: blok:runs_uncertain:increase15m
+        expr: sum by (job, blok_workflow) (increase(blok_runs_total{blok_outcome="uncertain"}[15m]))
+      - record: blok:run_duration_seconds:p99_5m
+        expr: histogram_quantile(0.99, sum by (job, blok_workflow, le) (rate(blok_run_duration_seconds_bucket[5m])))
+
+      # Steps: step attempts.
+      - record: blok:steps_failed:rate5m
+        expr: sum by (job, blok_workflow, blok_step, blok_error_class) (rate(blok_steps_total{blok_outcome="failed"}[5m]))
+      - record: blok:step_duration_seconds:p99_5m
+        expr: histogram_quantile(0.99, sum by (job, blok_workflow, blok_step, le) (rate(blok_step_duration_seconds_bucket[5m])))
+
+      # External calls: attempts of steps whose node declares effects.
+      - record: blok:external_calls:rate5m
+        expr: sum by (job, blok_workflow, blok_step, blok_outcome) (rate(blok_external_calls_total[5m]))
+      - record: blok:external_calls_uncertain:increase15m
+        expr: sum by (job, blok_workflow, blok_step) (increase(blok_external_calls_total{blok_outcome="uncertain"}[15m]))
+      - record: blok:external_call_duration_seconds:p99_5m
+        expr: histogram_quantile(0.99, sum by (job, blok_workflow, blok_step, le) (rate(blok_external_call_duration_seconds_bucket[5m])))
+
+      # Unfinished work by liveness. Waiting is recorded for dashboards only.
+      - record: blok:work_stalled:max
+        expr: max by (job, blok_source) (blok_work_items{blok_liveness="stalled"})
+      - record: blok:work_waiting:max
+        expr: max by (job, blok_source) (blok_work_items{blok_liveness="waiting"})
+      - record: blok:work_uncertain:max
+        expr: max by (job, blok_source) (blok_work_items{blok_liveness="uncertain"})
+      - record: blok:work_backlog_seconds:max
+        expr: max by (job, blok_source) (blok_work_oldest_pending_age_seconds)
+
+      # Timers, workers and partitions.
+      - record: blok:timer_lag_seconds:max
+        expr: max by (job, blok_source) (blok_timer_lag_seconds)
+      - record: blok:worker_saturation:ratio
+        expr: max by (job, blok_worker) (blok_worker_in_flight) / max by (job, blok_worker) (blok_worker_capacity > 0)
+      - record: blok:partitions_unowned:max
+        expr: max by (job) (blok_partitions{blok_owned="false"})
+
+      # Storage growth and the monitoring pipeline itself.
+      - record: blok:storage_used_bytes:deriv1h
+        expr: max by (job, blok_store) (deriv(blok_storage_used_bytes[1h]))
+      - record: blok:telemetry_dropped:rate10m
+        expr: sum by (job, reason) (rate(blok_telemetry_dropped_total[10m]))

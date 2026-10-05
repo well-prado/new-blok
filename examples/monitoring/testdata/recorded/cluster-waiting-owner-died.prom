@@ -1,0 +1,63 @@
+# blok-fixture v1
+# scenario: cluster-waiting-owner-died
+# source: internal/cluster Runtime.Census over real etcd v3.6.5, slo.WriteText
+# phase: before
+# HELP blok_work_items unfinished work by liveness; stalled pages, waiting never does
+# TYPE blok_work_items gauge
+blok_work_items{blok_source="cluster",blok_liveness="pending"} 0
+blok_work_items{blok_source="cluster",blok_liveness="active"} 1
+blok_work_items{blok_source="cluster",blok_liveness="waiting"} 1
+blok_work_items{blok_source="cluster",blok_liveness="uncertain"} 0
+blok_work_items{blok_source="cluster",blok_liveness="stalled"} 0
+# HELP blok_work_oldest_pending_age_seconds age of the oldest pending item (backlog lag)
+# TYPE blok_work_oldest_pending_age_seconds gauge
+blok_work_oldest_pending_age_seconds{blok_source="cluster"} 0
+# HELP blok_work_dead_letters dead-lettered work retained for an operator
+# TYPE blok_work_dead_letters gauge
+blok_work_dead_letters{blok_source="cluster"} 0
+# HELP blok_census_truncated 1 when the census hit its read bound; counts are lower bounds
+# TYPE blok_census_truncated gauge
+blok_census_truncated{blok_source="cluster"} 0
+# HELP blok_timers_overdue timers past their due time and not yet fired
+# TYPE blok_timers_overdue gauge
+blok_timers_overdue{blok_source="cluster"} 0
+# HELP blok_timer_lag_seconds how far past due the oldest unfired timer is
+# TYPE blok_timer_lag_seconds gauge
+blok_timer_lag_seconds{blok_source="cluster"} 0
+# HELP blok_partitions durable partitions by live ownership; an unowned partition claims nothing and fires no timer
+# TYPE blok_partitions gauge
+blok_partitions{blok_owned="true"} 8
+blok_partitions{blok_owned="false"} 0
+# HELP blok_operational_sample_failures_total operational source samples that failed, timed out or were invalid
+# TYPE blok_operational_sample_failures_total counter
+blok_operational_sample_failures_total 0
+# phase: after
+# HELP blok_work_items unfinished work by liveness; stalled pages, waiting never does
+# TYPE blok_work_items gauge
+blok_work_items{blok_source="cluster",blok_liveness="pending"} 0
+blok_work_items{blok_source="cluster",blok_liveness="active"} 0
+blok_work_items{blok_source="cluster",blok_liveness="waiting"} 1
+blok_work_items{blok_source="cluster",blok_liveness="uncertain"} 0
+blok_work_items{blok_source="cluster",blok_liveness="stalled"} 0
+# HELP blok_work_oldest_pending_age_seconds age of the oldest pending item (backlog lag)
+# TYPE blok_work_oldest_pending_age_seconds gauge
+blok_work_oldest_pending_age_seconds{blok_source="cluster"} 0
+# HELP blok_work_dead_letters dead-lettered work retained for an operator
+# TYPE blok_work_dead_letters gauge
+blok_work_dead_letters{blok_source="cluster"} 0
+# HELP blok_census_truncated 1 when the census hit its read bound; counts are lower bounds
+# TYPE blok_census_truncated gauge
+blok_census_truncated{blok_source="cluster"} 0
+# HELP blok_timers_overdue timers past their due time and not yet fired
+# TYPE blok_timers_overdue gauge
+blok_timers_overdue{blok_source="cluster"} 0
+# HELP blok_timer_lag_seconds how far past due the oldest unfired timer is
+# TYPE blok_timer_lag_seconds gauge
+blok_timer_lag_seconds{blok_source="cluster"} 0
+# HELP blok_partitions durable partitions by live ownership; an unowned partition claims nothing and fires no timer
+# TYPE blok_partitions gauge
+blok_partitions{blok_owned="true"} 7
+blok_partitions{blok_owned="false"} 1
+# HELP blok_operational_sample_failures_total operational source samples that failed, timed out or were invalid
+# TYPE blok_operational_sample_failures_total counter
+blok_operational_sample_failures_total 0

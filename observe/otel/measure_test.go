@@ -24,6 +24,7 @@ import (
 	"github.com/well-prado/new-blok/execution"
 	"github.com/well-prado/new-blok/node"
 	"github.com/well-prado/new-blok/observe/otel"
+	"github.com/well-prado/new-blok/observe/slo"
 )
 
 type batchReport struct {
@@ -72,9 +73,12 @@ func percentile(sorted []int64, p float64) int64 {
 func TestMeasureMode(t *testing.T) {
 	mode := os.Getenv("BLOK_OBSERVE_MEASURE")
 	if mode == "" {
-		t.Skip("set BLOK_OBSERVE_MEASURE=off|sampled|full (and BLOK_OBSERVE_REPORT) to measure")
+		t.Skip("set BLOK_OBSERVE_MEASURE=off|sampled|full|metrics|slo (and BLOK_OBSERVE_REPORT) to measure")
 	}
-	ratios := map[string]float64{"off": 0, "sampled": 0.1, "full": 1}
+	// metrics and slo export metrics only, with tracing off: slo adds the
+	// ADR 0022 operational sources (sampled every metric interval), so
+	// slo minus metrics is the operational overhead.
+	ratios := map[string]float64{"off": 0, "sampled": 0.1, "full": 1, "metrics": 0, "slo": 0}
 	ratio, ok := ratios[mode]
 	if !ok {
 		t.Fatalf("unknown mode %q", mode)
@@ -98,7 +102,17 @@ func TestMeasureMode(t *testing.T) {
 		metrics, _ := otlpmetrichttp.New(ctx, otlpmetrichttp.WithEndpointURL(endpoint+"/v1/metrics"), otlpmetrichttp.WithRetry(otlpmetrichttp.RetryConfig{Enabled: false}))
 		logs, _ := otlploghttp.New(ctx, otlploghttp.WithEndpointURL(endpoint+"/v1/logs"), otlploghttp.WithRetry(otlploghttp.RetryConfig{Enabled: false}))
 		var err error
-		exporter, err = otel.New(otel.Config{Traces: traces, Metrics: metrics, Logs: logs, MetricInterval: time.Second, LogAttributes: []string{"sku"}, TenantLabels: []string{"tenant-a"}})
+		exportConfig := otel.Config{Traces: traces, Metrics: metrics, Logs: logs, MetricInterval: time.Second, LogAttributes: []string{"sku"}, TenantLabels: []string{"tenant-a"}}
+		if mode == "metrics" || mode == "slo" {
+			// Collect every 10ms so the metric reader (and, for slo, every
+			// operational source) runs many times while runs are measured.
+			exportConfig.Traces, exportConfig.Logs, exportConfig.LogAttributes = nil, nil, nil
+			exportConfig.MetricInterval = 10 * time.Millisecond
+		}
+		if mode == "slo" {
+			exportConfig.Operational = measureSources()
+		}
+		exporter, err = otel.New(exportConfig)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -166,5 +180,32 @@ func TestMeasureMode(t *testing.T) {
 		if err := os.WriteFile(path, encoded, 0o644); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+// measureSources are representative operational sources for the slo mode: a
+// deployment-sized readiness and admission snapshot, and a census that
+// classifies 1000 in-memory work items on every sample.
+func measureSources() []slo.Source {
+	items := make([]slo.Observation, 1000)
+	for i := range items {
+		items[i] = slo.Observation{Claimed: i%3 == 0, OwnerLive: i%50 != 0, Waiting: i%7 == 0}
+	}
+	return []slo.Source{
+		func(context.Context) (slo.Snapshot, error) {
+			return slo.Snapshot{
+				Readiness: &slo.Readiness{Ready: true, Dependencies: []slo.Dependency{{Name: "artifact", Ready: true}, {Name: "store", Ready: true}}},
+				Admission: &slo.Admission{Active: 1, Capacity: 32, Accepted: 10, Rejected: map[slo.RejectReason]uint64{slo.RejectCapacity: 1}},
+				Workers:   []slo.Worker{{Name: "node", Ready: true, InFlight: 1, Capacity: 64}},
+				Storage:   []slo.Storage{{Name: "journal", Used: 1 << 20, Budget: 1 << 30}},
+			}, nil
+		},
+		func(context.Context) (slo.Snapshot, error) {
+			work := slo.Work{Source: "orders"}
+			for _, item := range items {
+				work.Add(slo.Classify(item))
+			}
+			return slo.Snapshot{Work: []slo.Work{work}, Timers: []slo.Timers{{Source: "orders"}}, Partitions: &slo.Partitions{Total: 8, Owned: 8}}, nil
+		},
 	}
 }
