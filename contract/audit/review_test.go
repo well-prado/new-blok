@@ -333,3 +333,69 @@ func TestListCursorIsPerTenant(t *testing.T) {
 		cursor = next
 	}
 }
+
+// TestPruneTombstonesHoldDigestsAndKinds: a tombstone stores the sha256 of
+// the record id, never the id (approval ids are application-chosen and may
+// carry personal data), and Verify accepts only a tombstone of the right
+// digest and kind: a wrong-kind or raw-id tombstone does not stand in for a
+// missing record.
+func TestPruneTombstonesHoldDigestsAndKinds(t *testing.T) {
+	r := newRig(t, rigOptions{})
+	completed, err := r.journal.Admit(r.ctx, journal.AdmissionRequest{RequestKey: "done", Principal: "alice", Workflow: "orders", ArtifactDigest: digest("artifact"), Input: []byte(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.journal.CompleteRun(r.ctx, completed.RunID, []byte(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	personal := "decision-for-jane.doe@example.test"
+	if _, err := r.approve(personal, completed.RunID, true); err != nil {
+		t.Fatal(err)
+	}
+	r.clock = r.clock.Add(time.Hour)
+	if report, err := r.audit.Prune(r.ctx, r.clock, r.journal); err != nil || report.Removed != 1 {
+		t.Fatalf("prune=%+v err=%v", report, err)
+	}
+	var stored, kind string
+	if err := r.db.WithTx(r.ctx, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(r.ctx, `SELECT id_digest, kind FROM audit_pruned_v1`).Scan(&stored, &kind)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if stored != audit.Digest([]byte("approval:"+personal)) || kind != string(audit.KindApproval) || strings.Contains(stored, "jane") {
+		t.Fatalf("tombstone=%q kind=%q", stored, kind)
+	}
+	if _, err := r.audit.Verify(r.ctx, r.approval); err != nil {
+		t.Fatalf("verify with a correct tombstone: %v", err)
+	}
+	for name, statement := range map[string]string{
+		"wrong kind": `UPDATE audit_pruned_v1 SET kind = 'deployment.decision'`,
+		"raw id":     `UPDATE audit_pruned_v1 SET id_digest = 'approval:` + personal + `', kind = 'approval.decision'`,
+	} {
+		if err := r.db.WithTx(r.ctx, func(tx *sql.Tx) error { _, err := tx.ExecContext(r.ctx, statement); return err }); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := r.audit.Verify(r.ctx, r.approval); !errors.Is(err, audit.ErrMismatch) {
+			t.Fatalf("%s tombstone satisfied Verify: %v", name, err)
+		}
+	}
+}
+
+// TestRedeliveredReconciliationUnderAnotherTenantSucceeds: a re-delivery is
+// a duplicate whatever tenant context carries it; an existing record is not
+// rewritten, so it cannot conflict.
+func TestRedeliveredReconciliationUnderAnotherTenantSucceeds(t *testing.T) {
+	r := newRig(t, rigOptions{})
+	_, op := r.uncertainEffect("tenants")
+	first := audit.WithTenant(r.ctx, "tenant-a")
+	if _, err := r.journal.Reconcile(first, op.Key, "operator:bob", "evidence", []byte(`{"ok":true}`), true); err != nil {
+		t.Fatal(err)
+	}
+	again, err := r.journal.Reconcile(audit.WithTenant(r.ctx, "tenant-b"), op.Key, "operator:bob", "evidence", []byte(`{"ok":true}`), true)
+	if err != nil || !again.Duplicate {
+		t.Fatalf("re-delivery under another tenant: %+v err=%v", again, err)
+	}
+	if n := r.count(`SELECT COUNT(*) FROM audit_records_v1 WHERE tenant = 'tenant-a'`); n != 1 {
+		t.Fatalf("original record rewritten: tenant-a records=%d", n)
+	}
+}

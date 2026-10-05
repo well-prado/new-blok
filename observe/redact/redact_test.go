@@ -149,3 +149,25 @@ func mustJSON(t *testing.T, value any) string {
 	}
 	return string(raw)
 }
+
+// TestCredentialChecksValuesUnderSensitiveKeys: the strict predicate refuses
+// a generated-looking value under a sensitive key even when only JSON
+// decoding reveals the key (an escaped key the text pattern cannot see),
+// and does not refuse prose under the same key; the broad predicate
+// redacts both.
+func TestCredentialChecksValuesUnderSensitiveKeys(t *testing.T) {
+	credential := `{"password":"SYNTHETIC0cred9xyz"}`
+	prose := `{"password":"the new one"}`
+	if !redact.Credential(credential) {
+		t.Fatal("credential value under an escaped sensitive key not refused")
+	}
+	if redact.Credential(prose) {
+		t.Fatal("prose under a sensitive key refused")
+	}
+	if !redact.Sensitive(credential) || !redact.Sensitive(prose) {
+		t.Fatal("broad predicate must redact both")
+	}
+	if !redact.HasCredentialValue(map[string]any{"default": credential}) || redact.HasCredentialValue(map[string]any{"default": prose}) {
+		t.Fatal("HasCredentialValue disagrees with Credential")
+	}
+}

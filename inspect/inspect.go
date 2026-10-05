@@ -467,9 +467,11 @@ func boundedProjectionPolicy(policy inspection.Policy, stepCount, attemptCount, 
 }
 
 // maxRedactedPayloadBytes caps the redaction work one projected payload may
-// cost. Redaction decodes and pattern-matches every string (measured at up
-// to ~250 us per KiB of marker-dense text), so a payload larger than twice
-// its slot or than this cap is truncated without being decoded or redacted.
+// cost. Redaction decodes and pattern-matches every string; crafted
+// payloads just under this cap have been measured at 189-218 ms in review
+// (~1.8 ms per KiB), ordinary text at ~16 us per KiB. A payload larger than
+// twice its slot or than this cap is truncated without being decoded or
+// redacted.
 // A payload whose redacted form would have fit (redaction can shrink a long
 // secret to the marker) is then truncated too: the safe direction. Work per
 // page is therefore bounded by about twice the response limit.

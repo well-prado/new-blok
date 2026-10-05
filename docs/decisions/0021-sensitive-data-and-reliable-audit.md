@@ -73,7 +73,9 @@ inserted, and different content under the same ID is `ErrConflict`.
 A refused decision can be retried once the store recovers; the retry writes
 the decision and its record exactly once. A re-delivered approval or
 reconciliation whose record is missing (it predates audit) writes that
-record.
+record. A re-delivered reconciliation whose record exists is a duplicate
+and never rewrites it, whatever tenant context carries the re-delivery; a
+backfilled record takes the re-delivery's tenant.
 
 ### 3. Access
 
@@ -100,7 +102,8 @@ users denied each other.
 
 `audit.Journal.Prune(ctx, cutoff, activity)` deletes records committed
 strictly before `cutoff`, in bounded batches (256 per transaction), leaves
-each deleted record's id as a tombstone (`audit_pruned_v1`) for Verify, and
+a tombstone (`audit_pruned_v1`) holding the **sha256 of the record id** and
+its kind (ids are application-chosen and may carry personal data), and
 never:
 
 - a record younger than `Config.MinRetention`, the application's legal
@@ -131,7 +134,8 @@ After a restore, `audit.Journal.Verify(ctx, owners...)` proves two things:
    and canonical encoding, and the record count matches the counter.
 2. **Agreement** (`ErrMismatch`), for each `audit.Owner` passed (the
    approval store and the journal implement it): every durable decision
-   has its record or a prune tombstone, and every record of the owner's
+   has its record or a prune tombstone of the same id digest and kind, and
+   every record of the owner's
    kind names a decision the owner still has. This catches an audit table
    that was dropped and recreated empty, a deleted row whose counter was
    adjusted, and a restore that mixed audit and state from different
@@ -150,21 +154,28 @@ content are different decisions:
 
 - **Broad** (`observe.SensitiveText`, `redact.Sensitive`), for redacting
   projected copies: any value after a sensitive key counts, except a plain
-  number after a token key, which is a count (`max_tokens: 256`), not a
-  token.
+  number after an exact token-count name (`max_tokens: 256`). A number after
+  any other token key (`access_token=48291736`) is redacted.
 - **Strict** (`observe.CredentialText`, `redact.Credential`), for refusing
-  content: an unconditional credential shape, or a value after a sensitive
-  key or bearer scheme that looks generated (at least 8 characters with
-  both letters and digits). `password: the new password` and
-  `max_tokens: 256` are not credentials.
+  content: an unconditional credential shape (listed below), or a value
+  after a sensitive key or bearer scheme that has **at least 8 characters
+  and both letters and digits**. That rule is deliberately narrow so tool
+  descriptions such as `password: the new password` or `max_tokens: 256`
+  are admitted, and it therefore misses letters-only, digits-only, uniform
+  and short values, and `Bearer <letters>`. Refusal is best effort; the
+  broad predicate still redacts all of these in every projected copy.
 
 What is recognised:
 
 - **Keys**: a key containing `password`, `passwd`, `pwd`, `passphrase`,
   `secret`, `token`, `authorization`, `credential`, `apikey`, `privatekey`,
   `cookie` or `sessionid` (case and `_` `-` `.` ignored) hides its whole
-  value. Token counts and limits (`usage.total_tokens`, `max_tokens`,
-  `token_count`, `tokenLimit`) are not tokens and are kept.
+  value. Only the exact names of model-token counts and limits are exempt
+  from `token` (`observe.TokenCountKey`: `max_tokens`, `total_tokens`,
+  `prompt_tokens`, `completion_tokens`, `input_tokens`, `output_tokens`,
+  `token_count`, `tokenLimit` and close equivalents, also as the last
+  segment of a dotted path). Plural keys that hold tokens (`refreshTokens`,
+  `accessTokens`, `csrfTokens`) stay sensitive.
 - **Text**: `key=value` / `key: value` for those markers with any prefix or
   suffix (`client_secret=`, `access_token:`), quoted or JSON-escaped as in
   `body={\"password\":…}`; XML elements (`<password>…`); `Cookie:`,
@@ -182,9 +193,10 @@ What is recognised:
 - **Bounds**: decoding is attempted only on strings up to 16 KiB; longer
   strings are matched as written. Structural depth is bounded at 64. A
   projected payload larger than `min(2 × its slot, 128 KiB)` is truncated
-  before it is decoded or redacted, so redaction work per page is about
-  twice the response limit (measured at up to ~250 µs per KiB of
-  marker-dense text, ~16 µs per KiB of ordinary text).
+  before it is decoded or redacted. Crafted payloads just under the cap
+  were measured at 189–218 ms each in review (~1.8 ms per KiB); ordinary
+  text costs ~16 µs per KiB. Work per page is bounded by about twice the
+  response limit, so a crafted full page can take seconds.
 
 Enforcement points (each covered by a mutation-tested check):
 
@@ -284,12 +296,12 @@ Pre-alpha. Classified per surface:
   legal hold, backup → more decisions → restore with audit and durable state
   agreeing and later decisions absent from both, tampered restored audit
   detected, two-tenant audit reads, pagination.
-- `observe/redact/testdata/cases.json`: 38 cases including JSON-in-string,
+- `observe/redact/testdata/cases.json`: 41 cases including JSON-in-string,
   escaped keys, percent-encoding (`+` as space), base64 (std, URL alphabet,
   double, triple, padded inside `key=value` and inside a percent-encoded
   query value), Basic auth, URL userinfo, PEM, cookie text, `pwd` and
   passphrase keys, provider token prefixes, JSON-escaped prose, XML, token
-  counts kept, plus negative and boundary cases (hex, unmarked prose, four
+  counts kept, plural token keys and digits after token keys redacted, plus negative and boundary cases (hex, unmarked prose, four
   encodings, unicode-escaped JSON after a prefix, gzip+base64).
 - `testdata/inspection/redaction/cases.json` through the real engine and the
   SQLite journal source: secret-shaped inputs, outputs, error codes and
@@ -297,21 +309,27 @@ Pre-alpha. Classified per surface:
 - Telemetry (`observe/otel/redaction_test.go`, real OTLP/HTTP exporter),
   worker log frames, catalog listings (refused and admitted), and the
   projection size gate (`inspect/bound_internal_test.go`).
-- 46 deliberate mutations, each shown red; commands and results are in the
+- 52 deliberate mutations, each shown red; commands and results are in the
   PR.
 
 ## Limits
 
 - Journaled and cluster runs on `store/distributed` (ADR 0019) have no audit
-  integration and no `RunActivity`; Prune's activity port answers only for
-  runs the journal holds. A record whose run lives elsewhere is treated as
-  inactive unless the application composes an activity port for it.
+  integration and no `RunActivity` of their own. Prune fails closed for
+  them: the journal's activity port reports a run it does not hold as
+  active, so such a record is kept until the application composes an
+  activity port that can prove the run ended.
+- An upgraded database's decisions recorded before audit existed are
+  reported by `Verify` as `ErrMismatch`, not as legacy; an audit start
+  marker is
+  [#284](https://github.com/well-prado/new-blok/issues/284).
 - Retention and erasure of durable state are [#281](https://github.com/well-prado/new-blok/issues/281): the compaction tombstone
   (`journal_audit`, #49) still stores a compacted run's output, and
-  reconciliation evidence text is kept forever in `journal_reconciliations`.
+  reconciliation evidence text is kept forever in `journal_reconciliations`,
+  and `Compact` can fail on a reconciled run's foreign key.
   Neither is this audit contract, and no read API exposes them.
-- Prune tombstones (`audit_pruned_v1`) keep a pruned record's id and kind
-  forever, so Verify can tell pruned from missing.
+- Prune tombstones (`audit_pruned_v1`) keep a pruned record's id digest
+  and kind forever, so Verify can tell pruned from missing.
 - No hash chain or external anchoring of audit records.
 - The live event stream (`observe/event`, `inspect/events*.go`) was not
   reshaped: it gains the new redaction through the shared `inspect`

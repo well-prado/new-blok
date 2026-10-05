@@ -289,7 +289,7 @@ func ValidLabel(value string) bool {
 // 7 a credential with an unconditional shape (cloud and provider token
 // prefixes, JWTs, URL userinfo, PEM private keys).
 var sensitiveLogText = regexp.MustCompile(`(?i)` +
-	`(password|passwd|pwd|passphrase|secret|token|authorization|credential|cookie|session[_-]?id|api[_-]?key|private[_-]?key)[a-z0-9_.-]*\\?["']?\s*[:=]\s*\\?["']?((?:bearer\s+|basic\s+)?[^\s"'\\,;&<>]+)` +
+	`((?:password|passwd|pwd|passphrase|secret|token|authorization|credential|cookie|session[_-]?id|api[_-]?key|private[_-]?key)[a-z0-9_.-]*)\\?["']?\s*[:=]\s*\\?["']?((?:bearer\s+|basic\s+)?[^\s"'\\,;&<>]+)` +
 	`|<(password|passwd|pwd|passphrase|secret|token|api[_-]?key|private[_-]?key)>\s*([^<\s]+)` +
 	`|\b(bearer)\s+([A-Za-z0-9._~+/=-]+)` +
 	`|(\bAKIA[0-9A-Z]{16}\b|\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|\b[a-z][a-z0-9+.-]*://[^/\s:@]+:[^/\s@]+@|-----BEGIN [A-Z ]*PRIVATE KEY-----|\bgh[pousr]_[A-Za-z0-9]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}|\bsk-[A-Za-z0-9_-]{16,}|\bxox[abprs]-[A-Za-z0-9-]{10,})`)
@@ -299,9 +299,11 @@ var sensitiveLogText = regexp.MustCompile(`(?i)` +
 // expression runs only on the rare text that might.
 var sensitiveMarkers = []string{"password", "passwd", "pwd", "passphrase", "secret", "token", "authorization", "credential", "cookie", "session", "api", "private", "bearer", "akia", "eyj", "://", "-----begin", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "sk-", "xox"}
 
-// scanCredentials calls accept for each candidate match: the key (or
-// "bearer"), its value, and whether the match has an unconditional
-// credential shape. It reports whether accept returned true for any.
+// scanCredentials calls accept for each candidate match: the full key (the
+// marker with its prefix and suffix, lowercased; "bearer" for a bearer
+// token; "" for an unconditional shape), its value, and whether the match
+// has an unconditional credential shape. It reports whether accept returned
+// true for any.
 func scanCredentials(text string, accept func(key, value string, shaped bool) bool) bool {
 	lower := strings.ToLower(text)
 	found := false
@@ -314,17 +316,29 @@ func scanCredentials(text string, accept func(key, value string, shaped bool) bo
 	if !found {
 		return false
 	}
-	for _, m := range sensitiveLogText.FindAllStringSubmatch(text, -1) {
+	group := func(m []int, i int) string {
+		if m[2*i] < 0 {
+			return ""
+		}
+		return text[m[2*i]:m[2*i+1]]
+	}
+	for _, m := range sensitiveLogText.FindAllStringSubmatchIndex(text, -1) {
 		var ok bool
 		switch {
-		case m[1] != "":
-			ok = accept(strings.ToLower(m[1]), m[2], false)
-		case m[3] != "":
-			ok = accept(strings.ToLower(m[3]), m[4], false)
-		case m[5] != "":
-			ok = accept("bearer", m[6], false)
+		case m[2] >= 0:
+			// The unanchored match starts at the marker; the key's prefix
+			// ("access_", "max_") precedes it.
+			start := m[2]
+			for start > 0 && keyByte(lower[start-1]) {
+				start--
+			}
+			ok = accept(lower[start:m[3]], group(m, 2), false)
+		case m[6] >= 0:
+			ok = accept(strings.ToLower(group(m, 3)), group(m, 4), false)
+		case m[10] >= 0:
+			ok = accept("bearer", group(m, 6), false)
 		default:
-			ok = accept("", m[7], true)
+			ok = accept("", group(m, 7), true)
 		}
 		if ok {
 			return true
@@ -333,14 +347,42 @@ func scanCredentials(text string, accept func(key, value string, shaped bool) bo
 	return false
 }
 
+func keyByte(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_' || c == '.' || c == '-'
+}
+
+// tokenCountNames are the exact (normalized) names of model-token counts and
+// limits. Only these are exempt from the "token" marker: a plural key such
+// as refreshTokens, accessTokens or csrfTokens holds tokens and stays
+// sensitive.
+var tokenCountNames = map[string]bool{
+	"maxtokens": true, "totaltokens": true, "prompttokens": true, "completiontokens": true,
+	"inputtokens": true, "outputtokens": true, "maxoutputtokens": true, "maxinputtokens": true,
+	"maxcompletiontokens": true, "cachedtokens": true, "reasoningtokens": true, "numtokens": true,
+	"tokensused": true, "usedtokens": true, "tokencount": true, "tokenlimit": true,
+	"tokenbudget": true, "tokenusage": true, "maxtokenlimit": true,
+}
+
+// TokenCountKey reports whether key is the exact name of a model-token
+// count or limit, such as "max_tokens", "tokenLimit" or the last segment of
+// a dotted path ("usage.total_tokens"). Case and '_' '-' are ignored.
+func TokenCountKey(key string) bool {
+	if dot := strings.LastIndexAny(key, "./"); dot >= 0 {
+		key = key[dot+1:]
+	}
+	key = strings.ToLower(strings.NewReplacer("_", "", "-", "").Replace(key))
+	return tokenCountNames[key]
+}
+
 // SensitiveText reports whether text contains a credential-shaped fragment.
 // It is deliberately broad, for redacting projected copies: any value after
-// a sensitive key counts, except a plain number after a token key, which is
-// a count ("max_tokens: 256"), not a token. It inspects the text as written;
+// a sensitive key counts, except a plain number after an exact token-count
+// name ("max_tokens: 256"). A number after any other token key
+// ("access_token=48291736") is still redacted. It inspects the text as written;
 // observe/redact also inspects encoded forms.
 func SensitiveText(text string) bool {
 	return scanCredentials(text, func(key, value string, shaped bool) bool {
-		return shaped || !(strings.Contains(key, "token") && digits(value))
+		return shaped || !(TokenCountKey(key) && digits(value))
 	})
 }
 

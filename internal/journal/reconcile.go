@@ -122,9 +122,15 @@ func (j *Journal) reconcileOnce(ctx context.Context, operationKey, actor, eviden
 			existing.Result = append([]byte(nil), existingResult...)
 			existing.Duplicate = true
 			reconciliation = existing
-			// A re-delivered reconciliation writes the record the original
-			// one wrote: a no-op when it exists, the missing record when the
-			// original predates audit.
+			// A re-delivered reconciliation succeeds as a duplicate. When its
+			// record is missing (the original predates audit) it writes it,
+			// under the re-delivery's tenant; an existing record is never
+			// rewritten, so a re-delivery under another tenant context does
+			// not conflict.
+			recorded, err := j.audit.Recorded(ctx, tx, "reconcile:"+existing.OperationKey)
+			if err != nil || recorded {
+				return err
+			}
 			record, inserted, err = j.audit.Append(ctx, tx, reconciliationRecord(ctx, existing.OperationKey, existing.Actor, existing.Evidence, existing.Result, runID, createdAt))
 			return err
 		}

@@ -44,33 +44,22 @@ const (
 
 var sensitiveKeyMarkers = []string{"password", "passwd", "pwd", "passphrase", "secret", "token", "authorization", "credential", "apikey", "privatekey", "cookie", "sessionid"}
 
-// tokenCountSuffixes name counts and limits of model tokens, not tokens:
-// "total_tokens", "maxTokens", "token_count", "tokenLimit".
-var tokenCountSuffixes = []string{"tokens", "tokencount", "tokenlimit", "tokenbudget", "tokenusage"}
-
 // Key reports whether a structured key names sensitive content. Case and the
 // separators '_', '-' and '.' are ignored, so "api_key", "API-Key" and
-// "client.secret" all match. A token count or limit ("usage.total_tokens",
-// "max_tokens") is not a token and is not matched by "token" alone.
+// "client.secret" all match. Only the exact name of a model-token count or
+// limit (observe.TokenCountKey: "total_tokens", "max_tokens", "tokenLimit")
+// is exempt from "token"; plural keys such as refreshTokens stay sensitive.
 func Key(key string) bool {
+	original := key
 	key = strings.ToLower(strings.NewReplacer("_", "", "-", "", ".", "").Replace(key))
 	for _, marker := range sensitiveKeyMarkers {
 		if !strings.Contains(key, marker) {
 			continue
 		}
-		if marker == "token" && tokenCount(key) {
+		if marker == "token" && observe.TokenCountKey(original) {
 			continue
 		}
 		return true
-	}
-	return false
-}
-
-func tokenCount(key string) bool {
-	for _, suffix := range tokenCountSuffixes {
-		if strings.HasSuffix(key, suffix) {
-			return true
-		}
 	}
 	return false
 }

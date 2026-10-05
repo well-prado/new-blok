@@ -441,6 +441,57 @@
       "redacted": 0
     },
     {
+      "name": "plural-token-keys-hold-tokens",
+      "kind": "value",
+      "input": {
+        "refreshTokens": [
+          "SYNTHETIC8f3kQ2pLz9xVb7Rm1nTw"
+        ],
+        "accessTokens": [
+          "SYNTHETIC-at-01"
+        ],
+        "apiTokens": "SYNTHETIC-api-02",
+        "auth_tokens": "SYNTHETIC-auth-03",
+        "pushTokens": [
+          "SYNTHETIC-push-04"
+        ],
+        "csrfTokens": "SYNTHETIC-csrf-05"
+      },
+      "expected": {
+        "refreshTokens": "[redacted]",
+        "accessTokens": "[redacted]",
+        "apiTokens": "[redacted]",
+        "auth_tokens": "[redacted]",
+        "pushTokens": "[redacted]",
+        "csrfTokens": "[redacted]"
+      },
+      "redacted": 6
+    },
+    {
+      "name": "digits-after-token-keys-in-text",
+      "kind": "value",
+      "input": {
+        "a": "retry with access_token=48291736",
+        "b": "session_token: 82734561",
+        "c": "usage.total_tokens: 1234",
+        "d": "maxTokens=4096"
+      },
+      "expected": {
+        "a": "[redacted]",
+        "b": "[redacted]",
+        "c": "usage.total_tokens: 1234",
+        "d": "maxTokens=4096"
+      },
+      "redacted": 2
+    },
+    {
+      "name": "message-digits-after-access-token",
+      "kind": "message",
+      "input": "refresh failed for access_token=48291736",
+      "expected": "[redacted: sensitive-looking log message]",
+      "redacted": 1
+    },
+    {
       "name": "boundary-unicode-escaped-json-after-prefix-not-detected",
       "kind": "value",
       "boundary": true,

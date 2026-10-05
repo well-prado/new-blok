@@ -82,9 +82,10 @@ func NewJournal(ctx context.Context, database store.Database, cfg Config) (*Jour
 			`CREATE INDEX IF NOT EXISTS audit_records_v1_time ON audit_records_v1(recorded_at, seq)`,
 			`CREATE INDEX IF NOT EXISTS audit_records_v1_kind ON audit_records_v1(kind, id)`,
 			`CREATE TABLE IF NOT EXISTS audit_meta_v1 (name TEXT PRIMARY KEY, value INTEGER NOT NULL)`,
-			// A pruned record leaves its id, so Verify can tell a pruned
-			// record from a missing one.
-			`CREATE TABLE IF NOT EXISTS audit_pruned_v1 (id TEXT PRIMARY KEY, kind TEXT NOT NULL, pruned_at INTEGER NOT NULL)`,
+			// A pruned record leaves the sha256 of its id (ids are
+			// application-chosen and may carry personal data) and its kind,
+			// so Verify can tell a pruned record from a missing one.
+			`CREATE TABLE IF NOT EXISTS audit_pruned_v1 (id_digest TEXT PRIMARY KEY, kind TEXT NOT NULL, pruned_at INTEGER NOT NULL)`,
 			`INSERT INTO audit_meta_v1 (name, value) SELECT 'records', COUNT(*) FROM audit_records_v1 WHERE true ON CONFLICT(name) DO NOTHING`,
 		} {
 			if _, err := tx.ExecContext(ctx, statement); err != nil {
@@ -173,6 +174,20 @@ func (j *Journal) Append(ctx context.Context, tx *sql.Tx, r Record) (record Reco
 		return Record{}, false, unavailableErr(err)
 	}
 	return r, true, nil
+}
+
+// Recorded reports, inside tx, whether a record with id exists. An owner
+// uses it to backfill a missing record without re-deriving one that exists
+// (whose tenant or time it may not know).
+func (j *Journal) Recorded(ctx context.Context, tx *sql.Tx, id string) (bool, error) {
+	if j == nil || tx == nil {
+		return false, ErrRequired
+	}
+	var found int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM audit_records_v1 WHERE id = ?`, id).Scan(&found); err != nil {
+		return false, unavailableErr(err)
+	}
+	return found > 0, nil
 }
 
 // Notify offers committed records to the optional Mirror. Owners call it
@@ -325,7 +340,7 @@ func crossCheck(ctx context.Context, tx *sql.Tx, owner Owner) error {
 	err := owner.AuditedIDs(ctx, tx, func(id string) error {
 		decisions[id] = true
 		var found int
-		if err := tx.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM audit_records_v1 WHERE id = ? AND kind = ?) + (SELECT COUNT(*) FROM audit_pruned_v1 WHERE id = ? AND kind = ?)`, id, string(kind), id, string(kind)).Scan(&found); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM audit_records_v1 WHERE id = ? AND kind = ?) + (SELECT COUNT(*) FROM audit_pruned_v1 WHERE id_digest = ? AND kind = ?)`, id, string(kind), Digest([]byte(id)), string(kind)).Scan(&found); err != nil {
 			return err
 		}
 		if found == 0 {
@@ -398,7 +413,7 @@ type PruneReport struct {
 // than Config.MinRetention, never one whose run activity reports active (an
 // activity port must report a run it cannot prove ended as active), and
 // never one the application's Hold keeps; it leaves each deleted record's id
-// as a tombstone for Verify. activity is required: without it
+// as a digest tombstone for Verify. activity is required: without it
 // a run's state is unknown, so nothing is deleted. Each batch is its own
 // bounded transaction; a failure leaves earlier batches committed and
 // deletes nothing in the failed one.
@@ -481,7 +496,7 @@ func (j *Journal) pruneBatch(ctx context.Context, cutoff, after int64, activity 
 			if _, err := tx.ExecContext(ctx, `DELETE FROM audit_records_v1 WHERE seq = ?`, item.seq); err != nil {
 				return err
 			}
-			if _, err := tx.ExecContext(ctx, `INSERT INTO audit_pruned_v1 (id, kind, pruned_at) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET pruned_at = excluded.pruned_at`, item.record.ID, string(item.record.Kind), j.cfg.Clock().UTC().UnixNano()); err != nil {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO audit_pruned_v1 (id_digest, kind, pruned_at) VALUES (?, ?, ?) ON CONFLICT(id_digest) DO UPDATE SET pruned_at = excluded.pruned_at`, Digest([]byte(item.record.ID)), string(item.record.Kind), j.cfg.Clock().UTC().UnixNano()); err != nil {
 				return err
 			}
 			report.Removed++

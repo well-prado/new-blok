@@ -33,6 +33,7 @@ func TestCatalogListingsAreOpaqueByDefault(t *testing.T) {
 		{name: "description-assignment", description: "call with api_key=SYNTHETIC-catalog-0002", schema: valueSchema, metadata: metadata()},
 		{name: "schema-default-bearer", description: "reads", schema: []byte(`{"type":"object","properties":{"value":{"type":"integer"},"auth":{"type":"string","default":"Bearer SYNTHETIC-catalog-0003"}},"required":["value"]}`), metadata: metadata()},
 		{name: "schema-default-encoded", description: "reads", schema: []byte(`{"type":"object","properties":{"value":{"type":"integer"},"mode":{"type":"string","default":"` + encoded + `"}},"required":["value"]}`), metadata: metadata()},
+		{name: "schema-default-json-escaped-key", description: "reads", schema: []byte(`{"type":"object","properties":{"value":{"type":"integer"},"cfg":{"type":"string","default":"{\"pass\\u0077ord\":\"SYNTHETIC0cred9xyz\"}"}},"required":["value"]}`), metadata: metadata()},
 		{name: "description-encoded", description: "uses " + encoded, schema: valueSchema, metadata: metadata()},
 	}
 	for _, item := range cases {
