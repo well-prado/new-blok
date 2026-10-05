@@ -69,52 +69,90 @@ func (d Definition[I, O]) Program() Program { return cloneProgram(d.program) }
 // Lower converts a structurally authored definition into the engine's
 // transport-independent internal program. It only lowers the instruction
 // forms supported by the native execution path; it never invokes a node.
+//
+// Each call's input lowers to the same structural reference the canonical
+// document compiler produces: the workflow input ("$input") carries no
+// reference, and an earlier call's result or field ("$step.<id>[.<field>…]")
+// becomes one reference with that path. Every other input — a literal, a
+// field of the workflow input, a reference to a call that is not strictly
+// earlier in this program — has no program form, so Lower rejects it instead
+// of letting the engine fall back to the workflow input (#244). Control
+// constructs are rejected the same way.
 func (d Definition[I, O]) Lower() (contract.InternalProgram, error) {
 	program := d.Program()
 	internal := contract.InternalProgram{
 		WorkflowID: program.Spec.Name,
 		Version:    program.Spec.Version,
 	}
-	for index, instruction := range program.Instructions {
+	for _, instruction := range program.Instructions {
 		if instruction.Kind != "call" {
 			return contract.InternalProgram{}, fmt.Errorf("flow: instruction %q of kind %q cannot be lowered", instruction.ID, instruction.Kind)
 		}
-		internal.Instructions = append(internal.Instructions, contract.InternalInstruction{
-			Index: index,
-			ID:    instruction.ID,
-			Kind:  instruction.Kind,
-			Node:  instruction.Node.Name,
-		})
 	}
-	step, path, err := lowerReference(program.Output)
+	earlier := make(map[string]bool, len(program.Instructions))
+	for index, instruction := range program.Instructions {
+		references, err := lowerCallInput(instruction, earlier)
+		if err != nil {
+			return contract.InternalProgram{}, fmt.Errorf("flow: call %q: %w", instruction.ID, err)
+		}
+		internal.Instructions = append(internal.Instructions, contract.InternalInstruction{
+			Index:      index,
+			ID:         instruction.ID,
+			Kind:       instruction.Kind,
+			Node:       instruction.Node.Name,
+			References: references,
+		})
+		earlier[instruction.ID] = true
+	}
+	output, err := lowerReference(program.Output, earlier)
 	if err != nil {
 		return contract.InternalProgram{}, fmt.Errorf("flow: output: %w", err)
 	}
 	internal.Instructions = append(internal.Instructions, contract.InternalInstruction{
-		Index: len(internal.Instructions),
-		ID:    "output",
-		Kind:  "output",
-		References: []contract.Reference{{
-			Step: step,
-			Path: path,
-		}},
+		Index:      len(internal.Instructions),
+		ID:         "output",
+		Kind:       "output",
+		References: []contract.Reference{output},
 	})
 	return internal, nil
 }
 
-func lowerReference(source string) (string, []string, error) {
+// lowerCallInput returns the references for one call's input. A call without
+// references receives the workflow input, so only "$input" may lower to none.
+func lowerCallInput(instruction Instruction, earlier map[string]bool) ([]contract.Reference, error) {
+	switch {
+	case instruction.Input == "$input":
+		return nil, nil
+	case instruction.Input == "$literal":
+		return nil, fmt.Errorf("literal input cannot be lowered: the engine program has no literal form")
+	}
+	reference, err := lowerReference(instruction.Input, earlier)
+	if err != nil {
+		return nil, fmt.Errorf("input %w", err)
+	}
+	return []contract.Reference{reference}, nil
+}
+
+// lowerReference converts "$step.<id>[.<field>…]" naming a call already in
+// earlier into a structural reference.
+func lowerReference(source string, earlier map[string]bool) (contract.Reference, error) {
 	const prefix = "$step."
 	if !strings.HasPrefix(source, prefix) {
-		return "", nil, fmt.Errorf("output %q must reference a call result", source)
+		return contract.Reference{}, fmt.Errorf("%q cannot be lowered: it does not name a call result", source)
 	}
 	parts := strings.Split(strings.TrimPrefix(source, prefix), ".")
-	if len(parts) == 0 || parts[0] == "" {
-		return "", nil, fmt.Errorf("output %q has no step", source)
+	for _, part := range parts {
+		if part == "" {
+			return contract.Reference{}, fmt.Errorf("%q has an empty field", source)
+		}
+	}
+	if !earlier[parts[0]] {
+		return contract.Reference{}, fmt.Errorf("%q does not reference an earlier call", source)
 	}
 	if len(parts) == 1 {
-		return parts[0], nil, nil
+		return contract.Reference{Step: parts[0]}, nil
 	}
-	return parts[0], parts[1:], nil
+	return contract.Reference{Step: parts[0], Path: parts[1:]}, nil
 }
 
 func Define[I, O any](spec Spec, build func(*Builder, Ref[I]) Ref[O]) (Definition[I, O], error) {
