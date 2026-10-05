@@ -88,3 +88,58 @@ func TestDottedKeyIsRejected(t *testing.T) {
 		t.Fatalf("err=%v; want the dotted key rejected", err)
 	}
 }
+
+// TestCustomMarshalersGetNoFieldAccessors: a type with its own MarshalJSON
+// or MarshalText encodes to whatever that method returns, so its Go fields
+// are not reference keys; an accessor for one would fail at run time (#241).
+func TestCustomMarshalersGetNoFieldAccessors(t *testing.T) {
+	source := []byte("package shop\n\n" +
+		"type Money struct{ Cents int64 }\n\n" +
+		"func (m Money) MarshalJSON() ([]byte, error) { return nil, nil }\n\n" +
+		"type Cents struct{ Value int64 }\n\n" +
+		"func (c *Cents) MarshalJSON() ([]byte, error) { return nil, nil }\n\n" +
+		"type Code struct{ Text string }\n\n" +
+		"func (c Code) MarshalText() ([]byte, error) { return nil, nil }\n\n" +
+		"type NotJSON struct{ Value int64 }\n\n" +
+		"func (NotJSON) MarshalJSON() string { return \"\" }\n\n" +
+		"type Line struct {\n\tPrice Money `json:\"price\"`\n}\n")
+	generated, err := Source(source, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(generated)
+	for _, absent := range []string{"MoneyRef", "CentsRef", "CodeRef"} {
+		if strings.Contains(text, absent) {
+			t.Fatalf("custom-marshaled type got %s:\n%s", absent, text)
+		}
+	}
+	for _, present := range []string{"func (r NotJSONRef) Value() flow.Ref[int64]", "func (r LineRef) Price() flow.Ref[Money]"} {
+		if !strings.Contains(text, present) {
+			t.Fatalf("missing %q:\n%s", present, text)
+		}
+	}
+}
+
+// TestStringOptionFieldsGetNoAccessor: a reference resolves a ",string"
+// field to its quoted text, so a flow.Ref of the field's Go type would be
+// wrong (#241).
+func TestStringOptionFieldsGetNoAccessor(t *testing.T) {
+	source := []byte("package shop\n\ntype Line struct {\n" +
+		"\tCount int64 `json:\"count,string\"`\n" +
+		"\tNote string `json:\"note,omitempty,string\"`\n" +
+		"\tTotal int64 `json:\"total\"`\n" +
+		"}\n")
+	generated, err := Source(source, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(generated)
+	for _, absent := range []string{"func (r LineRef) Count()", "func (r LineRef) Note()"} {
+		if strings.Contains(text, absent) {
+			t.Fatalf("a ,string field got an accessor:\n%s", text)
+		}
+	}
+	if !strings.Contains(text, `func (r LineRef) Total() flow.Ref[int64] { return flow.Select[Line, int64](r.value, "total") }`) {
+		t.Fatalf("missing Total accessor:\n%s", text)
+	}
+}

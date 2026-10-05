@@ -58,9 +58,15 @@ func Source(source []byte, options Options) ([]byte, error) {
 			if !ok {
 				continue
 			}
-			if _, ok := named.Underlying().(*types.Struct); ok {
-				typesToGenerate = append(typesToGenerate, named)
+			if _, ok := named.Underlying().(*types.Struct); !ok {
+				continue
 			}
+			if customJSON(named) {
+				// encoding/json writes whatever its marshaler returns, so
+				// its Go fields are not the keys a reference selects (#241).
+				continue
+			}
+			typesToGenerate = append(typesToGenerate, named)
 		}
 	}
 	sort.Slice(typesToGenerate, func(i, j int) bool { return typesToGenerate[i].Obj().Name() < typesToGenerate[j].Obj().Name() })
@@ -145,18 +151,50 @@ func renderType(typeValue types.Type) (string, error) {
 // jsonKey is the key encoding/json writes for a struct field, which is what
 // a workflow reference selects: the json tag's name when it has one,
 // otherwise the Go field name exactly. A field tagged "-" is never encoded,
-// so it gets no accessor (#240).
+// so it gets no accessor (#240). Nor does a ",string" field: a reference
+// resolves it to its quoted text, not to the field's Go type (#241).
 func jsonKey(field, tag string) (string, bool) {
 	value, tagged := reflect.StructTag(tag).Lookup("json")
 	if !tagged {
 		return field, true
 	}
-	name, _, _ := strings.Cut(value, ",")
+	name, options, _ := strings.Cut(value, ",")
 	if value == "-" {
 		return "", false
+	}
+	for _, option := range strings.Split(options, ",") {
+		if option == "string" {
+			return "", false
+		}
 	}
 	if name == "" {
 		return field, true
 	}
 	return name, true
+}
+
+// customJSON reports whether a type, or a pointer to it, has a MarshalJSON
+// or MarshalText method with the encoding/json signature.
+func customJSON(named *types.Named) bool {
+	for _, receiver := range []types.Type{named, types.NewPointer(named)} {
+		methods := types.NewMethodSet(receiver)
+		for _, name := range []string{"MarshalJSON", "MarshalText"} {
+			selection := methods.Lookup(nil, name)
+			if selection == nil {
+				continue
+			}
+			signature, ok := selection.Type().(*types.Signature)
+			if !ok || signature.Params().Len() != 0 || signature.Results().Len() != 2 {
+				continue
+			}
+			bytes, ok := signature.Results().At(0).Type().(*types.Slice)
+			if !ok || !types.Identical(bytes.Elem(), types.Typ[types.Byte]) {
+				continue
+			}
+			if types.Identical(signature.Results().At(1).Type(), types.Universe.Lookup("error").Type()) {
+				return true
+			}
+		}
+	}
+	return false
 }
