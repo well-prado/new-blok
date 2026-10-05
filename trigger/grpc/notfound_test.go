@@ -15,6 +15,10 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/well-prado/new-blok/app"
+	"github.com/well-prado/new-blok/contract/inspection"
+	"github.com/well-prado/new-blok/execution"
+	"github.com/well-prado/new-blok/flow"
 	"github.com/well-prado/new-blok/node"
 	tgrpc "github.com/well-prado/new-blok/trigger/grpc"
 	"github.com/well-prado/new-blok/trigger/grpc/internal/orderpb"
@@ -28,26 +32,91 @@ import (
 // transient. The class is the wire string, so this compiles on a tree without
 // the mapping and fails there.
 func TestNotFoundIsIndistinguishable(t *testing.T) {
+	assertNotFoundIndistinguishable(t, func(_ context.Context, call tgrpc.Call) (json.RawMessage, error) {
+		var order struct {
+			SKU string `json:"sku"`
+		}
+		if err := json.Unmarshal(call.Input, &order); err != nil {
+			return nil, err
+		}
+		if err := lookupOwned(order.SKU, call.Principal.ID); err != nil {
+			return nil, err
+		}
+		return echo(context.Background(), call)
+	})
+}
+
+// TestNotFoundThroughTheEngineIsIndistinguishable is the same acceptance with
+// the failure produced by a real node in a workflow run by the engine, so the
+// adapter sees the engine's classified error, not a hand-built DomainError.
+func TestNotFoundThroughTheEngineIsIndistinguishable(t *testing.T) {
+	type lookup struct {
+		SKU       string `json:"sku"`
+		Principal string `json:"principal"`
+	}
+	type owned struct {
+		SKU string `json:"sku"`
+	}
+	definition, err := node.Define("orders/owned", "1.0.0", func(_ context.Context, input lookup) (owned, error) {
+		if err := lookupOwned(input.SKU, input.Principal); err != nil {
+			return owned{}, err
+		}
+		return owned{SKU: input.SKU}, nil
+	}, node.Description("Reads an order its principal owns"), node.Pure(), node.Schemas([]byte(`{"type":"object"}`), []byte(`{"type":"object","properties":{"sku":{"type":"string"}},"required":["sku"]}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow, err := flow.Define(flow.Spec{Name: "orders-owned", Version: "1.0.0"}, func(builder *flow.Builder, input flow.Ref[lookup]) flow.Ref[owned] {
+		return flow.Call(builder, "owned", definition, input)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	program, err := workflow.Lower()
+	if err != nil {
+		t.Fatal(err)
+	}
+	application := started(t)
+	runner := execution.NewRunner(application, map[string]node.Any{"orders/owned": definition.Any()})
+	assertNotFoundIndistinguishableOn(t, application, func(ctx context.Context, call tgrpc.Call) (json.RawMessage, error) {
+		var order struct {
+			SKU string `json:"sku"`
+		}
+		if err := json.Unmarshal(call.Input, &order); err != nil {
+			return nil, err
+		}
+		if _, err := runner.Run(ctx, program, lookup{SKU: order.SKU, Principal: call.Principal.ID}, inspection.Invocation{}); err != nil {
+			return nil, err
+		}
+		return echo(ctx, call)
+	})
+}
+
+// lookupOwned is the synthetic table: "coffee" belongs to alice. A missing
+// order and another principal's order fail with the same code and class and
+// different private causes.
+func lookupOwned(sku, principal string) error {
+	owner, ok := map[string]string{"coffee": "alice"}[sku]
+	if !ok {
+		return &node.DomainError{Code: "not_found", Class: "not_found", Err: fmt.Errorf("synthetic-secret-detail: no row %q", sku)}
+	}
+	if owner != principal {
+		return &node.DomainError{Code: "not_found", Class: "not_found", Err: fmt.Errorf("synthetic-secret-detail: %q belongs to %s", sku, owner)}
+	}
+	return nil
+}
+
+func assertNotFoundIndistinguishable(t *testing.T, handle func(context.Context, tgrpc.Call) (json.RawMessage, error)) {
+	t.Helper()
+	assertNotFoundIndistinguishableOn(t, started(t), handle)
+}
+
+func assertNotFoundIndistinguishableOn(t *testing.T, application *app.Application, handle func(context.Context, tgrpc.Call) (json.RawMessage, error)) {
+	t.Helper()
 	f := loadCases(t)
-	owners := map[string]string{"coffee": "alice"}
-	adapter, err := tgrpc.New(started(t), principals, []tgrpc.Binding{{
+	adapter, err := tgrpc.New(application, principals, []tgrpc.Binding{{
 		Method: orders.Methods().ByName("Place"), Workflow: "place", WorkflowInput: f.Order, InputSchema: f.Order, OutputSchema: f.Placed, Authorize: notGuest,
-		Handle: func(_ context.Context, call tgrpc.Call) (json.RawMessage, error) {
-			var order struct {
-				SKU string `json:"sku"`
-			}
-			if err := json.Unmarshal(call.Input, &order); err != nil {
-				return nil, err
-			}
-			owner, ok := owners[order.SKU]
-			if !ok {
-				return nil, &node.DomainError{Code: "not_found", Class: "not_found", Err: fmt.Errorf("synthetic-secret-detail: no row %q", order.SKU)}
-			}
-			if owner != call.Principal.ID {
-				return nil, &node.DomainError{Code: "not_found", Class: "not_found", Err: fmt.Errorf("synthetic-secret-detail: %q belongs to %s", order.SKU, owner)}
-			}
-			return echo(context.Background(), call)
-		},
+		Handle: handle,
 	}})
 	if err != nil {
 		t.Fatal(err)

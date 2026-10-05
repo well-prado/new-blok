@@ -27,12 +27,12 @@ Bob creating an ID Alice already uses succeeds exactly as a fresh ID does and
 reveals nothing about Alice's records; creating an ID the caller already
 owns returns 400 `record_exists`. Record reads, updates, and deletes
 include the authenticated owner in their database predicate; another
-principal receives the same stable `not_found` response as an unknown record.
-The current `trigger/http` adapter maps its available classified validation
-errors to HTTP 400 and has no not-found status class, so the hidden record is
-reported as 400 `not_found` rather than 404. The not-found error class is
-tracked in #306; this recipe preserves concealment and does not change the
-trigger package. The webhook principal is established only after signature
+principal receives the same stable `not_found` response as an unknown record:
+404 `{"error":"not_found","requestId":…}`, byte-identical apart from the
+request id. The hidden record fails with the domain error class
+`node.ClassNotFound`, which `trigger/http` answers 404 with the code only
+(#306); because the owner is in the predicate, the recipe never knows which
+of the two cases it is. The webhook principal is established only after signature
 verification. A caller cannot set any principal through JSON.
 
 Every durable identity a caller influences is scoped to that caller, because
@@ -123,7 +123,8 @@ curl -i -X POST http://127.0.0.1:8080/records \
   -d '{"id":"record-1","value":"synthetic"}'
 curl -i http://127.0.0.1:8080/records/record-1 \
   -H 'Authorization: Bearer synthetic-bob-token-00002'
-# 400 with `{"error":"not_found"}`: the record exists but belongs to alice.
+# 404 with `{"error":"not_found",...}`: the record exists but belongs to alice,
+# and the answer is the same as for a record that does not exist.
 curl -i -X PUT http://127.0.0.1:8080/records/record-1 \
   -H 'Authorization: Bearer synthetic-alice-token-0001' \
   -H 'Content-Type: application/json' \

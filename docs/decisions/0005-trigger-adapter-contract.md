@@ -297,6 +297,16 @@ does not match it, and the inspection projection (#80) keeps it. No metric
 vocabulary changes: `blok.error.class` was already an open, series-bounded
 label (ADR 0022).
 
+A not-found run is a failed run, not a separate outcome. Its terminal event
+is `run.failed`, so it counts as `blok_runs_total{blok_outcome="failed"}`
+and feeds `blok:runs_failed:ratio_rate5m` and the warn-level
+`BlokRunErrorRatioHigh` example alert (more than 5% failed for 10m), exactly
+as a `validation` failure does. Its step counts as
+`blok_steps_total{blok_outcome="failed",blok_error_class="not_found"}`.
+`blok_runs_total` carries no error class, so an application whose callers
+routinely ask for records they cannot see should alert on the step metric
+by class, or exclude `not_found` there, rather than on the run ratio.
+
 **Remote nodes.** The runtime protocol's `ErrorClass` enum has no
 not-found value, so a node running in an external runtime cannot return
 this class yet: its failure arrives as one of the enum's classes. Adding the
