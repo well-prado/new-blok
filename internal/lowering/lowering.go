@@ -47,8 +47,10 @@ type Options struct {
 	// Literals lets a call take a recorded literal as its input. The engine
 	// program has no literal form, so the call lowers with no references and
 	// the literal is returned in Result.Literals for the caller to substitute
-	// when it dispatches that call. Only a caller that owns dispatch — the
-	// agent catalog — may set it; flow.Lower never does (ADR 0001, #249).
+	// when it dispatches that call. Only a caller that owns dispatch may set
+	// it: agent/internal/catalogprogram, which keeps the program where only
+	// catalog dispatch can run it (#260). flow.Lower never does (ADR 0001,
+	// #249).
 	Literals bool
 	// Children lowers a "child" instruction as a call of the child workflow
 	// key in Node, referenced by later instructions as "$child.<id>".

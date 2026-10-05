@@ -15,12 +15,10 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/well-prado/new-blok/contract"
+	"github.com/well-prado/new-blok/agent/internal/catalogprogram"
 	"github.com/well-prado/new-blok/contract/schema"
 	"github.com/well-prado/new-blok/contract/tool"
 	"github.com/well-prado/new-blok/flow"
-	"github.com/well-prado/new-blok/internal/engine"
-	"github.com/well-prado/new-blok/internal/lowering"
 	"github.com/well-prado/new-blok/node"
 )
 
@@ -44,15 +42,18 @@ type Listing struct {
 }
 
 type binding struct {
-	listing                 Listing
-	manifest                Manifest
-	in, out                 schema.Schema
-	resources               tool.Resources
-	native                  func(context.Context, []byte) ([]byte, error)
-	program                 *contract.InternalProgram
+	listing   Listing
+	manifest  Manifest
+	in, out   schema.Schema
+	resources tool.Resources
+	native    func(context.Context, []byte) ([]byte, error)
+	// program holds a workflow tool's lowered program and its literals. It
+	// runs only through catalog dispatch: package agent cannot name the raw
+	// program, so it cannot run, observe or journal it without the literal
+	// substitution (#260).
+	program                 *catalogprogram.Program
 	children                map[string]binding
 	steps                   map[string]binding
-	literals                map[string][]byte
 	maxDepth, calls, tokens int
 }
 
@@ -153,14 +154,14 @@ func RegisterWorkflow[I, O any](c *Catalog, wf flow.Definition[I, O], inputSchem
 	// same rules as flow.Lower, plus the catalog's two extensions — a
 	// literal call input, which dispatch substitutes, and a child workflow
 	// call.
-	instructions := make([]lowering.Instruction, len(p.Instructions))
+	instructions := make([]catalogprogram.Instruction, len(p.Instructions))
 	for index, instruction := range p.Instructions {
-		instructions[index] = lowering.Instruction{Kind: instruction.Kind, ID: instruction.ID, Node: instruction.Node.Name, Input: instruction.Input, Literal: instruction.Literal}
+		instructions[index] = catalogprogram.Instruction{Kind: instruction.Kind, ID: instruction.ID, Node: instruction.Node.Name, Input: instruction.Input, Literal: instruction.Literal}
 		if instruction.Kind == "child" {
 			instructions[index].Node, _ = instruction.Data["workflow"].(string)
 		}
 	}
-	lowered, err := lowering.Lower(p.Spec.Name, p.Spec.Version, instructions, p.Output, lowering.Options{Literals: true, Children: true})
+	program, err := catalogprogram.Lower(p.Spec.Name, p.Spec.Version, instructions, p.Output)
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrNotAgentSafe, err)
 	}
@@ -173,6 +174,7 @@ func RegisterWorkflow[I, O any](c *Catalog, wf flow.Definition[I, O], inputSchem
 		registered[key] = child
 	}
 	c.mu.RUnlock()
+	literals := program.Literals()
 	maxDepth, calls, tokens := 1, 0, 0
 	for _, instruction := range p.Instructions {
 		key := instruction.Node.Name + "@" + instruction.Node.Version
@@ -187,7 +189,7 @@ func RegisterWorkflow[I, O any](c *Catalog, wf flow.Definition[I, O], inputSchem
 		if instruction.Kind == "call" && (!bytes.Equal(instruction.Node.InputSchema, child.listing.InputSchema) || !bytes.Equal(instruction.Node.OutputSchema, child.listing.OutputSchema)) {
 			return ErrNotAgentSafe
 		}
-		if literal, ok := lowered.Literals[instruction.ID]; ok {
+		if literal, ok := literals[instruction.ID]; ok {
 			if err := checkLiteral(instruction.Kind, instruction.ID, key, child, literal); err != nil {
 				return err
 			}
@@ -210,13 +212,12 @@ func RegisterWorkflow[I, O any](c *Catalog, wf flow.Definition[I, O], inputSchem
 		m.SecretRefs = append(m.SecretRefs, child.manifest.SecretRefs...)
 		m.Deterministic = m.Deterministic && child.manifest.Deterministic
 	}
-	program := lowered.Program
 	m.Effects, m.Capabilities, m.SecretRefs = unique(m.Effects), unique(m.Capabilities), unique(m.SecretRefs)
 	b, err := prepare(p.Spec.Name, p.Spec.Version, "composed workflow tool", inputSchema, outputSchema, m, metadata)
 	if err != nil {
 		return err
 	}
-	b.program, b.children, b.steps, b.literals = &program, children, steps, lowered.Literals
+	b.program, b.children, b.steps = program, children, steps
 	b.maxDepth, b.calls, b.tokens = maxDepth, calls, tokens
 	b.resources = tool.Resources{TokenLimit: tokens}
 	b.listing.Resources = b.resources
@@ -392,46 +393,25 @@ func (c *Catalog) execute(ctx context.Context, b binding, input []byte, s *execu
 		scope := Principal{ID: s.principal.ID, Capabilities: append([]string(nil), b.manifest.Capabilities...), MaxDepth: s.budget.MaxDepth - depth + 1}
 		output, err = b.native(tool.WithScope(tool.WithTokenLimit(ctx, b.resources.TokenLimit), scope), normal)
 	} else {
-		nodes := map[string]node.Any{}
-		// Unique engine keys per instruction preserve literals and versions.
-		program := *b.program
-		program.Instructions = append([]contract.InternalInstruction(nil), b.program.Instructions...)
-		for index, instruction := range program.Instructions {
-			if instruction.Kind != "call" {
-				continue
-			}
-			child := b.steps[instruction.ID]
-			literal := b.literals[instruction.ID]
-			key := instruction.ID
-			program.Instructions[index].Node = key
-			n := node.MustDefine[any, any]("agent/dispatch", "1.0.0", func(ctx context.Context, value any) (any, error) {
-				raw, err := json.Marshal(value)
-				if err != nil {
-					return nil, err
-				}
-				if literal != nil {
-					raw = literal
-				}
-				result, err := c.execute(ctx, child, raw, s, depth+1)
-				if err != nil {
-					return nil, err
-				}
-				return decode(result)
-			}, node.Description("admitted tool dispatch"), node.Schemas([]byte(`{"type":"object"}`), []byte(`{"type":"object"}`)),
-				// The child's effects, so the engine knows a later step's
-				// saturation is no longer safe to retry (#190).
-				node.Effects(child.manifest.Effects...))
-			nodes[key] = n.Any()
-		}
 		value, decodeErr := decode(normal)
 		if decodeErr != nil {
 			return nil, decodeErr
 		}
-		result, runErr := engine.New(nodes).WithMaxSteps(s.budget.MaxCalls+1).Run(ctx, program, value)
+		// The program runs only here, through catalog dispatch, which
+		// substitutes each literal (#260).
+		result, runErr := b.program.Run(ctx, value, s.budget.MaxCalls+1,
+			func(id string) []string { return b.steps[id].manifest.Effects },
+			func(ctx context.Context, id string, input []byte) (any, error) {
+				result, err := c.execute(ctx, b.steps[id], input, s, depth+1)
+				if err != nil {
+					return nil, err
+				}
+				return decode(result)
+			})
 		if runErr != nil {
 			return nil, runErr
 		}
-		output, err = json.Marshal(result.Output)
+		output, err = json.Marshal(result)
 	}
 	if err != nil {
 		return nil, err
