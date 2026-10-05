@@ -27,9 +27,10 @@ import (
 )
 
 // journaledNode is a synthetic native node whose effect is recorded in the
-// real journal: intent, attempt, then commit. With block set it stops after
-// starting its attempt, the way a process dies mid-effect.
-func journaledNode(t testing.TB, store *journal.Journal, name, step, digest string, runID func() string, before <-chan struct{}, logs int, pace time.Duration, block bool) node.Any {
+// real journal: intent, attempt, then commit. With block set it reports the
+// committed attempt to block and stops there, the way a process dies
+// mid-effect.
+func journaledNode(t testing.TB, store *journal.Journal, name, step, digest string, runID func() string, before <-chan struct{}, logs int, pace time.Duration, block func()) node.Any {
 	definition, err := node.Define(name, "1.0.0", func(ctx context.Context, input quote.Input) (quote.Input, error) {
 		if before != nil {
 			select {
@@ -53,7 +54,8 @@ func journaledNode(t testing.TB, store *journal.Journal, name, step, digest stri
 				time.Sleep(pace)
 			}
 		}
-		if block {
+		if block != nil {
+			block()
 			<-ctx.Done()
 			select {}
 		}
@@ -116,7 +118,7 @@ func TestStalledSubscribersCannotBlockRunOrJournalTransitions(t *testing.T) {
 		// Paced so a reader that is draining keeps up: the stalled
 		// readers' handlers then fill their sockets and block in a write
 		// before the hub cuts them off.
-		flood := journaledNode(t, store, "test/gate", "flood", "sha256:"+name, func() string { return admission.RunID }, begin, logs, 100*time.Microsecond, false)
+		flood := journaledNode(t, store, "test/gate", "flood", "sha256:"+name, func() string { return admission.RunID }, begin, logs, 100*time.Microsecond, nil)
 		live := newLiveApp(t, liveConfig{
 			stream:   inspect.EventStreamConfig{Capture: inspect.Capture{Logs: true}, Hub: event.Config{QueueDepth: 4, LateWindow: 10 * time.Millisecond}},
 			handler:  inspect.EventHandlerConfig{WriteTimeout: time.Minute},
@@ -225,6 +227,10 @@ func TestCrashRecoveryReconstructsRunFromJournal(t *testing.T) {
 		t.Fatalf("pre-crash frames=%s", got)
 	}
 	cursor := before[len(before)-1].ID
+	// The stream's step.processing precedes the node's own journal write;
+	// crash only once the charge attempt is committed, so the journal holds
+	// the in-flight effect.
+	waitFor(t, func() bool { _, err := os.Stat(markerPath + ".attempt"); return err == nil })
 	// The crash: no shutdown, no flush, no terminal outcome.
 	if err := command.Process.Kill(); err != nil {
 		t.Fatal(err)
@@ -307,8 +313,11 @@ func runEventsCrashChild(t *testing.T) {
 		t.Fatal(err)
 	}
 	runner := execution.NewRunner(application, map[string]node.Any{
-		"test/reserve": journaledNode(t, store, "test/reserve", "reserve", "sha256:crash", runID, nil, 0, 0, false),
-		"test/charge":  journaledNode(t, store, "test/charge", "charge", "sha256:crash", runID, nil, 0, 0, true),
+		"test/reserve": journaledNode(t, store, "test/reserve", "reserve", "sha256:crash", runID, nil, 0, 0, nil),
+		"test/charge": journaledNode(t, store, "test/charge", "charge", "sha256:crash", runID, nil, 0, 0, func() {
+			// The charge attempt is committed; the process may now die.
+			_ = os.WriteFile(os.Getenv("NEWBLOK_EVENTS_CRASH_MARKER")+".attempt", nil, 0o600)
+		}),
 	})
 	program := contract.InternalProgram{WorkflowID: "checkout", Instructions: []contract.InternalInstruction{
 		{Index: 0, ID: "reserve", Kind: "call", Node: "test/reserve"},

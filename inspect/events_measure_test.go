@@ -3,6 +3,8 @@ package inspect_test
 import (
 	"context"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"runtime"
 	"slices"
@@ -59,6 +61,12 @@ func percentiles(samples []time.Duration) string {
 // interleaved in rounds so drift on a shared machine hits all of them. The
 // figures are logged raw; they are evidence, not a performance claim.
 func TestEventStreamOverheadOnRunLatency(t *testing.T) {
+	// The workflow logs once per run in every mode; without an inspection
+	// logger that log goes to the default slog handler, discarded here so the
+	// baseline is not charged for terminal output.
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
 	const rounds, perRound = 10, 100
 	type mode struct {
 		name    string
