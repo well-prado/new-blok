@@ -122,9 +122,12 @@ in this decision.
 A worker log is delivered off the call's result path (`Call.OnLog`), so it
 may reach inspection after its step, and its run, have completed. That can
 happen even without queue pressure: the result can simply win the race. A
-log that arrives late is still attributed to its step and appears in later
-projections, so a reader that needs a step's logs reads after its completion
-rather than at it (#226). A consumer that stops at a run's terminal event,
+log the runtime received before its call's result is still attributed to its
+step and appears in later projections, with the time it was delivered rather
+than the time it was emitted. A log frame received after the result, or one
+that arrives while the log queue is full, is dropped as before. A reader
+that needs a step's logs therefore reads after its completion rather than at
+it (#226). A consumer that stops at a run's terminal event,
 such as a live stream (#77), can miss such logs unless it keeps reading for
 a bound after that event.
 
