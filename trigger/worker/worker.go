@@ -340,28 +340,60 @@ func New(ctx context.Context, database store.Database, clock func() time.Time) (
 	}
 	writeDomain, _ := store.WriteDomainOf(database)
 	queue := &Queue{database: database, writeDomain: writeDomain, clock: clock, schemas: map[string]schema.Schema{}}
-	if err := queue.withTx(ctx, func(tx *sql.Tx) error {
-		if err := createJobs(ctx, tx); err != nil {
+	if err := migrate(ctx, func() error {
+		return queue.withTx(ctx, func(tx *sql.Tx) error {
+			if err := createJobs(ctx, tx); err != nil {
+				return err
+			}
+			if err := ensureColumn(ctx, tx, "deferrals", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+				return err
+			}
+			if err := ensureColumn(ctx, tx, "principal_json", "TEXT NOT NULL DEFAULT ''"); err != nil {
+				return err
+			}
+			// enqueue_seq orders jobs that share a created_at by when they were
+			// enqueued (#217). Jobs from before the column existed keep 0 and
+			// fall back to job_id among themselves.
+			if err := ensureColumn(ctx, tx, "enqueue_seq", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+				return err
+			}
+			_, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS worker_jobs_enqueue_seq ON worker_jobs (enqueue_seq)`)
 			return err
-		}
-		if err := ensureColumn(ctx, tx, "deferrals", "INTEGER NOT NULL DEFAULT 0"); err != nil {
-			return err
-		}
-		if err := ensureColumn(ctx, tx, "principal_json", "TEXT NOT NULL DEFAULT ''"); err != nil {
-			return err
-		}
-		// enqueue_seq orders jobs that share a created_at by when they were
-		// enqueued (#217). Jobs from before the column existed keep 0 and
-		// fall back to job_id among themselves.
-		if err := ensureColumn(ctx, tx, "enqueue_seq", "INTEGER NOT NULL DEFAULT 0"); err != nil {
-			return err
-		}
-		_, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS worker_jobs_enqueue_seq ON worker_jobs (enqueue_seq)`)
-		return err
+		})
 	}); err != nil {
 		return nil, fmt.Errorf("worker: schema: %w", err)
 	}
 	return queue, nil
+}
+
+// migrationBudget bounds how long New retries a schema migration that lost
+// a race with another opener.
+const migrationBudget = 10 * time.Second
+
+// migrate runs the schema transaction, retrying it while it fails busy (#233).
+// Adding a column must read the schema before it writes, and SQLite cannot
+// make such a transaction wait for another writer: when several processes
+// open a queue that needs a column, all but one fail busy at once instead of
+// waiting their turn. The migration is idempotent and a failed attempt
+// commits nothing, so it is simply run again, with a short growing pause,
+// until it succeeds, fails otherwise, ctx ends or the budget is spent.
+func migrate(ctx context.Context, run func() error) error {
+	deadline := time.Now().Add(migrationBudget)
+	pause := 5 * time.Millisecond
+	for {
+		err := run()
+		if err == nil || !errors.Is(err, store.ErrBusy) || time.Now().Add(pause).After(deadline) {
+			return err
+		}
+		timer := time.NewTimer(pause)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return errors.Join(err, ctx.Err())
+		case <-timer.C:
+		}
+		pause = min(2*pause, 200*time.Millisecond)
+	}
 }
 
 func createJobs(ctx context.Context, tx *sql.Tx) error {

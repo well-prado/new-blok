@@ -238,12 +238,13 @@ is never parsed before verification.
   crash tests instead.
 - Constant-time comparison relies on `hmac.Equal`; timing is not measured.
 - The worker sorts and de-duplicates principal roles before comparing.
-  Concurrent first opens of a queue that still needs a column added fail
-  with `SQLITE_BUSY`. The migration reads the schema before it writes, and
-  SQLite cannot wait to upgrade such a transaction. Startup fails, and a
-  restart recovers; nothing is corrupted. Six handles opening at once, 40
-  rounds: 103 of 240 opens failed adding `principal_json` on `main`, and 200
-  of 240 adding `enqueue_seq` (#217 review). Tracked as its own issue.
+  Adding a column must read the schema before it writes, and SQLite cannot
+  make such a transaction wait for another writer. So when several
+  processes open a queue that needs a column, all but one fail busy at once:
+  50 of 60 concurrent opens failed before #233. `worker.New` therefore
+  retries the idempotent migration while it fails busy, with a short growing
+  pause, for up to 10 s, and the same probe now has no failures. An opener
+  that still loses for 10 s fails startup as before; nothing is corrupted.
 - Only the Standard Webhooks scheme is built in. Provider-specific schemes
   (with their own header formats and key distribution) are written against
   `Verifier`, as the tests do for a synthetic provider.

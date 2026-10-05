@@ -1576,3 +1576,67 @@ func TestEnqueueOrderSurvivesBackup(t *testing.T) {
 		t.Fatalf("restored queue claimed %v; want enqueue order %v", claimed, want)
 	}
 }
+
+// TestConcurrentOpensMigrateWithoutFailing: several processes opening a queue
+// that still needs a column added must all start. The migration reads the
+// schema before it writes, so SQLite cannot make a second opener wait for the
+// first; it fails busy at once (#233). Six handles on one file open together,
+// round after round, each round on a queue missing every added column.
+func TestConcurrentOpensMigrateWithoutFailing(t *testing.T) {
+	ctx := context.Background()
+	const handles, rounds = 6, 10
+	failures := 0
+	var first error
+	for round := range rounds {
+		path := filepath.Join(t.TempDir(), fmt.Sprintf("migrate-%d.db", round))
+		seed, err := (sqlite.Backend{}).Open(ctx, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := seed.WithTx(ctx, func(tx *sql.Tx) error {
+			_, err := tx.ExecContext(ctx, `CREATE TABLE worker_jobs (
+				job_id TEXT PRIMARY KEY, request_key TEXT NOT NULL UNIQUE, kind TEXT NOT NULL, payload_json BLOB NOT NULL,
+				payload_digest TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 0, max_attempts INTEGER NOT NULL, state TEXT NOT NULL,
+				available_at INTEGER NOT NULL, lease_until INTEGER, error_text TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		_ = seed.Close()
+		databases := make([]store.Database, handles)
+		for i := range databases {
+			if databases[i], err = (sqlite.Backend{}).Open(ctx, path); err != nil {
+				t.Fatal(err)
+			}
+		}
+		start := make(chan struct{})
+		errs := make(chan error, handles)
+		var group sync.WaitGroup
+		for _, database := range databases {
+			group.Add(1)
+			go func() {
+				defer group.Done()
+				<-start
+				_, err := New(ctx, database, nil)
+				errs <- err
+			}()
+		}
+		close(start)
+		group.Wait()
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				failures++
+				if first == nil {
+					first = err
+				}
+			}
+		}
+		for _, database := range databases {
+			_ = database.Close()
+		}
+	}
+	if failures != 0 {
+		t.Fatalf("%d of %d concurrent opens failed; first: %v", failures, handles*rounds, first)
+	}
+}
