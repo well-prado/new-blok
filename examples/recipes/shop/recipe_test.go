@@ -198,7 +198,7 @@ func TestMigrationsReplayUpgradeAndTeardown(t *testing.T) {
 	}
 	var queueTables int
 	if err := database.WithTx(context.Background(), func(tx *sql.Tx) error {
-		return tx.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'worker_jobs'`).Scan(&queueTables)
+		return tx.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('worker_jobs', 'worker_compacted', 'worker_meta')`).Scan(&queueTables)
 	}); err != nil {
 		t.Fatal(err)
 	}

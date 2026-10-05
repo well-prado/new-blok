@@ -210,14 +210,16 @@ var migrations = [][]string{
 	},
 }
 
-// Teardown removes only this recipe's tables and the worker queue table it
-// selected. Close all application processes before calling it.
+// Teardown removes only this recipe's tables and the worker queue tables it
+// selected: the jobs, and the tombstones and counters of compacted jobs
+// (#290), so a later install does not inherit their dedupe identities.
+// Close all application processes before calling it.
 func Teardown(ctx context.Context, database store.Database) error {
 	if database == nil {
 		return errors.New("shop: database is required")
 	}
 	return database.WithTx(ctx, func(tx *sql.Tx) error {
-		for _, table := range []string{"shop_outbox", "shop_records", "shop_schema_migrations", "worker_jobs"} {
+		for _, table := range []string{"shop_outbox", "shop_records", "shop_schema_migrations", "worker_jobs", "worker_compacted", "worker_meta"} {
 			if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS `+table); err != nil {
 				return err
 			}
