@@ -48,6 +48,7 @@ import (
 	"github.com/well-prado/new-blok/contract/inspection"
 	"github.com/well-prado/new-blok/contract/observe"
 	"github.com/well-prado/new-blok/observe/redact"
+	"github.com/well-prado/new-blok/observe/slo"
 )
 
 // Bounds. A zero Config field takes the default; a value above the hard
@@ -77,27 +78,31 @@ const (
 
 // Metric instrument names.
 const (
-	MetricRuns          = "blok.runs"
-	MetricRunDuration   = "blok.run.duration"
-	MetricSteps         = "blok.steps"
-	MetricStepDuration  = "blok.step.duration"
-	MetricDropped       = "blok.telemetry.dropped"
-	AttrWorkflow        = "blok.workflow"
-	AttrStep            = "blok.step"
-	AttrOutcome         = "blok.outcome"
-	AttrTenant          = "blok.tenant"
-	AttrErrorCode       = "blok.error.code"
-	AttrErrorClass      = "blok.error.class"
-	AttrRunID           = "blok.run.id"
-	AttrAttempt         = "blok.attempt"
-	AttrAttemptID       = "blok.attempt.id"
-	AttrParentRun       = "blok.parent.run.id"
-	AttrParentStep      = "blok.parent.step"
-	AttrStartObserved   = "blok.start_observed"
-	AttrOverflow        = "otel.metric.overflow"
-	AttrDropReason      = "reason"
-	defaultServiceName  = "blok"
-	logSeverityFallback = otellog.SeverityInfo
+	MetricRuns         = "blok.runs"
+	MetricRunDuration  = "blok.run.duration"
+	MetricSteps        = "blok.steps"
+	MetricStepDuration = "blok.step.duration"
+	MetricDropped      = "blok.telemetry.dropped"
+	// MetricExternalCalls and MetricExternalDuration count and time attempts
+	// of steps whose node declares effects (ADR 0022).
+	MetricExternalCalls    = slo.MetricExternalCalls
+	MetricExternalDuration = slo.MetricExternalDuration
+	AttrWorkflow           = "blok.workflow"
+	AttrStep               = "blok.step"
+	AttrOutcome            = "blok.outcome"
+	AttrTenant             = "blok.tenant"
+	AttrErrorCode          = "blok.error.code"
+	AttrErrorClass         = "blok.error.class"
+	AttrRunID              = "blok.run.id"
+	AttrAttempt            = "blok.attempt"
+	AttrAttemptID          = "blok.attempt.id"
+	AttrParentRun          = "blok.parent.run.id"
+	AttrParentStep         = "blok.parent.step"
+	AttrStartObserved      = "blok.start_observed"
+	AttrOverflow           = "otel.metric.overflow"
+	AttrDropReason         = "reason"
+	defaultServiceName     = "blok"
+	logSeverityFallback    = otellog.SeverityInfo
 )
 
 var ErrConfig = errors.New("otel: invalid configuration")
@@ -141,6 +146,17 @@ type Config struct {
 	// LogAttributes allowlists structured log attribute keys exported with
 	// a step log; all other attributes are dropped. At most MaxLogAttributes.
 	LogAttributes []string
+
+	// Operational lists state sources (deployment readiness and admission, a
+	// queue census, the cluster census, worker availability, storage size)
+	// exported as the ADR 0022 snapshot metrics. They are sampled once per
+	// metric collection, on the metric reader's goroutine, never on a run's;
+	// each source is bounded by SampleTimeout and a failing one is counted
+	// (blok.operational.sample.failures), never fatal. Requires Metrics. At
+	// most slo.MaxSources.
+	Operational []slo.Source
+	// SampleTimeout bounds each operational source (default 1s).
+	SampleTimeout time.Duration
 }
 
 // Stats counts what the pipeline did. Every offered event is accepted or
@@ -164,6 +180,7 @@ type Stats struct {
 	MetricExports   uint64
 	MetricFailures  uint64
 	Panics          uint64 // recovered SDK panics; the event is dropped
+	SampleFailures  uint64 // operational source samples that failed (ADR 0022)
 }
 
 // Exporter is an inspection.Observer that exports to OpenTelemetry.
@@ -202,13 +219,17 @@ type Exporter struct {
 	logger         otellog.Logger
 	records        *logBuffer
 
-	runsCounter   metric.Int64Counter
-	runDuration   metric.Float64Histogram
-	stepsCounter  metric.Int64Counter
-	stepDuration  metric.Float64Histogram
-	series        map[string]map[string]struct{}
-	tenants       map[string]bool
-	logAttributes map[string]bool
+	runsCounter      metric.Int64Counter
+	runDuration      metric.Float64Histogram
+	stepsCounter     metric.Int64Counter
+	stepDuration     metric.Float64Histogram
+	externalCounter  metric.Int64Counter
+	externalDuration metric.Float64Histogram
+	sampler          *slo.Sampler
+	series           map[string]map[string]struct{}
+	zeroed           map[string]struct{}
+	tenants          map[string]bool
+	logAttributes    map[string]bool
 
 	runs  map[string]*list.Element
 	order *list.List
@@ -254,6 +275,7 @@ func New(config Config) (*Exporter, error) {
 		flushReq: make(chan chan struct{}),
 		done:     make(chan struct{}),
 		series:   map[string]map[string]struct{}{},
+		zeroed:   map[string]struct{}{},
 		tenants:  map[string]bool{},
 		runs:     map[string]*list.Element{},
 		order:    list.New(),
@@ -288,6 +310,14 @@ func New(config Config) (*Exporter, error) {
 		e.records = &logBuffer{exporter: config.Logs, owner: e}
 		e.loggerProvider = sdklog.NewLoggerProvider(sdklog.WithResource(res), sdklog.WithProcessor(e.records))
 		e.logger = e.loggerProvider.Logger(scopeName)
+	}
+	if len(config.Operational) > 0 {
+		sampler, err := slo.NewSampler(config.SampleTimeout, config.Operational...)
+		if err != nil {
+			e.cancelExports()
+			return nil, fmt.Errorf("%w: %v", ErrConfig, err)
+		}
+		e.sampler = sampler
 	}
 	if config.Metrics != nil {
 		e.metrics = &countingMetrics{Exporter: config.Metrics, owner: e}
@@ -335,6 +365,9 @@ func normalize(c *Config) error {
 	if c.ExportTimeout < time.Millisecond || c.ExportTimeout > MaxExportTimeout {
 		return fmt.Errorf("%w: export timeout %v outside 1ms..%v", ErrConfig, c.ExportTimeout, MaxExportTimeout)
 	}
+	if len(c.Operational) > 0 && c.Metrics == nil {
+		return fmt.Errorf("%w: Operational sources require a Metrics exporter", ErrConfig)
+	}
 	if len(c.TenantLabels) > MaxTenantLabels || len(c.LogAttributes) > MaxLogAttributes {
 		return fmt.Errorf("%w: at most %d tenant labels and %d log attributes", ErrConfig, MaxTenantLabels, MaxLogAttributes)
 	}
@@ -359,18 +392,30 @@ func (e *Exporter) instruments() error {
 	if e.runsCounter, err = meter.Int64Counter(MetricRuns, metric.WithUnit("{run}"), metric.WithDescription("Workflow runs by terminal outcome")); err != nil {
 		return err
 	}
-	if e.runDuration, err = meter.Float64Histogram(MetricRunDuration, metric.WithUnit("s"), metric.WithDescription("Observed workflow run duration")); err != nil {
+	buckets := metric.WithExplicitBucketBoundaries(slo.DurationBuckets...)
+	if e.runDuration, err = meter.Float64Histogram(MetricRunDuration, metric.WithUnit("s"), metric.WithDescription("Observed workflow run duration"), buckets); err != nil {
 		return err
 	}
 	if e.stepsCounter, err = meter.Int64Counter(MetricSteps, metric.WithUnit("{step}"), metric.WithDescription("Step attempts by outcome")); err != nil {
 		return err
 	}
-	if e.stepDuration, err = meter.Float64Histogram(MetricStepDuration, metric.WithUnit("s"), metric.WithDescription("Observed step attempt duration")); err != nil {
+	if e.stepDuration, err = meter.Float64Histogram(MetricStepDuration, metric.WithUnit("s"), metric.WithDescription("Observed step attempt duration"), buckets); err != nil {
 		return err
+	}
+	if e.externalCounter, err = meter.Int64Counter(MetricExternalCalls, metric.WithUnit("{call}"), metric.WithDescription("Attempts of steps whose node declares effects, by outcome")); err != nil {
+		return err
+	}
+	if e.externalDuration, err = meter.Float64Histogram(MetricExternalDuration, metric.WithUnit("s"), metric.WithDescription("External call duration"), buckets); err != nil {
+		return err
+	}
+	if e.sampler != nil {
+		if err := e.operationalInstruments(meter); err != nil {
+			return err
+		}
 	}
 	_, err = meter.Int64ObservableCounter(MetricDropped, metric.WithUnit("{event}"), metric.WithDescription("Telemetry the pipeline discarded, by reason"),
 		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
-			for reason, value := range map[string]*atomic.Uint64{"queue_full": &e.dropped, "closed": &e.droppedClosed, "abandoned": &e.abandoned, "orphaned": &e.orphaned, "series_overflow": &e.overflowed, "spans_failed": &e.spansFailed, "logs_failed": &e.logsFailed} {
+			for reason, value := range map[string]*atomic.Uint64{"queue_full": &e.dropped, "closed": &e.droppedClosed, "abandoned": &e.abandoned, "orphaned": &e.orphaned, "series_overflow": &e.overflowed, "spans_failed": &e.spansFailed, "logs_failed": &e.logsFailed, "metric_exports_failed": &e.metricFailures} {
 				observer.Observe(int64(value.Load()), metric.WithAttributes(attribute.String(AttrDropReason, reason)))
 			}
 			return nil
@@ -415,7 +460,7 @@ func (e *Exporter) Stats() Stats {
 		Accepted: e.accepted.Load(), Dropped: e.dropped.Load(), DroppedClosed: e.droppedClosed.Load(), DroppedShutdown: e.droppedShutdown.Load(), Queued: uint64(len(e.queue)), Processed: e.processed.Load(),
 		Abandoned: e.abandoned.Load(), Orphaned: e.orphaned.Load(), Overflowed: e.overflowed.Load(),
 		SpansExported: e.spansExported.Load(), SpansFailed: e.spansFailed.Load(), LogsExported: e.logsExported.Load(), LogsFailed: e.logsFailed.Load(),
-		MetricExports: e.metricExports.Load(), MetricFailures: e.metricFailures.Load(), Panics: e.panics.Load(),
+		MetricExports: e.metricExports.Load(), MetricFailures: e.metricFailures.Load(), Panics: e.panics.Load(), SampleFailures: e.sampler.Failures(),
 	}
 }
 
@@ -673,6 +718,7 @@ func (e *Exporter) runStarted(event inspection.Event) {
 		e.order.Remove(oldest)
 		delete(e.runs, state.id)
 	}
+	e.zeroRuns(event.Workflow, event.Tenant)
 	state := &runState{id: event.RunID, start: event.At, workflow: event.Workflow, tenant: event.Tenant, steps: map[string]*stepState{}}
 	if e.tracer != nil && event.Trace.Sampled() {
 		state.span = e.startSpan(event, "run "+label(event.Workflow), e.runAttributes(event))
@@ -690,6 +736,9 @@ func (e *Exporter) stepStarted(event inspection.Event) {
 			e.abandonStep(step)
 			delete(state.steps, key)
 		}
+	}
+	if event.External {
+		e.zeroExternal(state.workflow, event.StepID)
 	}
 	step := &stepState{start: event.At}
 	if e.tracer != nil && event.Trace.Sampled() {
@@ -717,6 +766,13 @@ func (e *Exporter) stepEnded(event inspection.Event) {
 		if step != nil && !step.start.IsZero() && !event.At.Before(step.start) {
 			e.stepDuration.Record(context.Background(), event.At.Sub(step.start).Seconds(), metric.WithAttributeSet(e.bounded(MetricStepDuration, attrs)))
 		}
+		if event.External {
+			e.zeroExternal(workflow, event.StepID)
+			e.externalCounter.Add(context.Background(), 1, metric.WithAttributeSet(e.bounded(MetricExternalCalls, attrs)))
+			if step != nil && !step.start.IsZero() && !event.At.Before(step.start) {
+				e.externalDuration.Record(context.Background(), event.At.Sub(step.start).Seconds(), metric.WithAttributeSet(e.bounded(MetricExternalDuration, attrs)))
+			}
+		}
 	}
 	if e.tracer == nil || !event.Trace.Sampled() {
 		return
@@ -730,6 +786,51 @@ func (e *Exporter) stepEnded(event inspection.Event) {
 		span = e.startSpan(event, "step "+label(event.StepID), append(e.stepAttributes(event), attribute.Bool(AttrStartObserved, false)))
 	}
 	endSpan(span, event, outcome)
+}
+
+// zeroRuns creates every run outcome of a workflow and tenant at zero the
+// first time it is seen, and zeroExternal every outcome of an external call.
+// A counter series born at its first increment has no increase() in
+// Prometheus, so without the zeros the first uncertain run of a workflow
+// that already ran would not be seen by a rate rule (ADR 0022). The created
+// sets count towards MaxSeries like any other.
+func (e *Exporter) zeroRuns(workflow, tenant string) {
+	if e.runsCounter == nil {
+		return
+	}
+	key := "runs|" + label(workflow) + "|"
+	var tenantAttr []attribute.KeyValue
+	if tenant != "" {
+		tenantAttr = []attribute.KeyValue{attribute.String(AttrTenant, e.tenantLabel(tenant))}
+		key += e.tenantLabel(tenant)
+	}
+	if !e.markZeroed(key) {
+		return
+	}
+	for _, outcome := range slo.RunOutcomes {
+		attrs := append([]attribute.KeyValue{attribute.String(AttrWorkflow, label(workflow)), attribute.String(AttrOutcome, outcome)}, tenantAttr...)
+		e.runsCounter.Add(context.Background(), 0, metric.WithAttributeSet(e.bounded(MetricRuns, attrs)))
+	}
+}
+
+func (e *Exporter) zeroExternal(workflow, step string) {
+	if e.externalCounter == nil || !e.markZeroed("external|"+label(workflow)+"|"+label(step)) {
+		return
+	}
+	for _, outcome := range slo.StepOutcomes {
+		attrs := []attribute.KeyValue{attribute.String(AttrWorkflow, label(workflow)), attribute.String(AttrStep, label(step)), attribute.String(AttrOutcome, outcome)}
+		e.externalCounter.Add(context.Background(), 0, metric.WithAttributeSet(e.bounded(MetricExternalCalls, attrs)))
+	}
+}
+
+// markZeroed records key and reports whether it is new; the record is
+// bounded by MaxSeries.
+func (e *Exporter) markZeroed(key string) bool {
+	if _, ok := e.zeroed[key]; ok || len(e.zeroed) >= e.config.MaxSeries {
+		return false
+	}
+	e.zeroed[key] = struct{}{}
+	return true
 }
 
 func (e *Exporter) runEnded(event inspection.Event) {

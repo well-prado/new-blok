@@ -312,9 +312,12 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 	// effected is the last completed step that declared effects: once it has
 	// run, a later failure is no longer safe to retry (see afterEffect).
 	effected := ""
+	// external marks the current step as an external call for observers:
+	// its node declares effects (ADR 0022).
+	external := false
 	appendStep := func(step StepResult) {
 		result.Steps = append(result.Steps, step)
-		event := inspection.Event{Kind: inspection.StepCompleted, StepID: step.ID, Attempt: step.Attempt, Trace: stepSpan}
+		event := inspection.Event{Kind: inspection.StepCompleted, StepID: step.ID, Attempt: step.Attempt, Trace: stepSpan, External: external}
 		if payloads {
 			event.Input = marshalObservation(step.Input)
 			event.Output = marshalObservation(step.Output)
@@ -340,6 +343,7 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 			return result, &Error{Code: "canceled", Class: "cancellation", Step: instruction.ID, Err: err}
 		}
 		step := StepResult{ID: instruction.ID}
+		external = false
 		if tracing {
 			stepSpan = runSpan.Child()
 		}
@@ -390,6 +394,7 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 				appendStep(step)
 				return result, step.Error
 			}
+			external = len(definition.Descriptor().Effects) > 0
 			callInput, err := resolveCallInput(state, instruction, input)
 			if err != nil {
 				step.Error = &Error{Code: "invalid_input_reference", Class: "validation", Step: instruction.ID, Err: err}
@@ -401,7 +406,7 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 			step.Attempt = 1
 			step.StartedAt = time.Now().UTC()
 			if observing {
-				processing := inspection.Event{Kind: inspection.StepProcessing, StepID: step.ID, Attempt: step.Attempt, AttemptID: invocation.AttemptID, Trace: stepSpan}
+				processing := inspection.Event{Kind: inspection.StepProcessing, StepID: step.ID, Attempt: step.Attempt, AttemptID: invocation.AttemptID, Trace: stepSpan, External: external}
 				if payloads {
 					processing.Input = marshalObservation(step.Input)
 				}

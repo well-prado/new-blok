@@ -14,6 +14,7 @@ import (
 
 	"github.com/well-prado/new-blok/contract/observe"
 	"github.com/well-prado/new-blok/observe/otel"
+	"github.com/well-prado/new-blok/observe/slo"
 )
 
 type fixtureCase struct {
@@ -102,8 +103,16 @@ func TestFixtureCasesExportThroughRealOTLP(t *testing.T) {
 			}
 			runs := h.collector.latest(otel.MetricRuns)
 			want := key(map[string]string{otel.AttrWorkflow: "shop/order", otel.AttrOutcome: tc.Expected.RunOutcome, otel.AttrTenant: tc.Expected.TenantLabel})
-			if len(runs) != 1 || runs[want].value != 1 {
-				t.Fatalf("runs metric %+v, want one point %s=1", runs, want)
+			// Every outcome of the workflow and tenant exists from its first
+			// run, at zero (ADR 0022); exactly one is incremented.
+			counted := 0
+			for _, point := range runs {
+				if point.value != 0 {
+					counted++
+				}
+			}
+			if len(runs) != len(slo.RunOutcomes) || counted != 1 || runs[want].value != 1 {
+				t.Fatalf("runs metric %+v, want every outcome and one point %s=1", runs, want)
 			}
 			steps := h.collector.latest(otel.MetricSteps)
 			if len(steps) != len(tc.Expected.Steps) {
