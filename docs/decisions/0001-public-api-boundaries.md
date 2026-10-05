@@ -93,6 +93,34 @@ Validate/Parse/Compile/Canonical tests prove rejection without executing
 business effects. This correction does not certify arbitrary control-flow
 programs or change typed authoring APIs.
 
+#### Lowered call inputs keep their references (#244)
+
+`flow.Definition.Lower` lowers each call's recorded input to the same
+structural reference the canonical document compiler produces for that edge:
+the workflow input (`$input`) carries no reference, and an earlier call's
+result or field (`$step.<id>[.<field>…]`, including generated accessors)
+becomes one reference with that path. Lower previously dropped every call
+input reference, so the engine handed every call the workflow input.
+
+This is a behavioral correction linked to
+[#244](https://github.com/well-prado/new-blok/issues/244), not a wire-shape or
+document-version change. Inputs with no program form now fail `Lower` with an
+error naming the call instead of silently running on the workflow input: a
+`flow.Lit` value, a field of the workflow input, a reference that is not a
+strictly earlier call of the same program (forward, self, or another
+definition's step), and an empty field segment. The output reference follows
+the same earlier-call rule. Control constructs (`If`, `Choose`, `Each`,
+`Parallel`, `TryFinally`, `Child`, `Compare`, `Default`, `Template`) are still
+rejected as a whole; their arm calls never lower on their own. Migration: a
+workflow that lowered a literal or workflow-input field as a call input
+already ran that call on the whole workflow input, so it must route the value
+through a call result or wait for a program literal form.
+`flow/lower_conformance_test.go` compares each lowered program with
+`internal/compile` and checks every call's delivered input through
+`execution.Runner`. Lower does not yet check selected fields against node
+output schemas; the engine still validates each call input against the node's
+input schema before invoking it.
+
 The initial portable contract is a bounded, JSON-compatible value subset with
 explicit semantics for missing, null, optional fields, objects, arrays, string,
 boolean, signed integer, exact decimal/money, timestamp, bytes/blob reference

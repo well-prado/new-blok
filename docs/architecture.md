@@ -66,7 +66,7 @@ var QuoteWorkflow = flow.MustDefine[QuoteInput, Quote](
 )
 ```
 
-Returning a reference declares the output. `Define` also returns an error for tooling. Whole-value wiring works without generation. Field-level composition uses generated typed accessors and argument structs accepting references or explicit `flow.Lit` values. Ordinary Go fields cannot hold both `string` and `Ref[string]`. Generation uses Go package/type analysis, never executes arbitrary package initialization, marks generated files and is deterministic.
+Returning a reference declares the output. `Define` also returns an error for tooling. Whole-value wiring works without generation. Field-level composition uses generated typed accessors and argument structs accepting references or explicit `flow.Lit` values. Today `Lower` carries the workflow input, whole call results and accessor-selected fields of earlier calls into the program, and rejects literal or workflow-input-field call inputs, which have no program form yet ([ADR 0001](decisions/0001-public-api-boundaries.md), #244). Ordinary Go fields cannot hold both `string` and `Ref[string]`. Generation uses Go package/type analysis, never executes arbitrary package initialization, marks generated files and is deterministic.
 
 Unified layout: `nodes/<runtime>/<node>/`; classic layout: `runtimes/<runtime>/nodes/<node>/`. Workflow source remains under a dedicated application workflow directory. Layout does not change node identity. Files inside one node may import each other and approved utility/domain packages, but cannot import another node. CLI migration is transactional and validates ownership/collisions.
 
