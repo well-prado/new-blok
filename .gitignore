@@ -8,3 +8,4 @@
 .DS_Store
 runtime/nodejs/node_modules/
 runtime/nodejs/dist/
+/benchmarks/parity/old-engine/node_modules/

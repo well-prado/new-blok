@@ -83,6 +83,14 @@
       "evidence": ["current-blok-parity", "live-ai-evaluation", "fleet-load-with-failures"]
     },
     {
+      "id": "blok-v2-structural-migration",
+      "question": "Which legacy Blok v2 workflow subset can be structurally converted and exported without changing business behavior?",
+      "owner": "E20-T01",
+      "status": "partial",
+      "decision": "ADR 0019 defines a bounded structural-only subset, pinned node inventory, strict duplicate/unknown-field handling, actionable rejection, and exact representable Export rules. Startup, idle, load and recovery distributions plus independent Review R remain open for E20-T01.",
+      "evidence": ["migration-structural-round-trip", "migration-unsupported-expression", "migration-export-loss-rejected", "current-blok-executable-parity"]
+    },
+    {
       "id": "trigger-adapter-contract",
       "question": "What must every trigger adapter declare and prove, and how does an extension author check it?",
       "owner": "E09-T01",
