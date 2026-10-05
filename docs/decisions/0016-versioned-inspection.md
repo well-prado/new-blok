@@ -249,7 +249,9 @@ reader gets 404, with neither live frames nor a reconstruction. A followed
 recovered run that no execution in this process ever publishes stays open
 until `MaxDuration` (also #263). The engine serializes observation payloads whenever
 any observer is selected, including when the stream discards them; that costs
-CPU, not retention. Measured overhead and latency in the PR are one
+CPU, not retention. (ADR 0020 adds `observe.PayloadObserver`, which lets a
+payload-free observer such as the telemetry exporter avoid that cost; the
+stream does not declare it yet.) Measured overhead and latency in the PR are one
 developer machine's figures, not performance claims.
 
 ## Compatibility and limits

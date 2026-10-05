@@ -1,6 +1,6 @@
 import * as grpc from "@grpc/grpc-js";
 import { timingSafeEqual } from "node:crypto";
-import { discover, DomainError, redactError, SchemaError, type AnyNode, type ExecutionContext } from "../../sdk/nodejs/index.js";
+import { discover, DomainError, redactError, SchemaError, type AnyNode, type ExecutionContext, type TraceContext } from "../../sdk/nodejs/index.js";
 import { loadProtocol, type Call, type Frame, type Hello, type ReceivedFrame } from "./protocol.js";
 import { BoundedWriter } from "./writer.js";
 
@@ -151,7 +151,8 @@ export class Worker {
           } catch { /* logging is optional and cannot change a node outcome */ }
         };
         const logger = Object.freeze({ debug: (message: string, attrs?: Readonly<Record<string, unknown>>) => log("DEBUG", message, attrs), info: (message: string, attrs?: Readonly<Record<string, unknown>>) => log("INFO", message, attrs), warn: (message: string, attrs?: Readonly<Record<string, unknown>>) => log("WARN", message, attrs), error: (message: string, attrs?: Readonly<Record<string, unknown>>) => log("ERROR", message, attrs) });
-        const ctx: ExecutionContext = Object.freeze({ signal: controller.signal, principal: this.options.principal, capabilities: Object.freeze([...call.capabilities]), idempotencyKey: call.idempotencyKey, callId: call.callId, attemptId: call.attemptId, logger });
+        const trace = traceContext(call.traceparent, call.tracestate);
+        const ctx: ExecutionContext = Object.freeze({ signal: controller.signal, principal: this.options.principal, capabilities: Object.freeze([...call.capabilities]), idempotencyKey: call.idempotencyKey, callId: call.callId, attemptId: call.attemptId, logger, ...(trace ? { trace } : {}) });
         void (async () => {
           try {
             const output = await node.invokeJSON(ctx, call.input.toString("utf8"));
@@ -195,6 +196,16 @@ export class Worker {
     // TextDecoder rejects invalid UTF-8 rather than replacing it before validation.
     new TextDecoder("utf-8", { fatal: true }).decode(c.input);
   }
+}
+
+// Trace context is optional correlation (ADR 0020): a malformed value is
+// dropped, never a reason to fail the call. Only canonical version-00 values
+// with non-zero ids and a bounded printable tracestate are exposed.
+const traceparentPattern = /^00-(?!0{32})[0-9a-f]{32}-(?!0{16})[0-9a-f]{16}-[0-9a-f]{2}$/;
+export function traceContext(traceparent: unknown, tracestate: unknown): TraceContext | undefined {
+  if (typeof traceparent !== "string" || typeof tracestate !== "string" || !traceparentPattern.test(traceparent)) return undefined;
+  if (tracestate.length > 256 || !/^[\x20-\x7e]*$/.test(tracestate)) return undefined;
+  return Object.freeze({ traceparent, tracestate });
 }
 
 const secretText = /(?:\b(?:password|passwd|secret|token|authorization|credential|api[_-]?key|private[_-]?key)\s*[:=]\s*\S+|\bbearer\s+[A-Za-z0-9._~+/-]+=*|\bAKIA[0-9A-Z]{16}\b|\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b)/i;

@@ -24,6 +24,17 @@ suppresses log frames for that negotiated session. A 1.1 client rejects a 1.0
 worker until the worker is rebuilt. Log message/attribute limits and redaction
 are defined by E15-T01 (#76) and the inspection projection decision.
 
+`Call.traceparent` (12) and `Call.tracestate` (13) optionally carry the
+dispatching step's W3C trace context (E16-T01, #79, ADR 0020). They are
+additive inside 1.1 rather than a minor bump: they are correlation only, a
+worker that ignores them is conformant, and proto3 peers ignore unknown
+fields, so requiring 1.2 would reject every 1.1 worker for data that cannot
+change execution. Go validates them before sending (canonical version-00
+traceparent, at most 256 printable bytes of tracestate, no tracestate alone)
+and omits them when they alone would exceed the negotiated frame ceiling.
+The Node worker exposes a canonical context as `ctx.trace` and drops a
+malformed one without failing the call.
+
 ## Identity and retry rules
 
 Every connection binds an artifact digest, canonical catalog digest, authenticated

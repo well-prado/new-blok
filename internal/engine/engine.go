@@ -16,6 +16,7 @@ import (
 	"github.com/well-prado/new-blok/contract"
 	"github.com/well-prado/new-blok/contract/capacity"
 	"github.com/well-prado/new-blok/contract/inspection"
+	"github.com/well-prado/new-blok/contract/observe"
 	"github.com/well-prado/new-blok/contract/schema"
 	"github.com/well-prado/new-blok/internal/value"
 	"github.com/well-prado/new-blok/node"
@@ -49,6 +50,10 @@ type Result struct {
 	Output any
 	State  map[string]any
 	Steps  []StepResult
+	// Trace is the run span of an observed, traced run (zero otherwise). The
+	// application boundary that owns the terminal event passes it back
+	// through EmitRunTerminal.
+	Trace observe.Span
 }
 
 type StepResult struct {
@@ -66,6 +71,10 @@ type Engine struct {
 	nodes    map[string]node.Any
 	maxSteps int
 	observer inspection.Observer
+	// payloads is false when every selected observer declared, through
+	// observe.PayloadObserver, that it never reads Input or Output.
+	payloads bool
+	tracing  observe.TracePolicy
 }
 
 // StepJournal is the execution boundary used by durable runtimes. Load returns
@@ -137,6 +146,19 @@ func (e *Engine) WithMaxSteps(max int) *Engine {
 func (e *Engine) WithObserver(observer inspection.Observer) *Engine {
 	copy := *e
 	copy.observer = observer
+	copy.payloads = observer != nil
+	if declared, ok := observer.(observe.PayloadObserver); ok {
+		copy.payloads = declared.ObservesPayloads()
+	}
+	return &copy
+}
+
+// WithTracing selects the head-sampling policy for observed runs. Tracing
+// happens only while an observer is selected; the zero policy disables it.
+// An invalid policy is ignored (app.New rejects it before it gets here).
+func (e *Engine) WithTracing(policy observe.TracePolicy) *Engine {
+	copy := *e
+	copy.tracing = policy
 	return &copy
 }
 
@@ -182,7 +204,7 @@ func (e *Engine) EmitRunTerminal(invocation inspection.Invocation, workflow stri
 		return
 	}
 	var output json.RawMessage
-	if kind == inspection.RunCompleted {
+	if kind == inspection.RunCompleted && e.payloads {
 		output = marshalObservation(result.Output)
 	}
 	e.observer.Observe(inspection.Event{
@@ -190,6 +212,7 @@ func (e *Engine) EmitRunTerminal(invocation inspection.Invocation, workflow stri
 		Workflow: workflow, ParentRun: invocation.ParentRun, ParentStep: invocation.ParentStep,
 		Output:    output,
 		ErrorCode: code, ErrorClass: class, At: time.Now().UTC(),
+		Tenant: invocation.Tenant, Trace: result.Trace,
 	})
 }
 
@@ -225,12 +248,30 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 		}
 		invocation.AttemptID = "attempt:" + hex.EncodeToString(id[:])
 	}
+	payloads := observing && e.payloads
+	// A traced run joins a trusted parent supplied with the invocation or,
+	// failing that, the trace of the step that started it (a child run).
+	// Spans are allocated here, not by an exporter, so the context handed to
+	// nodes, workers and child runs exists before any exporter sees it.
+	tracing := observing && e.tracing.Enabled()
+	var runSpan, stepSpan observe.Span
+	if tracing {
+		parent := invocation.Trace
+		if !parent.Valid() {
+			parent, _ = observe.TraceFrom(ctx)
+		}
+		runSpan = e.tracing.Root(parent)
+	}
 	emit := func(event inspection.Event) {
 		if !observing {
 			return
 		}
 		event.RunID, event.Principal, event.Workflow = invocation.RunID, invocation.Principal, program.WorkflowID
 		event.ParentRun, event.ParentStep = invocation.ParentRun, invocation.ParentStep
+		event.Tenant = invocation.Tenant
+		if tracing && !event.Trace.SpanID.IsValid() {
+			event.Trace = runSpan
+		}
 		if event.At.IsZero() {
 			event.At = time.Now().UTC()
 		}
@@ -240,7 +281,7 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 		e.observer.Observe(event)
 	}
 	var inputJSON json.RawMessage
-	if observing {
+	if payloads {
 		inputJSON = marshalObservation(input)
 	}
 	emit(inspection.Event{Kind: inspection.RunStarted, Input: inputJSON})
@@ -261,20 +302,20 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 			if terminal.Kind != inspection.RunUncertain && (errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded)) {
 				terminal.Kind = inspection.RunCanceled
 			}
-		} else if observing {
+		} else if payloads {
 			terminal.Output = marshalObservation(result.Output)
 		}
 		emit(terminal)
 	}()
 	state := make(map[string]any)
-	result = Result{State: state}
+	result = Result{State: state, Trace: runSpan}
 	// effected is the last completed step that declared effects: once it has
 	// run, a later failure is no longer safe to retry (see afterEffect).
 	effected := ""
 	appendStep := func(step StepResult) {
 		result.Steps = append(result.Steps, step)
-		event := inspection.Event{Kind: inspection.StepCompleted, StepID: step.ID, Attempt: step.Attempt}
-		if observing {
+		event := inspection.Event{Kind: inspection.StepCompleted, StepID: step.ID, Attempt: step.Attempt, Trace: stepSpan}
+		if payloads {
 			event.Input = marshalObservation(step.Input)
 			event.Output = marshalObservation(step.Output)
 		}
@@ -299,6 +340,9 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 			return result, &Error{Code: "canceled", Class: "cancellation", Step: instruction.ID, Err: err}
 		}
 		step := StepResult{ID: instruction.ID}
+		if tracing {
+			stepSpan = runSpan.Child()
+		}
 		switch instruction.Kind {
 		case "wait":
 			if journal == nil || instruction.Wait == nil {
@@ -357,7 +401,11 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 			step.Attempt = 1
 			step.StartedAt = time.Now().UTC()
 			if observing {
-				emit(inspection.Event{Kind: inspection.StepProcessing, StepID: step.ID, Attempt: step.Attempt, AttemptID: invocation.AttemptID, Input: marshalObservation(step.Input)})
+				processing := inspection.Event{Kind: inspection.StepProcessing, StepID: step.ID, Attempt: step.Attempt, AttemptID: invocation.AttemptID, Trace: stepSpan}
+				if payloads {
+					processing.Input = marshalObservation(step.Input)
+				}
+				emit(processing)
 			}
 			if err := validateSchema(definition.Descriptor().InputSchema, callInput); err != nil {
 				step.Error = &Error{Code: "invalid_input", Class: "validation", Step: instruction.ID, Err: err}
@@ -427,7 +475,12 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 			}
 			invokeCtx := ctx
 			if observing {
-				invokeCtx = node.WithLogger(ctx, slog.New(&inspectionLogHandler{emit: emit, step: instruction.ID}))
+				invokeCtx = node.WithLogger(ctx, slog.New(&inspectionLogHandler{emit: emit, step: instruction.ID, trace: stepSpan}))
+			}
+			if tracing {
+				// The node, a worker it calls and any child run it starts
+				// see this step attempt as their parent.
+				invokeCtx = observe.WithTrace(invokeCtx, stepSpan.TraceContext)
 			}
 			output, err := definition.Invoke(invokeCtx, callInput)
 			step.Executed = true
@@ -516,7 +569,7 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 			step.StartedAt = time.Now().UTC()
 			step.Attempt = 1
 			if observing {
-				emit(inspection.Event{Kind: inspection.StepProcessing, StepID: step.ID, Attempt: step.Attempt, AttemptID: invocation.AttemptID})
+				emit(inspection.Event{Kind: inspection.StepProcessing, StepID: step.ID, Attempt: step.Attempt, AttemptID: invocation.AttemptID, Trace: stepSpan})
 			}
 			output, err := resolveOutput(state, instruction.References)
 			if err != nil {
