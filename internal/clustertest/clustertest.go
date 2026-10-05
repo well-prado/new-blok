@@ -13,15 +13,26 @@
 // [PauseQuorum]). Ordinary tests still run concurrently with each other; a
 // disruptive test waits until they drain and runs alone. A waiting disruptive
 // test blocks new shared holders, so it is not starved. Before an exclusive
-// lock is released the cluster must be healthy again (one agreed leader, and
-// every voter answering a linearizable read), so the next test never inherits
-// a cluster that is still recovering.
+// lock is released the cluster must be healthy again (one agreed leader and
+// Raft term, unchanged for longer than an election timeout, and every voter
+// answering a linearizable read), so the next test never inherits a cluster
+// that is still recovering. When a disruptive test acquires the lock, voters
+// that an earlier, killed test binary left paused are unpaused, and a cluster
+// that is still unhealthy fails the test with the reason instead of being
+// disrupted further.
 //
 // Locks are released by t.Cleanup on success, failure, skip or panic, and by
 // the kernel when a test binary exits or is killed (for example on -timeout).
 // A different cluster has a different key, so two clusters never block each
 // other. In one process, tests run sequentially; parallel cluster tests in one
 // package are refused rather than silently sharing an exclusive lock.
+//
+// The lock files live under os.TempDir() (blok-clustertest/<key>.lock), so the
+// guard covers only processes that resolve the same temporary directory. `go
+// test` passes TMPDIR through unchanged, so one `go test ./...` is covered. Two
+// runs with different TMPDIR values (different users, sandboxes, containers,
+// or an explicit TMPDIR=...) against the same cluster do not see each other's
+// locks and can still interfere.
 package clustertest
 
 import (
@@ -77,10 +88,28 @@ var (
 	slowWait = 5 * time.Second
 	// healthBound bounds the post-disruption recovery wait.
 	healthBound = 90 * time.Second
-	// healthCheck is replaced only by this package's own lock tests, whose
-	// fake endpoints have no cluster behind them.
-	healthCheck = WaitHealthy
+	// healthCheck, voterPaused and unpauseVoter are replaced only by this
+	// package's own lock tests, whose fake endpoints and voters have no
+	// cluster behind them.
+	healthCheck  = WaitHealthy
+	voterPaused  = dockerPaused
+	unpauseVoter = dockerUnpause
 )
+
+func dockerPaused(voter string) (bool, error) {
+	output, err := exec.Command("docker", "inspect", "--format", "{{.State.Paused}}", voter).CombinedOutput()
+	if err != nil {
+		return false, fmt.Errorf("docker inspect %s: %w: %s", voter, err, strings.TrimSpace(string(output)))
+	}
+	return strings.TrimSpace(string(output)) == "true", nil
+}
+
+func dockerUnpause(voter string) error {
+	if output, err := exec.Command("docker", "unpause", voter).CombinedOutput(); err != nil {
+		return fmt.Errorf("docker unpause %s: %w: %s", voter, err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
 
 // Endpoints returns the shared cluster's endpoints and holds a shared lock on
 // it for the rest of t. It skips t when the cluster environment is unset. The
@@ -96,13 +125,48 @@ func Endpoints(t testing.TB) []string {
 // Disrupt holds the exclusive lock on the shared cluster for the rest of t and
 // returns its endpoints. Call it first in any test that pauses, kills or
 // partitions a voter, before the test creates leases or deadlines that a wait
-// for the lock could outlast. When t ends the cluster must be healthy again
-// before the lock is released.
+// for the lock could outlast. On acquisition it recovers voters left paused
+// by an earlier, killed test binary and fails t if the cluster is not healthy
+// (see [RecoverVoters]). When t ends the cluster must be healthy again before
+// the lock is released.
 func Disrupt(t testing.TB) []string {
 	t.Helper()
 	endpoints := envEndpoints(t)
+	if lockFor(endpoints).holdsExclusive(t) {
+		// A parent test already acquired, and checked, the cluster.
+		return endpoints
+	}
 	Hold(t, endpoints, Exclusive)
+	RecoverVoters(t, endpoints)
 	return endpoints
+}
+
+// RecoverVoters runs under the exclusive lock. It unpauses any voter that is
+// paused (only a disruptive test pauses voters, and none holds the lock, so a
+// paused voter was left by a binary killed mid-disruption), then fails t
+// unless the cluster is healthy. A voter that cannot be inspected is reported
+// and left to the health check.
+func RecoverVoters(t testing.TB, endpoints []string) {
+	t.Helper()
+	for _, voter := range Voters() {
+		paused, err := voterPaused(voter)
+		if err != nil {
+			t.Logf("cluster %s: cannot inspect voter %s before disrupting: %v", Key(endpoints), voter, err)
+			continue
+		}
+		if !paused {
+			continue
+		}
+		t.Logf("cluster %s: voter %s was left paused, probably by a test binary killed mid-disruption; unpausing it", Key(endpoints), voter)
+		if err := unpauseVoter(voter); err != nil {
+			t.Errorf("cluster %s: unpause leftover paused voter: %v", Key(endpoints), err)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), healthBound)
+	defer cancel()
+	if err := healthCheck(ctx, endpoints); err != nil {
+		t.Fatalf("cluster %s is unhealthy before the disruptive test %s; recover it (unpause voters, reconnect networks) first: %v", Key(endpoints), t.Name(), err)
+	}
 }
 
 func envEndpoints(t testing.TB) []string {

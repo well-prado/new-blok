@@ -25,9 +25,13 @@ const (
 )
 
 func TestMain(m *testing.M) {
-	// Fake endpoints have no cluster behind them. The health check itself is
-	// exercised against the real cluster by TestReleaseWaitsForRecovery.
+	// Fake endpoints and voters have no cluster behind them. The real health
+	// check and voter recovery are exercised against the real cluster by
+	// TestReleaseWaitsForRecovery and TestRecoverVotersUnpausesALeftoverVoter
+	// (see useRealCluster).
 	healthCheck = func(context.Context, []string) error { return nil }
+	voterPaused = func(string) (bool, error) { return false, nil }
+	unpauseVoter = func(string) error { return nil }
 	os.Exit(m.Run())
 }
 
@@ -173,6 +177,21 @@ func TestHelperProcess(t *testing.T) {
 	case "disrupt":
 		t.Setenv(EndpointsEnv, strings.Join(endpoints, ","))
 		Disrupt(t)
+	case "pause-without-disrupt":
+		// Voter names that exist nowhere: if the guard let this through,
+		// docker would fail on them rather than pause anything real.
+		t.Setenv(EndpointsEnv, strings.Join(endpoints, ","))
+		t.Setenv(VotersEnv, "clustertest-no-such-voter-1,clustertest-no-such-voter-2,clustertest-no-such-voter-3")
+		ready()
+		PauseQuorum(t)
+		return
+	case "pause-after-disrupt":
+		t.Setenv(EndpointsEnv, strings.Join(endpoints, ","))
+		t.Setenv(VotersEnv, "clustertest-no-such-voter-1,clustertest-no-such-voter-2,clustertest-no-such-voter-3")
+		ready()
+		Disrupt(t)
+		t.Run("subtest", func(t *testing.T) { PauseQuorum(t) })
+		return
 	case "fatal":
 		// A disruptive subtest fails while holding the exclusive lock. Its
 		// parent then checks, from a fresh descriptor in this same process,
@@ -336,17 +355,29 @@ func TestUpgradeWithinOneTestThenDowngrade(t *testing.T) {
 // test can watch another hold fail without failing itself.
 type recorder struct {
 	testing.TB
+	name     string
 	cleanups []func()
 	errors   []string
+	logs     []string
 }
 
-func (r *recorder) Name() string     { return r.TB.Name() + "/recorded" }
+func (r *recorder) Name() string {
+	if r.name != "" {
+		return r.name
+	}
+	return r.TB.Name() + "/recorded"
+}
 func (r *recorder) Helper()          {}
 func (r *recorder) Cleanup(f func()) { r.cleanups = append(r.cleanups, f) }
 func (r *recorder) Errorf(format string, a ...any) {
 	r.errors = append(r.errors, fmt.Sprintf(format, a...))
 }
+func (r *recorder) Error(a ...any)                 { r.errors = append(r.errors, fmt.Sprint(a...)) }
 func (r *recorder) Fatalf(format string, a ...any) { r.Errorf(format, a...) }
+func (r *recorder) Fatal(a ...any)                 { r.Error(a...) }
+func (r *recorder) Logf(format string, a ...any)   { r.logs = append(r.logs, fmt.Sprintf(format, a...)) }
+func (r *recorder) Log(a ...any)                   { r.logs = append(r.logs, fmt.Sprint(a...)) }
+func (r *recorder) Skipf(format string, a ...any)  { r.Errorf("skipped: "+format, a...) }
 
 func (r *recorder) finish() {
 	for index := len(r.cleanups) - 1; index >= 0; index-- {
@@ -360,10 +391,9 @@ func (r *recorder) finish() {
 // voter until it is back.
 func TestReleaseWaitsForRecovery(t *testing.T) {
 	requireLocks(t)
-	previousCheck, previousBound := healthCheck, healthBound
-	t.Cleanup(func() { healthCheck, healthBound = previousCheck, previousBound })
-	healthCheck = WaitHealthy
-	endpoints := Disrupt(t)
+	previousBound := healthBound
+	t.Cleanup(func() { healthBound = previousBound })
+	endpoints := useRealCluster(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := WaitHealthy(ctx, endpoints); err != nil {
@@ -393,4 +423,135 @@ func TestReleaseWaitsForRecovery(t *testing.T) {
 	if err := WaitHealthy(recoverCtx, endpoints); err != nil {
 		t.Fatalf("cluster did not recover after unpausing %s: %v", voter, err)
 	}
+}
+
+// useRealCluster restores the real health check and docker voter control for
+// the rest of t and takes the exclusive lock on the real cluster.
+func useRealCluster(t *testing.T) []string {
+	t.Helper()
+	previousCheck, previousPaused, previousUnpause := healthCheck, voterPaused, unpauseVoter
+	t.Cleanup(func() { healthCheck, voterPaused, unpauseVoter = previousCheck, previousPaused, previousUnpause })
+	healthCheck, voterPaused, unpauseVoter = WaitHealthy, dockerPaused, dockerUnpause
+	return Disrupt(t)
+}
+
+// runHelper runs role in a separate process to completion.
+func runHelper(t *testing.T, role string, endpoints []string) (string, error) {
+	t.Helper()
+	h := startHelper(t, role, endpoints)
+	err := h.wait(t)
+	return h.output.String(), err
+}
+
+func TestPauseQuorumRequiresDisrupt(t *testing.T) {
+	requireLocks(t)
+	output, err := runHelper(t, "pause-without-disrupt", fakeEndpoints(t))
+	if err == nil || !strings.Contains(output, "call clustertest.Disrupt(t) at the start of the disruptive test first") {
+		t.Fatalf("PauseQuorum without the exclusive lock was not refused: err=%v\n%s", err, output)
+	}
+	if strings.Contains(output, "pause voter") {
+		t.Fatalf("PauseQuorum without the exclusive lock reached docker:\n%s", output)
+	}
+	// Under a parent's Disrupt the check passes, and the subtest reaches
+	// docker (which fails on the nonexistent voter).
+	output, err = runHelper(t, "pause-after-disrupt", fakeEndpoints(t))
+	if err == nil || strings.Contains(output, "call clustertest.Disrupt") || !strings.Contains(output, "pause voter clustertest-no-such-voter-2") {
+		t.Fatalf("PauseQuorum under a parent's Disrupt: err=%v, want it past the lock check and stopped by docker\n%s", err, output)
+	}
+}
+
+func TestParallelDisruptionInOneProcessIsRefused(t *testing.T) {
+	requireLocks(t)
+	for _, modes := range [][2]Mode{{Exclusive, Shared}, {Shared, Exclusive}, {Exclusive, Exclusive}} {
+		endpoints := fakeEndpoints(t)
+		first := &recorder{TB: t, name: "TestSiblings/first"}
+		second := &recorder{TB: t, name: "TestSiblings/second"}
+		Hold(first, endpoints, modes[0])
+		if len(first.errors) != 0 {
+			t.Fatalf("first %s hold: %v", modes[0], first.errors)
+		}
+		Hold(second, endpoints, modes[1])
+		second.finish()
+		first.finish()
+		if len(second.errors) != 1 || !strings.Contains(second.errors[0], "parallel cluster tests cannot share a disruption") {
+			t.Fatalf("a concurrent %s hold beside an unrelated %s hold in one process reported %q, want a refusal", modes[1], modes[0], second.errors)
+		}
+	}
+	// Related tests (a parent and its subtest) are not parallel siblings.
+	endpoints := fakeEndpoints(t)
+	parent := &recorder{TB: t, name: "TestFamily"}
+	child := &recorder{TB: t, name: "TestFamily/child"}
+	Hold(parent, endpoints, Shared)
+	Hold(child, endpoints, Exclusive)
+	child.finish()
+	parent.finish()
+	if len(parent.errors)+len(child.errors) != 0 {
+		t.Fatalf("a subtest's exclusive hold under its parent was refused: %v %v", parent.errors, child.errors)
+	}
+}
+
+func TestDisruptRecoversVotersLeftPaused(t *testing.T) {
+	requireLocks(t)
+	previousCheck, previousPaused, previousUnpause := healthCheck, voterPaused, unpauseVoter
+	t.Cleanup(func() { healthCheck, voterPaused, unpauseVoter = previousCheck, previousPaused, previousUnpause })
+	t.Setenv(EndpointsEnv, strings.Join(fakeEndpoints(t), ","))
+	t.Setenv(VotersEnv, "fake-1,fake-2,fake-3")
+	paused := map[string]bool{"fake-3": true}
+	var unpaused []string
+	voterPaused = func(voter string) (bool, error) { return paused[voter], nil }
+	unpauseVoter = func(voter string) error {
+		unpaused = append(unpaused, voter)
+		paused[voter] = false
+		return nil
+	}
+	var checked int
+	healthCheck = func(context.Context, []string) error {
+		checked++
+		return nil
+	}
+
+	acquirer := &recorder{TB: t}
+	Disrupt(acquirer)
+	if len(unpaused) != 1 || unpaused[0] != "fake-3" || checked != 1 || len(acquirer.errors) != 0 {
+		t.Fatalf("Disrupt over a voter left paused: unpaused=%v health checks=%d errors=%v, want fake-3 unpaused, one check, no errors", unpaused, checked, acquirer.errors)
+	}
+	if !strings.Contains(strings.Join(acquirer.logs, "\n"), "voter fake-3 was left paused") {
+		t.Fatalf("the recovered voter was not reported: %v", acquirer.logs)
+	}
+	acquirer.finish()
+
+	// A cluster that is still unhealthy is reported, not disrupted further.
+	healthCheck = func(context.Context, []string) error { return errors.New("synthetic: http://fake-3 unreachable") }
+	unhealthy := &recorder{TB: t}
+	Disrupt(unhealthy)
+	if len(unhealthy.errors) != 1 || !strings.Contains(unhealthy.errors[0], "unhealthy before the disruptive test") || !strings.Contains(unhealthy.errors[0], "http://fake-3 unreachable") {
+		t.Fatalf("Disrupt over an unhealthy cluster reported %q, want one failure naming the reason", unhealthy.errors)
+	}
+	healthCheck = func(context.Context, []string) error { return nil }
+	unhealthy.finish()
+}
+
+// TestRecoverVotersUnpausesALeftoverVoter runs against the real cluster: a
+// voter paused with nobody to unpause it (a killed binary) is unpaused and
+// the cluster is healthy before the next disruption starts.
+func TestRecoverVotersUnpausesALeftoverVoter(t *testing.T) {
+	requireLocks(t)
+	endpoints := useRealCluster(t)
+	voter := Voters()[1]
+	t.Cleanup(func() { _ = exec.Command("docker", "unpause", voter).Run() })
+	if output, err := exec.Command("docker", "pause", voter).CombinedOutput(); err != nil {
+		t.Fatalf("pause %s: %v: %s", voter, err, output)
+	}
+	next := &recorder{TB: t}
+	RecoverVoters(next, endpoints)
+	if len(next.errors) != 0 {
+		t.Fatalf("recovering a leftover paused voter failed: %v", next.errors)
+	}
+	if !strings.Contains(strings.Join(next.logs, "\n"), "voter "+voter+" was left paused") {
+		t.Fatalf("the leftover paused voter was not reported: %v", next.logs)
+	}
+	if paused, err := dockerPaused(voter); err != nil || paused {
+		t.Fatalf("voter %s paused=%v err=%v after recovery", voter, paused, err)
+	}
+	t.Logf("recovered: %s", strings.Join(next.logs, "; "))
 }
