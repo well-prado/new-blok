@@ -45,3 +45,36 @@ func TestSourceDoesNotExecuteInitAndRejectsUnsupportedTypes(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 }
+
+// TestAccessorsSelectTheJSONKey: an accessor selects the key encoding/json
+// writes, which is what a workflow reference resolves: the tag's name, or the
+// exact Go field name without one. A field tagged "-" has no accessor (#240).
+func TestAccessorsSelectTheJSONKey(t *testing.T) {
+	source := []byte("package shop\n\ntype Line struct {\n" +
+		"\tSKU string `json:\"sku\"`\n" +
+		"\tTotalCents int64\n" +
+		"\tTotal int64 `json:\"total_cents,omitempty\"`\n" +
+		"\tNote string `json:\",omitempty\"`\n" +
+		"\tSecret string `json:\"-\"`\n" +
+		"\tDash string `json:\"-,\"`\n" +
+		"}\n")
+	generated, err := Source(source, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(generated)
+	for accessor, path := range map[string]string{"SKU": "sku", "TotalCents": "TotalCents", "Total": "total_cents", "Note": "Note", "Dash": "-"} {
+		want := "func (r LineRef) " + accessor + "() "
+		index := strings.Index(text, want)
+		if index < 0 {
+			t.Fatalf("no %s accessor:\n%s", accessor, text)
+		}
+		line := text[index : index+strings.IndexByte(text[index:], '\n')]
+		if !strings.Contains(line, `(r.value, "`+path+`")`) {
+			t.Fatalf("%s selects %q; want %q", accessor, line, path)
+		}
+	}
+	if strings.Contains(text, "func (r LineRef) Secret()") {
+		t.Fatalf("a field tagged \"-\" got an accessor:\n%s", text)
+	}
+}
