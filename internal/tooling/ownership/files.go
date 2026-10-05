@@ -26,9 +26,24 @@ type projectFiles struct {
 	abs      string
 	listings map[string]listing
 	bytes    int64
-	// limited is set once the read budget is exhausted.
-	limited bool
+	// work counts path elements looked up; past maxWork every lookup
+	// fails closed as a bound overrun, so the check's time is bounded by
+	// counted steps, not by a clock.
+	work int
 }
+
+// maxWork bounds one check's resolution work in path elements looked up
+// (each a map access over cached directory listings). A variable so tests
+// can reach it.
+var maxWork = 4 << 20
+
+// spend counts n units of work and reports whether the budget still holds.
+func (f *projectFiles) spend(n int) bool {
+	f.work += n
+	return f.work <= maxWork
+}
+
+func (f *projectFiles) exhausted() bool { return f.work > maxWork }
 
 type listing struct {
 	entries map[string]fs.FileMode // exact name → type bits
@@ -97,6 +112,9 @@ func (f *projectFiles) lookup(rel string) entry {
 		return entry{kind: kindDir}
 	}
 	parts := strings.Split(rel, "/")
+	if !f.spend(len(parts)) {
+		return entry{kind: kindLimit, path: rel}
+	}
 	var spelled []string
 	mismatch := false
 	for i, part := range parts {
@@ -184,6 +202,22 @@ type resolved struct {
 	findings []diagnostic.Diagnostic
 }
 
+// bind returns a copy of a cached resolution with the placeholder source
+// replaced by the importing file:line.
+func (r resolved) bind(source string) resolved {
+	out := resolved{targets: r.targets, findings: make([]diagnostic.Diagnostic, len(r.findings))}
+	for i, d := range r.findings {
+		if d.Source == placeholderSource {
+			d.Source = source
+		}
+		if d.Field == placeholderSource {
+			d.Field = source
+		}
+		out.findings[i] = d
+	}
+	return out
+}
+
 func (r *resolved) target(unit string, noFollow bool) {
 	for _, existing := range r.targets {
 		if existing.Unit == unit && existing.NoFollow == noFollow {
@@ -199,7 +233,7 @@ func (r *resolved) target(unit string, noFollow bool) {
 func (r *resolved) accept(e entry, source string) bool {
 	switch e.kind {
 	case kindLimit:
-		r.findings = append(r.findings, diagnostic.Diagnostic{Code: CodeLimitExceeded, Source: source, Actual: e.path, Message: "a directory on the import's path lists more entries than the ownership check reads", Remediation: remediations[CodeLimitExceeded]})
+		r.findings = append(r.findings, diagnostic.Diagnostic{Code: CodeLimitExceeded, Source: source, Actual: e.path, Message: "resolving the import reached an ownership bound: a directory listing past the entry bound, or the check's work budget", Remediation: remediations[CodeLimitExceeded]})
 		return true
 	case kindLink:
 		r.findings = append(r.findings, linkFinding(e, source))

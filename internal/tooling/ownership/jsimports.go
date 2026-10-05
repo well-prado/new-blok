@@ -24,25 +24,37 @@ type jsScan struct {
 	unverified []jsUnverified
 }
 
-// loaderNames are identifiers that reach Node's module loader or evaluate
-// source without a static specifier. Any appearance makes the file
-// unverified (ADR 0025).
+// loaderNames are identifiers that reach Node's module loader, a native
+// binding, or evaluate source without a static specifier. Any appearance,
+// as a name or as a property, makes the file unverified (ADR 0025).
 var loaderNames = map[string]bool{
 	"createRequire": true, "getBuiltinModule": true, "mainModule": true, "_load": true,
 	"dlopen": true, "importScripts": true, "ShadowRealm": true,
+	"_linkedBinding": true, "eval": true, "Function": true, "Worker": true,
 }
 
-// loaderModules are built-in modules whose purpose is loading or
-// evaluating code by computed name.
-var loaderModules = map[string]bool{"vm": true, "module": true}
+// memberLoaderNames are loaders reached as a property (process.binding)
+// whose bare name is a common variable; called bare they are unverified too.
+var memberLoaderNames = map[string]bool{"binding": true}
+
+// globalObjects are names of the global object; a computed property of one
+// (globalThis["ev" + "al"]) can reach any loader, so it is unverified.
+var globalObjects = map[string]bool{"globalThis": true, "global": true, "window": true, "self": true, "this": true}
+
+// loaderModules are built-in modules whose purpose is loading, evaluating
+// or running code by computed name or path.
+var loaderModules = map[string]bool{"vm": true, "module": true, "worker_threads": true, "child_process": true, "cluster": true}
 
 // scanJS lexes src and returns every import form it contains.
 func scanJS(src []byte) (jsScan, error) {
-	toks, refs, err := lex(src)
+	toks, refs, ambiguous, err := lex(src)
 	if err != nil {
 		return jsScan{}, err
 	}
 	r := &recognizer{toks: toks}
+	for _, line := range ambiguous {
+		r.unverified(line, CodeAmbiguousSyntax, "regular expression or division")
+	}
 	for _, ref := range refs {
 		r.out.imports = append(r.out.imports, jsImport{line: ref.line, form: "reference", specifier: ref.value, types: ref.types})
 	}
@@ -99,8 +111,19 @@ func (r *recognizer) scan() {
 			}
 		case t.kind != tokIdent:
 		case r.member(i):
-			if loaderNames[t.text] {
-				r.unverified(t.line, CodeUnsupportedForm, t.text)
+			switch {
+			case loaderNames[t.text] || memberLoaderNames[t.text]:
+				r.unverified(t.line, CodeUnsupportedForm, "."+t.text)
+			case t.text == "require":
+				// module.require, require.main.require, x?.require,
+				// prototype.require.call: every member route to a
+				// require function is unverified.
+				r.unverified(t.line, CodeUnsupportedForm, ".require")
+			case t.text == "constructor" && !(isPunct(r.at(i+1), ".") && isIdent(r.at(i+2), "name")):
+				// x.constructor reaches the Function and AsyncFunction
+				// constructors (f.constructor("…")); only .constructor.name
+				// is read without that risk
+				r.unverified(t.line, CodeUnsupportedForm, ".constructor")
 			}
 		case r.propertyKey(i):
 			// { require: … } or { import: … }
@@ -110,17 +133,26 @@ func (r *recognizer) scan() {
 			i = r.exportAt(i)
 		case t.text == "require":
 			r.requireAt(i)
-		case t.text == "module" && isPunct(r.at(i+1), ".") && isIdent(r.at(i+2), "require"):
-			r.requireAt(i + 2)
-			i += 2
+		case t.text == "module" && (isPunct(r.at(i+1), ".") || isPunct(r.at(i+1), "?.")):
+			if !isIdent(r.at(i+2), "exports") && !isIdent(r.at(i+2), "require") { // .require is reported as a member
+				r.unverified(t.line, CodeUnsupportedForm, "module."+r.at(i+2).text)
+			}
 		case t.text == "module" && isPunct(r.at(i+1), "["):
 			r.unverified(t.line, CodeUnsupportedForm, "module[…]")
-		case t.text == "eval" && (isPunct(r.at(i+1), "(") || isPunct(r.at(i+1), "?.")):
-			r.unverified(t.line, CodeUnsupportedForm, "eval")
-		case t.text == "Function" && (isPunct(r.at(i+1), "(") || isIdent(r.at(i-1), "new")):
-			r.unverified(t.line, CodeUnsupportedForm, "Function constructor")
-		case t.text == "Worker" && isIdent(r.at(i-1), "new"):
-			r.unverified(t.line, CodeUnsupportedForm, "new Worker")
+		case globalObjects[t.text] && (isPunct(r.at(i+1), "[") || isPunct(r.at(i+1), "?.") && isPunct(r.at(i+2), "[")):
+			r.unverified(t.line, CodeUnsupportedForm, t.text+"[…]")
+		case (t.text == "globalThis" || t.text == "global") && !isPunct(r.at(i+1), ".") && !isPunct(r.at(i+1), "?."):
+			// the global object as a value (Reflect.get(globalThis, k))
+			// reaches eval by a computed name
+			r.unverified(t.line, CodeUnsupportedForm, t.text+" as a value")
+		case memberLoaderNames[t.text] && isPunct(r.at(i+1), "("):
+			r.unverified(t.line, CodeUnsupportedForm, t.text+"(…)")
+		case t.text == "arguments":
+			// at CommonJS module scope (or in an arrow function there) this
+			// is the wrapper's (exports, require, module, …)
+			r.unverified(t.line, CodeUnsupportedForm, "arguments")
+		case t.text == "define" && isPunct(r.at(i+1), "("):
+			r.unverified(t.line, CodeUnsupportedForm, "AMD define")
 		case loaderNames[t.text]:
 			r.unverified(t.line, CodeUnsupportedForm, t.text)
 		}
@@ -140,22 +172,6 @@ func (r *recognizer) inObjectOrClass() bool {
 	}
 	kind := r.braces[len(r.braces)-1]
 	return kind == braceExpr || kind == braceClass
-}
-
-// methodAt reports `name(…) {` in a class body or object literal: a method
-// named like a loader, not a call.
-func (r *recognizer) methodAt(i int) bool {
-	if !r.inObjectOrClass() || !isPunct(r.at(i+1), "(") {
-		return false
-	}
-	prev := r.at(i - 1)
-	if !(isPunct(prev, "{") || isPunct(prev, ",") || isPunct(prev, ";") || isPunct(prev, "}") || isPunct(prev, "*") ||
-		isIdent(prev, "static") || isIdent(prev, "async") || isIdent(prev, "get") || isIdent(prev, "set") ||
-		isIdent(prev, "public") || isIdent(prev, "private") || isIdent(prev, "protected") || isIdent(prev, "override")) {
-		return false
-	}
-	close := r.matching(i + 1)
-	return close > 0 && (isPunct(r.at(close+1), "{") || isPunct(r.at(close+1), ":"))
 }
 
 // matching returns the index of the ")" matching the "(" at open, or -1.
@@ -201,9 +217,6 @@ func (r *recognizer) importAt(i int) int {
 		}
 		return i
 	case isPunct(next, "("):
-		if r.methodAt(i) {
-			return i
-		}
 		if specifier, ok := r.callArgument(i + 1); ok {
 			r.add(t.line, "import()", specifier)
 		} else {
@@ -316,26 +329,20 @@ func (r *recognizer) requireAt(i int) {
 	prev, next := r.at(i-1), r.at(i+1)
 	switch {
 	case isPunct(next, "("):
-		if r.methodAt(i) {
-			return
-		}
 		if specifier, ok := r.callArgument(i + 1); ok {
 			r.add(t.line, "require", specifier)
 		} else {
 			r.unverified(t.line, CodeDynamicImport, "require(expression)")
 		}
-	case isPunct(next, "."):
-		switch member := r.at(i + 2); {
-		case isIdent(member, "resolve") && isPunct(r.at(i+3), "("):
-			if specifier, ok := r.callArgument(i + 3); ok {
-				r.add(t.line, "require.resolve", specifier)
-			} else {
-				r.unverified(t.line, CodeDynamicImport, "require.resolve(expression)")
-			}
-		case isIdent(member, "main"):
-		default:
-			r.unverified(t.line, CodeUnsupportedForm, "require."+member.text)
+	case isPunct(next, ".") && isIdent(r.at(i+2), "resolve") && isPunct(r.at(i+3), "("):
+		if specifier, ok := r.callArgument(i + 3); ok {
+			r.add(t.line, "require.resolve", specifier)
+		} else {
+			r.unverified(t.line, CodeDynamicImport, "require.resolve(expression)")
 		}
+	case isPunct(next, ".") || isPunct(next, "?.") || isPunct(next, "["):
+		// require.main.require, require.cache, require?.(…), require[…]
+		r.unverified(t.line, CodeUnsupportedForm, "require"+next.text+r.at(i+2).text)
 	case isIdent(prev, "typeof"), isIdent(prev, "function"), isIdent(prev, "const"), isIdent(prev, "let"), isIdent(prev, "var"), isPunct(next, ":") && isIdent(r.at(i-2), "declare"):
 		// typeof require, or a declaration of the name
 	default:

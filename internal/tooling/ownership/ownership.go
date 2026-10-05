@@ -41,6 +41,7 @@ const (
 	CodeUnsupportedForm      = "ownership_unsupported_form"
 	CodeSourceUnsupported    = "ownership_source_unsupported"
 	CodeParseFailed          = "ownership_parse_failed"
+	CodeAmbiguousSyntax      = "ownership_ambiguous_syntax"
 	CodeConfigInvalid        = "ownership_config_invalid"
 	CodeRuntimeUnsupported   = "ownership_runtime_unsupported"
 	CodeLimitExceeded        = "ownership_limit_exceeded"
@@ -68,6 +69,7 @@ var remediations = map[string]string{
 	CodeUnsupportedForm:        "remove the evaluating or loader form; ownership can verify only static imports",
 	CodeSourceUnsupported:      "this file type has no checked ownership adapter; keep node source in a supported language form",
 	CodeParseFailed:            "fix the syntax error; ownership reads source without running it",
+	CodeAmbiguousSyntax:        "a \"/\" here reads both as division and as a regular expression; parenthesize or end the statement with a semicolon so the file can be verified",
 	CodeConfigInvalid:          "fix the tsconfig.json, package.json or go.mod that import resolution reads",
 	CodeRuntimeUnsupported:     "this runtime has no checked ownership adapter yet; its nodes cannot be verified",
 	CodeLimitExceeded:          "reduce the import graph below the documented ownership bounds",
@@ -89,6 +91,7 @@ var classes = map[string]string{
 	CodeUnsupportedForm:        ClassUnverified,
 	CodeSourceUnsupported:      ClassUnverified,
 	CodeParseFailed:            ClassUnverified,
+	CodeAmbiguousSyntax:        ClassUnverified,
 	CodeConfigInvalid:          ClassUnverified,
 	CodeRuntimeUnsupported:     ClassUnverified,
 	CodeLimitExceeded:          ClassUnverified,

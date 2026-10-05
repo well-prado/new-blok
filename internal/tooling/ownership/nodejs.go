@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"path"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -26,12 +27,24 @@ type nodeAdapter struct {
 	packages map[string]*packageJSON // directory → package.json, nil when absent
 	configs  map[string]*tsOptions   // directory → effective tsconfig options
 	local    map[string][]string     // package name → local package directories
+	// resolutions caches each (directory, specifier) resolution with a
+	// placeholder source, so a specifier imported many times is resolved
+	// once; loaded caches each tsconfig file's effective options.
+	resolutions map[string]resolved
+	loaded      map[string]tsOptions
+	// targets caches each package's exports/imports match per key.
+	targets map[string]matchedTargets
+}
+
+type matchedTargets struct {
+	targets []string
+	matched bool
 }
 
 const nodeRuntime = "nodejs"
 
 func newNodeAdapter(files *projectFiles, project *layout.Project) *nodeAdapter {
-	return &nodeAdapter{files: files, project: project, packages: map[string]*packageJSON{}, configs: map[string]*tsOptions{}}
+	return &nodeAdapter{files: files, project: project, packages: map[string]*packageJSON{}, configs: map[string]*tsOptions{}, resolutions: map[string]resolved{}, loaded: map[string]tsOptions{}, targets: map[string]matchedTargets{}}
 }
 
 func (a *nodeAdapter) Runtime() string { return nodeRuntime }
@@ -79,8 +92,8 @@ func (a *nodeAdapter) Analyze(file string) Analysis {
 	case hasExtension(name, unsupportedExtensions):
 		analysis.Findings = append(analysis.Findings, finding(CodeSourceUnsupported, file, path.Ext(name), "JSX, native addons and WebAssembly have no checked import grammar here; this file's imports cannot be verified"))
 		return analysis
-	case !hasExtension(name, scriptExtensions):
-		return analysis // JSON and assets import nothing
+	case strings.HasSuffix(name, ".json"):
+		return analysis // JSON imports nothing
 	}
 	data, problem := a.files.read(file)
 	if problem != nil {
@@ -88,6 +101,13 @@ func (a *nodeAdapter) Analyze(file string) Analysis {
 		return analysis
 	}
 	scan, err := scanJS(data)
+	if err != nil && !hasExtension(name, scriptExtensions) {
+		// Node's CommonJS loader runs a required file with any other
+		// extension, or none, as JavaScript; one that does not lex as
+		// JavaScript cannot be shown harmless.
+		analysis.Findings = append(analysis.Findings, finding(CodeSourceUnsupported, file, path.Ext(name), "an imported file without a script extension would run as JavaScript under require, and it does not lex as JavaScript; its imports cannot be verified"))
+		return analysis
+	}
 	if err != nil {
 		line := 0
 		if lexErr, ok := err.(*lexError); ok {
@@ -109,23 +129,43 @@ func (a *nodeAdapter) Analyze(file string) Analysis {
 	}
 	for _, imported := range scan.imports {
 		source := at(file, imported.line)
-		var r resolved
-		switch {
-		case imported.form == "reference" && !imported.types:
-			if rel, inside := cleanJoin(path.Dir(file), imported.specifier); inside {
-				a.resolvePath(rel, source, &r)
-			} else {
-				r.findings = append(r.findings, finding(CodeImportOutsideRoot, source, imported.specifier, "the reference leaves the project root"))
-			}
-		default:
-			a.resolveSpecifier(file, imported.specifier, source, &r, 0)
-		}
+		r := a.resolveCached(file, imported).bind(source)
 		analysis.Findings = append(analysis.Findings, r.findings...)
 		if len(r.targets) > 0 {
 			analysis.Edges = append(analysis.Edges, Edge{Source: source, Specifier: imported.specifier, Targets: r.targets})
 		}
 	}
 	return analysis
+}
+
+// placeholderSource stands for the importing file:line in a cached
+// resolution; bind replaces it.
+const placeholderSource = "\x00source\x00"
+
+// resolveCached resolves one import, reusing an earlier resolution of the
+// same specifier from the same directory.
+func (a *nodeAdapter) resolveCached(file string, imported jsImport) resolved {
+	dir := path.Dir(file)
+	key := dir + "\x00" + imported.form + "\x00" + strconv.FormatBool(imported.types) + "\x00" + imported.specifier
+	if cached, ok := a.resolutions[key]; ok {
+		return cached
+	}
+	var r resolved
+	switch {
+	case imported.form == "reference" && !imported.types:
+		if rel, inside := cleanJoin(dir, imported.specifier); inside {
+			a.resolvePath(rel, placeholderSource, &r)
+		} else {
+			r.findings = append(r.findings, finding(CodeImportOutsideRoot, placeholderSource, imported.specifier, "the reference leaves the project root"))
+		}
+	default:
+		a.resolveSpecifier(file, imported.specifier, placeholderSource, &r, 0)
+	}
+	if a.files.exhausted() {
+		r.findings = append(r.findings, finding(CodeLimitExceeded, placeholderSource, imported.specifier, "the ownership check's work budget ran out while resolving this import"))
+	}
+	a.resolutions[key] = r
+	return r
 }
 
 func (a *nodeAdapter) unresolved(r *resolved, source, specifier, why string) {
@@ -295,7 +335,8 @@ func (a *nodeAdapter) resolveBare(file, specifier, source string, r *resolved, d
 		}
 		return
 	}
-	if version, declaredIn, declared := a.dependency(name, dir, r); declared {
+	version, declaredIn, declared := a.dependency(name, dir, r)
+	if declared {
 		for _, prefix := range []string{"file:", "link:", "portal:"} {
 			if target, local := strings.CutPrefix(version, prefix); local {
 				packageDir, inside := cleanJoin(declaredIn, target)
@@ -307,30 +348,36 @@ func (a *nodeAdapter) resolveBare(file, specifier, source string, r *resolved, d
 				return
 			}
 		}
-		if strings.HasPrefix(version, "workspace:") {
-			a.unresolved(r, source, specifier, "the workspace dependency "+name+" matches no workspace package")
-		}
-		return // a registry, git or tarball dependency: external
 	}
+	// What is installed decides what Node loads, so node_modules is checked
+	// before any declaration is trusted: a link there is never followed.
+	installed := false
+search:
 	for current := dir; ; current = path.Dir(current) {
 		if current == "." {
 			current = ""
 		}
 		e := a.files.lookup(path.Join(current, "node_modules", name))
 		switch e.kind {
+		case kindLimit:
+			r.accept(e, source)
+			return
 		case kindDir, kindFile:
-			return // an installed third-party package: external
+			installed = true
+			break search
 		case kindLink:
-			switch e.linkCode {
-			case layout.CodeSymlinkAlias:
-				if a.owned(e.linkTarget) {
-					r.findings = append(r.findings, linkFinding(e, source))
-					r.target(e.linkTarget, true)
-				}
+			switch {
+			case e.linkCode == layout.CodeSymlinkAlias && a.owned(e.linkTarget):
+				r.findings = append(r.findings, linkFinding(e, source))
+				r.target(e.linkTarget, true)
 				return
-			case layout.CodeSymlinkEscape:
-				return // a package manager store outside the project: external
+			case e.linkCode == layout.CodeSymlinkAlias && inNodeModules(e.linkTarget),
+				e.linkCode == layout.CodeSymlinkEscape:
+				// a package manager's store, inside or outside the project
+				installed = true
+				break search
 			}
+			// a link to project code outside any store, or a broken one
 			r.findings = append(r.findings, linkFinding(e, source))
 			return
 		}
@@ -338,7 +385,22 @@ func (a *nodeAdapter) resolveBare(file, specifier, source string, r *resolved, d
 			break
 		}
 	}
-	a.unresolved(r, source, specifier, "the package is not a local, workspace or declared package and is not installed")
+	switch {
+	case declared && strings.HasPrefix(version, "workspace:"):
+		a.unresolved(r, source, specifier, "the workspace dependency "+name+" matches no workspace package")
+	case declared:
+		// a registry, git or tarball dependency the project declares:
+		// third-party code, external like another Go module
+	case installed:
+		a.unresolved(r, source, specifier, "the package is installed but not declared in any package.json; undeclared installed code is not trusted or analyzed")
+	default:
+		a.unresolved(r, source, specifier, "the package is not a local, workspace or declared package and is not installed")
+	}
+}
+
+// inNodeModules reports a path with a node_modules element.
+func inNodeModules(rel string) bool {
+	return slices.Contains(strings.Split(rel, "/"), "node_modules")
 }
 
 // owned reports a path inside a node directory or a workflow path.
@@ -363,7 +425,7 @@ func (a *nodeAdapter) resolvePackage(dir, subpath, specifier, source string, r *
 		if subpath != "" {
 			key = "./" + subpath
 		}
-		targets, matched := mapTargets(pkg.Exports, key, true)
+		targets, matched := a.mapTargetsOnce("exports\x00"+dir+"\x00"+key, pkg.Exports, key, true)
 		if !matched {
 			a.unresolved(r, source, specifier, "package "+dir+" does not export "+key)
 			return
@@ -404,7 +466,7 @@ func (a *nodeAdapter) resolveImportsField(file, specifier, source string, r *res
 		a.unresolved(r, source, specifier, "no package.json imports field defines this specifier")
 		return
 	}
-	targets, matched := mapTargets(pkg.Imports, specifier, false)
+	targets, matched := a.mapTargetsOnce("imports\x00"+scope+"\x00"+specifier, pkg.Imports, specifier, false)
 	if !matched {
 		a.unresolved(r, source, specifier, "the package.json imports field does not define this specifier")
 		return
@@ -591,6 +653,18 @@ func (a *nodeAdapter) dependency(name, dir string, r *resolved) (version, declar
 	}
 }
 
+// mapTargetsOnce is mapTargets memoized per package and key, with the
+// targets it walks counted against the work budget.
+func (a *nodeAdapter) mapTargetsOnce(cacheKey string, field any, key string, exports bool) ([]string, bool) {
+	if cached, ok := a.targets[cacheKey]; ok {
+		return cached.targets, cached.matched
+	}
+	targets, matched := mapTargets(field, key, exports)
+	a.files.spend(len(targets))
+	a.targets[cacheKey] = matchedTargets{targets: targets, matched: matched}
+	return targets, matched
+}
+
 // mapTargets applies Node's exports/imports subpath matching to key and
 // returns every target any condition could select (conditions are a
 // union, so "types", "import", "require" and "default" are all checked).
@@ -617,7 +691,7 @@ func mapTargets(field any, key string, exports bool) ([]string, bool) {
 		table = map[string]any{".": value}
 	}
 	if value, ok := table[key]; ok && !strings.Contains(key, "*") {
-		return collectTargets(value, "", 0), true
+		return uniqueTargets(collectTargets(value, "", 0)), true
 	}
 	best, bestStar := "", ""
 	for pattern := range table {
@@ -632,9 +706,23 @@ func mapTargets(field any, key string, exports bool) ([]string, bool) {
 		}
 	}
 	if best != "" {
-		return collectTargets(table[best], bestStar, 0), true
+		return uniqueTargets(collectTargets(table[best], bestStar, 0)), true
 	}
 	return nil, false
+}
+
+// uniqueTargets removes repeated targets, keeping the first of each, so an
+// exports array repeating one target is resolved once.
+func uniqueTargets(targets []string) []string {
+	seen := map[string]bool{}
+	out := targets[:0]
+	for _, target := range targets {
+		if !seen[target] {
+			seen[target] = true
+			out = append(out, target)
+		}
+	}
+	return out
 }
 
 func collectTargets(value any, star string, depth int) []string {
@@ -748,7 +836,14 @@ type tsconfigFile struct {
 // loadConfig reads a tsconfig and the configs it extends; the extending
 // config's baseUrl and paths override its bases'.
 func (a *nodeAdapter) loadConfig(rel string, depth int, visiting map[string]bool, r *resolved) tsOptions {
+	if done, ok := a.loaded[rel]; ok {
+		return done
+	}
 	var options tsOptions
+	if !a.files.spend(1) {
+		r.findings = append(r.findings, finding(CodeLimitExceeded, rel, "", "the ownership check's work budget ran out while reading tsconfig extends"))
+		return options
+	}
 	if depth > maxConfigDepth || visiting[rel] {
 		r.findings = append(r.findings, finding(CodeConfigInvalid, rel, "", "tsconfig extends chain is cyclic or deeper than the ownership bound"))
 		return options
@@ -803,6 +898,7 @@ func (a *nodeAdapter) loadConfig(rel string, depth int, visiting map[string]bool
 		options.paths, options.pathsDir = config.CompilerOptions.Paths, dir
 	}
 	delete(visiting, rel)
+	a.loaded[rel] = options
 	return options
 }
 

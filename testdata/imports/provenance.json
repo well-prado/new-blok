@@ -1,5 +1,5 @@
 {
-  "source": "synthetic import-graph fixtures authored for E12-T02 (#68); no application, customer or private data",
+  "source": "synthetic import-graph fixtures authored for E12-T02 (#68), including the Review R probes of PR #314; no application, customer or private data",
   "license": "Apache-2.0",
   "privateData": false,
   "expected": {
@@ -127,6 +127,48 @@
       "runtime": "nodejs",
       "outputRecords": 3,
       "errorRecords": 3,
+      "effectRecords": 0
+    },
+    "probe-lexer": {
+      "runtime": "nodejs",
+      "outputRecords": 15,
+      "errorRecords": 14,
+      "effectRecords": 0
+    },
+    "probe-loaders": {
+      "runtime": "nodejs",
+      "outputRecords": 18,
+      "errorRecords": 21,
+      "effectRecords": 0
+    },
+    "probe-files-packages": {
+      "runtime": "nodejs",
+      "outputRecords": 17,
+      "errorRecords": 18,
+      "effectRecords": 0
+    },
+    "probe-go-sources": {
+      "runtime": "go",
+      "outputRecords": 7,
+      "errorRecords": 5,
+      "effectRecords": 0
+    },
+    "probe-go-replace": {
+      "runtime": "go",
+      "outputRecords": 3,
+      "errorRecords": 2,
+      "effectRecords": 0
+    },
+    "probe-go-work": {
+      "runtime": "go",
+      "outputRecords": 2,
+      "errorRecords": 1,
+      "effectRecords": 0
+    },
+    "probe-go-vendor": {
+      "runtime": "go",
+      "outputRecords": 2,
+      "errorRecords": 1,
       "effectRecords": 0
     }
   }

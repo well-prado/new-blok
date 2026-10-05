@@ -1,6 +1,8 @@
 # ADR 0025: Node independence across language import graphs
 
-- Status: implementation in review for E12-T02 (#68)
+- Status: implementation in review for E12-T02 (#68); revised after the
+  first specialist review of PR #314, which found 15 routes by which a node
+  loaded another node while reported verified
 - Date: 2026-10-05
 - Roadmap: E12-T02 ([#68](https://github.com/well-prado/new-blok/issues/68));
   builds on E12-T01 (#67, ADR 0023: discovery, node ownership, link and
@@ -98,10 +100,25 @@ module path to its directory — `replace example.com/billing =>
 ./nodes/go/b` makes `example.com/billing` node `b`. Other modules and the
 standard library are external. A path inside the module with no non-test
 Go files, or inside a nested module, is unresolved. Imports in
-build-constrained files count like any other (ADR 0023). `import "plugin"`
-and `//go:linkname` are `ownership_unsupported_form`: each reaches code
-without a resolvable import. `_test.go` files are not part of a node, as
-in ADR 0023.
+build-constrained files count like any other (ADR 0023). A `//go:embed`
+pattern's directory or file (up to its first wildcard) is ownership-checked
+like an import, so embedding another node's file is a node import;
+embedded data is not traversed as code. `_test.go` files are not part of a
+node, as in ADR 0023.
+
+Everything else go build compiles or consults that the adapter does not
+resolve makes the reaching node unverified, never verified:
+
+| Unverified | Why |
+| --- | --- |
+| a `go.work` at the project root | a workspace can redirect any module path to any directory (`ownership_unsupported_form`, `Source` `go.work`); it applies to every Go node |
+| a `vendor` directory at the project root | vendored module source is not resolved (`Source` `vendor`); every Go node |
+| `import "C"` | cgo compiles a C preamble whose `#include` can name any file |
+| `.c .cc .cpp .cxx .m .s .S .sx .f .F .for .f90 .syso .swig .swigcxx` beside a package | compiled with the package; their includes and symbols are not checked |
+| a `.go` file that is a symbolic link | go build compiles it; the link is never followed (`layout_symlink_*`) |
+| a `.go` entry that is not a regular file | `ownership_source_unsupported` |
+| `import "plugin"`, `//go:linkname` | each reaches code without a resolvable import |
+| a package directory listing more than 4096 entries | `ownership_limit_exceeded` |
 
 Layout discovery keeps reporting a *direct* Go node or workflow import as
 `layout_node_imports_node` / `layout_node_imports_workflow`; the ownership
@@ -117,71 +134,138 @@ file that is imported is analyzed like any other.
 
 **Parsing.** `internal/tooling/ownership/jslex.go` is a JavaScript and
 TypeScript lexer written for this check, in pure Go with no dependency. It
-tokenizes the whole file following the ECMAScript lexical grammar: line
-and block comments, string literals with every escape decoded (`\x2e`,
-`\u{2e}`, legacy octal `\56`, line continuations), template literals with
-nested substitutions, identifier escapes (`require` is `require`),
-numeric literals, and the regular-expression-versus-division goal decided
-from the paren and brace context (a `/` after `if (…)` or a block `}`
-starts a regular expression; after an operand, an object literal `}` or a
-TypeScript non-null `!` it divides). An unterminated literal, comment or
-expression, or an unbalanced bracket, fails the whole file
-(`ownership_parse_failed`), so a mis-tokenization cannot drop an import: it
-can only make the file unverified. A recognizer then reads the token
-stream:
+tokenizes the whole file following the ECMAScript lexical grammar: a byte
+order mark and a hashbang line, line and block comments, string literals
+with every escape decoded (`\x2e`, `\u{2e}`, legacy octal `\56`, line
+continuations), template literals with nested substitutions, identifier
+escapes (`require` is `require`) and numeric literals. An
+unterminated literal, comment or expression, or an unbalanced bracket,
+fails the whole file (`ownership_parse_failed`).
+
+A lexer cannot always decide whether `/` starts a regular expression or
+divides; that needs a parser. A wrong guess can hide an import inside a
+mis-read literal: `function () {} / 1; require("../b"); 1 / 1` read as a
+regular expression from the first `/` to the last swallows the `require`.
+So the lexer decides only where the previous token settles it — after an
+operand, a `]`, `++`/`--`, a property name (`o.if(4) / 2`, `x.return /
+2`), a non-control `)` or a TypeScript non-null `!` it divides; after an
+operator, `(`, `,` or a reserved word such as `return` it starts a regular
+expression — and every other position is `ownership_ambiguous_syntax`,
+which makes the file unverified:
+
+- after `}` (a block, class body, function or object literal: `class {} /
+  1`, `L: {} /re/`);
+- after the `)` of an `if`, `while`, `for` or `with` head;
+- after `>` (`a > /re/`, or TypeScript's instantiation `f<T> / 2`);
+- after a contextual keyword that may be an identifier (`of`, `yield`,
+  `await`, `let`, `async`: `var of = 4; of / 2`).
+
+The lexer still makes a guess there so the rest of the file is read and a
+violation elsewhere is still reported, but the file is never verified. In
+1,366 TypeScript and JavaScript files of the Blok TypeScript repository
+(`~/Projects/Deskree/blok`, excluding `node_modules`, `dist` and
+declaration files) no position was ambiguous.
+
+A recognizer then reads the token stream. Only a static string (or a
+template without substitutions) in one of these forms is an edge:
 
 | Form | Treated as |
 | --- | --- |
 | `import … from "s"`, `import "s"`, `import type …`, `import defer/source …`, with attributes | edge |
 | `export * from "s"`, `export * as n from "s"`, `export { … } from "s"`, `export type … from "s"` | edge |
 | `import x = require("s")`, `export import x = require("s")` | edge |
-| `require("s")`, `module.require("s")`, `require.resolve("s")` | edge |
+| `require("s")`, `require.resolve("s")` | edge |
 | `import("s")`, `typeof import("s")`, `import.meta.resolve("s")` | edge |
 | `/// <reference path="…">` / `<reference types="…">` | edge |
-| `import(expr)`, `require(expr)`, a template with a substitution | `ownership_dynamic_import` |
-| `eval(…)`, `Function(…)`/`new Function`, `createRequire`, `getBuiltinModule`, `mainModule`, `_load`, `dlopen`, `importScripts`, `ShadowRealm`, `new Worker`, `require` used as a value, `require.<member>` other than `resolve`/`main`, `module[…]`, the `vm` and `module` built-ins, `data:`/`http(s):` specifiers, an unrecognized `import`/`export` clause | `ownership_unsupported_form` |
+
+Everything below is unverified (the node is never verified). This is the
+complete list:
+
+| Form | Code |
+| --- | --- |
+| `import(expr)`, `require(expr)`, `require.resolve(expr)`, `import.meta.resolve(expr)`, a template with a substitution; methods named `import`/`require` with a non-literal argument | `ownership_dynamic_import` |
+| any `.require` property access (`module.require`, `require.main.require`, `module?.require`, `x.prototype.require.call`) | `ownership_unsupported_form` |
+| `require` followed by `.`, `?.` or `[` other than a static `require.resolve("s")` (including `require.main`, `require.cache`, `require?.()`); `require` used as a value | `ownership_unsupported_form` |
+| `module.<name>` / `module?.<name>` other than `module.exports`, and `module[…]` | `ownership_unsupported_form` |
+| the names `eval`, `Function`, `Worker`, `createRequire`, `getBuiltinModule`, `mainModule`, `_load`, `_linkedBinding`, `dlopen`, `importScripts`, `ShadowRealm`, bare or as a property (`globalThis.eval`, `(0, eval)`, `Reflect.construct(Function, …)`, TypeScript's `Function` type too) | `ownership_unsupported_form` |
+| `.binding` (`process.binding`), and `binding(…)` called bare | `ownership_unsupported_form` |
+| `.constructor` other than `.constructor.name` (it reaches the `Function` and `AsyncFunction` constructors) | `ownership_unsupported_form` |
+| `arguments` (at CommonJS module scope, or in an arrow function there, it is the module wrapper's `exports, require, module, …`) | `ownership_unsupported_form` |
+| `globalThis`/`global` used as a value (not followed by `.`), and a computed property of `globalThis`, `global`, `window`, `self` or `this` (`globalThis["ev"+"al"]`) | `ownership_unsupported_form` |
+| AMD `define(…)` | `ownership_unsupported_form` |
+| the built-ins `vm`, `module`, `worker_threads`, `child_process`, `cluster` (with or without `node:`); `data:`, `http:` and `https:` specifiers | `ownership_unsupported_form` |
+| an unrecognized `import`/`export` clause | `ownership_unsupported_form` |
+| a "/" whose goal needs a parser (above) | `ownership_ambiguous_syntax` |
+| `.jsx`, `.tsx`, `.node`, `.wasm` | `ownership_source_unsupported` |
+| a reached file with no script extension (none, `.txt`, …) that does not lex as JavaScript | `ownership_source_unsupported` |
 
 Type-only imports are edges: a node depending on another node's types is
 still coupled to it. This is stricter than the SDK's executable-graph
 checker, which excludes type-only edges because they do not run. Strings,
-comments, template text, regular expressions, property names
-(`{ require: … }`, `x.import`) and methods named `import`/`require` are not
-imports. `.jsx` and `.tsx` (JSX has no checked grammar here), `.node` and
-`.wasm` are `ownership_source_unsupported`.
+comments, template text, regular expressions, property keys
+(`{ require: … }`) and calls of methods on other objects (`o.import()`)
+are not imports.
+
+Node's CommonJS loader runs a required file with any extension other than
+`.js`, `.json` and `.node` — or none — as JavaScript, so any reached file
+that is not JSON is analyzed as JavaScript; one that does not lex is
+unverified, never treated as an inert asset.
+
+The fail-closed rules cost some verifications of ordinary code: on the
+same 1,366-file corpus, 90 files (6.6%) carry an unverified form —
+`import(expression)` 28, the `Function` name (mostly the TypeScript type)
+26, `globalThis` as a value 16, `createRequire` 12, `arguments` 10,
+`.constructor` 6, AMD `define` 4, `this[…]` 3, `global` as a value 3, and
+one or two each for the rest. A node
+whose code needs one of these is reported unverified, not violating.
 
 **Resolution.** Every candidate any of Node.js or TypeScript could select
 is an edge (the union), so a declaration file and a runtime file cannot
 disagree unnoticed:
 
-1. Relative specifiers: the exact file; TypeScript's source for a `.js`,
-   `.mjs`, `.cjs` or `.jsx` specifier (`.ts`, `.tsx`, `.d.ts`; `.mts`;
-   `.cts`); every probe extension (`.ts .tsx .d.ts .mts .d.mts .cts
-   .d.cts .js .jsx .mjs .cjs .json .node`); and, for a directory,
-   `package.json` `main`/`module`/`types`/`typings` and `index.*`.
+1. Relative specifiers: the exact file (whatever its extension);
+   TypeScript's source for a `.js`, `.mjs`, `.cjs` or `.jsx` specifier
+   (`.ts`, `.tsx`, `.d.ts`; `.mts`; `.cts`); every probe extension (`.ts
+   .tsx .d.ts .mts .d.mts .cts .d.cts .js .jsx .mjs .cjs .json .node`);
+   and, for a directory, `package.json` `main`/`module`/`types`/`typings`
+   and `index.*`.
 2. `#` specifiers: the nearest `package.json` `imports`, with Node's exact
    and `*` pattern matching (longest prefix); a target may be a `./` path
    or a package.
-3. Bare specifiers, in order: built-ins (external); the nearest
-   `tsconfig.json` or `jsconfig.json` `paths` (exact key, else the longest
-   `*` prefix; substitutions relative to `baseUrl` when set, else to the
-   config declaring `paths`; JSON with comments and trailing commas;
-   relative `extends` chains, at most 8 deep, cycles refused; an
-   uninstalled package `extends` is skipped) and `baseUrl`; a local package
-   whose `package.json` `name` matches — any `package.json` inside a node
-   directory, a root `workspaces` directory (`dir`, `dir/*`, `dir/**` one
-   level) or the importing file's own package (self-reference) — resolved
-   through its `exports` (conditions are a union; patterns and subpaths per
-   Node; an unexported subpath is unresolved) or main fields and files; a
-   dependency declared in a `package.json` at or above the file — `file:`,
-   `link:` and `portal:` resolve to that directory, `workspace:` with no
-   matching workspace is unresolved, any other version is external;
-   finally an installed `node_modules/<name>` directory is external, and an
-   installed link is classified (below). Anything else is
-   `ownership_import_unresolved`.
+3. Bare specifiers, in order:
+   1. built-ins (external, except the loader modules above);
+   2. the nearest `tsconfig.json` or `jsconfig.json` `paths` (exact key,
+      else the longest `*` prefix; substitutions relative to `baseUrl` when
+      set, else to the config declaring `paths`; JSON with comments and
+      trailing commas; relative `extends` chains, at most 8 deep, cycles
+      refused, each config loaded once; an uninstalled package `extends` is
+      skipped) and `baseUrl`;
+   3. a local package whose `package.json` `name` matches — any
+      `package.json` inside a node directory, a root `workspaces`
+      directory (`dir`, `dir/*`, `dir/**` one level) or the importing
+      file's own package (self-reference) — resolved through its `exports`
+      (conditions are a union; patterns and subpaths per Node; an
+      unexported subpath is unresolved) or main fields and files;
+   4. a `file:`, `link:` or `portal:` dependency declared in a
+      `package.json` at or above the file: that directory, as a local
+      package;
+   5. the installed `node_modules/<name>` nearest the file, checked
+      **before** any other declaration is trusted, because it decides what
+      Node loads. A link into a node or workflow is reported and is a
+      violation, even for a declared registry dependency; a link into a
+      package manager's store (a path with a `node_modules` element inside
+      the project, or outside the project) counts as installed; any other
+      link — to shared project code — is reported and never followed
+      (unverified);
+   6. then: a declared `workspace:` dependency with no matching workspace
+      is unresolved; any other declared dependency (registry, git,
+      tarball) is external third-party code, trusted like another Go
+      module; a package that is installed but declared nowhere is
+      unverified (`ownership_import_unresolved`: undeclared installed code
+      is neither trusted nor analyzed); anything else is unresolved.
 
 Absolute paths and `file:` URLs are `ownership_import_outside_root`.
-Nothing is installed, built or run; `node_modules` is read only to
-recognise an installed third-party package or a config it provides.
+Nothing is installed, built or run.
 
 ### Links and letter case (ADR 0023)
 
@@ -195,10 +279,8 @@ another node is also a violation. A link anywhere in a resolved path is
 never followed: it is classified with ADR 0023's codes
 (`layout_symlink_escape`, `_alias`, `_dangling`, `_loop`) by
 `layout.ClassifyLink`, and an alias's lexical target is still checked for
-ownership, so a link into another node is a violation. An installed
-`node_modules` link that resolves outside the project (a package manager's
-store) is external; one that resolves into a node or workflow is reported
-and fails. Files are opened with `layout.OpenRegular` (non-blocking on
+ownership, so a link into another node is a violation. Installed
+`node_modules` links follow step 3.5 above. Files are opened with `layout.OpenRegular` (non-blocking on
 Unix, type re-checked on the handle, hard links refused).
 
 ### Diagnostics
@@ -224,6 +306,7 @@ target unit in `Actual` and the whole chain in `Message`. Tools match on
 | `ownership_unsupported_form` | unverified |
 | `ownership_source_unsupported` | unverified |
 | `ownership_parse_failed` | unverified |
+| `ownership_ambiguous_syntax` | unverified |
 | `ownership_config_invalid` | unverified |
 | `ownership_runtime_unsupported` | unverified |
 | `ownership_limit_exceeded` | unverified |
@@ -241,9 +324,21 @@ target unit in `Actual` and the whole chain in `Message`. Tools match on
 | tokens per file | 1,048,576 |
 | specifier resolution nesting (`imports` → package → …) | 16 |
 | tsconfig `extends` depth | 8 |
+| resolution work per check | 4,194,304 path elements looked up (`maxWork`) |
 | diagnostics | 256, then `ownership_limit_exceeded` |
 
 An overrun is `ownership_limit_exceeded` and leaves the node unverified.
+Time is bounded by counted work, not by a clock: every path element looked
+up (each a map access over cached directory listings) is counted, and past
+the budget every lookup is a bound overrun. Resolution is cached per
+directory and specifier, `exports`/`imports` matches per package and key
+(repeated targets resolved once), and each tsconfig is loaded once. A
+package whose 0.9 MiB `exports` array repeats one target 100,000 times,
+required 4,000 times and from 50 directories, previously took 2 m 55 s and
+allocated 119 GB; it now takes about 0.3 s. A diamond of tsconfig
+`extends` (9 levels of 8 configs each extending all 8 of the next) took
+8.3 s and 2.6 GB and now takes milliseconds and fails closed on the depth
+bound.
 
 ### Report for `blok check`
 
@@ -282,7 +377,7 @@ No wire, journal, artifact, worker or manifest contract changes.
 
 ## Verification record
 
-- `internal/tooling/ownership` tests: 21 synthetic `txtar` fixtures under
+- `internal/tooling/ownership` tests: 28 synthetic `txtar` fixtures under
   `testdata/imports` (Apache-2.0, synthetic), each with predeclared node
   statuses and exact sorted `[code, source]` diagnostics, unit counts for
   the positive cases, and output/error/effect counts in
@@ -298,20 +393,31 @@ No wire, journal, artifact, worker or manifest contract changes.
   transitive (ESM → re-export → CommonJS), dynamic/evaluating forms,
   unresolved and cycle, links (shared and `node_modules`), case, workflow,
   JSX and an unsupported runtime.
+- Every probe of the first review is a node in one of seven `probe-*`
+  fixtures (`probe-lexer`, `probe-loaders`, `probe-files-packages`,
+  `probe-go-sources`, `probe-go-replace`, `probe-go-work`,
+  `probe-go-vendor`) with its predeclared verdict; none of the 15 routes
+  that were verified is verified any more, and the controls that held
+  still hold.
 - The real `blok new` starter in both layouts, and a Node.js example built
   from it with the repository's actual Node.js SDK source and worker
   fixture node file (its `../../../sdk/nodejs/index.js` import unchanged in
   the unified layout; the workspace package `@blok/nodejs-sdk` for a second
   node), verify with zero diagnostics and non-empty graphs.
-- `TestImportForms` pins 46 lexical cases; `TestRepositoryNodeSourcesLex`
-  lexes every Node.js source in the repository. Differentially, the pinned
-  TypeScript 5.9.3 parser and this lexer found the identical 111 imports in
-  the repository's 31 Node.js sources and the identical 51 in the fixtures.
+- `TestImportForms` pins the lexical cases, including the ambiguous `/`
+  positions, a hashbang holding a quote and a byte order mark;
+  `TestRepositoryNodeSourcesLex` lexes every Node.js source in the
+  repository. Differentially, the pinned TypeScript 5.9.3 parser and this
+  lexer found the identical 111 imports in the repository's 31 Node.js
+  sources and the identical 51 in the fixtures (first revision).
+- `TestResolutionTimeIsBounded` and `TestWorkBudgetFailsClosed` bound the
+  resolution work; `TestBoundsLeaveNodesUnverified` the entry and size
+  bounds.
 - `TestCheckNeverExecutesSource` is structural: the package imports nothing
   that builds, loads or runs code and reads only through the `os.Root`;
   fixtures carry a Go `init` panic and a top-level JavaScript `throw`.
-- 18 mutations, each applied to a committed tree and reverted, turn a
-  test red; they are listed in the pull request.
+- Mutations, each applied to a committed tree and reverted, turn a test
+  red; they are listed in the pull request.
 
 ## Limits
 
@@ -319,23 +425,39 @@ No wire, journal, artifact, worker or manifest contract changes.
   `windows/arm64`; no test ran on Windows, the link fixtures skip there,
   and off Unix files are not opened non-blocking or link-counted (ADR
   0023).
-- The lexer follows the lexical grammar; it is not a full parser. Its
-  regular-expression decision mirrors the grammar for every form in the
-  fixtures and the repository, and any lexical failure fails closed, but
-  contrived code where context-free brace classification differs from the
-  grammar (for example a block statement after a `case x:` label followed
-  by a regular expression) can make a file unverified.
-- The unverified list covers the named loader and evaluating forms. Code
-  that reaches Node's loader indirectly through an object graph not in that
-  list (for example the CommonJS wrapper's `arguments`) is not detected; it
-  is a documented gap, as is spawning another process.
+- **What "verified" can and cannot promise for Node.js.** JavaScript can
+  reach its loader through the object graph at run time. Verified means:
+  every file in the node's reachable graph lexed without an ambiguous
+  `/`, every import was one of the static forms above and resolved, none
+  of the unverified forms listed above appears, and nothing crosses a
+  node or workflow. A route outside that list that obtains a loader,
+  `eval` or the `Function` constructor by aliasing (for example
+  destructuring a property named `constructor` out of a function, or
+  receiving `module` as an argument and calling a method on it that is
+  not `require`) is not detected statically. The list is closed over the
+  routes found so far and fails closed on every one of them; it is not a
+  proof against arbitrary code. Native nodes are trusted application code
+  (AGENTS.md); this check catches mistakes and shortcuts, it is not a
+  sandbox.
+- The lexer is not a parser. It never decides an ambiguous `/` silently
+  (above), but brace kinds used elsewhere (property keys) are inferred
+  from context; a mis-inferred key position can only hide a `require`
+  label or key, which loads nothing.
+- Spawning another process is not an import; `child_process`,
+  `worker_threads` and `cluster` are unverified instead.
+- Installed third-party packages that a `package.json` declares (registry,
+  git or tarball) are trusted and not analyzed, like other Go modules; an
+  undeclared installed package is unverified.
 - Union resolution is conservative: a candidate only one tool would pick
   still counts, and type-only imports count.
 - Resolution ignores tsconfig `include`/`files` (the nearest config
-  applies), `rootDirs`, project references, `typesVersions`, the
-  `browser` field, `exports` legacy folder mappings (`"./x/"`) and package
-  `extends` that are not installed. Go workspaces (`go.work`) and vendored
-  copies are not resolved; their paths are external.
+  applies), `rootDirs`, project references, `typesVersions`, the `browser`
+  field, `exports` legacy folder mappings (`"./x/"`) and package `extends`
+  that are not installed. A `go.work` or `vendor` directory at the project
+  root is not resolved: it makes every Go node unverified. A `go.work` in
+  a directory above the project root, `GOWORK`, `GOFLAGS=-modfile` and
+  `-mod=vendor` from the environment are outside the project and not
+  observed (ADR 0023 never reads outside the root).
 - Ownership is checked only from nodes: shared code and workflows may
   import nodes, and a node reached only from a workflow is not affected.
 - Imports in a node's test files are not checked, as in ADR 0023.

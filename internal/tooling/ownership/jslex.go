@@ -8,14 +8,19 @@ import (
 )
 
 // This file is a JavaScript/TypeScript lexer and import recognizer. It is
-// not a regular expression over source text: it jsTokenizes the whole file
+// not a regular expression over source text: it tokenizes the whole file
 // following the ECMAScript lexical grammar (comments, string and template
 // literals with escapes, identifier escapes, and the regular-expression
 // versus division goal decided from the paren/brace context), and then
 // recognizes every import form from the token stream. Any lexical error or
-// unbalanced bracket fails the file, so a mis-tokenization can never
-// silently drop an import: it makes the file unverified instead. Nothing
-// here evaluates or runs the source.
+// unbalanced bracket fails the file. The one decision the lexical grammar
+// cannot make without a parser, whether a "/" starts a regular expression
+// or divides, is made from context; wherever that context is ambiguous
+// (after "}", after a control-statement head ")", after ">", or after a
+// contextual keyword that may be an identifier) the line is recorded and
+// the file is reported unverified, because a wrong guess could hide an
+// import inside a mis-read literal. Nothing here evaluates or runs the
+// source.
 
 type tokenKind uint8
 
@@ -72,6 +77,9 @@ type lexer struct {
 	line int
 	toks []jsToken
 	refs []reference
+	// ambiguous lists the lines of every "/" whose lexical goal the
+	// context cannot decide; any entry makes the file unverified.
+	ambiguous []int
 
 	parens     []bool // per open "(": preceded by if/while/for/with
 	brackets   int
@@ -84,32 +92,35 @@ type lexer struct {
 // maxTokens bounds one file's token stream (files are at most 1 MiB).
 const maxTokens = 1 << 20
 
-func lex(src []byte) ([]jsToken, []reference, error) {
+func lex(src []byte) ([]jsToken, []reference, []int, error) {
 	l := &lexer{src: src, line: 1}
-	if len(src) >= 2 && src[0] == '#' && src[1] == '!' { // hashbang
-		for l.pos < len(src) && src[l.pos] != '\n' {
+	if len(src) >= 3 && src[0] == 0xef && src[1] == 0xbb && src[2] == 0xbf { // byte order mark
+		l.pos = 3
+	}
+	if len(src) >= l.pos+2 && src[l.pos] == '#' && src[l.pos+1] == '!' { // hashbang
+		for l.pos < len(src) && !isLineTerminator(src[l.pos]) {
 			l.pos++
 		}
 	}
 	for {
 		if err := l.skipSpaceAndComments(); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		if l.pos >= len(l.src) {
 			break
 		}
 		if len(l.toks) >= maxTokens {
-			return nil, nil, &lexError{l.line, "too many tokens"}
+			return nil, nil, nil, &lexError{l.line, "too many tokens"}
 		}
 		if err := l.next(); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 	}
 	if len(l.parens) != 0 || l.brackets != 0 || len(l.braces) != 0 {
-		return nil, nil, &lexError{l.line, "unbalanced brackets at end of file"}
+		return nil, nil, nil, &lexError{l.line, "unbalanced brackets at end of file"}
 	}
 	l.toks = append(l.toks, jsToken{kind: tokEOF, line: l.line})
-	return l.toks, l.refs, nil
+	return l.toks, l.refs, l.ambiguous, nil
 }
 
 func (l *lexer) emit(kind tokenKind, text, value string, line int) {
@@ -227,9 +238,25 @@ var regexKeywords = map[string]bool{
 	"yield": true, "await": true, "extends": true,
 }
 
+// contextualKeywords may be identifiers (var of = 4) or operators
+// (yield /re/), so a "/" after one cannot be decided lexically.
+var contextualKeywords = map[string]bool{"of": true, "yield": true, "await": true, "let": true, "async": true}
+
+// propertyName reports whether the token before the previous one is "." or
+// "?.", making the previous identifier a property name (o.if, x.return).
+func (l *lexer) propertyName() bool {
+	if len(l.toks) < 2 {
+		return false
+	}
+	before := l.toks[len(l.toks)-2]
+	return before.kind == tokPunct && (before.text == "." || before.text == "?.")
+}
+
 // regexAllowed decides the lexical goal for "/" from the previous token, the
 // way the grammar does: after an expression a "/" divides, elsewhere it
-// starts a regular expression.
+// starts a regular expression. Where the token alone cannot decide, the
+// line is recorded as ambiguous (and the file becomes unverified); the
+// guess made there only affects which imports are still reported.
 func (l *lexer) regexAllowed() bool {
 	p := l.prev()
 	if p == nil {
@@ -237,13 +264,34 @@ func (l *lexer) regexAllowed() bool {
 	}
 	switch p.kind {
 	case tokIdent:
+		if l.propertyName() {
+			return false
+		}
+		if contextualKeywords[p.text] {
+			l.ambiguous = append(l.ambiguous, l.line)
+		}
 		return regexKeywords[p.text]
 	case tokPunct:
 		switch p.text {
 		case ")":
+			if l.lastParen {
+				// if (x) /re/ is a regular expression, but a head
+				// misjudged as control would hide a division.
+				l.ambiguous = append(l.ambiguous, l.line)
+			}
 			return l.lastParen
 		case "]", "++", "--":
 			return false
+		case "}":
+			// A block, class body, function or object literal: which
+			// one a "}" closes needs a parser (function () {} / 1,
+			// L: {} /re/), so it is never guessed silently.
+			l.ambiguous = append(l.ambiguous, l.line)
+			return l.lastBrace == braceBlock || l.lastBrace == braceClass
+		case ">":
+			// a > /re/, or TypeScript's instantiation f<T> / 2
+			l.ambiguous = append(l.ambiguous, l.line)
+			return true
 		case "!":
 			// TypeScript's postfix non-null assertion (a! / b): a prefix
 			// "!" cannot follow an operand, so after one it divides.
@@ -254,8 +302,6 @@ func (l *lexer) regexAllowed() bool {
 				return !operand
 			}
 			return true
-		case "}":
-			return l.lastBrace == braceBlock || l.lastBrace == braceClass
 		}
 		return true
 	}
@@ -340,7 +386,7 @@ func (l *lexer) next() error {
 		l.emit(tokPunct, "/", "", line)
 	case c == '(':
 		p := l.prev()
-		l.parens = append(l.parens, p != nil && p.kind == tokIdent && (p.text == "if" || p.text == "while" || p.text == "for" || p.text == "with"))
+		l.parens = append(l.parens, p != nil && p.kind == tokIdent && (p.text == "if" || p.text == "while" || p.text == "for" || p.text == "with") && !l.propertyName())
 		l.pos++
 		l.emit(tokPunct, "(", "", line)
 	case c == ')':
