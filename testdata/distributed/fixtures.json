@@ -1,0 +1,50 @@
+{
+  "fixtureVersion": 1,
+  "synthetic": true,
+  "cases": [
+    {
+      "name": "single-current-owner",
+      "expected": {"acquired": 1, "committed": 1, "errors": []}
+    },
+    {
+      "name": "competing-owner-before-expiry",
+      "expected": {"additionalOwners": 0, "committed": 0, "errors": ["ownership_lost"]}
+    },
+    {
+      "name": "concurrent-competing-owners",
+      "expected": {"successfulOwners": 1, "rejectedOwners": 11, "committed": 1, "errors": ["ownership_lost"]}
+    },
+    {
+      "name": "paused-owner-after-expiry-and-takeover",
+      "expected": {"oldOwnerCommitted": 0, "newOwnerCommitted": 1, "errors": ["ownership_lost"]}
+    },
+    {
+      "name": "one-voter-paused",
+      "expected": {"majorityCommit": 1, "recoveredReplicaReadsCommit": true, "errors": []}
+    },
+    {
+      "name": "one-voter-network-partition",
+      "expected": {"majorityCommit": 1, "partitionedReplicaCatchesUp": true, "errors": []}
+    },
+    {
+      "name": "two-voters-paused",
+      "expected": {"acknowledgment": "unknown", "reconcileByStableID": true, "committedRecordsAfterRecovery": 1, "errors": ["acknowledgment_unknown"]}
+    },
+    {
+      "name": "snapshot-restore-revision-rewind",
+      "expected": {"numericRevisionRewound": true, "oldIncarnationCommit": 0, "oldIncarnationRenew": 0, "freshIncarnationCommit": 1, "errors": ["incarnation_mismatch", "ownership_lost"]}
+    },
+    {
+      "name": "blob-unavailable-before-reference",
+      "expected": {"referenceCommitted": 0, "outputPublished": 0, "errors": ["blob_unavailable"]}
+    },
+    {
+      "name": "blob-unavailable-after-reference",
+      "expected": {"referenceStillDurable": true, "resumeAllowed": false, "errors": ["blob_unavailable"]}
+    },
+    {
+      "name": "partition-takeover-timer-signal-blob",
+      "expected": {"timerRecordRetained": true, "signalRecordRetained": true, "blobDigestVerified": true, "oldOwnerCommitted": 0, "newOwnerCommitted": 1, "errors": ["ownership_lost"]}
+    }
+  ]
+}

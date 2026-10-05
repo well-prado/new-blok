@@ -1,0 +1,42 @@
+name: blok-distributed-spike
+services:
+  etcd1:
+    image: quay.io/coreos/etcd:v3.6.5
+    command: ["etcd", "--name=etcd1", "--data-dir=/etcd-data", "--listen-peer-urls=http://0.0.0.0:2380", "--initial-advertise-peer-urls=http://etcd1:2380", "--listen-client-urls=http://0.0.0.0:2379", "--advertise-client-urls=http://etcd1:2379", "--initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380", "--initial-cluster-state=new"]
+    ports: ["127.0.0.1:2379:2379"]
+    volumes: ["etcd1:/etcd-data"]
+    networks: [distributed]
+  etcd2:
+    image: quay.io/coreos/etcd:v3.6.5
+    command: ["etcd", "--name=etcd2", "--data-dir=/etcd-data", "--listen-peer-urls=http://0.0.0.0:2380", "--initial-advertise-peer-urls=http://etcd2:2380", "--listen-client-urls=http://0.0.0.0:2379", "--advertise-client-urls=http://etcd2:2379", "--initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380", "--initial-cluster-state=new"]
+    ports: ["127.0.0.1:22379:2379"]
+    volumes: ["etcd2:/etcd-data"]
+    networks: [distributed]
+  etcd3:
+    image: quay.io/coreos/etcd:v3.6.5
+    command: ["etcd", "--name=etcd3", "--data-dir=/etcd-data", "--listen-peer-urls=http://0.0.0.0:2380", "--initial-advertise-peer-urls=http://etcd3:2380", "--listen-client-urls=http://0.0.0.0:2379", "--advertise-client-urls=http://etcd3:2379", "--initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380", "--initial-cluster-state=new"]
+    ports: ["127.0.0.1:32379:2379"]
+    volumes: ["etcd3:/etcd-data"]
+    networks: [distributed]
+  s3:
+    image: chrislusf/seaweedfs:4.47
+    # Headroom for small disks (#292): by default SeaweedFS sizes its volume
+    # budget from free disk space at 1 GB per volume, which can leave only a
+    # handful of slots, and every S3 bucket claims some. Small volumes and a
+    # fixed slot count keep a long-lived dev cluster writable.
+    command: ["server", "-dir=/data", "-s3", "-master.volumeSizeLimitMB=64", "-volume.max=64"]
+    environment:
+      AWS_ACCESS_KEY_ID: spike-access
+      AWS_SECRET_ACCESS_KEY: spike-secret-only-local
+      S3_BUCKET: blok-spike
+    ports: ["127.0.0.1:8333:8333"]
+    volumes: ["s3:/data"]
+    networks: [distributed]
+networks:
+  distributed:
+    name: blok-distributed-spike
+volumes:
+  etcd1:
+  etcd2:
+  etcd3:
+  s3:

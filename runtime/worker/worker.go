@@ -8,14 +8,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"sort"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/well-prado/new-blok/contract/observe"
 	contract "github.com/well-prado/new-blok/contract/runtime"
 	"github.com/well-prado/new-blok/contract/schema"
 	"github.com/well-prado/new-blok/contract/tool"
 	runtime "github.com/well-prado/new-blok/internal/runtime"
 	"github.com/well-prado/new-blok/node"
-	"strings"
-	"sync/atomic"
-	"time"
+	"github.com/well-prado/new-blok/observe/redact"
 )
 
 type Config = runtime.Config
@@ -123,7 +128,9 @@ func DefineScoped[I, O any](supervisor *Supervisor, descriptor node.Descriptor, 
 		if !ok {
 			deadline = time.Now().Add(30 * time.Second)
 		}
-		result, err := supervisor.Call(ctx, contract.Call{CallID: id.CallID, AttemptID: id.AttemptID, IdempotencyKey: id.OperationKey, Generation: ready.Generation, Node: descriptor.Name, NodeVersion: descriptor.Version, Deadline: deadline, Input: payload, Capabilities: capabilities})
+		call := contract.Call{CallID: id.CallID, AttemptID: id.AttemptID, IdempotencyKey: id.OperationKey, Generation: ready.Generation, Node: descriptor.Name, NodeVersion: descriptor.Version, Deadline: deadline, Input: payload, Capabilities: capabilities, OnLog: func(entry contract.Log) { emitWorkerLog(ctx, entry) }}
+		propagateTrace(ctx, &call, ready.Limits.MaxFrameBytes)
+		result, err := supervisor.Call(ctx, call)
 		if err != nil {
 			if len(descriptor.Effects) > 0 {
 				return zero, transportFailure(ctx, err)
@@ -155,6 +162,95 @@ func DefineScoped[I, O any](supervisor *Supervisor, descriptor node.Descriptor, 
 		return output, nil
 	}, opts...)
 }
+
+// propagateTrace hands the dispatching step's trace context to the worker
+// (ADR 0020). Trace context is optional correlation: when adding it would push
+// an otherwise admissible call over the negotiated frame ceiling it is
+// omitted, so tracing never changes whether a call is dispatched.
+func propagateTrace(ctx context.Context, call *contract.Call, maxFrameBytes int) {
+	trace, ok := observe.TraceFrom(ctx)
+	if !ok {
+		return
+	}
+	traced := *call
+	traced.Traceparent, traced.Tracestate = trace.Traceparent(), trace.State
+	if contract.EncodedCallBytes(traced) > maxFrameBytes && contract.EncodedCallBytes(*call) <= maxFrameBytes {
+		return
+	}
+	call.Traceparent, call.Tracestate = traced.Traceparent, traced.Tracestate
+}
+
+func emitWorkerLog(ctx context.Context, entry contract.Log) {
+	level, ok := map[string]slog.Level{"DEBUG": slog.LevelDebug, "INFO": slog.LevelInfo, "WARN": slog.LevelWarn, "ERROR": slog.LevelError}[entry.Level]
+	if !ok || len(entry.Message) > 1024 || len(entry.Attrs) > 4096 {
+		return
+	}
+	attrs := make(map[string]any)
+	if len(entry.Attrs) != 0 {
+		if !json.Valid(entry.Attrs) {
+			return
+		}
+		decoder := json.NewDecoder(bytes.NewReader(entry.Attrs))
+		decoder.UseNumber()
+		if decoder.Decode(&attrs) != nil || attrs == nil {
+			return
+		}
+		var extra any
+		if decoder.Decode(&extra) == nil {
+			return
+		}
+	}
+	keys := make([]string, 0, len(attrs))
+	for key := range attrs {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	fields := make([]slog.Attr, 0, min(len(keys), 32))
+	count := 0
+	for _, key := range keys {
+		if count >= 32 {
+			break
+		}
+		if !validLogAttrKey(key) {
+			continue
+		}
+		value := attrs[key]
+		if sensitiveLogKey(key) {
+			value = redact.Marker
+		} else {
+			switch typed := value.(type) {
+			case string:
+				value = redact.String(typed)
+			case nil, bool, json.Number, float64:
+			default:
+				continue
+			}
+		}
+		fields = append(fields, slog.Any(key, value))
+		count++
+	}
+	node.Logger(ctx).LogAttrs(ctx, level, safeLogMessage(entry.Message), fields...)
+}
+
+func validLogAttrKey(key string) bool {
+	if len(key) == 0 || len(key) > 64 || key[0] < 'A' || key[0] > 'Z' && key[0] < 'a' || key[0] > 'z' {
+		return false
+	}
+	for i := 1; i < len(key); i++ {
+		c := key[i]
+		if !(c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_' || c == '.' || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+// sensitiveLogKey and safeLogMessage are the worker log enforcement points;
+// they use the framework's single redaction boundary (ADR 0021).
+func sensitiveLogKey(key string) bool { return redact.Key(key) }
+
+func safeLogMessage(message string) string { return redact.Message(message) }
+
 func transportFailure(ctx context.Context, err error) *node.DomainError {
 	failure := &node.DomainError{Class: "uncertain", Code: "worker_transport", Uncertain: true}
 	if errors.Is(err, context.Canceled) {

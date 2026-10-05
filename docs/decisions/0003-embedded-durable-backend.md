@@ -12,8 +12,10 @@ The SQLite configuration used by the port is:
 
 - WAL journal mode;
 - `synchronous=FULL`;
-- a 5-second busy timeout on every pooled connection;
-- foreign-key enforcement enabled.
+- a 5-second busy timeout on every pooled connection, configurable through
+  `sqlite.Backend.BusyTimeout`, that also bounds the writer queue (#214);
+- foreign-key enforcement enabled;
+- `secure_delete=ON` on every pooled connection (#281, below).
 
 `Database.WithTx` returns only after the transaction commit succeeds. Durable
 callers may acknowledge accepted work only after that return. This is a local
@@ -59,7 +61,9 @@ committed nothing. Three things narrow it:
   declare their child's effects, so the same holds for them.
 - Past an agent action's dispatch barrier, a busy store leaves the effect
   uncertain, and the policy reports `ErrExecution`, never saturation.
-- A worker handler's busy store is a failure, not a deferral (ADR 0006).
+- A worker handler's busy store defers the job when it is another store,
+  and fails it as a nested submission when the busy error names the write
+  domain the handler's own claim holds (ADR 0006, #207).
 
 Not covered: a node that commits more than one transaction itself, a step
 whose writes are not declared as effects, and work outside the engine (a
@@ -67,14 +71,86 @@ handler or catalog that writes before or around `engine.Run`, or a custom
 `tool.Gate` whose `Publish` reads a busy store after a native tool's
 effect). Retrying such work is safe only if its writes are idempotent. A worker
 whose consumer is canceled while it waits reports `ErrConsumerLost`, after
-up to the busy timeout, because the driver does not interrupt a busy wait.
+up to the busy timeout, because its claim transaction is deliberately not
+canceled with the consumer.
 
 Measured with 4 workers draining 200 instant jobs, 5 samples per run
 (`NEWBLOK_MEASURE_CLAIM=1 go test -run TestMeasureClaimContention -v
 ./trigger/worker/`, `golang:1.27.1`, linux/arm64). The write-first claim:
 0 busy errors in 148–195 ms. The same harness with the read-first claim of
 `996f184` restored: 2,720–7,516 busy errors in 161–368 ms in one run, and
-5,851–8,866 in 322–485 ms in an independent reviewer's run.
+5,851–8,866 in 322–485 ms in an independent reviewer's run. Since #245 a job
+commits two write transactions (the attempt's start, then the handler with
+its acknowledgment; ADR 0006): 29–32 ms against 22–28 ms on the same macOS
+host, 0 busy errors on both.
+
+## Transactions that do not return (#267)
+
+`Database.WithTx` rolls the transaction back on every exit that does not
+reach COMMIT, including a callback that panics or calls `runtime.Goexit`,
+and a panic in the commit hook the crash tests install. It does not
+recover the panic: the rollback runs as the panic unwinds, and the caller
+receives the original value with its original stack. A panic after COMMIT
+leaves the commit in place. A marked writer's turn in the writer queue
+(#214) is released after the rollback, on every exit, so the next writer
+never takes its turn while the lock is still held. The busy and
+write-domain annotations (#184, #207) apply only to returned errors; a
+panic is never converted into one.
+
+Before #267 `WithTx` rolled back only when its callback returned an error.
+`database/sql` rolls back a transaction left open only when its context is
+canceled, and the worker's handle transaction runs on a context that is
+deliberately not cancelable (ADR 0006). A handler panic that a supervisor
+recovered therefore kept the write lock and a pooled connection for the
+life of the process: every later writer on the file, on any handle, failed
+`store.ErrBusy` after the busy timeout, and on `:memory:` no other
+connection could even read. A read transaction left open by a panicking
+`RetainedArtifacts` visitor kept its connection, and eight of them spent the
+pool, after which every call waited for a connection forever.
+
+The rollback covers every caller of the port: the worker, the journal and
+the engine through it, cron, provider records, approval records, and the
+examples. A panic inside the driver's own COMMIT is not reachable through
+this package: `database/sql` marks the transaction done before it calls the
+driver, so a rollback could not undo it there.
+
+| Change | Class | Migration |
+| --- | --- | --- |
+| `WithTx` rolls back when its callback, or the commit hook, panics or calls `runtime.Goexit`, then lets the panic continue (#267) | behavioral (bug fix) | None. Callbacks that return are unaffected. A caller that recovered a panic from `WithTx` and relied on the transaction staying open, which no API exposed, now finds it rolled back. Other `store.Database` implementations must do the same |
+
+## Secure deletion and purge (#281)
+
+Journal compaction is the framework's erasure (ADR 0021 §7), and a deleted
+SQLite row is not erased: its bytes stay in the page's free space, on freed
+pages, and in older write-ahead-log frames until something overwrites them.
+Measured on this backend (`store/sqlite/erasure_test.go`): rows inserted,
+updated and deleted with the previous settings were still readable in the
+file after a truncating checkpoint.
+
+- **`secure_delete=ON`** is set through the DSN (`_pragma`), so every pooled
+  connection has it, not only the one that ran `configure`. SQLite then
+  zeroes deleted content in the page and on freed and overflow pages. It is
+  on for the whole database, since every component shares it. Measured in
+  review over 500 operations, three interleaved samples, without and with
+  it: worker queue 295–342 vs 301–397 ms, journal 89–112 vs 87–121 ms,
+  journal compaction 27–29 vs 31–33 ms (about +12%).
+- **`store.Purger`** is a new optional `Database` capability. `PurgeLog`
+  runs `PRAGMA wal_checkpoint(TRUNCATE)` in the handle's writer turn, on a
+  connection whose busy timeout is at most 100 ms: the checkpoint holds
+  writers while it waits for readers, so it must not wait the store's full
+  timeout. It returns `store.ErrBusy` when a reader still needs the log,
+  having truncated nothing; the journal persists the pending purge and
+  retries it (ADR 0021 §7). `PurgeFree` runs `VACUUM` and then `PurgeLog`, removing
+  free space written before secure deletion was on; it rewrites the whole
+  database and needs free space of its size. `:memory:` has no log, so
+  `PurgeLog` is a no-op there.
+- `Backup` (`VACUUM INTO`) already writes a fresh file without free space or
+  log, so a backup taken after an erasure holds none of the erased content.
+
+| Change | Class | Migration |
+| --- | --- | --- |
+| `secure_delete=ON` on every connection (#281) | behavioral | None. Deletes and updates write zeros over freed space; content deleted before the upgrade stays until `PurgeFree` |
+| `store.Purger`, `store.PurgerOf`; `sqlite` implements it | additive | Optional; other `store.Database` implementations need not purge, and the journal then reports `LogPurged = false` |
 
 ## Alternatives considered
 
@@ -128,7 +204,13 @@ their first read. Journal `withTx` therefore begins with an empty
 `UPDATE journal_runs SET run_id = run_id WHERE 0`: it obtains the write
 reservation without changing rows, invoking row triggers, or replaying the
 callback. Schema initialization is the exception: its first statement is
-`CREATE TABLE`, before `journal_runs` exists. `Records.Execute` uses the same
+`CREATE TABLE`, before `journal_runs` exists. Adding a column to an
+existing journal reads the schema before it alters it, so concurrent
+openers of a journal that needs one race: without help, all but one fail
+`store.ErrBusy` at once (50 of 60 opens in a six-handle probe). `journal.New`
+therefore reruns the idempotent schema transaction while it fails busy,
+through the same `internal/migration.Retry` the worker queue uses (#233,
+#235). `Records.Execute` uses the same
 empty-update rule on `provider_records`; its constructor starts with DDL.
 
 All journal mutation paths follow this rule: admission, replay, effect intent,
@@ -149,6 +231,74 @@ is tested at its single-transaction boundary, so its outer retry cannot hide
 the defect. `provider/database_contention_test.go` verifies the same contention
 and then verifies duplicate/conflicting operation behavior and exactly one
 business row plus one outbox row. These tests fail on the pre-fix callbacks.
-The existing 5-second busy timeout still bounds waiting: writer starvation or
-an exhausted timeout may legitimately return an error. This is not a promise
-of unlimited contention tolerance.
+The existing 5-second busy timeout still bounds waiting: an exhausted timeout
+may legitimately return an error. This is not a promise of unlimited
+contention tolerance.
+
+## Fair writer queue (#214)
+
+SQLite's busy handler is not a queue. A writer that finds the lock taken
+sleeps for 1, 2, 5, … up to 100 ms between polls, so the writers that have
+waited longest poll least often, and writers that just arrived keep taking
+the lock first. Measured with 200 submissions (16 in flight) and 4 workers on
+one handle (macOS arm64, go1.27.1), no transaction held the write lock for
+1 ms (p50 43 µs). Yet the longest wait reached the full 5 s busy timeout, and
+submissions failed `store.ErrBusy` in 5 of 8 runs. A writer was starved, not
+slowed.
+
+The framework's own writers therefore take turns.
+- **Marked writers:** a transaction whose context is marked `store.Writer` is
+  queued per `sqlite` handle, first come first served, before it begins.
+- **Who marks:** every journal transition (not schema creation, which only
+  reads when the journal is reopened), the worker's submission, claim and
+  claim-accounting writes, provider records, cron cursor writes and approval
+  records. All of these write first (#176, #179, above), so holding the turn
+  from begin to commit is holding the write lock.
+- **Bound:** the wait is bounded by the busy timeout, and fails as SQLite's
+  would: `store.ErrBusy` annotated with the handle's write domain. A handler
+  that submits to the store its own claim holds therefore still fails after
+  one busy wait (#207).
+- **`:memory:`:** every `:memory:` handle shares one database and one queue.
+
+On the same harness (`NEWBLOK_MEASURE_WRITER_WAITS=1 go test -run
+TestMeasureWriterWaits -count=8 -v ./trigger/worker/`) with the queue, there
+were no busy failures in 16 runs:
+
+| build | longest wait |
+|---|---|
+| plain | 2.2–3.0 ms |
+| `-race` | 19–27 ms |
+
+That is what an ordered queue predicts: contenders × hold time.
+
+**Unmarked transactions are not queued**, and behave exactly as before.
+- **Reads:** they run beside a writer on a committed snapshot (WAL; `:memory:`
+  uses its memdb lock instead). That includes a read nested inside a marked
+  writer's own callback on the same handle, such as a worker handler reading
+  its store.
+- **Callbacks that do work before writing:** they hold no turn while they do
+  it.
+- **Contention:** unmarked writers contend in SQLite's busy handler, as do
+  writers on other handles or in other processes.
+
+An earlier draft queued every unmarked transaction instead. Independent review
+showed that a handler's ordinary read of its own store then waited out the
+busy timeout, and the job was dead-lettered as a nested submission.
+
+**Limits**
+- **Opting in:** mark only a callback that writes first and does no slow work,
+  since it holds the turn as long as it holds the lock.
+- **Unenforced:** the mark is not enforced. An unmarked framework write would
+  silently lose its ordering, so tests assert the marks on each writer path:
+  journal transitions, worker Enqueue, claim, `chargeLostClaim` and
+  `deferLost`, provider `Execute`, cron `Add` and tick flush, approval
+  `Record`.
+- **Two waits:** a marked writer that then meets an unmarked or out-of-handle
+  writer in SQLite waits up to the busy timeout again there. Its total wait
+  can therefore reach twice the timeout.
+
+| Change | Class | Migration |
+| --- | --- | --- |
+| `store.Writer` / `store.IsWriter` | additive | Optional; unmarked transactions are unchanged |
+| `sqlite.Backend.BusyTimeout` | additive | Zero keeps 5 s |
+| Marked `sqlite` writers on one handle take turns | behavioral | Same bound and `store.ErrBusy`; a wrapper that lowered `PRAGMA busy_timeout` inside a transaction no longer shortens a marked writer's wait for its turn, so set `BusyTimeout` instead |

@@ -143,6 +143,10 @@ type Config struct {
 	SessionTimeout time.Duration
 	// MaxPrincipals bounds the per-principal views kept in memory.
 	MaxPrincipals int
+	// Trace opts in to reading traceparent/tracestate from the HTTP request
+	// that carries a tool call, as the parent of the run the catalog starts
+	// for it (ADR 0020). Off by default.
+	Trace trigger.TraceIngress
 }
 
 // Server is an MCP endpoint over Streamable HTTP.
@@ -247,6 +251,9 @@ func New(application *app.Application, config Config) (*Server, error) {
 		config.MaxPrincipals > MaxPrincipalsLimit {
 		return nil, errors.New("mcp: a timeout, concurrency, request size, session or principal bound exceeds its limit")
 	}
+	if err := config.Trace.Validate(); err != nil {
+		return nil, fmt.Errorf("mcp: %w", err)
+	}
 	probe := config.Budget
 	probe.Deadline = time.Now().Add(config.Timeout)
 	if err := probe.Validate(); err != nil {
@@ -276,6 +283,15 @@ func New(application *app.Application, config Config) (*Server, error) {
 	})
 	route := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch {
+		case request.Method != http.MethodPost && request.Method != http.MethodDelete:
+			// The server offers no standalone SSE stream: it never sends a
+			// message outside the request it answers, so a GET has nothing to
+			// carry. The specification lets such a server refuse the GET with
+			// 405, and a client then never sees a stream end at Shutdown and
+			// mistake it for a failed connection (ADR 0014).
+			writer.Header().Set("Allow", "POST, DELETE")
+			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+			return
 		case request.Method == http.MethodDelete:
 			// The transport answers a DELETE only after the session's calls
 			// return, so a session its owner ends cancels its calls first.
@@ -300,18 +316,13 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		http.Error(writer, "unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	// A GET is the session's standing stream and lasts as long as the
-	// session, so it is admitted but does not hold the application open.
-	// Each call holds its own lease while it runs.
-	if request.Method == http.MethodGet {
-		lease.Release()
-	} else {
-		defer lease.Release()
-		// The request's own work (building the session's view) also
-		// stops if the application's drain times out. Only that work is
-		// bound: canceling the request itself would drop its response.
-		request = request.WithContext(context.WithValue(request.Context(), leaseKey{}, lease))
-	}
+	// Every request is answered while it holds its lease; each call also
+	// holds its own lease while it runs.
+	defer lease.Release()
+	// The request's own work (building the session's view) also stops if
+	// the application's drain times out. Only that work is bound: canceling
+	// the request itself would drop its response.
+	request = request.WithContext(context.WithValue(request.Context(), leaseKey{}, lease))
 	// The request's context ends when this handler returns, whatever
 	// server hosts it: a call's answer is written by then.
 	ctx, finish := context.WithCancel(request.Context())
@@ -771,7 +782,15 @@ func (s *Server) handler(owner tool.Principal, t Tool, input schema.Schema, outp
 		}
 		budget := s.config.Budget
 		budget.Deadline, _ = ctx.Deadline()
-		out, err := s.config.Catalog.Invoke(ctx, principal, Call{Name: t.Name, Version: t.Version, Input: normalized, Approval: named, Budget: budget})
+		// The trace headers are read only now, after authentication,
+		// admission and validation. The catalog's policy (capabilities,
+		// budget, approval) never reads them (ADR 0020); a run it starts
+		// with this context joins them as its parent.
+		invokeCtx := ctx
+		if request.Extra != nil {
+			invokeCtx = s.config.Trace.Context(ctx, s.application.TracePolicy(), request.Extra.Header.Values(trigger.TraceparentField), request.Extra.Header.Values(trigger.TracestateField))
+		}
+		out, err := s.config.Catalog.Invoke(invokeCtx, principal, Call{Name: t.Name, Version: t.Version, Input: normalized, Approval: named, Budget: budget})
 		if err == nil && ctx.Err() != nil {
 			// The catalog returned after the deadline or after the client
 			// left: the call has already failed.

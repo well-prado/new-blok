@@ -2,6 +2,7 @@
 package journal
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -12,29 +13,39 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/well-prado/new-blok/contract/audit"
+	"github.com/well-prado/new-blok/internal/migration"
 	"github.com/well-prado/new-blok/store"
 )
 
 var (
-	ErrRequestConflict = errors.New("journal: request key conflicts with existing input")
-	ErrNotFound        = errors.New("journal: record not found")
-	ErrNotDispatchable = errors.New("journal: operation is not dispatchable")
-	ErrStaleAttempt    = errors.New("journal: stale attempt cannot publish")
-	ErrUncertain       = errors.New("journal: operation outcome is uncertain")
+	ErrRequestConflict  = errors.New("journal: request key conflicts with existing input")
+	ErrNotFound         = errors.New("journal: record not found")
+	ErrNotDispatchable  = errors.New("journal: operation is not dispatchable")
+	ErrStaleAttempt     = errors.New("journal: stale attempt cannot publish")
+	ErrUncertain        = errors.New("journal: operation outcome is uncertain")
+	ErrRunActiveWork    = errors.New("journal: run still has active durable work")
+	ErrRunNotActive     = errors.New("journal: run is not active")
+	ErrObservationLimit = errors.New("journal: inspection input exceeds the hard byte limit")
+	ErrRunOutputLimit   = errors.New("journal: run output exceeds the hard byte limit")
 )
 
 const (
-	runAccepted         = "accepted"
-	runCompleted        = "completed"
-	operationIntent     = "intent"
-	operationDispatched = "dispatched"
-	operationCommitted  = "committed"
-	operationUncertain  = "uncertain"
-	operationFailed     = "failed"
-	attemptDispatched   = "dispatched"
-	attemptFailed       = "failed"
-	attemptCommitted    = "committed"
-	attemptUncertain    = "uncertain"
+	MaxInspectionInputBytes = 64 << 10
+	MaxRunOutputBytes       = 1 << 20
+	runAccepted             = "accepted"
+	runCompleted            = "completed"
+	runFailed               = "failed"
+	runUncertain            = "uncertain"
+	operationIntent         = "intent"
+	operationDispatched     = "dispatched"
+	operationCommitted      = "committed"
+	operationUncertain      = "uncertain"
+	operationFailed         = "failed"
+	attemptDispatched       = "dispatched"
+	attemptFailed           = "failed"
+	attemptCommitted        = "committed"
+	attemptUncertain        = "uncertain"
 )
 
 // Hooks are test-only crash barriers. Production callers leave them nil.
@@ -46,16 +57,36 @@ type Hooks struct {
 type Config struct {
 	Clock func() time.Time
 	Hooks Hooks
+	// Audit is the durable audit journal (ADR 0021). Reconcile and
+	// DecideUpgrade require it and refuse without it. It must write to the
+	// same database, so each decision and its record commit together.
+	Audit *audit.Journal
+	// Hold is the application's legal-hold policy for run data: Compact
+	// keeps a completed run for which it returns true.
+	Hold func(RetainedRun) bool
+	// MinRetention is the application's legal minimum for run data: Compact
+	// never removes a run completed less than this long ago, whatever cutoff
+	// it is given. Negative is refused.
+	MinRetention time.Duration
+}
+
+// RetainedRun identifies a completed run Compact is about to delete.
+type RetainedRun struct {
+	RunID, Workflow, Principal string
 }
 
 type Journal struct {
 	database store.Database
 	clock    func() time.Time
 	hooks    Hooks
+	audit    *audit.Journal
+	hold     func(RetainedRun) bool
+	minimum  time.Duration
 }
 
 type AdmissionRequest struct {
 	RequestKey     string
+	Principal      string
 	Workflow       string
 	ArtifactDigest string
 	Input          json.RawMessage
@@ -71,6 +102,7 @@ type Admission struct {
 
 type Run struct {
 	RunID          string
+	Principal      string
 	RequestKey     string
 	Workflow       string
 	ArtifactDigest string
@@ -79,6 +111,8 @@ type Run struct {
 	State          string
 	ReplayOf       string
 	Output         json.RawMessage
+	ErrorCode      string
+	ErrorClass     string
 }
 
 type OperationIdentity struct {
@@ -96,6 +130,7 @@ func (i OperationIdentity) Key() string {
 
 type EffectIntent struct {
 	Identity OperationIdentity
+	Input    json.RawMessage
 }
 
 type Operation struct {
@@ -104,6 +139,7 @@ type Operation struct {
 	ProviderOperationKey string
 	State                string
 	CurrentAttemptID     string
+	Input                json.RawMessage
 	Result               json.RawMessage
 }
 
@@ -113,6 +149,7 @@ type Attempt struct {
 	AttemptNumber        int
 	ProviderOperationKey string
 	State                string
+	Input                json.RawMessage
 	Result               json.RawMessage
 }
 
@@ -129,21 +166,86 @@ func New(ctx context.Context, database store.Database, config Config) (*Journal,
 	if err := database.Integrity(ctx); err != nil {
 		return nil, fmt.Errorf("journal: integrity check: %w", err)
 	}
-	j := &Journal{database: database, clock: config.Clock, hooks: config.Hooks}
+	if config.Audit != nil && !config.Audit.Shares(database) {
+		return nil, errors.New("journal: audit must write to the journal's database")
+	}
+	if config.MinRetention < 0 {
+		return nil, errors.New("journal: minimum retention must not be negative")
+	}
+	j := &Journal{database: database, clock: config.Clock, hooks: config.Hooks, audit: config.Audit, hold: config.Hold, minimum: config.MinRetention}
 	if j.clock == nil {
 		j.clock = time.Now
 	}
-	if err := j.withTx(ctx, "schema", func(tx *sql.Tx) error {
-		for _, statement := range schemaStatements {
-			if _, err := tx.ExecContext(ctx, statement); err != nil {
-				return fmt.Errorf("schema: %w", err)
+	// Adding a column reads the schema first, so concurrent openers of a
+	// journal that needs one race; the idempotent migration is retried
+	// while it loses (#235).
+	if err := migration.Retry(ctx, func() error {
+		return j.withTx(ctx, "schema", func(tx *sql.Tx) error {
+			for _, statement := range schemaStatements {
+				if _, err := tx.ExecContext(ctx, statement); err != nil {
+					return fmt.Errorf("schema: %w", err)
+				}
 			}
-		}
-		return nil
+			rows, err := tx.QueryContext(ctx, `PRAGMA table_info(journal_runs)`)
+			if err != nil {
+				return err
+			}
+			hasPrincipal := false
+			for rows.Next() {
+				var cid, notnull, pk int
+				var name, typ string
+				var def any
+				if err := rows.Scan(&cid, &name, &typ, &notnull, &def, &pk); err != nil {
+					rows.Close()
+					return err
+				}
+				if name == "principal" {
+					hasPrincipal = true
+				}
+			}
+			if err := rows.Close(); err != nil {
+				return err
+			}
+			if !hasPrincipal {
+				if _, err := tx.ExecContext(ctx, `ALTER TABLE journal_runs ADD COLUMN principal TEXT NOT NULL DEFAULT ''`); err != nil {
+					return err
+				}
+			}
+			for _, column := range []struct{ table, name, declaration string }{
+				{"journal_runs", "error_code", `TEXT NOT NULL DEFAULT ''`},
+				{"journal_runs", "error_class", `TEXT NOT NULL DEFAULT ''`},
+				{"journal_operations", "input_json", `BLOB`},
+				{"journal_attempts", "input_json", `BLOB`},
+				{"journal_scopes", "input_json", `BLOB`},
+			} {
+				if err := ensureColumn(ctx, tx, column.table, column.name, column.declaration); err != nil {
+					return err
+				}
+			}
+			if err := j.migrateErasure(ctx, tx); err != nil {
+				return err
+			}
+			// A reconciliation records the tenant that decided it (#286).
+			// The column is added once; every open then fixes the tenant of
+			// any row without one, from its verified audit record or "".
+			if err := ensureColumn(ctx, tx, "journal_reconciliations", "tenant", `TEXT`); err != nil {
+				return err
+			}
+			return backfillReconciliationTenants(ctx, tx)
+		})
 	}); err != nil {
 		return nil, err
 	}
 	return j, nil
+}
+
+func ensureColumn(ctx context.Context, tx *sql.Tx, table, column, declaration string) error {
+	found, err := hasColumn(ctx, tx, table, column)
+	if err != nil || found {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, declaration))
+	return err
 }
 
 var schemaStatements = []string{
@@ -158,7 +260,10 @@ var schemaStatements = []string{
 		replay_of TEXT NOT NULL DEFAULT '',
 		output_json BLOB,
 		created_at INTEGER NOT NULL,
-		completed_at INTEGER
+		completed_at INTEGER,
+		principal TEXT NOT NULL DEFAULT '',
+		error_code TEXT NOT NULL DEFAULT '',
+		error_class TEXT NOT NULL DEFAULT ''
 	)`,
 	`CREATE TABLE IF NOT EXISTS journal_operations (
 		operation_key TEXT PRIMARY KEY,
@@ -170,6 +275,7 @@ var schemaStatements = []string{
 		state TEXT NOT NULL,
 		current_attempt_id TEXT NOT NULL DEFAULT '',
 		result_json BLOB,
+		input_json BLOB,
 		created_at INTEGER NOT NULL,
 		updated_at INTEGER NOT NULL,
 		FOREIGN KEY (run_id) REFERENCES journal_runs(run_id)
@@ -181,6 +287,7 @@ var schemaStatements = []string{
 		provider_operation_key TEXT NOT NULL,
 		state TEXT NOT NULL,
 		result_json BLOB,
+		input_json BLOB,
 		error_text TEXT NOT NULL DEFAULT '',
 		started_at INTEGER NOT NULL,
 		finished_at INTEGER,
@@ -229,6 +336,7 @@ var schemaStatements = []string{
 		parent_path TEXT NOT NULL DEFAULT '',
 		state TEXT NOT NULL,
 		output_json BLOB,
+		input_json BLOB,
 		error_text TEXT NOT NULL DEFAULT '',
 		updated_at INTEGER NOT NULL,
 		PRIMARY KEY (run_id, path),
@@ -259,24 +367,43 @@ var schemaStatements = []string{
 		manifest_json BLOB NOT NULL,
 		created_at INTEGER NOT NULL
 	)`,
-	`CREATE TABLE IF NOT EXISTS journal_reconciliations (
+	// A reconciliation's evidence, provider result and actor are kept with
+	// its run and erased with it, leaving the decision's identity, tenant
+	// and digests (#281, #286). The table has no foreign key to journal_operations:
+	// the decision outlives its compacted operation.
+	reconciliationsTable("journal_reconciliations"),
+	// journal_meta holds the journal's own counters: erasure_generation
+	// counts compactions that erased content, purged_generation the latest
+	// one whose log purge succeeded (#281).
+	`CREATE TABLE IF NOT EXISTS journal_meta (name TEXT PRIMARY KEY, value INTEGER NOT NULL)`,
+	// The compaction tombstone proves a run existed and ended; it holds
+	// digests and timestamps only (#281).
+	`CREATE TABLE IF NOT EXISTS journal_compacted (
+		run_id TEXT PRIMARY KEY,
+		request_digest TEXT NOT NULL,
+		artifact_digest TEXT NOT NULL,
+		input_digest TEXT NOT NULL,
+		output_digest TEXT NOT NULL,
+		state TEXT NOT NULL,
+		completed_at INTEGER NOT NULL,
+		compacted_at INTEGER NOT NULL
+	)`,
+}
+
+func reconciliationsTable(name string) string {
+	return `CREATE TABLE IF NOT EXISTS ` + name + ` (
 		operation_key TEXT PRIMARY KEY,
+		run_id TEXT NOT NULL,
 		actor TEXT NOT NULL,
-		evidence TEXT NOT NULL,
-		result_json BLOB NOT NULL,
+		evidence TEXT,
+		result_json BLOB,
+		evidence_digest TEXT NOT NULL,
+		result_digest TEXT NOT NULL,
 		state TEXT NOT NULL,
 		created_at INTEGER NOT NULL,
-		FOREIGN KEY (operation_key) REFERENCES journal_operations(operation_key)
-	)`,
-	`CREATE TABLE IF NOT EXISTS journal_audit (
-		audit_id TEXT PRIMARY KEY,
-		run_id TEXT NOT NULL,
-		request_key TEXT NOT NULL,
-		artifact_digest TEXT NOT NULL,
-		state TEXT NOT NULL,
-		output_json BLOB,
-		created_at INTEGER NOT NULL
-	)`,
+		erased_at INTEGER,
+		tenant TEXT
+	)`
 }
 
 func (j *Journal) Admit(ctx context.Context, request AdmissionRequest) (Admission, error) {
@@ -291,9 +418,9 @@ func (j *Journal) Admit(ctx context.Context, request AdmissionRequest) (Admissio
 	admission := Admission{RunID: runID, RequestKey: request.RequestKey}
 	err = j.withTx(ctx, "admission", func(tx *sql.Tx) error {
 		result, err := tx.ExecContext(ctx, `INSERT INTO journal_runs
-			(run_id, request_key, workflow, artifact_digest, input_json, input_digest, state, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(request_key) DO NOTHING`,
-			runID, request.RequestKey, request.Workflow, request.ArtifactDigest, []byte(request.Input), digest, runAccepted, j.now())
+			(run_id, request_key, workflow, artifact_digest, input_json, input_digest, state, created_at, principal)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(request_key) DO NOTHING`,
+			runID, request.RequestKey, request.Workflow, request.ArtifactDigest, []byte(request.Input), digest, runAccepted, j.now(), request.Principal)
 		if err != nil {
 			return err
 		}
@@ -303,11 +430,11 @@ func (j *Journal) Admit(ctx context.Context, request AdmissionRequest) (Admissio
 		}
 		var existing Run
 		if inserted == 0 {
-			existing, err = scanRun(tx.QueryRowContext(ctx, `SELECT run_id, request_key, workflow, artifact_digest, input_json, input_digest, state, replay_of, output_json FROM journal_runs WHERE request_key = ?`, request.RequestKey))
+			existing, err = scanRun(tx.QueryRowContext(ctx, `SELECT run_id, request_key, workflow, artifact_digest, input_json, input_digest, state, replay_of, output_json, principal, error_code, error_class FROM journal_runs WHERE request_key = ?`, request.RequestKey))
 			if err != nil {
 				return err
 			}
-			if existing.Workflow != request.Workflow || existing.ArtifactDigest != request.ArtifactDigest || existing.InputDigest != digest {
+			if existing.Principal != request.Principal || existing.Workflow != request.Workflow || existing.ArtifactDigest != request.ArtifactDigest || existing.InputDigest != digest {
 				return ErrRequestConflict
 			}
 			admission.RunID = existing.RunID
@@ -336,14 +463,14 @@ func (j *Journal) Replay(ctx context.Context, sourceRunID, requestKey string) (A
 	}
 	var admission Admission
 	err = j.withTx(ctx, "replay", func(tx *sql.Tx) error {
-		source, err := scanRun(tx.QueryRowContext(ctx, `SELECT run_id, request_key, workflow, artifact_digest, input_json, input_digest, state, replay_of, output_json FROM journal_runs WHERE run_id = ?`, sourceRunID))
+		source, err := scanRun(tx.QueryRowContext(ctx, `SELECT run_id, request_key, workflow, artifact_digest, input_json, input_digest, state, replay_of, output_json, principal, error_code, error_class FROM journal_runs WHERE run_id = ?`, sourceRunID))
 		if err != nil {
 			return err
 		}
 		result, err := tx.ExecContext(ctx, `INSERT INTO journal_runs
-			(run_id, request_key, workflow, artifact_digest, input_json, input_digest, state, replay_of, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(request_key) DO NOTHING`,
-			runID, requestKey, source.Workflow, source.ArtifactDigest, []byte(source.Input), source.InputDigest, runAccepted, source.RunID, j.now())
+			(run_id, request_key, workflow, artifact_digest, input_json, input_digest, state, replay_of, created_at, principal)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(request_key) DO NOTHING`,
+			runID, requestKey, source.Workflow, source.ArtifactDigest, []byte(source.Input), source.InputDigest, runAccepted, source.RunID, j.now(), source.Principal)
 		if err != nil {
 			return err
 		}
@@ -367,17 +494,51 @@ func (j *Journal) BeginEffect(ctx context.Context, intent EffectIntent) (Operati
 	if err := intent.Identity.validate(); err != nil {
 		return Operation{}, err
 	}
+	if len(intent.Input) > MaxInspectionInputBytes {
+		return Operation{}, ErrObservationLimit
+	}
+	if len(intent.Input) > 0 && !json.Valid(intent.Input) {
+		return Operation{}, errors.New("journal: effect input must be valid JSON")
+	}
 	key := intent.Identity.Key()
 	var operation Operation
 	err := j.withTx(ctx, "effect-intent", func(tx *sql.Tx) error {
+		var runState string
+		if err := tx.QueryRowContext(ctx, `SELECT state FROM journal_runs WHERE run_id=?`, intent.Identity.RunID).Scan(&runState); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		var exists int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM journal_operations WHERE operation_key=?`, key).Scan(&exists); err != nil {
+			return err
+		}
+		if exists == 0 && runState != runAccepted {
+			return ErrRunNotActive
+		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO journal_operations
-			(operation_key, run_id, artifact_digest, invocation_path, iteration_path, provider_operation_key, state, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(operation_key) DO NOTHING`,
-			key, intent.Identity.RunID, intent.Identity.ArtifactDigest, intent.Identity.InvocationPath, intent.Identity.IterationPath, key, operationIntent, j.now(), j.now()); err != nil {
+		(operation_key, run_id, artifact_digest, invocation_path, iteration_path, provider_operation_key, state, input_json, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(operation_key) DO NOTHING`,
+			key, intent.Identity.RunID, intent.Identity.ArtifactDigest, intent.Identity.InvocationPath, intent.Identity.IterationPath, key, operationIntent, nullableJSON(intent.Input), j.now(), j.now()); err != nil {
 			return err
 		}
 		var err error
-		operation, err = scanOperation(tx.QueryRowContext(ctx, `SELECT operation_key, run_id, artifact_digest, invocation_path, iteration_path, provider_operation_key, state, current_attempt_id, result_json FROM journal_operations WHERE operation_key = ?`, key))
+		operation, err = scanOperation(tx.QueryRowContext(ctx, `SELECT operation_key, run_id, artifact_digest, invocation_path, iteration_path, provider_operation_key, state, current_attempt_id, input_json, result_json FROM journal_operations WHERE operation_key = ?`, key))
+		if err == nil && len(intent.Input) > 0 && len(operation.Input) > 0 && !bytes.Equal(intent.Input, operation.Input) {
+			return ErrRequestConflict
+		}
+		if err == nil && len(intent.Input) > 0 && len(operation.Input) == 0 && operation.State == operationIntent {
+			var updated sql.Result
+			updated, err = tx.ExecContext(ctx, `UPDATE journal_operations SET input_json=? WHERE operation_key=? AND input_json IS NULL AND state=? AND NOT EXISTS (SELECT 1 FROM journal_attempts WHERE operation_key=?)`, []byte(intent.Input), key, operationIntent, key)
+			if err == nil {
+				var changed int64
+				changed, err = updated.RowsAffected()
+				if err == nil && changed == 1 {
+					operation.Input = append([]byte(nil), intent.Input...)
+				}
+			}
+		}
 		return err
 	})
 	if err != nil {
@@ -392,7 +553,7 @@ func (j *Journal) StartAttempt(ctx context.Context, operationKey string) (Attemp
 	}
 	var attempt Attempt
 	err := j.withTx(ctx, "attempt-start", func(tx *sql.Tx) error {
-		operation, err := scanOperation(tx.QueryRowContext(ctx, `SELECT operation_key, run_id, artifact_digest, invocation_path, iteration_path, provider_operation_key, state, current_attempt_id, result_json FROM journal_operations WHERE operation_key = ?`, operationKey))
+		operation, err := scanOperation(tx.QueryRowContext(ctx, `SELECT operation_key, run_id, artifact_digest, invocation_path, iteration_path, provider_operation_key, state, current_attempt_id, input_json, result_json FROM journal_operations WHERE operation_key = ?`, operationKey))
 		if err != nil {
 			return err
 		}
@@ -402,6 +563,13 @@ func (j *Journal) StartAttempt(ctx context.Context, operationKey string) (Attemp
 			}
 			return ErrNotDispatchable
 		}
+		var runState string
+		if err := tx.QueryRowContext(ctx, `SELECT state FROM journal_runs WHERE run_id=?`, operation.Identity.RunID).Scan(&runState); err != nil {
+			return err
+		}
+		if runState != runAccepted {
+			return ErrRunNotActive
+		}
 		var next int
 		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(attempt_number), 0) + 1 FROM journal_attempts WHERE operation_key = ?`, operationKey).Scan(&next); err != nil {
 			return err
@@ -410,13 +578,13 @@ func (j *Journal) StartAttempt(ctx context.Context, operationKey string) (Attemp
 		if err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO journal_attempts (attempt_id, operation_key, attempt_number, provider_operation_key, state, started_at) VALUES (?, ?, ?, ?, ?, ?)`, attemptID, operationKey, next, operation.ProviderOperationKey, attemptDispatched, j.now()); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO journal_attempts (attempt_id, operation_key, attempt_number, provider_operation_key, state, input_json, started_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, attemptID, operationKey, next, operation.ProviderOperationKey, attemptDispatched, nullableJSON(operation.Input), j.now()); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE journal_operations SET state = ?, current_attempt_id = ?, updated_at = ? WHERE operation_key = ? AND state IN (?, ?)`, operationDispatched, attemptID, j.now(), operationKey, operationIntent, operationFailed); err != nil {
 			return err
 		}
-		attempt = Attempt{ID: attemptID, OperationKey: operationKey, AttemptNumber: next, ProviderOperationKey: operation.ProviderOperationKey, State: attemptDispatched}
+		attempt = Attempt{ID: attemptID, OperationKey: operationKey, AttemptNumber: next, ProviderOperationKey: operation.ProviderOperationKey, State: attemptDispatched, Input: append([]byte(nil), operation.Input...)}
 		return nil
 	})
 	if err != nil {
@@ -533,10 +701,16 @@ func (j *Journal) MarkUncertain(ctx context.Context, operationKey, attemptID, ev
 }
 
 func (j *Journal) CompleteRun(ctx context.Context, runID string, output json.RawMessage) error {
+	if len(output) > MaxRunOutputBytes {
+		return ErrRunOutputLimit
+	}
 	if runID == "" || !json.Valid(output) {
 		return errors.New("journal: valid run and output are required")
 	}
 	return j.withTx(ctx, "run-complete", func(tx *sql.Tx) error {
+		if err := requireQuiescentRun(ctx, tx, runID); err != nil {
+			return err
+		}
 		result, err := tx.ExecContext(ctx, `UPDATE journal_runs SET state = ?, output_json = ?, completed_at = ? WHERE run_id = ? AND state = ?`, runCompleted, []byte(output), j.now(), runID, runAccepted)
 		if err != nil {
 			return err
@@ -559,11 +733,128 @@ func (j *Journal) CompleteRun(ctx context.Context, runID string, output json.Raw
 	})
 }
 
+// FailRun records the canonical terminal workflow outcome. Attempt failures
+// never imply that the whole run stopped: callers invoke this only after the
+// engine has ended all active dispatches and waits.
+func (j *Journal) FailRun(ctx context.Context, runID, errorCode, errorClass string) error {
+	if runID == "" || !validDiagnosticLabel(errorCode) || !validDiagnosticLabel(errorClass) {
+		return errors.New("journal: run and safe failure code/class are required")
+	}
+	return j.withTx(ctx, "run-fail", func(tx *sql.Tx) error {
+		var state string
+		if err := tx.QueryRowContext(ctx, `SELECT state FROM journal_runs WHERE run_id=?`, runID).Scan(&state); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if state == runFailed {
+			var oldCode, oldClass string
+			if err := tx.QueryRowContext(ctx, `SELECT error_code,error_class FROM journal_runs WHERE run_id=?`, runID).Scan(&oldCode, &oldClass); err != nil {
+				return err
+			}
+			if oldCode == errorCode && oldClass == errorClass {
+				return nil
+			}
+			return ErrStaleAttempt
+		}
+		if state == runUncertain {
+			return ErrUncertain
+		}
+		if state != runAccepted {
+			return ErrStaleAttempt
+		}
+		if err := requireQuiescentRun(ctx, tx, runID); err != nil {
+			return err
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE journal_runs SET state=?,error_code=?,error_class=?,completed_at=? WHERE run_id=? AND state=?`, runFailed, errorCode, errorClass, j.now(), runID, runAccepted)
+		if err != nil {
+			return err
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if changed != 1 {
+			return ErrStaleAttempt
+		}
+		return nil
+	})
+}
+
+// MarkRunUncertain records a conservative terminal projection when the
+// execution boundary reports an unknown external outcome. It intentionally
+// does not rewrite operation/attempt facts or authorize a retry.
+func (j *Journal) MarkRunUncertain(ctx context.Context, runID, errorCode, errorClass string) error {
+	if runID == "" || !validDiagnosticLabel(errorCode) || !validDiagnosticLabel(errorClass) {
+		return errors.New("journal: run and safe uncertainty code/class are required")
+	}
+	return j.withTx(ctx, "run-uncertain", func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ctx, `UPDATE journal_runs SET state=?,error_code=?,error_class=?,completed_at=? WHERE run_id=? AND state=?`, runUncertain, errorCode, errorClass, j.now(), runID, runAccepted)
+		if err != nil {
+			return err
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if changed == 1 {
+			return nil
+		}
+		var state, oldCode, oldClass string
+		if err := tx.QueryRowContext(ctx, `SELECT state,error_code,error_class FROM journal_runs WHERE run_id=?`, runID).Scan(&state, &oldCode, &oldClass); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if state == runUncertain && oldCode == errorCode && oldClass == errorClass {
+			return nil
+		}
+		return ErrStaleAttempt
+	})
+}
+
+func requireQuiescentRun(ctx context.Context, tx *sql.Tx, runID string) error {
+	var dispatched, waiting, uncertain, runningScopes int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM journal_operations WHERE run_id=? AND state=?`, runID, operationDispatched).Scan(&dispatched); err != nil {
+		return err
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM journal_waits WHERE run_id=? AND state=?`, runID, waitWaiting).Scan(&waiting); err != nil {
+		return err
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM journal_operations WHERE run_id=? AND state=?`, runID, operationUncertain).Scan(&uncertain); err != nil {
+		return err
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM journal_scopes WHERE run_id=? AND state=?`, runID, checkpointRunning).Scan(&runningScopes); err != nil {
+		return err
+	}
+	if uncertain > 0 {
+		return ErrUncertain
+	}
+	if dispatched > 0 || waiting > 0 || runningScopes > 0 {
+		return ErrRunActiveWork
+	}
+	return nil
+}
+
+func validDiagnosticLabel(value string) bool {
+	if value == "" || len(value) > 64 {
+		return false
+	}
+	for _, c := range value {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-' || c == '.') {
+			return false
+		}
+	}
+	return true
+}
+
 func (j *Journal) Run(ctx context.Context, runID string) (Run, error) {
 	var run Run
 	err := j.withRead(ctx, func(tx *sql.Tx) error {
 		var err error
-		run, err = scanRun(tx.QueryRowContext(ctx, `SELECT run_id, request_key, workflow, artifact_digest, input_json, input_digest, state, replay_of, output_json FROM journal_runs WHERE run_id = ?`, runID))
+		run, err = scanRun(tx.QueryRowContext(ctx, `SELECT run_id, request_key, workflow, artifact_digest, input_json, input_digest, state, replay_of, output_json, principal, error_code, error_class FROM journal_runs WHERE run_id = ?`, runID))
 		return err
 	})
 	if err != nil {
@@ -576,7 +867,7 @@ func (j *Journal) Operation(ctx context.Context, operationKey string) (Operation
 	var operation Operation
 	err := j.withRead(ctx, func(tx *sql.Tx) error {
 		var err error
-		operation, err = scanOperation(tx.QueryRowContext(ctx, `SELECT operation_key, run_id, artifact_digest, invocation_path, iteration_path, provider_operation_key, state, current_attempt_id, result_json FROM journal_operations WHERE operation_key = ?`, operationKey))
+		operation, err = scanOperation(tx.QueryRowContext(ctx, `SELECT operation_key, run_id, artifact_digest, invocation_path, iteration_path, provider_operation_key, state, current_attempt_id, input_json, result_json FROM journal_operations WHERE operation_key = ?`, operationKey))
 		return err
 	})
 	if err != nil {
@@ -586,7 +877,14 @@ func (j *Journal) Operation(ctx context.Context, operationKey string) (Operation
 }
 
 func (j *Journal) withTx(ctx context.Context, name string, fn func(*sql.Tx) error) error {
-	err := j.database.WithTx(ctx, func(tx *sql.Tx) error {
+	// Every transition writes first, so it takes its turn in the store's
+	// writer queue (#214). Schema creation does not: reopening a journal
+	// only reads that its tables exist, so it is not queued.
+	txCtx := store.Writer(ctx)
+	if name == "schema" {
+		txCtx = ctx
+	}
+	err := j.database.WithTx(txCtx, func(tx *sql.Tx) error {
 		// Reserve the writer before reading a snapshot. SQLite cannot wait when
 		// upgrading a read transaction to a writer; even an empty UPDATE takes
 		// the writer reservation without changing any committed values.
@@ -635,6 +933,13 @@ func digestBytes(data []byte) string {
 	return "sha256:" + hex.EncodeToString(digest[:])
 }
 
+func nullableJSON(data json.RawMessage) any {
+	if len(data) == 0 {
+		return nil
+	}
+	return []byte(data)
+}
+
 func randomID(prefix string) (string, error) {
 	var bytes [16]byte
 	if _, err := rand.Read(bytes[:]); err != nil {
@@ -648,7 +953,7 @@ type scanner interface{ Scan(...any) error }
 func scanRun(row scanner) (Run, error) {
 	var run Run
 	var input, output []byte
-	if err := row.Scan(&run.RunID, &run.RequestKey, &run.Workflow, &run.ArtifactDigest, &input, &run.InputDigest, &run.State, &run.ReplayOf, &output); err != nil {
+	if err := row.Scan(&run.RunID, &run.RequestKey, &run.Workflow, &run.ArtifactDigest, &input, &run.InputDigest, &run.State, &run.ReplayOf, &output, &run.Principal, &run.ErrorCode, &run.ErrorClass); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Run{}, ErrNotFound
 		}
@@ -661,13 +966,14 @@ func scanRun(row scanner) (Run, error) {
 
 func scanOperation(row scanner) (Operation, error) {
 	var operation Operation
-	var result []byte
-	if err := row.Scan(&operation.Key, &operation.Identity.RunID, &operation.Identity.ArtifactDigest, &operation.Identity.InvocationPath, &operation.Identity.IterationPath, &operation.ProviderOperationKey, &operation.State, &operation.CurrentAttemptID, &result); err != nil {
+	var input, result []byte
+	if err := row.Scan(&operation.Key, &operation.Identity.RunID, &operation.Identity.ArtifactDigest, &operation.Identity.InvocationPath, &operation.Identity.IterationPath, &operation.ProviderOperationKey, &operation.State, &operation.CurrentAttemptID, &input, &result); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Operation{}, ErrNotFound
 		}
 		return Operation{}, err
 	}
+	operation.Input = append([]byte(nil), input...)
 	operation.Result = append([]byte(nil), result...)
 	return operation, nil
 }

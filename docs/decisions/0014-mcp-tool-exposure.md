@@ -37,6 +37,17 @@ session-less call would escape the session that binds a caller and ends its
 work. The SDK client probes 2026-07-28 with `server/discover` first and falls
 back to `initialize`.
 
+The adapter offers no standalone SSE stream. It never sends a message
+outside the request it answers: no list-changed or resource-updated
+notifications (a view's tools and resources are fixed before any session
+uses it, and nothing subscribes), no logging, no keepalive pings, and no
+server-to-client requests (sampling, elicitation, roots). A call's own
+messages travel on the POST that carries it. A GET therefore has nothing to
+carry, and the adapter refuses it, after authentication, with 405 and
+`Allow: POST, DELETE`, as the specification lets a server that does not
+offer the stream do; any other method but POST and DELETE gets the same.
+Under 2026-07-28 the GET stream is gone from the protocol anyway.
+
 ### Authentication and sessions
 
 Every HTTP request carries a bearer token. The application's `Authenticator`
@@ -44,8 +55,7 @@ resolves it to a `tool.Principal` (id, capabilities, maximum depth). Any
 failure, including an outage of whatever the authenticator consults, and a
 blank principal id are 401; the token is never echoed. The token's user id is
 the principal id, so the SDK binds a session to the principal that opened it
-and answers 403 when anyone else uses its session id, on GET, POST and
-DELETE.
+and answers 403 when anyone else uses its session id, on POST and DELETE.
 
 A call runs as the principal **its own request** authenticated, not the one
 that opened the session: capabilities revoked while a session stays open
@@ -178,8 +188,8 @@ session is kept in a registry `Shutdown` closes.
 ### Lifecycle
 
 Each request takes an application lease; a draining application answers 503
-with `Retry-After`. A GET is the session's standing stream, so it is admitted
-but releases its lease at once. Each call holds its own lease while it runs.
+with `Retry-After`. Every request holds its lease until it is answered, and
+each call also holds its own lease while it runs.
 A drain timeout cancels a request's own work (its authentication and
 building the session's view) and every call (#177); the request's response
 itself is not canceled.
@@ -191,7 +201,7 @@ returns `ctx.Err()` when ctx ends first. The SDK writes a call's answer on
 its request after the tool handler returns, and a session being closed
 refuses that write, so closing as soon as the calls end lost the answer to
 work that was done (#197). A call admitted before `Shutdown` began therefore
-has its answer written and flushed before any of its session's streams end.
+has its answer written and flushed before its session closes.
 The request's context ends when the adapter's `ServeHTTP` returns, whatever
 server hosts it. A call refused because `Shutdown` has begun is not waited
 for: it did nothing, and its refusal may not arrive.
@@ -252,16 +262,24 @@ likely to be subtly wrong, and the official SDK tracks the specification.
   the adapter handles session-less calls with request-scoped cancellation.
 - A client that loses its connection loses its call: there is no event store
   and no resumption.
-- `Shutdown` delivers the answer to a call in flight to the wire, but cannot
-  make a client read it. Closing a session ends its standing GET stream, and
-  the Go SDK client (v1.8.0) reads that end and the answer on separate
-  connections in no fixed order. When it treats the end of the standing
-  stream as fatal at once (`MaxRetries` below zero), it can fail the
-  connection, and the call with it, before it reads an answer already on the
-  wire: in a probe of 100 calls, every answer was flushed before the stream
-  ended and 73 were still reported as failed. The SDK's default waits at
-  least a second before reconnecting; with it, the regression test's client
-  received every answer.
+- `Shutdown` delivers the answer to a call in flight, and a client reads it,
+  whatever its retry policy. Were the adapter to offer a standalone GET
+  stream, closing a session would end it, and the Go SDK client (v1.8.0)
+  reads that end and the answer on separate connections in no fixed order:
+  a client that treats the end of the stream as fatal at once (`MaxRetries`
+  below zero) fails the connection, and the call with it, even with the
+  answer already on the wire (73 of 100 calls in the first probe; 21 to 55
+  of 100 across regression-test runs against a server that still served the
+  stream).
+  Upstream declined to change the client (modelcontextprotocol/go-sdk#1175).
+  Refusing the GET with 405 leaves Shutdown no stream to end, so the flaw
+  has nothing to act on for any client of this server, the SDK's or
+  anyone else's; the
+  regression test's client disables retries and receives every answer.
+- A client sees its session closed by `Shutdown` only at its next request,
+  which the closing adapter refuses with 503 (and a stopped listener does
+  not accept): without a standalone stream nothing tells it sooner. The
+  adapter never had anything else to send it there.
 - Prompts, sampling, elicitation, subscriptions and resource templates are
   not offered.
 
@@ -276,7 +294,8 @@ protocol versions, deadline, client cancel, a dropped request, a bare DELETE,
 a late-queued call, a canceled call before the catalog, overload, per-principal slots, session bounds, output
 size, draining, a call outliving its request, shutdown, a call answered on the
 wire and received when shutdown begins while it runs (100 trials, with the
-answer held after the handler returns), a session opened during
+answer held after the handler returns, by a client that disables retries),
+the standalone GET refused with 405 and `Allow`, a session opened during
 and after shutdown, evicted views, view
 building, a panic while listing, the dependency rule and goroutine bounds.
 Every response byte, and the server's error log, is checked for the

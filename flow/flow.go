@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/well-prado/new-blok/contract"
+	"github.com/well-prado/new-blok/internal/lowering"
 	"github.com/well-prado/new-blok/node"
 )
 
@@ -39,7 +40,7 @@ func Lit[T any](value T) Ref[T] {
 
 func Select[I, O any](input Ref[I], path string) Ref[O] {
 	if path == "" {
-		panic("flow: field path is required")
+		violate("flow: field path is required")
 	}
 	return Ref[O]{expression: expression{Kind: "reference", Source: input.expression.Source + "." + path}}
 }
@@ -64,65 +65,94 @@ type Definition[I, O any] struct {
 	program Program
 }
 
+// OutputID is the id of the instruction Lower appends to return the
+// workflow's output. Every builder rejects it as a step id, so a lowered
+// program never holds two instructions with this id (#247).
+const OutputID = lowering.OutputID
+
 func (d Definition[I, O]) Program() Program { return cloneProgram(d.program) }
 
 // Lower converts a structurally authored definition into the engine's
 // transport-independent internal program. It only lowers the instruction
 // forms supported by the native execution path; it never invokes a node.
+//
+// Each call's input lowers to the same structural reference the canonical
+// document compiler produces: the workflow input ("$input") carries no
+// reference, and an earlier call's result or field ("$step.<id>[.<field>…]")
+// becomes one reference with that path. Every other input — a literal, a
+// field of the workflow input, a reference to a call that is not strictly
+// earlier in this program — has no program form, so Lower rejects it instead
+// of letting the engine fall back to the workflow input (#244). Control
+// constructs are rejected the same way.
+//
+// The rules live in internal/lowering, which the agent catalog lowers
+// composed workflows through as well, so the two cannot drift (#249). Lower
+// uses it without the catalog's extensions: a literal call input and a
+// child workflow call stay rejected here.
 func (d Definition[I, O]) Lower() (contract.InternalProgram, error) {
 	program := d.Program()
-	internal := contract.InternalProgram{
-		WorkflowID: program.Spec.Name,
-		Version:    program.Spec.Version,
-	}
-	for index, instruction := range program.Instructions {
-		if instruction.Kind != "call" {
-			return contract.InternalProgram{}, fmt.Errorf("flow: instruction %q of kind %q cannot be lowered", instruction.ID, instruction.Kind)
-		}
-		internal.Instructions = append(internal.Instructions, contract.InternalInstruction{
-			Index: index,
-			ID:    instruction.ID,
-			Kind:  instruction.Kind,
-			Node:  instruction.Node.Name,
-		})
-	}
-	step, path, err := lowerReference(program.Output)
+	result, err := lowering.Lower(program.Spec.Name, program.Spec.Version, loweringInstructions(program), program.Output, lowering.Options{})
 	if err != nil {
-		return contract.InternalProgram{}, fmt.Errorf("flow: output: %w", err)
+		return contract.InternalProgram{}, err
 	}
-	internal.Instructions = append(internal.Instructions, contract.InternalInstruction{
-		Index: len(internal.Instructions),
-		ID:    "output",
-		Kind:  "output",
-		References: []contract.Reference{{
-			Step: step,
-			Path: path,
-		}},
-	})
-	return internal, nil
+	return result.Program, nil
 }
 
-func lowerReference(source string) (string, []string, error) {
-	const prefix = "$step."
-	if !strings.HasPrefix(source, prefix) {
-		return "", nil, fmt.Errorf("output %q must reference a call result", source)
+// loweringInstructions copies the recorded instructions into the shared
+// lowering's form. A call names its node by descriptor name, as the
+// canonical compiler does.
+func loweringInstructions(program Program) []lowering.Instruction {
+	instructions := make([]lowering.Instruction, len(program.Instructions))
+	for index, instruction := range program.Instructions {
+		instructions[index] = lowering.Instruction{Kind: instruction.Kind, ID: instruction.ID, Node: instruction.Node.Name, Input: instruction.Input, Literal: instruction.Literal}
 	}
-	parts := strings.Split(strings.TrimPrefix(source, prefix), ".")
-	if len(parts) == 0 || parts[0] == "" {
-		return "", nil, fmt.Errorf("output %q has no step", source)
-	}
-	if len(parts) == 1 {
-		return parts[0], nil, nil
-	}
-	return parts[0], parts[1:], nil
+	return instructions
 }
 
+// violation is the panic value a builder raises when a definition breaks an
+// authoring rule. Define recovers exactly this type and returns it.
+type violation struct{ message string }
+
+func (v *violation) Error() string { return v.message }
+
+func violate(message string) { panic(&violation{message: message}) }
+
+// Define records the program build authors. A builder rule the callback
+// breaks — an id outside the grammar, a reserved or duplicate id, a malformed
+// construct — is returned as an error, so tooling that loads definitions gets
+// a diagnostic instead of a crash. Any other panic raised while build runs is
+// the application's own and propagates unchanged.
 func Define[I, O any](spec Spec, build func(*Builder, Ref[I]) Ref[O]) (Definition[I, O], error) {
+	return define(spec, build, true)
+}
+
+// MustDefine is Define for package-level definitions. A broken builder rule
+// panics at the builder call that broke it, so the stack names the line.
+func MustDefine[I, O any](spec Spec, build func(*Builder, Ref[I]) Ref[O]) Definition[I, O] {
+	definition, err := define(spec, build, false)
+	if err != nil {
+		panic(err)
+	}
+	return definition
+}
+
+func define[I, O any](spec Spec, build func(*Builder, Ref[I]) Ref[O], recoverViolations bool) (definition Definition[I, O], err error) {
 	if build == nil {
 		return Definition[I, O]{}, fmt.Errorf("flow build callback is required")
 	}
 	if spec.Name == "" || spec.Version == "" {
 		return Definition[I, O]{}, fmt.Errorf("flow name and version are required")
+	}
+	if recoverViolations {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				authoring, ok := recovered.(*violation)
+				if !ok {
+					panic(recovered)
+				}
+				definition, err = Definition[I, O]{}, authoring
+			}
+		}()
 	}
 	builder := &Builder{program: Program{Spec: spec}, ids: make(map[string]struct{})}
 	output := build(builder, Ref[I]{expression: expression{Kind: "input", Source: "$input"}})
@@ -133,14 +163,6 @@ func Define[I, O any](spec Spec, build func(*Builder, Ref[I]) Ref[O]) (Definitio
 	return Definition[I, O]{program: cloneProgram(builder.program)}, nil
 }
 
-func MustDefine[I, O any](spec Spec, build func(*Builder, Ref[I]) Ref[O]) Definition[I, O] {
-	definition, err := Define(spec, build)
-	if err != nil {
-		panic(err)
-	}
-	return definition
-}
-
 type Builder struct {
 	program Program
 	ids     map[string]struct{}
@@ -148,10 +170,7 @@ type Builder struct {
 
 func Call[I, O any](builder *Builder, id string, definition node.Definition[I, O], input Ref[I]) Ref[O] {
 	if builder == nil {
-		panic("flow: nil builder")
-	}
-	if id == "" {
-		panic("flow: call id is required")
+		violate("flow: nil builder")
 	}
 	builder.reserveID(id)
 	output := "$step." + id
@@ -165,7 +184,7 @@ func Call[I, O any](builder *Builder, id string, definition node.Definition[I, O
 	if input.expression.Kind == "literal" {
 		literal, err := json.Marshal(input.expression.Value)
 		if err != nil {
-			panic("flow: literal cannot be encoded: " + err.Error())
+			violate("flow: literal cannot be encoded: " + err.Error())
 		}
 		instruction.Literal = literal
 	}
@@ -173,9 +192,19 @@ func Call[I, O any](builder *Builder, id string, definition node.Definition[I, O
 	return Ref[O]{expression: expression{Kind: "reference", Source: output}}
 }
 
+// reserveID is the one place every builder's step id is checked. Ids follow
+// the document id grammar, so a step id has the same meaning in flow, the
+// canonical compiler and documents, and never contains the "." that a
+// "$step.<id>.<field>" reference splits on (#251).
 func (builder *Builder) reserveID(id string) {
+	if !contract.ValidID(id) {
+		violate(fmt.Sprintf("flow: instruction id %q does not match the id grammar %s; rename the step", id, contract.IDPattern))
+	}
+	if id == OutputID {
+		violate("flow: instruction id \"" + OutputID + "\" is reserved for the workflow output instruction Lower appends; rename the step")
+	}
 	if _, exists := builder.ids[id]; exists {
-		panic("flow: duplicate instruction id " + id)
+		violate("flow: duplicate instruction id " + id)
 	}
 	builder.ids[id] = struct{}{}
 }
@@ -184,14 +213,14 @@ type ArmBuilder struct{ parent *Builder }
 
 func ArmCall[I, O any](arm *ArmBuilder, id string, definition node.Definition[I, O], input Ref[I]) Ref[O] {
 	if arm == nil || arm.parent == nil {
-		panic("flow: nil arm builder")
+		violate("flow: nil arm builder")
 	}
 	return Call(arm.parent, id, definition, input)
 }
 
 func If[T any](builder *Builder, id string, condition Ref[bool], thenArm, elseArm func(*ArmBuilder) Ref[T]) Ref[T] {
 	if thenArm == nil || elseArm == nil {
-		panic("flow: both if arms are required")
+		violate("flow: both if arms are required")
 	}
 	arm := &ArmBuilder{parent: builder}
 	thenOutput := thenArm(arm)
@@ -204,7 +233,7 @@ func If[T any](builder *Builder, id string, condition Ref[bool], thenArm, elseAr
 
 func Choose[T any](builder *Builder, id string, condition Ref[string], cases map[string]func(*ArmBuilder) Ref[T], fallback func(*ArmBuilder) Ref[T]) Ref[T] {
 	if len(cases) == 0 || fallback == nil {
-		panic("flow: choose requires cases and a fallback")
+		violate("flow: choose requires cases and a fallback")
 	}
 	keys := make([]string, 0, len(cases))
 	for key := range cases {
@@ -225,10 +254,10 @@ func Choose[T any](builder *Builder, id string, condition Ref[string], cases map
 
 func Each[I, O any](builder *Builder, id string, input Ref[[]I], concurrency int, body func(*ArmBuilder, Ref[I]) Ref[O]) Ref[[]O] {
 	if concurrency < 1 || concurrency > 1024 {
-		panic("flow: each concurrency must be between 1 and 1024")
+		violate("flow: each concurrency must be between 1 and 1024")
 	}
 	if body == nil {
-		panic("flow: each body is required")
+		violate("flow: each body is required")
 	}
 	arm := &ArmBuilder{parent: builder}
 	bodyOutput := body(arm, Ref[I]{expression: expression{Kind: "iteration", Source: "$item"}})
@@ -240,12 +269,12 @@ func Each[I, O any](builder *Builder, id string, input Ref[[]I], concurrency int
 
 func Parallel(builder *Builder, id string, arms ...func(*ArmBuilder)) {
 	if len(arms) == 0 {
-		panic("flow: parallel requires at least one arm")
+		violate("flow: parallel requires at least one arm")
 	}
 	arm := &ArmBuilder{parent: builder}
 	for _, build := range arms {
 		if build == nil {
-			panic("flow: parallel arm is required")
+			violate("flow: parallel arm is required")
 		}
 		build(arm)
 	}
@@ -255,7 +284,7 @@ func Parallel(builder *Builder, id string, arms ...func(*ArmBuilder)) {
 
 func TryFinally[T any](builder *Builder, id string, tryArm func(*ArmBuilder) Ref[T], finallyArm func(*ArmBuilder)) Ref[T] {
 	if tryArm == nil || finallyArm == nil {
-		panic("flow: try and finally arms are required")
+		violate("flow: try and finally arms are required")
 	}
 	arm := &ArmBuilder{parent: builder}
 	tryOutput := tryArm(arm)
@@ -268,7 +297,7 @@ func TryFinally[T any](builder *Builder, id string, tryArm func(*ArmBuilder) Ref
 
 func Child[I, O any](builder *Builder, id, workflow string, input Ref[I]) Ref[O] {
 	if workflow == "" {
-		panic("flow: child workflow name is required")
+		violate("flow: child workflow name is required")
 	}
 	builder.reserveID(id)
 	output := "$child." + id
@@ -278,7 +307,7 @@ func Child[I, O any](builder *Builder, id, workflow string, input Ref[I]) Ref[O]
 
 func Compare[T any](builder *Builder, id, operator string, left, right Ref[T]) Ref[bool] {
 	if operator == "" {
-		panic("flow: comparison operator is required")
+		violate("flow: comparison operator is required")
 	}
 	builder.reserveID(id)
 	output := "$op." + id
@@ -295,7 +324,7 @@ func Default[T any](builder *Builder, id string, value, fallback Ref[T]) Ref[T] 
 
 func Template(builder *Builder, id, template string, values ...Ref[string]) Ref[string] {
 	if strings.Contains(template, "js/") {
-		panic("flow: raw expression strings are not supported")
+		violate("flow: raw expression strings are not supported")
 	}
 	builder.reserveID(id)
 	paths := make([]string, len(values))

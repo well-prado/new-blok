@@ -1,0 +1,8 @@
+{
+  "signalId": "signal-continue-1",
+  "signalPayload": "{\"approved\":true}",
+  "expectedOutput": "{\"value\":99}",
+  "expectedTimerOutput": "{\"value\":100}",
+  "expectedPrefixEffects": 1,
+  "expectedSuffixEffects": 1
+}

@@ -651,6 +651,57 @@ func TestSessionsCannotBeHijacked(t *testing.T) {
 	}
 }
 
+// TestStandaloneStreamIsRefused: the server offers no standalone SSE
+// stream, so a GET, from the session's owner or anyone else, is refused with
+// 405 and an Allow header naming the methods it serves (ADR 0014). A GET is
+// still authenticated first. The session keeps working, and its owner can
+// still end it with DELETE.
+func TestStandaloneStreamIsRefused(t *testing.T) {
+	r := newRig(t, nil)
+	alice := r.connect("alice")
+	version := alice.InitializeResult().ProtocolVersion
+	for _, c := range []struct {
+		method, token string
+		sessionless   bool
+		status        int
+	}{
+		{http.MethodGet, "alice", false, http.StatusMethodNotAllowed},
+		{http.MethodGet, "bob", false, http.StatusMethodNotAllowed},
+		{http.MethodGet, "alice", true, http.StatusMethodNotAllowed},
+		{http.MethodPut, "alice", false, http.StatusMethodNotAllowed},
+		{http.MethodHead, "alice", false, http.StatusMethodNotAllowed},
+		{http.MethodOptions, "alice", false, http.StatusMethodNotAllowed},
+		{http.MethodGet, "intruder", false, http.StatusUnauthorized},
+	} {
+		request, err := http.NewRequest(c.method, r.endpoint, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Accept", "text/event-stream")
+		if !c.sessionless {
+			request.Header.Set("Mcp-Session-Id", alice.ID())
+		}
+		request.Header.Set("Mcp-Protocol-Version", version)
+		response, err := (&http.Client{Transport: recordingClient{token: c.token, log: r.wire}, Timeout: 5 * time.Second}).Do(request)
+		if err != nil {
+			t.Fatalf("%s as %s: %v", c.method, c.token, err)
+		}
+		_ = response.Body.Close()
+		if response.StatusCode != c.status {
+			t.Fatalf("%s as %s (sessionless=%v): status=%d, want %d", c.method, c.token, c.sessionless, response.StatusCode, c.status)
+		}
+		if allow := response.Header.Get("Allow"); c.status == http.StatusMethodNotAllowed && allow != "POST, DELETE" {
+			t.Fatalf("%s as %s: Allow=%q, want \"POST, DELETE\"", c.method, c.token, allow)
+		}
+	}
+	if result, err := call(alice, "demo.echo_v1.0.0", map[string]any{"text": "a"}, nil); err != nil || result.IsError {
+		t.Fatalf("the session stopped working: result=%+v err=%v", result, err)
+	}
+	if status, _ := r.raw(http.MethodDelete, "alice", alice.ID(), version, nil); status != http.StatusNoContent {
+		t.Fatalf("alice's DELETE: status=%d, want 204", status)
+	}
+}
+
 func TestUnsupportedProtocolVersionIsRefused(t *testing.T) {
 	r := newRig(t, nil)
 	alice := r.connect("alice")
@@ -822,6 +873,7 @@ func TestShutdownWaitsForCallsThenClosesSessions(t *testing.T) {
 	r := newRig(t, nil)
 	session := r.connect("alice")
 	version := session.InitializeResult().ProtocolVersion
+	held := openSessions(t, r.adapter, session.ID())
 	done := make(chan error, 1)
 	go func() {
 		result, err := call(session, "demo.block_v1.0.0", map[string]any{}, nil)
@@ -847,35 +899,62 @@ func TestShutdownWaitsForCallsThenClosesSessions(t *testing.T) {
 	if err := r.adapter.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	closed := make(chan struct{})
-	go func() { _ = session.Wait(); close(closed) }()
-	select {
-	case <-closed:
-	case <-time.After(5 * time.Second):
-		t.Fatal("Shutdown left the session open")
+	requireClosed(t, held)
+}
+
+// openSessions returns the sessions the server holds open, and requires
+// those with the given ids among them.
+func openSessions(t *testing.T, adapter *tmcp.Server, ids ...string) []*sdk.ServerSession {
+	t.Helper()
+	sessions := tmcp.ServerSessions(adapter)
+	for _, id := range ids {
+		if !slices.ContainsFunc(sessions, func(s *sdk.ServerSession) bool { return s.ID() == id }) {
+			t.Fatalf("the server holds no session %q", id)
+		}
+	}
+	return sessions
+}
+
+// requireClosed requires every session to close on the server's side. The
+// server offers no standalone stream (ADR 0014), so the client sees a
+// closed session only at its next request; the server's side is where
+// Shutdown's close is observable.
+func requireClosed(t *testing.T, sessions []*sdk.ServerSession) {
+	t.Helper()
+	for _, session := range sessions {
+		closed := make(chan struct{})
+		go func() { _ = session.Wait(); close(closed) }()
+		select {
+		case <-closed:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("Shutdown left session %q open", session.ID())
+		}
 	}
 }
 
 // answerProbe watches one session on the server side of the wire. It
-// orders two events: the flush that puts a tools/call answer on the POST
-// carrying the call, and the end of the session's standing GET stream.
+// records the flush that puts a tools/call answer on the POST carrying the
+// call, and the status the server gave each GET: a GET answered with
+// anything but 405 opened a standalone stream that Shutdown would end.
 type answerProbe struct {
 	seq      atomic.Int64
 	answered atomic.Int64
-	getEnded atomic.Int64
-	ended    chan struct{}
-	once     sync.Once
+	gets     atomic.Int64
+	streamed atomic.Int64
 }
 
-func newAnswerProbe() *answerProbe { return &answerProbe{ended: make(chan struct{})} }
+func newAnswerProbe() *answerProbe { return &answerProbe{} }
 
 func (p *answerProbe) wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch request.Method {
 		case http.MethodGet:
-			next.ServeHTTP(writer, request)
-			p.getEnded.CompareAndSwap(0, p.seq.Add(1))
-			p.once.Do(func() { close(p.ended) })
+			status := &statusWriter{ResponseWriter: writer}
+			p.gets.Add(1)
+			next.ServeHTTP(status, request)
+			if status.status != http.StatusMethodNotAllowed {
+				p.streamed.Add(1)
+			}
 			return
 		case http.MethodPost:
 			body, _ := io.ReadAll(request.Body)
@@ -887,6 +966,35 @@ func (p *answerProbe) wrap(next http.Handler) http.Handler {
 		next.ServeHTTP(writer, request)
 	})
 }
+
+// statusWriter records the status a response started with.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *statusWriter) Write(data []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.ResponseWriter.Write(data)
+}
+
+func (w *statusWriter) Flush() {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	_ = http.NewResponseController(w.ResponseWriter).Flush()
+}
+
+func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 // answerWriter records the flush that follows the write of an answer.
 type answerWriter struct {
@@ -914,26 +1022,26 @@ func (w *answerWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 // flight, then lets the call finish (#197). The SDK writes the answer after
 // the tool handler returns; the test holds it there briefly, so a Shutdown
 // that closes the session as soon as the call ends always beats it. On the
-// wire, the answer must be written and flushed before Shutdown ends the
-// session's standing stream, and the client must get it. The client
-// reconnects its standing stream as the SDK does by default: one that
-// treats the end of that stream as fatal at once can still fail the call,
-// because it reads the stream's end and the answer on separate
-// connections, in no fixed order (ADR 0014).
+// wire, the answer must be written and flushed, and the client must get it.
+//
+// The client treats the end of a standalone stream as fatal at once
+// (MaxRetries below zero), as any client that disables retries does. Go SDK
+// v1.8.0 such a client fails the whole connection, and the call with it,
+// when that stream ends, even after the answer is on the wire: it reads the
+// two on separate connections in no fixed order. The server therefore
+// offers no standalone stream: it refuses every GET with 405, so Shutdown
+// has no stream to end and the client nothing to misread (ADR 0014).
 func TestShutdownAnswersTheCallInFlight(t *testing.T) {
 	const trials = 100
-	unwritten, late, lost := 0, 0, 0
+	unwritten, streamed, lost, gets := 0, 0, 0, int64(0)
 	for trial := range trials {
 		probe := newAnswerProbe()
 		r := newWrappedRig(t, nil, probe.wrap)
-		client := sdk.NewClient(&sdk.Implementation{Name: "integration-client", Version: "1.0.0"}, nil)
-		transport := &sdk.StreamableClientTransport{Endpoint: r.endpoint, HTTPClient: &http.Client{Transport: recordingClient{token: "alice", log: r.wire}}}
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		session, err := client.Connect(ctx, transport, nil)
-		cancel()
+		session, err := r.dial("alice")
 		if err != nil {
 			t.Fatalf("trial %d: connect: %v", trial, err)
 		}
+		held := openSessions(t, r.adapter, session.ID())
 		tmcp.HoldAnswers(r.adapter, 5*time.Millisecond)
 		done := make(chan error, 1)
 		go func() {
@@ -945,7 +1053,11 @@ func TestShutdownAnswersTheCallInFlight(t *testing.T) {
 		}()
 		<-r.catalog.started
 		stopped := make(chan error, 1)
-		go func() { stopped <- r.adapter.Shutdown(context.Background()) }()
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			stopped <- r.adapter.Shutdown(ctx)
+		}()
 		close(r.catalog.release)
 		if err := <-done; err != nil {
 			lost++
@@ -954,24 +1066,26 @@ func TestShutdownAnswersTheCallInFlight(t *testing.T) {
 		if err := <-stopped; err != nil {
 			t.Fatalf("trial %d: shutdown: %v", trial, err)
 		}
-		select {
-		case <-probe.ended:
-		case <-time.After(5 * time.Second):
-			t.Fatalf("trial %d: Shutdown left the session open", trial)
-		}
-		switch answered, ended := probe.answered.Load(), probe.getEnded.Load(); {
-		case answered == 0:
+		requireClosed(t, held)
+		if probe.answered.Load() == 0 {
 			unwritten++
 			t.Logf("trial %d: the answer was never written", trial)
-		case answered > ended:
-			late++
-			t.Logf("trial %d: the session's stream ended before the answer was written", trial)
 		}
+		if n := probe.streamed.Load(); n != 0 {
+			streamed++
+			t.Logf("trial %d: %d GETs opened a standalone stream", trial, n)
+		}
+		gets += probe.gets.Load()
 		_ = session.Close()
 		r.stop()
 	}
-	if unwritten+late+lost != 0 {
-		t.Fatalf("of %d calls in flight at Shutdown: %d answers never written, %d written after the session's stream ended, %d not received", trials, unwritten, late, lost)
+	if unwritten+streamed+lost != 0 {
+		t.Fatalf("of %d calls in flight at Shutdown: %d answers never written, %d sessions served a standalone stream, %d answers not received", trials, unwritten, streamed, lost)
+	}
+	// The client asks for the standalone stream: the 405 was exercised, not
+	// merely never requested.
+	if gets == 0 {
+		t.Fatal("the client never asked for a standalone stream")
 	}
 }
 
@@ -994,18 +1108,13 @@ func TestEvictedViewsSessionsCloseOnShutdown(t *testing.T) {
 			t.Fatalf("result=%+v err=%v", result, err)
 		}
 	}
+	// alice's first session is reachable only through the registry: her
+	// view was evicted.
+	held := openSessions(t, r.adapter, first.ID(), second.ID())
 	if err := r.adapter.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	for _, s := range []*sdk.ClientSession{first, second} {
-		closed := make(chan struct{})
-		go func() { _ = s.Wait(); close(closed) }()
-		select {
-		case <-closed:
-		case <-time.After(5 * time.Second):
-			t.Fatal("Shutdown left a session open")
-		}
-	}
+	requireClosed(t, held)
 }
 
 // TestNoGoroutinesOutliveTheServer runs sessions and calls, stops

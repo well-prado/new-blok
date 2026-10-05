@@ -1,0 +1,10 @@
+{
+  "fixtureVersion": 1,
+  "synthetic": true,
+  "name": "concurrent-admission-with-free-capacity",
+  "limits": {"partitions": 8, "partitionAdmissions": 16, "tenantAdmissions": 4},
+  "tenants": 12,
+  "ingressClients": 2,
+  "rounds": 5,
+  "expected": {"acceptedPerRound": 12, "admissionFullPerRound": 0, "unavailablePerRound": 0, "activeRunsPerRound": 12, "distinctGlobalSlotsPerRound": 12}
+}

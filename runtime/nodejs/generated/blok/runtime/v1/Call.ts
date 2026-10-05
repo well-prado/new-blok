@@ -16,6 +16,8 @@ export interface Call {
   'blobs'?: (_blok_runtime_v1_BlobRef)[];
   'principal'?: (string);
   'capabilities'?: (string)[];
+  'traceparent'?: (string);
+  'tracestate'?: (string);
 }
 
 export interface Call__Output {
@@ -30,4 +32,6 @@ export interface Call__Output {
   'blobs': (_blok_runtime_v1_BlobRef__Output)[];
   'principal': (string);
   'capabilities': (string)[];
+  'traceparent': (string);
+  'tracestate': (string);
 }

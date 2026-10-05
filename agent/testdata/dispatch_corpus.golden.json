@@ -1,0 +1,2002 @@
+{
+  "child-with-literal": {
+    "RegisterError": "",
+    "Listings": {
+      "conf/audit@1.0.0": [
+        "sha256:a690e924b6407d7f403d50a63f325ca14557706bbf072ee99d92cb32473c08b2",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/child@1.0.0": [
+        "sha256:2aec573e18e6abb63a794b1bdd9613755d15b467f5173cb71f524eb4ae6647e7",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/commit@1.0.0": [
+        "sha256:60480374de5fcc669a64a09cb6ddc3d0b52446673dfc46177f61997eec7a637e",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/label@1.0.0": [
+        "sha256:6326fd5638643a97bbec0bf406bf6039a0c7a870691b9f036820f2769f0e6829",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/normalize@1.0.0": [
+        "sha256:a95b139ae3707bff24785dff9c598d44d19514228de67b50d6a3e3b91dd25f6a",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/reserve@1.0.0": [
+        "sha256:49764b4376fc081556502e2ffc5c13c4e45b862c3b6f4481cc945b5428a17533",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/workflow@1.0.0": [
+        "sha256:2af0c852c25449e60427abb8e1a8564d2d3dd49c4e3061f3dc4b4b4474f34a20",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ]
+    },
+    "Invocations": [
+      {
+        "Input": "{\"sku\":\"coffee\",\"quantity\":2}",
+        "Output": "{\"committed\":\"child-tea\",\"quantity\":5}",
+        "Error": "",
+        "Admitted": [
+          {
+            "Name": "conf/workflow",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:2af0c852c25449e60427abb8e1a8564d2d3dd49c4e3061f3dc4b4b4474f34a20",
+            "ArtifactDigest": "sha256:2af0c852c25449e60427abb8e1a8564d2d3dd49c4e3061f3dc4b4b4474f34a20",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:35ee91f6ad7b90f42e521c74b6dc8fe33d276fb0ba2042fbb1da4abc4ceac944",
+            "Input": "{\"quantity\":2,\"sku\":\"coffee\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/reserve",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:2af0c852c25449e60427abb8e1a8564d2d3dd49c4e3061f3dc4b4b4474f34a20",
+            "ArtifactDigest": "sha256:49764b4376fc081556502e2ffc5c13c4e45b862c3b6f4481cc945b5428a17533",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:35ee91f6ad7b90f42e521c74b6dc8fe33d276fb0ba2042fbb1da4abc4ceac944",
+            "Input": "{\"quantity\":2,\"sku\":\"coffee\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/child",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:2af0c852c25449e60427abb8e1a8564d2d3dd49c4e3061f3dc4b4b4474f34a20",
+            "ArtifactDigest": "sha256:2aec573e18e6abb63a794b1bdd9613755d15b467f5173cb71f524eb4ae6647e7",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:189e4a479affef113f99c3e12a331d094bce082bb15bae99fcaca1d31c06b972",
+            "Input": "{\"quantity\":2,\"sku\":\"reserved-coffee\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/reserve",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:2af0c852c25449e60427abb8e1a8564d2d3dd49c4e3061f3dc4b4b4474f34a20",
+            "ArtifactDigest": "sha256:49764b4376fc081556502e2ffc5c13c4e45b862c3b6f4481cc945b5428a17533",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:189e4a479affef113f99c3e12a331d094bce082bb15bae99fcaca1d31c06b972",
+            "Input": "{\"quantity\":2,\"sku\":\"reserved-coffee\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/commit",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:2af0c852c25449e60427abb8e1a8564d2d3dd49c4e3061f3dc4b4b4474f34a20",
+            "ArtifactDigest": "sha256:60480374de5fcc669a64a09cb6ddc3d0b52446673dfc46177f61997eec7a637e",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:c84da37c3cfc3311386e690e0f12fd3bd8821c0b45803c88e6f115d94cba8191",
+            "Input": "{\"quantity\":5,\"sku\":\"child-tea\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          }
+        ],
+        "Published": [
+          {
+            "Name": "conf/reserve",
+            "Output": "{\"body\":{\"quantity\":2,\"sku\":\"reserved-coffee\"},\"id\":\"r-coffee\"}"
+          },
+          {
+            "Name": "conf/reserve",
+            "Output": "{\"body\":{\"quantity\":2,\"sku\":\"reserved-reserved-coffee\"},\"id\":\"r-reserved-coffee\"}"
+          },
+          {
+            "Name": "conf/commit",
+            "Output": "{\"committed\":\"child-tea\",\"quantity\":5}"
+          },
+          {
+            "Name": "conf/child",
+            "Output": "{\"committed\":\"child-tea\",\"quantity\":5}"
+          },
+          {
+            "Name": "conf/workflow",
+            "Output": "{\"committed\":\"child-tea\",\"quantity\":5}"
+          }
+        ],
+        "NodeInputs": {
+          "conf/commit": [
+            "{\"quantity\":5,\"sku\":\"child-tea\"}"
+          ],
+          "conf/reserve": [
+            "{\"quantity\":2,\"sku\":\"coffee\"}",
+            "{\"quantity\":2,\"sku\":\"reserved-coffee\"}"
+          ]
+        }
+      },
+      {
+        "Input": "{\"quantity\":7,\"sku\":\"SECRET\"}",
+        "Output": "{\"committed\":\"child-tea\",\"quantity\":5}",
+        "Error": "",
+        "Admitted": [
+          {
+            "Name": "conf/workflow",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:2af0c852c25449e60427abb8e1a8564d2d3dd49c4e3061f3dc4b4b4474f34a20",
+            "ArtifactDigest": "sha256:2af0c852c25449e60427abb8e1a8564d2d3dd49c4e3061f3dc4b4b4474f34a20",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:53c0b050efb93e327701f1c392743e0184a5e2920aa3da8c7c5d28831e801e3e",
+            "Input": "{\"quantity\":7,\"sku\":\"SECRET\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/reserve",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:2af0c852c25449e60427abb8e1a8564d2d3dd49c4e3061f3dc4b4b4474f34a20",
+            "ArtifactDigest": "sha256:49764b4376fc081556502e2ffc5c13c4e45b862c3b6f4481cc945b5428a17533",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:53c0b050efb93e327701f1c392743e0184a5e2920aa3da8c7c5d28831e801e3e",
+            "Input": "{\"quantity\":7,\"sku\":\"SECRET\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/child",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:2af0c852c25449e60427abb8e1a8564d2d3dd49c4e3061f3dc4b4b4474f34a20",
+            "ArtifactDigest": "sha256:2aec573e18e6abb63a794b1bdd9613755d15b467f5173cb71f524eb4ae6647e7",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:e5e5a9f7ed5fdb9a9eb2d5a35195b507064b2d0342945177700fc2adfc2cd370",
+            "Input": "{\"quantity\":7,\"sku\":\"reserved-SECRET\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/reserve",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:2af0c852c25449e60427abb8e1a8564d2d3dd49c4e3061f3dc4b4b4474f34a20",
+            "ArtifactDigest": "sha256:49764b4376fc081556502e2ffc5c13c4e45b862c3b6f4481cc945b5428a17533",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:e5e5a9f7ed5fdb9a9eb2d5a35195b507064b2d0342945177700fc2adfc2cd370",
+            "Input": "{\"quantity\":7,\"sku\":\"reserved-SECRET\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/commit",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:2af0c852c25449e60427abb8e1a8564d2d3dd49c4e3061f3dc4b4b4474f34a20",
+            "ArtifactDigest": "sha256:60480374de5fcc669a64a09cb6ddc3d0b52446673dfc46177f61997eec7a637e",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:c84da37c3cfc3311386e690e0f12fd3bd8821c0b45803c88e6f115d94cba8191",
+            "Input": "{\"quantity\":5,\"sku\":\"child-tea\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          }
+        ],
+        "Published": [
+          {
+            "Name": "conf/reserve",
+            "Output": "{\"body\":{\"quantity\":7,\"sku\":\"reserved-SECRET\"},\"id\":\"r-SECRET\"}"
+          },
+          {
+            "Name": "conf/reserve",
+            "Output": "{\"body\":{\"quantity\":7,\"sku\":\"reserved-reserved-SECRET\"},\"id\":\"r-reserved-SECRET\"}"
+          },
+          {
+            "Name": "conf/commit",
+            "Output": "{\"committed\":\"child-tea\",\"quantity\":5}"
+          },
+          {
+            "Name": "conf/child",
+            "Output": "{\"committed\":\"child-tea\",\"quantity\":5}"
+          },
+          {
+            "Name": "conf/workflow",
+            "Output": "{\"committed\":\"child-tea\",\"quantity\":5}"
+          }
+        ],
+        "NodeInputs": {
+          "conf/commit": [
+            "{\"quantity\":5,\"sku\":\"child-tea\"}"
+          ],
+          "conf/reserve": [
+            "{\"quantity\":7,\"sku\":\"SECRET\"}",
+            "{\"quantity\":7,\"sku\":\"reserved-SECRET\"}"
+          ]
+        }
+      }
+    ]
+  },
+  "field-select-string": {
+    "RegisterError": "",
+    "Listings": {
+      "conf/audit@1.0.0": [
+        "sha256:a690e924b6407d7f403d50a63f325ca14557706bbf072ee99d92cb32473c08b2",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/commit@1.0.0": [
+        "sha256:60480374de5fcc669a64a09cb6ddc3d0b52446673dfc46177f61997eec7a637e",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/label@1.0.0": [
+        "sha256:6326fd5638643a97bbec0bf406bf6039a0c7a870691b9f036820f2769f0e6829",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/normalize@1.0.0": [
+        "sha256:a95b139ae3707bff24785dff9c598d44d19514228de67b50d6a3e3b91dd25f6a",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/reserve@1.0.0": [
+        "sha256:49764b4376fc081556502e2ffc5c13c4e45b862c3b6f4481cc945b5428a17533",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/workflow@1.0.0": [
+        "sha256:de632ea4554c4858f7aaf72d88c5a4809405d6d3264a83781323cb64ac8feb6d",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ]
+    },
+    "Invocations": [
+      {
+        "Input": "{\"sku\":\"coffee\",\"quantity\":2}",
+        "Output": "{\"label\":\"label:r-coffee\"}",
+        "Error": "",
+        "Admitted": [
+          {
+            "Name": "conf/workflow",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:de632ea4554c4858f7aaf72d88c5a4809405d6d3264a83781323cb64ac8feb6d",
+            "ArtifactDigest": "sha256:de632ea4554c4858f7aaf72d88c5a4809405d6d3264a83781323cb64ac8feb6d",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:35ee91f6ad7b90f42e521c74b6dc8fe33d276fb0ba2042fbb1da4abc4ceac944",
+            "Input": "{\"quantity\":2,\"sku\":\"coffee\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/reserve",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:de632ea4554c4858f7aaf72d88c5a4809405d6d3264a83781323cb64ac8feb6d",
+            "ArtifactDigest": "sha256:49764b4376fc081556502e2ffc5c13c4e45b862c3b6f4481cc945b5428a17533",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:35ee91f6ad7b90f42e521c74b6dc8fe33d276fb0ba2042fbb1da4abc4ceac944",
+            "Input": "{\"quantity\":2,\"sku\":\"coffee\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/label",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:de632ea4554c4858f7aaf72d88c5a4809405d6d3264a83781323cb64ac8feb6d",
+            "ArtifactDigest": "sha256:6326fd5638643a97bbec0bf406bf6039a0c7a870691b9f036820f2769f0e6829",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:025f77228cbcce44745ce4e841ff05f157e14f9969cc747a147d120a68c59ac1",
+            "Input": "\"r-coffee\"",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          }
+        ],
+        "Published": [
+          {
+            "Name": "conf/reserve",
+            "Output": "{\"body\":{\"quantity\":2,\"sku\":\"reserved-coffee\"},\"id\":\"r-coffee\"}"
+          },
+          {
+            "Name": "conf/label",
+            "Output": "{\"label\":\"label:r-coffee\"}"
+          },
+          {
+            "Name": "conf/workflow",
+            "Output": "{\"label\":\"label:r-coffee\"}"
+          }
+        ],
+        "NodeInputs": {
+          "conf/label": [
+            "\"r-coffee\""
+          ],
+          "conf/reserve": [
+            "{\"quantity\":2,\"sku\":\"coffee\"}"
+          ]
+        }
+      },
+      {
+        "Input": "{\"quantity\":7,\"sku\":\"SECRET\"}",
+        "Output": "{\"label\":\"label:r-SECRET\"}",
+        "Error": "",
+        "Admitted": [
+          {
+            "Name": "conf/workflow",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:de632ea4554c4858f7aaf72d88c5a4809405d6d3264a83781323cb64ac8feb6d",
+            "ArtifactDigest": "sha256:de632ea4554c4858f7aaf72d88c5a4809405d6d3264a83781323cb64ac8feb6d",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:53c0b050efb93e327701f1c392743e0184a5e2920aa3da8c7c5d28831e801e3e",
+            "Input": "{\"quantity\":7,\"sku\":\"SECRET\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/reserve",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:de632ea4554c4858f7aaf72d88c5a4809405d6d3264a83781323cb64ac8feb6d",
+            "ArtifactDigest": "sha256:49764b4376fc081556502e2ffc5c13c4e45b862c3b6f4481cc945b5428a17533",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:53c0b050efb93e327701f1c392743e0184a5e2920aa3da8c7c5d28831e801e3e",
+            "Input": "{\"quantity\":7,\"sku\":\"SECRET\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/label",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:de632ea4554c4858f7aaf72d88c5a4809405d6d3264a83781323cb64ac8feb6d",
+            "ArtifactDigest": "sha256:6326fd5638643a97bbec0bf406bf6039a0c7a870691b9f036820f2769f0e6829",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:3aae8c6380b5a717c3bf52eccdd73e13a44e9f292114c13506318b16cbd6df5a",
+            "Input": "\"r-SECRET\"",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          }
+        ],
+        "Published": [
+          {
+            "Name": "conf/reserve",
+            "Output": "{\"body\":{\"quantity\":7,\"sku\":\"reserved-SECRET\"},\"id\":\"r-SECRET\"}"
+          },
+          {
+            "Name": "conf/label",
+            "Output": "{\"label\":\"label:r-SECRET\"}"
+          },
+          {
+            "Name": "conf/workflow",
+            "Output": "{\"label\":\"label:r-SECRET\"}"
+          }
+        ],
+        "NodeInputs": {
+          "conf/label": [
+            "\"r-SECRET\""
+          ],
+          "conf/reserve": [
+            "{\"quantity\":7,\"sku\":\"SECRET\"}"
+          ]
+        }
+      }
+    ]
+  },
+  "input-chain": {
+    "RegisterError": "",
+    "Listings": {
+      "conf/audit@1.0.0": [
+        "sha256:a690e924b6407d7f403d50a63f325ca14557706bbf072ee99d92cb32473c08b2",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/commit@1.0.0": [
+        "sha256:60480374de5fcc669a64a09cb6ddc3d0b52446673dfc46177f61997eec7a637e",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/label@1.0.0": [
+        "sha256:6326fd5638643a97bbec0bf406bf6039a0c7a870691b9f036820f2769f0e6829",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/normalize@1.0.0": [
+        "sha256:a95b139ae3707bff24785dff9c598d44d19514228de67b50d6a3e3b91dd25f6a",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/reserve@1.0.0": [
+        "sha256:49764b4376fc081556502e2ffc5c13c4e45b862c3b6f4481cc945b5428a17533",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/workflow@1.0.0": [
+        "sha256:69b58e8e7bb26ddb3368b7182d15a18770da5b10f3dbfe783e6f4ab1e155f6d3",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ]
+    },
+    "Invocations": [
+      {
+        "Input": "{\"sku\":\"coffee\",\"quantity\":2}",
+        "Output": "{\"committed\":\"reserved-coffee\",\"quantity\":2}",
+        "Error": "",
+        "Admitted": [
+          {
+            "Name": "conf/workflow",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:69b58e8e7bb26ddb3368b7182d15a18770da5b10f3dbfe783e6f4ab1e155f6d3",
+            "ArtifactDigest": "sha256:69b58e8e7bb26ddb3368b7182d15a18770da5b10f3dbfe783e6f4ab1e155f6d3",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:35ee91f6ad7b90f42e521c74b6dc8fe33d276fb0ba2042fbb1da4abc4ceac944",
+            "Input": "{\"quantity\":2,\"sku\":\"coffee\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/reserve",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:69b58e8e7bb26ddb3368b7182d15a18770da5b10f3dbfe783e6f4ab1e155f6d3",
+            "ArtifactDigest": "sha256:49764b4376fc081556502e2ffc5c13c4e45b862c3b6f4481cc945b5428a17533",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:35ee91f6ad7b90f42e521c74b6dc8fe33d276fb0ba2042fbb1da4abc4ceac944",
+            "Input": "{\"quantity\":2,\"sku\":\"coffee\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/commit",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:69b58e8e7bb26ddb3368b7182d15a18770da5b10f3dbfe783e6f4ab1e155f6d3",
+            "ArtifactDigest": "sha256:60480374de5fcc669a64a09cb6ddc3d0b52446673dfc46177f61997eec7a637e",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:189e4a479affef113f99c3e12a331d094bce082bb15bae99fcaca1d31c06b972",
+            "Input": "{\"quantity\":2,\"sku\":\"reserved-coffee\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          }
+        ],
+        "Published": [
+          {
+            "Name": "conf/reserve",
+            "Output": "{\"body\":{\"quantity\":2,\"sku\":\"reserved-coffee\"},\"id\":\"r-coffee\"}"
+          },
+          {
+            "Name": "conf/commit",
+            "Output": "{\"committed\":\"reserved-coffee\",\"quantity\":2}"
+          },
+          {
+            "Name": "conf/workflow",
+            "Output": "{\"committed\":\"reserved-coffee\",\"quantity\":2}"
+          }
+        ],
+        "NodeInputs": {
+          "conf/commit": [
+            "{\"quantity\":2,\"sku\":\"reserved-coffee\"}"
+          ],
+          "conf/reserve": [
+            "{\"quantity\":2,\"sku\":\"coffee\"}"
+          ]
+        }
+      },
+      {
+        "Input": "{\"quantity\":7,\"sku\":\"SECRET\"}",
+        "Output": "{\"committed\":\"reserved-SECRET\",\"quantity\":7}",
+        "Error": "",
+        "Admitted": [
+          {
+            "Name": "conf/workflow",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:69b58e8e7bb26ddb3368b7182d15a18770da5b10f3dbfe783e6f4ab1e155f6d3",
+            "ArtifactDigest": "sha256:69b58e8e7bb26ddb3368b7182d15a18770da5b10f3dbfe783e6f4ab1e155f6d3",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:53c0b050efb93e327701f1c392743e0184a5e2920aa3da8c7c5d28831e801e3e",
+            "Input": "{\"quantity\":7,\"sku\":\"SECRET\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/reserve",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:69b58e8e7bb26ddb3368b7182d15a18770da5b10f3dbfe783e6f4ab1e155f6d3",
+            "ArtifactDigest": "sha256:49764b4376fc081556502e2ffc5c13c4e45b862c3b6f4481cc945b5428a17533",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:53c0b050efb93e327701f1c392743e0184a5e2920aa3da8c7c5d28831e801e3e",
+            "Input": "{\"quantity\":7,\"sku\":\"SECRET\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/commit",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:69b58e8e7bb26ddb3368b7182d15a18770da5b10f3dbfe783e6f4ab1e155f6d3",
+            "ArtifactDigest": "sha256:60480374de5fcc669a64a09cb6ddc3d0b52446673dfc46177f61997eec7a637e",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:e5e5a9f7ed5fdb9a9eb2d5a35195b507064b2d0342945177700fc2adfc2cd370",
+            "Input": "{\"quantity\":7,\"sku\":\"reserved-SECRET\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          }
+        ],
+        "Published": [
+          {
+            "Name": "conf/reserve",
+            "Output": "{\"body\":{\"quantity\":7,\"sku\":\"reserved-SECRET\"},\"id\":\"r-SECRET\"}"
+          },
+          {
+            "Name": "conf/commit",
+            "Output": "{\"committed\":\"reserved-SECRET\",\"quantity\":7}"
+          },
+          {
+            "Name": "conf/workflow",
+            "Output": "{\"committed\":\"reserved-SECRET\",\"quantity\":7}"
+          }
+        ],
+        "NodeInputs": {
+          "conf/commit": [
+            "{\"quantity\":7,\"sku\":\"reserved-SECRET\"}"
+          ],
+          "conf/reserve": [
+            "{\"quantity\":7,\"sku\":\"SECRET\"}"
+          ]
+        }
+      }
+    ]
+  },
+  "invalid-literal": {
+    "RegisterError": "agent: tool is not agent-safe: call \"commit\": literal input does not satisfy the input schema of conf/commit@1.0.0: type_mismatch at $.quantity: expected integer",
+    "Listings": {
+      "conf/audit@1.0.0": [
+        "sha256:a690e924b6407d7f403d50a63f325ca14557706bbf072ee99d92cb32473c08b2",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/commit@1.0.0": [
+        "sha256:60480374de5fcc669a64a09cb6ddc3d0b52446673dfc46177f61997eec7a637e",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/label@1.0.0": [
+        "sha256:6326fd5638643a97bbec0bf406bf6039a0c7a870691b9f036820f2769f0e6829",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/normalize@1.0.0": [
+        "sha256:a95b139ae3707bff24785dff9c598d44d19514228de67b50d6a3e3b91dd25f6a",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/reserve@1.0.0": [
+        "sha256:49764b4376fc081556502e2ffc5c13c4e45b862c3b6f4481cc945b5428a17533",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ]
+    },
+    "Invocations": null
+  },
+  "literal-only": {
+    "RegisterError": "",
+    "Listings": {
+      "conf/audit@1.0.0": [
+        "sha256:a690e924b6407d7f403d50a63f325ca14557706bbf072ee99d92cb32473c08b2",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/commit@1.0.0": [
+        "sha256:60480374de5fcc669a64a09cb6ddc3d0b52446673dfc46177f61997eec7a637e",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/label@1.0.0": [
+        "sha256:6326fd5638643a97bbec0bf406bf6039a0c7a870691b9f036820f2769f0e6829",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/normalize@1.0.0": [
+        "sha256:a95b139ae3707bff24785dff9c598d44d19514228de67b50d6a3e3b91dd25f6a",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/reserve@1.0.0": [
+        "sha256:49764b4376fc081556502e2ffc5c13c4e45b862c3b6f4481cc945b5428a17533",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/workflow@1.0.0": [
+        "sha256:90bd90c8f1b3620719a13ace3fe8b8d36b0d42d55f39844d8584a375450fba24",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ]
+    },
+    "Invocations": [
+      {
+        "Input": "{\"sku\":\"coffee\",\"quantity\":2}",
+        "Output": "{\"committed\":\"tea\",\"quantity\":1}",
+        "Error": "",
+        "Admitted": [
+          {
+            "Name": "conf/workflow",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:90bd90c8f1b3620719a13ace3fe8b8d36b0d42d55f39844d8584a375450fba24",
+            "ArtifactDigest": "sha256:90bd90c8f1b3620719a13ace3fe8b8d36b0d42d55f39844d8584a375450fba24",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:35ee91f6ad7b90f42e521c74b6dc8fe33d276fb0ba2042fbb1da4abc4ceac944",
+            "Input": "{\"quantity\":2,\"sku\":\"coffee\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/commit",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:90bd90c8f1b3620719a13ace3fe8b8d36b0d42d55f39844d8584a375450fba24",
+            "ArtifactDigest": "sha256:60480374de5fcc669a64a09cb6ddc3d0b52446673dfc46177f61997eec7a637e",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:27623a6783d6a485e45ed24830ef9d2d9e664f5b3591d30f644caddab85ba66f",
+            "Input": "{\"quantity\":1,\"sku\":\"tea\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          }
+        ],
+        "Published": [
+          {
+            "Name": "conf/commit",
+            "Output": "{\"committed\":\"tea\",\"quantity\":1}"
+          },
+          {
+            "Name": "conf/workflow",
+            "Output": "{\"committed\":\"tea\",\"quantity\":1}"
+          }
+        ],
+        "NodeInputs": {
+          "conf/commit": [
+            "{\"quantity\":1,\"sku\":\"tea\"}"
+          ]
+        }
+      },
+      {
+        "Input": "{\"quantity\":7,\"sku\":\"SECRET\"}",
+        "Output": "{\"committed\":\"tea\",\"quantity\":1}",
+        "Error": "",
+        "Admitted": [
+          {
+            "Name": "conf/workflow",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:90bd90c8f1b3620719a13ace3fe8b8d36b0d42d55f39844d8584a375450fba24",
+            "ArtifactDigest": "sha256:90bd90c8f1b3620719a13ace3fe8b8d36b0d42d55f39844d8584a375450fba24",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:53c0b050efb93e327701f1c392743e0184a5e2920aa3da8c7c5d28831e801e3e",
+            "Input": "{\"quantity\":7,\"sku\":\"SECRET\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/commit",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:90bd90c8f1b3620719a13ace3fe8b8d36b0d42d55f39844d8584a375450fba24",
+            "ArtifactDigest": "sha256:60480374de5fcc669a64a09cb6ddc3d0b52446673dfc46177f61997eec7a637e",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:27623a6783d6a485e45ed24830ef9d2d9e664f5b3591d30f644caddab85ba66f",
+            "Input": "{\"quantity\":1,\"sku\":\"tea\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          }
+        ],
+        "Published": [
+          {
+            "Name": "conf/commit",
+            "Output": "{\"committed\":\"tea\",\"quantity\":1}"
+          },
+          {
+            "Name": "conf/workflow",
+            "Output": "{\"committed\":\"tea\",\"quantity\":1}"
+          }
+        ],
+        "NodeInputs": {
+          "conf/commit": [
+            "{\"quantity\":1,\"sku\":\"tea\"}"
+          ]
+        }
+      }
+    ]
+  },
+  "literal-over-invocation-budget": {
+    "RegisterError": "",
+    "Listings": {
+      "conf/audit@1.0.0": [
+        "sha256:a690e924b6407d7f403d50a63f325ca14557706bbf072ee99d92cb32473c08b2",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/commit@1.0.0": [
+        "sha256:60480374de5fcc669a64a09cb6ddc3d0b52446673dfc46177f61997eec7a637e",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/label@1.0.0": [
+        "sha256:6326fd5638643a97bbec0bf406bf6039a0c7a870691b9f036820f2769f0e6829",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/normalize@1.0.0": [
+        "sha256:a95b139ae3707bff24785dff9c598d44d19514228de67b50d6a3e3b91dd25f6a",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/reserve@1.0.0": [
+        "sha256:49764b4376fc081556502e2ffc5c13c4e45b862c3b6f4481cc945b5428a17533",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/workflow@1.0.0": [
+        "sha256:997d0d43ab77a5e968068d18044df506ba590c8866e0e4b3ea2dd336e6c016cd",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ]
+    },
+    "Invocations": [
+      {
+        "Input": "{\"sku\":\"coffee\",\"quantity\":2}",
+        "Output": "",
+        "Error": "node_error: agent: execution budget exceeded",
+        "Admitted": [
+          {
+            "Name": "conf/workflow",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:997d0d43ab77a5e968068d18044df506ba590c8866e0e4b3ea2dd336e6c016cd",
+            "ArtifactDigest": "sha256:997d0d43ab77a5e968068d18044df506ba590c8866e0e4b3ea2dd336e6c016cd",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:35ee91f6ad7b90f42e521c74b6dc8fe33d276fb0ba2042fbb1da4abc4ceac944",
+            "Input": "{\"quantity\":2,\"sku\":\"coffee\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 1024,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/reserve",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:997d0d43ab77a5e968068d18044df506ba590c8866e0e4b3ea2dd336e6c016cd",
+            "ArtifactDigest": "sha256:49764b4376fc081556502e2ffc5c13c4e45b862c3b6f4481cc945b5428a17533",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:35ee91f6ad7b90f42e521c74b6dc8fe33d276fb0ba2042fbb1da4abc4ceac944",
+            "Input": "{\"quantity\":2,\"sku\":\"coffee\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 1024,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          }
+        ],
+        "Published": [
+          {
+            "Name": "conf/reserve",
+            "Output": "{\"body\":{\"quantity\":2,\"sku\":\"reserved-coffee\"},\"id\":\"r-coffee\"}"
+          }
+        ],
+        "NodeInputs": {
+          "conf/reserve": [
+            "{\"quantity\":2,\"sku\":\"coffee\"}"
+          ]
+        }
+      },
+      {
+        "Input": "{\"quantity\":7,\"sku\":\"SECRET\"}",
+        "Output": "",
+        "Error": "node_error: agent: execution budget exceeded",
+        "Admitted": [
+          {
+            "Name": "conf/workflow",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:997d0d43ab77a5e968068d18044df506ba590c8866e0e4b3ea2dd336e6c016cd",
+            "ArtifactDigest": "sha256:997d0d43ab77a5e968068d18044df506ba590c8866e0e4b3ea2dd336e6c016cd",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:53c0b050efb93e327701f1c392743e0184a5e2920aa3da8c7c5d28831e801e3e",
+            "Input": "{\"quantity\":7,\"sku\":\"SECRET\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 1024,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/reserve",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:997d0d43ab77a5e968068d18044df506ba590c8866e0e4b3ea2dd336e6c016cd",
+            "ArtifactDigest": "sha256:49764b4376fc081556502e2ffc5c13c4e45b862c3b6f4481cc945b5428a17533",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:53c0b050efb93e327701f1c392743e0184a5e2920aa3da8c7c5d28831e801e3e",
+            "Input": "{\"quantity\":7,\"sku\":\"SECRET\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 1024,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          }
+        ],
+        "Published": [
+          {
+            "Name": "conf/reserve",
+            "Output": "{\"body\":{\"quantity\":7,\"sku\":\"reserved-SECRET\"},\"id\":\"r-SECRET\"}"
+          }
+        ],
+        "NodeInputs": {
+          "conf/reserve": [
+            "{\"quantity\":7,\"sku\":\"SECRET\"}"
+          ]
+        }
+      }
+    ]
+  },
+  "literal-string": {
+    "RegisterError": "",
+    "Listings": {
+      "conf/audit@1.0.0": [
+        "sha256:a690e924b6407d7f403d50a63f325ca14557706bbf072ee99d92cb32473c08b2",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/commit@1.0.0": [
+        "sha256:60480374de5fcc669a64a09cb6ddc3d0b52446673dfc46177f61997eec7a637e",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/label@1.0.0": [
+        "sha256:6326fd5638643a97bbec0bf406bf6039a0c7a870691b9f036820f2769f0e6829",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/normalize@1.0.0": [
+        "sha256:a95b139ae3707bff24785dff9c598d44d19514228de67b50d6a3e3b91dd25f6a",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/reserve@1.0.0": [
+        "sha256:49764b4376fc081556502e2ffc5c13c4e45b862c3b6f4481cc945b5428a17533",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/workflow@1.0.0": [
+        "sha256:2532c31270c76569773b95ddbdeb0ad322d4e7bab63258ea509e292652568ad7",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ]
+    },
+    "Invocations": [
+      {
+        "Input": "{\"sku\":\"coffee\",\"quantity\":2}",
+        "Output": "{\"label\":\"label:fixed-sku\"}",
+        "Error": "",
+        "Admitted": [
+          {
+            "Name": "conf/workflow",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:2532c31270c76569773b95ddbdeb0ad322d4e7bab63258ea509e292652568ad7",
+            "ArtifactDigest": "sha256:2532c31270c76569773b95ddbdeb0ad322d4e7bab63258ea509e292652568ad7",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:35ee91f6ad7b90f42e521c74b6dc8fe33d276fb0ba2042fbb1da4abc4ceac944",
+            "Input": "{\"quantity\":2,\"sku\":\"coffee\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/reserve",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:2532c31270c76569773b95ddbdeb0ad322d4e7bab63258ea509e292652568ad7",
+            "ArtifactDigest": "sha256:49764b4376fc081556502e2ffc5c13c4e45b862c3b6f4481cc945b5428a17533",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:35ee91f6ad7b90f42e521c74b6dc8fe33d276fb0ba2042fbb1da4abc4ceac944",
+            "Input": "{\"quantity\":2,\"sku\":\"coffee\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/label",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:2532c31270c76569773b95ddbdeb0ad322d4e7bab63258ea509e292652568ad7",
+            "ArtifactDigest": "sha256:6326fd5638643a97bbec0bf406bf6039a0c7a870691b9f036820f2769f0e6829",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:4508bc94b0a873cb0df3fbe1788a8cb1701cc8f02d0e7725d21b670a23af5f81",
+            "Input": "\"fixed-sku\"",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          }
+        ],
+        "Published": [
+          {
+            "Name": "conf/reserve",
+            "Output": "{\"body\":{\"quantity\":2,\"sku\":\"reserved-coffee\"},\"id\":\"r-coffee\"}"
+          },
+          {
+            "Name": "conf/label",
+            "Output": "{\"label\":\"label:fixed-sku\"}"
+          },
+          {
+            "Name": "conf/workflow",
+            "Output": "{\"label\":\"label:fixed-sku\"}"
+          }
+        ],
+        "NodeInputs": {
+          "conf/label": [
+            "\"fixed-sku\""
+          ],
+          "conf/reserve": [
+            "{\"quantity\":2,\"sku\":\"coffee\"}"
+          ]
+        }
+      },
+      {
+        "Input": "{\"quantity\":7,\"sku\":\"SECRET\"}",
+        "Output": "{\"label\":\"label:fixed-sku\"}",
+        "Error": "",
+        "Admitted": [
+          {
+            "Name": "conf/workflow",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:2532c31270c76569773b95ddbdeb0ad322d4e7bab63258ea509e292652568ad7",
+            "ArtifactDigest": "sha256:2532c31270c76569773b95ddbdeb0ad322d4e7bab63258ea509e292652568ad7",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:53c0b050efb93e327701f1c392743e0184a5e2920aa3da8c7c5d28831e801e3e",
+            "Input": "{\"quantity\":7,\"sku\":\"SECRET\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/reserve",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:2532c31270c76569773b95ddbdeb0ad322d4e7bab63258ea509e292652568ad7",
+            "ArtifactDigest": "sha256:49764b4376fc081556502e2ffc5c13c4e45b862c3b6f4481cc945b5428a17533",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:53c0b050efb93e327701f1c392743e0184a5e2920aa3da8c7c5d28831e801e3e",
+            "Input": "{\"quantity\":7,\"sku\":\"SECRET\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/label",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:2532c31270c76569773b95ddbdeb0ad322d4e7bab63258ea509e292652568ad7",
+            "ArtifactDigest": "sha256:6326fd5638643a97bbec0bf406bf6039a0c7a870691b9f036820f2769f0e6829",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:4508bc94b0a873cb0df3fbe1788a8cb1701cc8f02d0e7725d21b670a23af5f81",
+            "Input": "\"fixed-sku\"",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          }
+        ],
+        "Published": [
+          {
+            "Name": "conf/reserve",
+            "Output": "{\"body\":{\"quantity\":7,\"sku\":\"reserved-SECRET\"},\"id\":\"r-SECRET\"}"
+          },
+          {
+            "Name": "conf/label",
+            "Output": "{\"label\":\"label:fixed-sku\"}"
+          },
+          {
+            "Name": "conf/workflow",
+            "Output": "{\"label\":\"label:fixed-sku\"}"
+          }
+        ],
+        "NodeInputs": {
+          "conf/label": [
+            "\"fixed-sku\""
+          ],
+          "conf/reserve": [
+            "{\"quantity\":7,\"sku\":\"SECRET\"}"
+          ]
+        }
+      }
+    ]
+  },
+  "mixed-literal": {
+    "RegisterError": "",
+    "Listings": {
+      "conf/audit@1.0.0": [
+        "sha256:a690e924b6407d7f403d50a63f325ca14557706bbf072ee99d92cb32473c08b2",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/commit@1.0.0": [
+        "sha256:60480374de5fcc669a64a09cb6ddc3d0b52446673dfc46177f61997eec7a637e",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/label@1.0.0": [
+        "sha256:6326fd5638643a97bbec0bf406bf6039a0c7a870691b9f036820f2769f0e6829",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/normalize@1.0.0": [
+        "sha256:a95b139ae3707bff24785dff9c598d44d19514228de67b50d6a3e3b91dd25f6a",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/reserve@1.0.0": [
+        "sha256:49764b4376fc081556502e2ffc5c13c4e45b862c3b6f4481cc945b5428a17533",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/workflow@1.0.0": [
+        "sha256:5f097e10143102458813765f2925241d024ee8393dc5655c348de9db2718b356",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ]
+    },
+    "Invocations": [
+      {
+        "Input": "{\"sku\":\"coffee\",\"quantity\":2}",
+        "Output": "{\"committed\":\"tea\",\"quantity\":1}",
+        "Error": "",
+        "Admitted": [
+          {
+            "Name": "conf/workflow",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:5f097e10143102458813765f2925241d024ee8393dc5655c348de9db2718b356",
+            "ArtifactDigest": "sha256:5f097e10143102458813765f2925241d024ee8393dc5655c348de9db2718b356",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:35ee91f6ad7b90f42e521c74b6dc8fe33d276fb0ba2042fbb1da4abc4ceac944",
+            "Input": "{\"quantity\":2,\"sku\":\"coffee\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/reserve",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:5f097e10143102458813765f2925241d024ee8393dc5655c348de9db2718b356",
+            "ArtifactDigest": "sha256:49764b4376fc081556502e2ffc5c13c4e45b862c3b6f4481cc945b5428a17533",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:35ee91f6ad7b90f42e521c74b6dc8fe33d276fb0ba2042fbb1da4abc4ceac944",
+            "Input": "{\"quantity\":2,\"sku\":\"coffee\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/commit",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:5f097e10143102458813765f2925241d024ee8393dc5655c348de9db2718b356",
+            "ArtifactDigest": "sha256:60480374de5fcc669a64a09cb6ddc3d0b52446673dfc46177f61997eec7a637e",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:27623a6783d6a485e45ed24830ef9d2d9e664f5b3591d30f644caddab85ba66f",
+            "Input": "{\"quantity\":1,\"sku\":\"tea\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/audit",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:5f097e10143102458813765f2925241d024ee8393dc5655c348de9db2718b356",
+            "ArtifactDigest": "sha256:a690e924b6407d7f403d50a63f325ca14557706bbf072ee99d92cb32473c08b2",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:0b48dd3b164e14b3921b8f7bf986711c11cbcfa0305f00124d968f775da290ee",
+            "Input": "{\"body\":{\"quantity\":2,\"sku\":\"reserved-coffee\"},\"id\":\"r-coffee\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          }
+        ],
+        "Published": [
+          {
+            "Name": "conf/reserve",
+            "Output": "{\"body\":{\"quantity\":2,\"sku\":\"reserved-coffee\"},\"id\":\"r-coffee\"}"
+          },
+          {
+            "Name": "conf/commit",
+            "Output": "{\"committed\":\"tea\",\"quantity\":1}"
+          },
+          {
+            "Name": "conf/audit",
+            "Output": "{\"audited\":\"r-coffee\"}"
+          },
+          {
+            "Name": "conf/workflow",
+            "Output": "{\"committed\":\"tea\",\"quantity\":1}"
+          }
+        ],
+        "NodeInputs": {
+          "conf/audit": [
+            "{\"body\":{\"quantity\":2,\"sku\":\"reserved-coffee\"},\"id\":\"r-coffee\"}"
+          ],
+          "conf/commit": [
+            "{\"quantity\":1,\"sku\":\"tea\"}"
+          ],
+          "conf/reserve": [
+            "{\"quantity\":2,\"sku\":\"coffee\"}"
+          ]
+        }
+      },
+      {
+        "Input": "{\"quantity\":7,\"sku\":\"SECRET\"}",
+        "Output": "{\"committed\":\"tea\",\"quantity\":1}",
+        "Error": "",
+        "Admitted": [
+          {
+            "Name": "conf/workflow",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:5f097e10143102458813765f2925241d024ee8393dc5655c348de9db2718b356",
+            "ArtifactDigest": "sha256:5f097e10143102458813765f2925241d024ee8393dc5655c348de9db2718b356",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:53c0b050efb93e327701f1c392743e0184a5e2920aa3da8c7c5d28831e801e3e",
+            "Input": "{\"quantity\":7,\"sku\":\"SECRET\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/reserve",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:5f097e10143102458813765f2925241d024ee8393dc5655c348de9db2718b356",
+            "ArtifactDigest": "sha256:49764b4376fc081556502e2ffc5c13c4e45b862c3b6f4481cc945b5428a17533",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:53c0b050efb93e327701f1c392743e0184a5e2920aa3da8c7c5d28831e801e3e",
+            "Input": "{\"quantity\":7,\"sku\":\"SECRET\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/commit",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:5f097e10143102458813765f2925241d024ee8393dc5655c348de9db2718b356",
+            "ArtifactDigest": "sha256:60480374de5fcc669a64a09cb6ddc3d0b52446673dfc46177f61997eec7a637e",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:27623a6783d6a485e45ed24830ef9d2d9e664f5b3591d30f644caddab85ba66f",
+            "Input": "{\"quantity\":1,\"sku\":\"tea\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/audit",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:5f097e10143102458813765f2925241d024ee8393dc5655c348de9db2718b356",
+            "ArtifactDigest": "sha256:a690e924b6407d7f403d50a63f325ca14557706bbf072ee99d92cb32473c08b2",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:220e86659a765d7127aaaa2a06c836451fd8b7f40e39f3c1a7bda6854b4d8283",
+            "Input": "{\"body\":{\"quantity\":7,\"sku\":\"reserved-SECRET\"},\"id\":\"r-SECRET\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          }
+        ],
+        "Published": [
+          {
+            "Name": "conf/reserve",
+            "Output": "{\"body\":{\"quantity\":7,\"sku\":\"reserved-SECRET\"},\"id\":\"r-SECRET\"}"
+          },
+          {
+            "Name": "conf/commit",
+            "Output": "{\"committed\":\"tea\",\"quantity\":1}"
+          },
+          {
+            "Name": "conf/audit",
+            "Output": "{\"audited\":\"r-SECRET\"}"
+          },
+          {
+            "Name": "conf/workflow",
+            "Output": "{\"committed\":\"tea\",\"quantity\":1}"
+          }
+        ],
+        "NodeInputs": {
+          "conf/audit": [
+            "{\"body\":{\"quantity\":7,\"sku\":\"reserved-SECRET\"},\"id\":\"r-SECRET\"}"
+          ],
+          "conf/commit": [
+            "{\"quantity\":1,\"sku\":\"tea\"}"
+          ],
+          "conf/reserve": [
+            "{\"quantity\":7,\"sku\":\"SECRET\"}"
+          ]
+        }
+      }
+    ]
+  },
+  "normalizing-literal": {
+    "RegisterError": "",
+    "Listings": {
+      "conf/audit@1.0.0": [
+        "sha256:a690e924b6407d7f403d50a63f325ca14557706bbf072ee99d92cb32473c08b2",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/commit@1.0.0": [
+        "sha256:60480374de5fcc669a64a09cb6ddc3d0b52446673dfc46177f61997eec7a637e",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/label@1.0.0": [
+        "sha256:6326fd5638643a97bbec0bf406bf6039a0c7a870691b9f036820f2769f0e6829",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/normalize@1.0.0": [
+        "sha256:a95b139ae3707bff24785dff9c598d44d19514228de67b50d6a3e3b91dd25f6a",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/reserve@1.0.0": [
+        "sha256:49764b4376fc081556502e2ffc5c13c4e45b862c3b6f4481cc945b5428a17533",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ],
+      "conf/workflow@1.0.0": [
+        "sha256:22f2cabadf270aa90f46e1370b4c83295ebccf58ca97ec7a82ba61279f10a8d3",
+        "sha256:0c326c4f02797b088fc566e64fbfe2162390f52f2fec1483ec3a413a7f11c910"
+      ]
+    },
+    "Invocations": [
+      {
+        "Input": "{\"sku\":\"coffee\",\"quantity\":2}",
+        "Output": "{\"committed\":\"tea\",\"quantity\":3}",
+        "Error": "",
+        "Admitted": [
+          {
+            "Name": "conf/workflow",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:22f2cabadf270aa90f46e1370b4c83295ebccf58ca97ec7a82ba61279f10a8d3",
+            "ArtifactDigest": "sha256:22f2cabadf270aa90f46e1370b4c83295ebccf58ca97ec7a82ba61279f10a8d3",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:35ee91f6ad7b90f42e521c74b6dc8fe33d276fb0ba2042fbb1da4abc4ceac944",
+            "Input": "{\"quantity\":2,\"sku\":\"coffee\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/reserve",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:22f2cabadf270aa90f46e1370b4c83295ebccf58ca97ec7a82ba61279f10a8d3",
+            "ArtifactDigest": "sha256:49764b4376fc081556502e2ffc5c13c4e45b862c3b6f4481cc945b5428a17533",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:35ee91f6ad7b90f42e521c74b6dc8fe33d276fb0ba2042fbb1da4abc4ceac944",
+            "Input": "{\"quantity\":2,\"sku\":\"coffee\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/normalize",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:22f2cabadf270aa90f46e1370b4c83295ebccf58ca97ec7a82ba61279f10a8d3",
+            "ArtifactDigest": "sha256:a95b139ae3707bff24785dff9c598d44d19514228de67b50d6a3e3b91dd25f6a",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:da93b683b8993993a009829fe4954edf4357ec3b06c1111e0116cf66d8b61983",
+            "Input": "{\"big\":\"9007199254740993\",\"quantity\":3,\"sku\":\"tea\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/audit",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:22f2cabadf270aa90f46e1370b4c83295ebccf58ca97ec7a82ba61279f10a8d3",
+            "ArtifactDigest": "sha256:a690e924b6407d7f403d50a63f325ca14557706bbf072ee99d92cb32473c08b2",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:0b48dd3b164e14b3921b8f7bf986711c11cbcfa0305f00124d968f775da290ee",
+            "Input": "{\"body\":{\"quantity\":2,\"sku\":\"reserved-coffee\"},\"id\":\"r-coffee\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          }
+        ],
+        "Published": [
+          {
+            "Name": "conf/reserve",
+            "Output": "{\"body\":{\"quantity\":2,\"sku\":\"reserved-coffee\"},\"id\":\"r-coffee\"}"
+          },
+          {
+            "Name": "conf/normalize",
+            "Output": "{\"committed\":\"tea\",\"quantity\":3}"
+          },
+          {
+            "Name": "conf/audit",
+            "Output": "{\"audited\":\"r-coffee\"}"
+          },
+          {
+            "Name": "conf/workflow",
+            "Output": "{\"committed\":\"tea\",\"quantity\":3}"
+          }
+        ],
+        "NodeInputs": {
+          "conf/audit": [
+            "{\"body\":{\"quantity\":2,\"sku\":\"reserved-coffee\"},\"id\":\"r-coffee\"}"
+          ],
+          "conf/normalize": [
+            "{\"big\":9007199254740993,\"quantity\":3,\"sku\":\"tea\"}"
+          ],
+          "conf/reserve": [
+            "{\"quantity\":2,\"sku\":\"coffee\"}"
+          ]
+        }
+      },
+      {
+        "Input": "{\"quantity\":7,\"sku\":\"SECRET\"}",
+        "Output": "{\"committed\":\"tea\",\"quantity\":3}",
+        "Error": "",
+        "Admitted": [
+          {
+            "Name": "conf/workflow",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:22f2cabadf270aa90f46e1370b4c83295ebccf58ca97ec7a82ba61279f10a8d3",
+            "ArtifactDigest": "sha256:22f2cabadf270aa90f46e1370b4c83295ebccf58ca97ec7a82ba61279f10a8d3",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:53c0b050efb93e327701f1c392743e0184a5e2920aa3da8c7c5d28831e801e3e",
+            "Input": "{\"quantity\":7,\"sku\":\"SECRET\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/reserve",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:22f2cabadf270aa90f46e1370b4c83295ebccf58ca97ec7a82ba61279f10a8d3",
+            "ArtifactDigest": "sha256:49764b4376fc081556502e2ffc5c13c4e45b862c3b6f4481cc945b5428a17533",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:53c0b050efb93e327701f1c392743e0184a5e2920aa3da8c7c5d28831e801e3e",
+            "Input": "{\"quantity\":7,\"sku\":\"SECRET\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/normalize",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:22f2cabadf270aa90f46e1370b4c83295ebccf58ca97ec7a82ba61279f10a8d3",
+            "ArtifactDigest": "sha256:a95b139ae3707bff24785dff9c598d44d19514228de67b50d6a3e3b91dd25f6a",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:da93b683b8993993a009829fe4954edf4357ec3b06c1111e0116cf66d8b61983",
+            "Input": "{\"big\":\"9007199254740993\",\"quantity\":3,\"sku\":\"tea\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          },
+          {
+            "Name": "conf/audit",
+            "Version": "1.0.0",
+            "Workflow": "conf/workflow@1.0.0",
+            "WorkflowDigest": "sha256:22f2cabadf270aa90f46e1370b4c83295ebccf58ca97ec7a82ba61279f10a8d3",
+            "ArtifactDigest": "sha256:a690e924b6407d7f403d50a63f325ca14557706bbf072ee99d92cb32473c08b2",
+            "Principal": "synthetic-app",
+            "InputDigest": "sha256:220e86659a765d7127aaaa2a06c836451fd8b7f40e39f3c1a7bda6854b4d8283",
+            "Input": "{\"body\":{\"quantity\":7,\"sku\":\"reserved-SECRET\"},\"id\":\"r-SECRET\"}",
+            "Effects": [
+              "db:conf"
+            ],
+            "Capabilities": [
+              "conf"
+            ],
+            "MaxDepth": 4,
+            "MaxCalls": 16,
+            "MaxTokens": 100,
+            "MaxInputBytes": 4096,
+            "MaxOutputBytes": 4096,
+            "Resources": {
+              "TokenLimit": 0
+            }
+          }
+        ],
+        "Published": [
+          {
+            "Name": "conf/reserve",
+            "Output": "{\"body\":{\"quantity\":7,\"sku\":\"reserved-SECRET\"},\"id\":\"r-SECRET\"}"
+          },
+          {
+            "Name": "conf/normalize",
+            "Output": "{\"committed\":\"tea\",\"quantity\":3}"
+          },
+          {
+            "Name": "conf/audit",
+            "Output": "{\"audited\":\"r-SECRET\"}"
+          },
+          {
+            "Name": "conf/workflow",
+            "Output": "{\"committed\":\"tea\",\"quantity\":3}"
+          }
+        ],
+        "NodeInputs": {
+          "conf/audit": [
+            "{\"body\":{\"quantity\":7,\"sku\":\"reserved-SECRET\"},\"id\":\"r-SECRET\"}"
+          ],
+          "conf/normalize": [
+            "{\"big\":9007199254740993,\"quantity\":3,\"sku\":\"tea\"}"
+          ],
+          "conf/reserve": [
+            "{\"quantity\":7,\"sku\":\"SECRET\"}"
+          ]
+        }
+      }
+    ]
+  }
+}

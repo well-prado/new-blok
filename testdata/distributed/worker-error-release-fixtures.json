@@ -1,0 +1,14 @@
+{
+  "fixtureVersion": 2,
+  "synthetic": true,
+  "name": "worker-releases-partition-after-processing-error",
+  "limits": {"partitions": 1, "partitionAdmissions": 4, "tenantAdmissions": 2, "ownerTTLMillis": 6000},
+  "observeAfterHandoverMillis": 2000,
+  "expected": {
+    "faultyWorkerOwnedFirst": true,
+    "maxHandoverMillis": 2000,
+    "finalState": "completed",
+    "externalEffects": 1,
+    "minFaultyGrantSpacingMillis": 250
+  }
+}

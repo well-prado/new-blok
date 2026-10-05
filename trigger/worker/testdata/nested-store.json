@@ -1,0 +1,27 @@
+{
+  "schemaVersion": "worker-nested-store/v1",
+  "cases": [
+    {
+      "name": "same-store",
+      "nestedError": "worker.ErrNestedSubmission",
+      "processError": "none",
+      "state": "dead",
+      "jobError": "nested submission to claimed store; use worker.Tx for atomic writes",
+      "attempt": 1,
+      "deferrals": 0,
+      "nestedSubmissionRows": 0,
+      "handlerEffectRows": 0
+    },
+    {
+      "name": "other-store-busy",
+      "nestedError": "store.ErrBusy",
+      "processError": "none",
+      "state": "pending",
+      "jobError": "",
+      "attempt": 0,
+      "deferrals": 1,
+      "nestedSubmissionRows": 0,
+      "handlerEffectRows": 0
+    }
+  ]
+}

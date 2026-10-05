@@ -38,8 +38,13 @@ principal are bound to transport metadata, not user input. The local listener
 does not implement remote TLS; remote exposure is refused. No credentials are
 included in descriptors, errors, or discovery. SIGTERM/SIGINT cancel the session
 and active cooperative work; a selected process supervisor reaps the process.
+Windows has no signal the supervisor can send. There it starts the worker with
+its own hidden console, so the host's Ctrl+C or Ctrl+Break does not reach it,
+inside a job object it joins before its first instruction runs, and after the
+drain terminates the worker's whole process tree; the worker's abort handlers
+do not run on that path.
 
-One persistent Connect stream negotiates protocol 1.0, exact catalog/artifact/
+One persistent Connect stream negotiates protocol 1.1, exact catalog/artifact/
 generation and intersected bounds. Production does not implement unary Invoke.
 Default frame 1 MiB, blob declarations 8 MiB aggregate, concurrent execution 64,
 call deadline at most five minutes (shared Go/Node contract), outbound queue 64
@@ -58,6 +63,23 @@ validated but this SDK does not dereference blob content; the owning application
 must inject its authenticated blob provider. Required node capabilities must be
 present in the call's narrowed grant. Provider errors are redacted and keep their
 class and logical operation key; only explicit transient errors are retryable.
+
+Protocol 1.1 adds optional per-call log frames. Node code uses
+`ctx.logger.debug|info|warn|error(message, attrs?)`; it never intercepts
+process-wide stdout/stderr. Each invocation is tagged with its call, attempt,
+and generation. The worker accepts at most 100 log attempts per call, caps
+messages at 1 KiB and structured scalar attributes at 4 KiB, and drops optional
+records when the bounded outbound queue is full while reserving room for the
+terminal result. Sensitive attribute names and common credential-shaped
+free-form text are redacted. Log messages are untrusted text: applications
+should use static descriptions and structured attributes, never interpolate
+credentials or customer payloads. Pattern redaction cannot identify arbitrary
+secret values embedded in prose.
+
+Protocol 1.0 clients remain compatible with a 1.1 worker and receive no log
+frames. A 1.1 client rejects a 1.0 worker because that worker cannot honor the
+negotiated log-frame contract; rebuild the Node worker with the matching
+runtime package before upgrading the Go adapter.
 
 The Go integration gate explicitly launches this built worker and real engine:
 `BLOK_NODE_INTEGRATION_ROOT=<repo> go test ./runtime/worker -run TestActualNodeWorkerThroughTypedWorkflow -v`.

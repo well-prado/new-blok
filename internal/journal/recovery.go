@@ -1,6 +1,7 @@
 package journal
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -35,6 +36,7 @@ type ScopeRecord struct {
 	Kind       string
 	ParentPath string
 	State      string
+	Input      json.RawMessage
 	Output     json.RawMessage
 	Error      string
 }
@@ -90,21 +92,33 @@ func (j *Journal) StartScope(ctx context.Context, record ScopeRecord) (alreadyCo
 	if record.RunID == "" || record.Path == "" || record.Kind == "" {
 		return false, errors.New("journal: scope run, path and kind are required")
 	}
+	if len(record.Input) > MaxInspectionInputBytes {
+		return false, ErrObservationLimit
+	}
+	if len(record.Input) > 0 && !json.Valid(record.Input) {
+		return false, errors.New("journal: scope input must be valid JSON")
+	}
 	err = j.withTx(ctx, "scope-start", func(tx *sql.Tx) error {
 		var state string
-		queryErr := tx.QueryRowContext(ctx, `SELECT state FROM journal_scopes WHERE run_id = ? AND path = ?`, record.RunID, record.Path).Scan(&state)
+		var input []byte
+		queryErr := tx.QueryRowContext(ctx, `SELECT state,input_json FROM journal_scopes WHERE run_id = ? AND path = ?`, record.RunID, record.Path).Scan(&state, &input)
 		if queryErr == nil {
+			if len(record.Input) > 0 && len(input) > 0 && !bytes.Equal(record.Input, input) {
+				return ErrRequestConflict
+			}
 			alreadyCompleted = state == checkpointCompleted
 			if alreadyCompleted {
 				return nil
 			}
+			// Existing rows may predate input capture. Never backfill an unknown
+			// historical input from a later recovery request.
 			_, queryErr = tx.ExecContext(ctx, `UPDATE journal_scopes SET state = ?, updated_at = ? WHERE run_id = ? AND path = ?`, checkpointRunning, j.now(), record.RunID, record.Path)
 			return queryErr
 		}
 		if !errors.Is(queryErr, sql.ErrNoRows) {
 			return queryErr
 		}
-		_, queryErr = tx.ExecContext(ctx, `INSERT INTO journal_scopes (run_id, path, kind, parent_path, state, updated_at) VALUES (?, ?, ?, ?, ?, ?)`, record.RunID, record.Path, record.Kind, record.ParentPath, checkpointRunning, j.now())
+		_, queryErr = tx.ExecContext(ctx, `INSERT INTO journal_scopes (run_id, path, kind, parent_path, state, input_json, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, record.RunID, record.Path, record.Kind, record.ParentPath, checkpointRunning, nullableJSON(record.Input), j.now())
 		return queryErr
 	})
 	return alreadyCompleted, err

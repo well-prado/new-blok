@@ -25,7 +25,11 @@ receive only their own narrowed capabilities. The existing engine runs programs;
 this is not a second interpreter or source-expression evaluator. Unsupported
 control-flow kinds fail closed at registration rather than conceal authority.
 Only call/child chains are currently agent-tool-compatible; ordinary authoring
-support outside agent registration is unchanged.
+support outside agent registration is unchanged. Programs lower through the same
+`internal/lowering` rules as `flow.Lower`, with literal call inputs and child
+calls as explicit catalog options (ADR 0001, #249). Each literal call input is
+checked at registration against the receiving tool's input schema with the
+`Normalize` dispatch uses, and stored unchanged (ADR 0001, #261).
 
 Budget bounds: depth 1–64; input/output up to 1 MiB; explicit positive token/call
 budget and deadline; calls at most 10000; at most 64 active top-level invocations,

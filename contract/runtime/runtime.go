@@ -16,16 +16,21 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/well-prado/new-blok/contract/observe"
 	"github.com/well-prado/new-blok/contract/schema"
 )
 
 const (
 	ProtocolName       = "blok.runtime"
 	ProtocolMajor      = 1
-	ProtocolMinor      = 0
+	ProtocolMinor      = 1
 	MaxFrameBytes      = 1 << 20
 	MaxBlobBytes       = 8 << 20
 	MaxConcurrentCalls = 64
+	MaxCallLogs        = 100
+	MaxCallLogBytes    = 64 << 10
+	MaxLogMessageBytes = 1024
+	MaxLogAttrsBytes   = 4096
 )
 
 var (
@@ -190,6 +195,24 @@ type Call struct {
 	Blobs          []BlobRef    `json:"blobs,omitempty"`
 	Principal      string       `json:"principal"`
 	Capabilities   []Capability `json:"capabilities,omitempty"`
+	// Traceparent and Tracestate optionally carry the dispatching step's W3C
+	// trace context (ADR 0020). Validate requires a canonical version-00
+	// traceparent and a bounded tracestate; neither can affect the outcome.
+	Traceparent string `json:"traceparent,omitempty"`
+	Tracestate  string `json:"tracestate,omitempty"`
+	// OnLog receives best-effort logs asynchronously on a bounded per-connection
+	// dispatcher. It must return promptly; blocking it drops later logs but
+	// cannot block result-frame processing or change call outcomes. A log may
+	// be delivered after Call has returned that call's result (#226).
+	OnLog func(Log) `json:"-"`
+}
+
+// Log is a bounded, call-scoped worker record. OnLog is an invocation-local
+// callback and is never encoded on the wire.
+type Log struct {
+	Level   string
+	Message string
+	Attrs   []byte
 }
 
 func (c Call) Validate(limits Limits, generation uint64) error {
@@ -214,6 +237,9 @@ func (c Call) Validate(limits Limits, generation uint64) error {
 	if !utf8.ValidString(c.IdempotencyKey) {
 		return fmt.Errorf("%w: invalid key encoding", ErrLimitExceeded)
 	}
+	if err := validateTrace(c.Traceparent, c.Tracestate); err != nil {
+		return err
+	}
 	if c.Principal != "" && !identityPattern.MatchString(c.Principal) {
 		return ErrCapabilityDenied
 	}
@@ -236,6 +262,23 @@ func (c Call) Validate(limits Limits, generation uint64) error {
 	}
 	if EncodedCallBytes(c) > limits.MaxFrameBytes {
 		return fmt.Errorf("%w: complete frame", ErrLimitExceeded)
+	}
+	return nil
+}
+
+// validateTrace accepts an absent trace context or a canonical version-00
+// traceparent (what TraceContext.Traceparent formats) with a bounded
+// printable tracestate. A tracestate without a traceparent is rejected.
+func validateTrace(traceparent, tracestate string) error {
+	if traceparent == "" {
+		if tracestate != "" {
+			return fmt.Errorf("%w: tracestate without traceparent", observe.ErrInvalidTraceContext)
+		}
+		return nil
+	}
+	parsed, err := observe.ParseTraceparent(traceparent)
+	if err != nil || parsed.Traceparent() != traceparent || !observe.ValidTracestate(tracestate) {
+		return fmt.Errorf("%w: call trace context", observe.ErrInvalidTraceContext)
 	}
 	return nil
 }
@@ -281,11 +324,12 @@ const (
 	FrameResult FrameKind = "result"
 	FrameCancel FrameKind = "cancel"
 	FrameDrain  FrameKind = "drain"
+	FrameLog    FrameKind = "log"
 )
 
 func (k FrameKind) Valid() bool {
 	switch k {
-	case FrameHello, FrameReady, FrameCall, FrameResult, FrameCancel, FrameDrain:
+	case FrameHello, FrameReady, FrameCall, FrameResult, FrameCancel, FrameDrain, FrameLog:
 		return true
 	default:
 		return false

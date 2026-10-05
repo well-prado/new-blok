@@ -251,6 +251,24 @@ func (m *message) ID() string {
 	return "s:" + m.Cursor()
 }
 func (m *message) Data() []byte { return m.msg.Data() }
+
+// TraceHeaders implements pubsub.TraceCarrier. NATS header names are case
+// sensitive; every spelling of traceparent and tracestate is collected, so a
+// message carrying two spellings is seen as a duplicate and ignored.
+func (m *message) TraceHeaders() (traceparent, tracestate []string) {
+	for name, values := range m.msg.Headers() {
+		switch {
+		case strings.EqualFold(name, trigger.TraceparentField):
+			traceparent = append(traceparent, values...)
+		case strings.EqualFold(name, trigger.TracestateField):
+			tracestate = append(tracestate, values...)
+		}
+	}
+	return traceparent, tracestate
+}
+
+var _ pubsub.TraceCarrier = (*message)(nil)
+
 func (m *message) Attempt() int { return int(m.meta.NumDelivered) }
 func (m *message) Cursor() string {
 	return fmt.Sprintf("%s@%d:%d", m.meta.Stream, m.incarnation, m.meta.Sequence.Stream)

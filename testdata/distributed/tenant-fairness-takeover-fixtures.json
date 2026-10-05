@@ -1,0 +1,5 @@
+{
+  "candidateTenants": ["alpha", "bravo", "charlie"],
+  "expectedFirstTurn": "alpha",
+  "expectedNextTurn": "bravo"
+}

@@ -83,3 +83,29 @@ func FuzzCompileMalformedReferences(f *testing.F) {
 		_, _ = Compile(document)
 	})
 }
+
+// Issue #247: flow.Lower appends an instruction under the reserved id
+// "output". The canonical compiler synthesizes nothing: a document names its
+// own output instruction, so a call named "output" lowers unambiguously and
+// only a document that repeats an id itself collides, which duplicate_id
+// rejects.
+func TestCompileSynthesizesNoOutputInstructionToCollideWith(t *testing.T) {
+	document := loadDocument(t)
+	document.Workflow.Instructions[0].ID = "output"
+	document.Workflow.Instructions[1].References[0].Step = "output"
+	result, err := Compile(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, instruction := range result.Program.Instructions {
+		ids = append(ids, instruction.ID)
+	}
+	if strings.Join(ids, ",") != "output,respond" || result.Program.Instructions[1].References[0].Step != "output" {
+		t.Fatalf("program=%+v", result.Program)
+	}
+	document.Workflow.Instructions[1].ID = "output"
+	if _, err := Compile(document); err == nil || !strings.Contains(err.Error(), "duplicate_id") {
+		t.Fatalf("got %v, want duplicate_id", err)
+	}
+}

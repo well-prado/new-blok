@@ -1,0 +1,72 @@
+{
+  "schemaVersion": 1,
+  "owner": "E15-T02",
+  "contract": "inspection/v1 live event stream (text/event-stream)",
+  "note": "Synthetic. Each case runs a real trigger/http request through execution.Runner and reads GET /inspect/runs/{run}/events. effects counts actual calls of the synthetic catalog dependency; payloadFrames counts frames carrying input, output or log attributes (an output step's processing frame has no input).",
+  "cases": [
+    {
+      "id": "completed-run-full-capture",
+      "kind": "accepted",
+      "run": {"principal": "alice", "sku": "coffee"},
+      "read": {"principal": "alice"},
+      "capture": "full",
+      "expected": {"runHTTP": "200 OK", "streamStatus": 200, "frames": ["run.started", "step.processing", "step.log", "step.completed", "step.processing", "step.completed", "step.processing", "step.completed", "run.completed", "end"], "effects": 1, "payloadFrames": 8, "secretLeaks": 0}
+    },
+    {
+      "id": "failed-run-streams-classified-failure",
+      "kind": "accepted",
+      "run": {"principal": "alice", "sku": "failure"},
+      "read": {"principal": "alice"},
+      "capture": "full",
+      "expected": {"runHTTP": "500 Internal Server Error", "streamStatus": 200, "frames": ["run.started", "step.processing", "step.log", "step.completed", "step.processing", "step.failed", "run.failed", "end"], "effects": 1, "errorCode": "node_error", "payloadFrames": 6, "secretLeaks": 0}
+    },
+    {
+      "id": "uncertain-run-stays-uncertain",
+      "kind": "accepted",
+      "run": {"principal": "alice", "sku": "uncertain"},
+      "read": {"principal": "alice"},
+      "capture": "full",
+      "expected": {"runHTTP": "500 Internal Server Error", "streamStatus": 200, "frames": ["run.started", "step.processing", "step.log", "step.completed", "step.processing", "step.uncertain", "run.uncertain", "end"], "effects": 1, "errorCode": "provider_outcome_unknown", "payloadFrames": 6, "secretLeaks": 0}
+    },
+    {
+      "id": "default-capture-keeps-no-content",
+      "kind": "accepted",
+      "run": {"principal": "alice", "sku": "coffee"},
+      "read": {"principal": "alice"},
+      "capture": "none",
+      "expected": {"runHTTP": "200 OK", "streamStatus": 200, "frames": ["run.started", "step.processing", "step.completed", "step.processing", "step.completed", "step.processing", "step.completed", "run.completed", "end"], "effects": 1, "payloadFrames": 0, "secretLeaks": 0}
+    },
+    {
+      "id": "unauthenticated-reader",
+      "kind": "rejected",
+      "run": {"principal": "alice", "sku": "coffee"},
+      "read": {"principal": ""},
+      "capture": "full",
+      "expected": {"runHTTP": "200 OK", "streamStatus": 401, "frames": [], "effects": 1, "payloadFrames": 0, "secretLeaks": 0}
+    },
+    {
+      "id": "foreign-principal-reader",
+      "kind": "rejected",
+      "run": {"principal": "alice", "sku": "coffee"},
+      "read": {"principal": "mallory"},
+      "capture": "full",
+      "expected": {"runHTTP": "200 OK", "streamStatus": 404, "frames": [], "effects": 1, "payloadFrames": 0, "secretLeaks": 0}
+    },
+    {
+      "id": "malformed-cursor",
+      "kind": "rejected",
+      "run": {"principal": "alice", "sku": "coffee"},
+      "read": {"principal": "alice", "cursor": "malformed"},
+      "capture": "full",
+      "expected": {"runHTTP": "200 OK", "streamStatus": 400, "frames": [], "effects": 1, "payloadFrames": 0, "secretLeaks": 0}
+    },
+    {
+      "id": "unauthenticated-run-never-starts",
+      "kind": "rejected",
+      "run": {"principal": "", "sku": "coffee"},
+      "read": {"principal": "alice"},
+      "capture": "full",
+      "expected": {"runHTTP": "401 Unauthorized", "streamStatus": 404, "frames": [], "effects": 0, "payloadFrames": 0, "secretLeaks": 0}
+    }
+  ]
+}

@@ -41,6 +41,10 @@ dependency. It defines:
   publisher as a `caller`. Every other kind must authenticate its caller, so
   a caller-facing adapter cannot opt out of the authentication cases.
 - `Principal`: produced only by an adapter's authenticator.
+- `TraceIngress`: an adapter's opt-in policy for an inbound W3C trace
+  context (#276, ADR 0020). It is read only after admission,
+  authentication and validation, and never feeds a principal, a key or a
+  route.
 - `ErrSaturated` (the same value as `capacity.ErrSaturated`): returned by an
   admission handler without capacity, or by anything a handler calls that
   ran out of capacity: a busy store's `store.ErrBusy` matches it (#190). It
@@ -82,7 +86,9 @@ assigns. Conformance distinguishes the two by counting dispatches per delivery.
 Redelivery is bounded. In the worker, a handler failure consumes an attempt;
 saturation and a lost consumer consume a separate deferral budget instead
 (`MaxDeferrals` = 16, backoff 1s doubling to a 1-minute cap), after which the
-job is dead-lettered with `deferral_budget_exhausted`.
+job is dead-lettered with `deferral_budget_exhausted`. Saturation that names
+the write domain the job's own claim holds is not backpressure but a nested
+submission, and fails the job (ADR 0006, #207).
 
 ### Drain timeout
 
@@ -107,6 +113,25 @@ Shutdown then cancels it rather than closing the store under it (#177):
   bounds the grace. Work that ignores its context beyond that still meets
   closed dependencies: it fails with their error, and nothing it was
   writing commits.
+- `app/deploy.Deployment.Run` has two bounded phases. Its configured
+  `deployment.Config.DrainTimeout` bounds HTTP server drain. If that expires,
+  it cancels request contexts with `app.ErrDrainTimeout`, closes the listener
+  and connections, then gives the application at most its configured
+  `AbortGrace` for canceled handlers to release their leases. The overall
+  handler-drain bound is therefore the deployment drain timeout plus the
+  application abort grace. A handler that ignores cancellation beyond that
+  grace may still be running when dependencies close; native application code
+  is trusted code, so the host cannot guarantee it stops. Dependencies must
+  honor their close context. `Deployment.Run` treats its `ctx` cancellation
+  or signal as the shutdown trigger; the configured two phases bound shutdown
+  after that trigger. Direct `app.Shutdown(ctx)` instead keeps the caller's
+  context as the bound for both of its waits.
+  Only admitted work holds the HTTP drain open. Once admission is closed,
+  `Run` closes every connection that has not yet delivered a request (a
+  client's spare or speculative dial): it carries no admitted work, and
+  `http.Server.Shutdown` alone would keep it for five seconds, timing out a
+  drain whose real work had finished (#194). Such a connection gets no
+  answer; its request was never admitted, so retrying it is safe.
 - Aborted work may already have committed something, so it is answered as
   a retry invitation only where a retry is harmless. The durable starts
   (webhook, SSE) are keyed, so they answer 503 `unavailable` with
@@ -135,8 +160,8 @@ order, which `trigger/nine_test.go` drives with work in flight (#173):
    `mcp.Server.Shutdown` refuses new sessions and calls and waits for the
    calls in flight and their answers (#197), the gRPC server's `GracefulStop` finishes its calls, and
    the HTTP server's `Shutdown` finishes its requests (HTTP, webhook, SSE
-   starts). The order matters: SSE subscriptions and MCP standing streams
-   keep their connections active, so the HTTP server's `Shutdown` would
+   starts). The order matters: SSE subscriptions keep their connections
+   active, so the HTTP server's `Shutdown` would
    wait on them until its deadline if they were not ended first. The
    application stays ready meanwhile, so work they hold completes and is
    answered, and until the HTTP server's `Shutdown` runs, HTTP, webhook and
@@ -230,8 +255,10 @@ not applicable with a reason, never as passed. Failures are
 | Agent catalog workflow tools' dispatch steps declare their child's effects (#190) | behavioral | lets the engine hide saturation after a child's effect; dispatch steps are internal, so nothing else observes it |
 | `store.ErrBusy` text is `store: busy` | behavioral | log text only; match it with `errors.Is` |
 | `app.Lease.Context`/`Bind`, `app.Aborted`, `Config.AbortGrace` | additive | none |
+| `app.Application.AbortGrace()` | additive | none; reports the effective configured grace for host shutdown orchestration |
 | A drain timeout cancels admitted work, waits up to `AbortGrace`, then closes the dependencies (#177) | behavioral (fix) | work that outlived `DrainTimeout` used to run on into closed dependencies. Handlers should observe their context |
 | HTTP's draining 503 carries `Retry-After` | additive | none |
+| `Deployment.Run` closes request-less connections when drain begins (#194) | behavioral (fix) | a connection opened but not yet carrying a request is closed instead of answered. Its request was never admitted. A drain that used to report `application_drain_timeout` because of such a connection now ends when the admitted work does |
 
 ## Limits
 

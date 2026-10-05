@@ -1,6 +1,6 @@
 import * as grpc from "@grpc/grpc-js";
 import { timingSafeEqual } from "node:crypto";
-import { discover, DomainError, redactError, SchemaError, type AnyNode, type ExecutionContext } from "../../sdk/nodejs/index.js";
+import { discover, DomainError, redactError, SchemaError, type AnyNode, type ExecutionContext, type TraceContext } from "../../sdk/nodejs/index.js";
 import { loadProtocol, type Call, type Frame, type Hello, type ReceivedFrame } from "./protocol.js";
 import { BoundedWriter } from "./writer.js";
 
@@ -24,7 +24,7 @@ export interface WorkerOptions {
   replayEntries?: number;
   handshakeTimeoutMs?: number;
 }
-type Active = { controller: AbortController; terminal: boolean; timer: NodeJS.Timeout; operationKey: string };
+type Active = { controller: AbortController; terminal: boolean; timer: NodeJS.Timeout; operationKey: string; logs: number };
 export class Worker {
   readonly catalog: ReturnType<typeof discover>;
   readonly server: grpc.Server;
@@ -134,13 +134,25 @@ export class Worker {
           }
           return true;
         };
-        const state: Active = { controller, terminal: false, operationKey: call.idempotencyKey, timer: setTimeout(() => {
+        const state: Active = { controller, terminal: false, operationKey: call.idempotencyKey, logs: 0, timer: setTimeout(() => {
           if (state.terminal || stopped) return;
           state.terminal = true; controller.abort(new DomainError("call_deadline", "DEADLINE_EXCEEDED"));
           send({ result: { ...this.resultIdentity(call), error: redactError(new DomainError("call_deadline", "DEADLINE_EXCEEDED"), call.idempotencyKey) } });
         }, Math.max(0, remaining)) };
         active.set(key, state); this.executing++; this.controllers.add(controller);
-        const ctx: ExecutionContext = Object.freeze({ signal: controller.signal, principal: this.options.principal, capabilities: Object.freeze([...call.capabilities]), idempotencyKey: call.idempotencyKey, callId: call.callId, attemptId: call.attemptId });
+        const log = (level: string, message: string, attrs?: Readonly<Record<string, unknown>>): void => {
+          if (state.terminal || stopped || negotiated?.minor !== 1 || state.logs >= 100 || !["DEBUG", "INFO", "WARN", "ERROR"].includes(level) || typeof message !== "string") return;
+          state.logs++;
+          try {
+            const safeMessage = safeLogMessage(message);
+            const safeAttrs = safeLogAttrs(attrs);
+            const frame = { log: { callId: call.callId, attemptId: call.attemptId, generation: call.generation, level, message: safeMessage, attrsJson: Buffer.from(JSON.stringify(safeAttrs)) } };
+            writer.trySend(frame, 1 << 20);
+          } catch { /* logging is optional and cannot change a node outcome */ }
+        };
+        const logger = Object.freeze({ debug: (message: string, attrs?: Readonly<Record<string, unknown>>) => log("DEBUG", message, attrs), info: (message: string, attrs?: Readonly<Record<string, unknown>>) => log("INFO", message, attrs), warn: (message: string, attrs?: Readonly<Record<string, unknown>>) => log("WARN", message, attrs), error: (message: string, attrs?: Readonly<Record<string, unknown>>) => log("ERROR", message, attrs) });
+        const trace = traceContext(call.traceparent, call.tracestate);
+        const ctx: ExecutionContext = Object.freeze({ signal: controller.signal, principal: this.options.principal, capabilities: Object.freeze([...call.capabilities]), idempotencyKey: call.idempotencyKey, callId: call.callId, attemptId: call.attemptId, logger, ...(trace ? { trace } : {}) });
         void (async () => {
           try {
             const output = await node.invokeJSON(ctx, call.input.toString("utf8"));
@@ -167,7 +179,7 @@ export class Worker {
   }
   private resultIdentity(c: Call): { callId: string; attemptId: string; generation: string } { return { callId: c.callId, attemptId: c.attemptId, generation: c.generation }; }
   private negotiate(h: Hello): Hello {
-    if (h.protocol !== "blok.runtime" || h.major !== 1 || h.minor !== 0 || h.artifactDigest !== this.options.artifactDigest || h.catalogDigest !== this.catalog.catalogDigest || h.generation !== this.options.generation || !h.limits || !limitsValid(h.limits) || !capabilities(h.capabilities)) throw new Error("invalid_hello");
+    if (h.protocol !== "blok.runtime" || h.major !== 1 || h.minor < 0 || h.minor > 1 || h.artifactDigest !== this.options.artifactDigest || h.catalogDigest !== this.catalog.catalogDigest || h.generation !== this.options.generation || !h.limits || !limitsValid(h.limits) || !capabilities(h.capabilities)) throw new Error("invalid_hello");
     if (h.capabilities.some(c => !this.options.capabilities.includes(c))) throw new DomainError("capability_denied");
     return { ...h, capabilities: [...h.capabilities], limits: { maxFrameBytes: Math.min(h.limits.maxFrameBytes, this.limits.maxFrameBytes), maxBlobBytes: Math.min(h.limits.maxBlobBytes, this.limits.maxBlobBytes), maxConcurrentCalls: Math.min(h.limits.maxConcurrentCalls, this.limits.maxConcurrentCalls) } };
   }
@@ -184,4 +196,43 @@ export class Worker {
     // TextDecoder rejects invalid UTF-8 rather than replacing it before validation.
     new TextDecoder("utf-8", { fatal: true }).decode(c.input);
   }
+}
+
+// Trace context is optional correlation (ADR 0020): a malformed value is
+// dropped, never a reason to fail the call. Only canonical version-00 values
+// with non-zero ids and a bounded printable tracestate are exposed.
+const traceparentPattern = /^00-(?!0{32})[0-9a-f]{32}-(?!0{16})[0-9a-f]{16}-[0-9a-f]{2}$/;
+export function traceContext(traceparent: unknown, tracestate: unknown): TraceContext | undefined {
+  if (typeof traceparent !== "string" || typeof tracestate !== "string" || !traceparentPattern.test(traceparent)) return undefined;
+  if (tracestate.length > 256 || !/^[\x20-\x7e]*$/.test(tracestate)) return undefined;
+  return Object.freeze({ traceparent, tracestate });
+}
+
+const secretText = /(?:\b(?:password|passwd|secret|token|authorization|credential|api[_-]?key|private[_-]?key)\s*[:=]\s*\S+|\bbearer\s+[A-Za-z0-9._~+/-]+=*|\bAKIA[0-9A-Z]{16}\b|\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b)/i;
+function safeLogMessage(message: string): string {
+  const bounded = truncateUtf8(message, 1024);
+  return secretText.test(bounded) ? "[redacted: sensitive-looking log message]" : bounded;
+}
+function truncateUtf8(value: string, maxBytes: number): string {
+  let output = "", bytes = 0;
+  for (const character of value) {
+    const size = Buffer.byteLength(character, "utf8");
+    if (bytes + size > maxBytes) break;
+    output += character; bytes += size;
+  }
+  return output;
+}
+function safeLogAttrs(attrs?: Readonly<Record<string, unknown>>): Record<string, unknown> {
+  if (!attrs || typeof attrs !== "object" || Array.isArray(attrs) || Object.getPrototypeOf(attrs) !== Object.prototype) return {};
+  const output: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(attrs).slice(0, 32)) {
+    if (!/^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(key)) continue;
+    if (/(password|passwd|secret|token|authorization|credential|api.?key|private.?key)/i.test(key)) { output[key] = "[redacted]"; continue; }
+    if (typeof value === "string") output[key] = truncateUtf8(value, 256);
+    else if (typeof value === "boolean" || value === null) output[key] = value;
+    else if (typeof value === "number" && Number.isFinite(value)) output[key] = value;
+  }
+  const keys = Object.keys(output);
+  while (keys.length && Buffer.byteLength(JSON.stringify(output), "utf8") > 4096) delete output[keys.pop()!];
+  return output;
 }

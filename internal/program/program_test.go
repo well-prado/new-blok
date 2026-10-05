@@ -83,3 +83,54 @@ func TestProgramEnforcesInstructionBudget(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 }
+
+func TestProgramValidatesWaitMetadata(t *testing.T) {
+	const maxTimeout = int64(365 * 24 * 60 * 60 * 1000)
+	cases := []struct {
+		name string
+		kind string
+		wait *contract.WaitInstruction
+		code string
+	}{
+		{"missing metadata", "wait", nil, "invalid_wait"},
+		{"blank name", "wait", &contract.WaitInstruction{}, "invalid_wait"},
+		{"oversized name", "wait", &contract.WaitInstruction{Name: strings.Repeat("n", 181)}, "invalid_wait"},
+		{"negative timeout", "wait", &contract.WaitInstruction{Name: "approval", TimeoutMillis: -1}, "invalid_wait"},
+		{"timeout beyond bound", "wait", &contract.WaitInstruction{Name: "approval", TimeoutMillis: maxTimeout + 1}, "invalid_wait"},
+		{"metadata on a call", "call", &contract.WaitInstruction{Name: "approval"}, "unexpected_wait"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			input := inputProgram()
+			input.Instructions[0].Kind = tc.kind
+			input.Instructions[0].Wait = tc.wait
+			if _, err := Build(input, Limits{}); err == nil || !strings.Contains(err.Error(), tc.code) {
+				t.Fatalf("got %v, want %s", err, tc.code)
+			}
+		})
+	}
+	input := inputProgram()
+	input.Instructions[0].Kind = "wait"
+	input.Instructions[0].Node = ""
+	input.Instructions[0].Wait = &contract.WaitInstruction{Name: strings.Repeat("n", 180), TimeoutMillis: maxTimeout}
+	built, err := Build(input, Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := built.JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := Decode(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored := decoded.Instructions()[0].Wait
+	if restored == nil || restored.TimeoutMillis != maxTimeout {
+		t.Fatalf("decoded wait=%+v", restored)
+	}
+	restored.Name = "changed"
+	if decoded.Instructions()[0].Wait.Name == "changed" {
+		t.Fatal("decoded program aliases its wait metadata")
+	}
+}

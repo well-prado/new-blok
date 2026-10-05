@@ -66,7 +66,7 @@ var QuoteWorkflow = flow.MustDefine[QuoteInput, Quote](
 )
 ```
 
-Returning a reference declares the output. `Define` also returns an error for tooling. Whole-value wiring works without generation. Field-level composition uses generated typed accessors and argument structs accepting references or explicit `flow.Lit` values. Ordinary Go fields cannot hold both `string` and `Ref[string]`. Generation uses Go package/type analysis, never executes arbitrary package initialization, marks generated files and is deterministic.
+Returning a reference declares the output. `Define` returns a broken builder rule as an error for tooling; `MustDefine` panics at the offending builder call (#251). Whole-value wiring works without generation. Field-level composition uses generated typed accessors. A call takes one input reference, so a call cannot yet read two earlier steps at once; the generated argument structs that would combine references, and literal call inputs, have no consumer or program form yet. Today `Lower` carries the workflow input, whole call results and accessor-selected fields of earlier calls into the program, and rejects literal or workflow-input-field call inputs, which have no program form yet ([ADR 0001](decisions/0001-public-api-boundaries.md), #244). The agent catalog lowers composed workflows through the same rules (`internal/lowering`); its only extensions are literal call inputs, which its dispatch substitutes, and child workflow calls (#249). `Lower` appends the workflow output instruction under the id `output` (`flow.OutputID`), so no builder accepts that id for a step (#247). Step ids follow the document id grammar `^[a-z][a-z0-9_-]{0,63}$` (`contract.IDPattern`), so an id never contains the `.` that separates a reference's fields (#251). Ordinary Go fields cannot hold both `string` and `Ref[string]`. Generation uses Go package/type analysis, never executes arbitrary package initialization, marks generated files and is deterministic.
 
 Unified layout: `nodes/<runtime>/<node>/`; classic layout: `runtimes/<runtime>/nodes/<node>/`. Workflow source remains under a dedicated application workflow directory. Layout does not change node identity. Files inside one node may import each other and approved utility/domain packages, but cannot import another node. CLI migration is transactional and validates ownership/collisions.
 
@@ -84,6 +84,8 @@ generic numeric envelope preserves exact JSON integers; its supplied inner
 schema owns integer range/wire rules. Template expansion preflights the byte
 budget before allocating output. See [ADR 0012](decisions/0012-catalog-null-and-template-bounds.md)
 for the correction, supported array limits and pending Node mirror integration.
+
+Field references select `encoding/json` object keys, so a path resolves identically on a typed node output and on its JSON-decoded form, with work bounded by the selected member; a selected field keeps its Go type. See [ADR 0001](decisions/0001-public-api-boundaries.md#field-references-select-encodingjson-keys-241).
 
 Logical values are immutable. Maps, slices and pointers require isolation between nodes and branches. Typed native fast paths must preserve this rule, and benchmarks include required validation/copies. Portable encodings serve journals and worker boundaries. Stable diagnostics name code, file/line, workflow, step, field, expected/actual and remediation.
 
@@ -111,6 +113,19 @@ One admission path authenticates/authorizes, maps and validates input, deduplica
 
 HTTP and one durable job path ship first. Other adapters pass shared conformance plus actual protocol integration tests. They implement no second interpreter, mapper or retry engine. The shared `trigger` contract, the per-kind completion/disconnect table and the `contract/conformance.RunTrigger` harness are recorded in [ADR 0005](decisions/0005-trigger-adapter-contract.md). Multiple bindings can share a listener where protocols permit; independent TLS/listeners remain selectable. Queue acknowledgment follows an explicit transfer model and stable delivery deduplication.
 
+Worker handlers write durable business state through the handler's `worker.Tx`
+so effects and acknowledgment commit together. The handler context carries the
+claim's write domain when the store exposes it; a nested queue submission to
+that same domain returns an actionable error before waiting on its own writer
+lock. A nested submission that bypasses that check (a replaced context, or a
+wrapper that hides the domain) waits out one busy timeout; its saturation
+names the write domain it waited on, and when that is the claim's own the job
+fails as a nested submission instead of being deferred. Saturation from
+another store remains backpressure and defers the job without spending an
+attempt. Stores and wrappers opt into detection by exposing and forwarding
+`store.WriteDomainProvider` and by naming the domain on their busy errors
+(`store.WithWriteDomain`).
+
 ## 7. Durability, effects and artifacts
 
 Memory mode permits in-flight loss. Journal mode resumes accepted work after process restart with its volume intact; it does not imply disk-loss survival or multi-host failover. Choose one embedded backend through a measured spike (SQLite candidate, Pebble alternative), implement the winner and keep the port replaceable.
@@ -121,7 +136,9 @@ An external success followed by a crash before result commit creates an uncertai
 
 Deployment manifests bind workflow document, native binary, worker artifacts, schemas, module locks, runtime versions, compiler and checkpoint formats. Immutable versions cannot be overwritten. Initial upgrades drain/retain compatible executables or refuse startup with actionable diagnostics. A later multi-version manager retains old workers for old runs. Replay creates a new run with lineage; partial reruns require separate tested effect semantics.
 
-Retention, compaction, backup, corruption checks and restore must preserve verified checkpoints and audit obligations. The current SQLite backup contract uses `VACUUM INTO` to create a new, transaction-consistent snapshot; it never overwrites an existing destination. Restore first runs `PRAGMA integrity_check`, copies into a temporary file, syncs it, and renames it into a new destination before checking the restored database again. These guarantees cover one local filesystem only: they do not provide disk-loss survival, replication, or multi-host failover. Business tables remain application-owned; the journal is not an ORM or a substitute for domain persistence.
+Retention, compaction, backup, corruption checks and restore must preserve verified checkpoints and audit obligations. The current SQLite backup contract uses `VACUUM INTO` to create a new, transaction-consistent snapshot; it never overwrites an existing destination. Restore first runs `PRAGMA integrity_check`, copies into a temporary file, syncs it, and renames it into a new destination before checking the restored database again. These guarantees cover one local filesystem only: they do not provide disk-loss survival, replication, or multi-host failover. Compaction erases a run's content once it is past retention, keeping only digests and timestamps; SQLite deletes securely and the write-ahead log is purged after compaction, but a backup taken before an erasure still holds the content (ADR 0021 §7). Business tables remain application-owned; the journal is not an ORM or a substitute for domain persistence.
+
+Distributed ownership remains an evaluation spike, not an available backend. [ADR 0017](decisions/0017-distributed-persistence-ownership.md) records an isolated etcd v3.6.5 fencing prototype, the incarnation-plus-revision fence needed across snapshot restore, the S3 blob acknowledgment boundary, and the limits of its one-host failure experiments. No app or engine code imports the prototype, and the spike does not select a production backend.
 
 ## 8. Workers and runtime coverage
 
@@ -141,15 +158,17 @@ The implemented pre-alpha durable tool policy is described in [ADR 0008](decisio
 
 CLI and read-only development MCP expose versioned inspection/validation projections with source/test references and stable diagnostics. Bounded repair validates every proposal against the real compiler. Generic nodes and custom nodes use the same descriptor and review path. Complete recipes cover authenticated CRUD, jobs, signed webhooks, schedules, streaming and MCP with explicit storage/migration/module dependencies.
 
-Dev inspection streams bounded per-step input, started/processing events, output, attempts, timing, logs and errors. Sensitive content is authorized/redacted and opt-in. Production telemetry supports OpenTelemetry-compatible export without importing providers into the engine. Optional events may drop/sample under pressure; required audit and state transitions use reliable paths with explicit failure policy.
+Dev inspection streams bounded per-step input, started/processing events, output, attempts, timing, logs and errors. Sensitive content is authorized/redacted and opt-in. Production telemetry supports OpenTelemetry-compatible export without importing providers into the engine: the engine allocates W3C trace context for observed runs under an explicit `TracePolicy` and hands it to nodes, workers and child runs through the stdlib-only `contract/observe` port, and the optional `observe/otel` module (a separate Go module, so unselected applications carry none of its dependencies) exports traces, metrics and logs with bounded labels and a drop-and-count policy that never blocks a run ([ADR 0020](decisions/0020-optional-observability-export.md)). Optional events may drop/sample under pressure; required audit and state transitions use reliable paths with explicit failure policy.
+
+Mandatory audit is a separate contract, not telemetry ([ADR 0021](decisions/0021-sensitive-data-and-reliable-audit.md)). `contract/audit` records approval, reconciliation and deployment decisions (actor, outcome, digests and opaque scope names; never inputs, evidence text or secret values) in the same store transaction as the decision, so an audit failure refuses the decision with nothing applied; an optional mirror receives copies only after commit and its drops cannot remove a record. Audit reads are tenant-authorized and digest-verified, retention never deletes a record for an active run, under legal hold or younger than the legal minimum, and audit is backed up and restored with durable state. `observe/redact` is the single redaction boundary for inspection, worker logs, telemetry attributes, catalog listings and audit records, including bounded decoding of JSON-in-string, percent-encoded and base64 content; it covers framework-owned channels only, and a native node can still leak what it is given.
 
 ## 10. Registry, deployment and scale
 
-Node/workflow packages have namespaced immutable identities, schemas, capability manifests, artifacts, dependency bounds and integrity digests. CLI add/remove/update/verify works offline from locked/cache data, rejects traversal/signature/digest/cycle/version conflicts, stages atomic changes and never executes install hooks without explicit policy. Go packages remain normal modules; foreign dependencies retain native lockfiles. Hosted publishing, ownership/moderation/search infrastructure and billing belong to the separate registry product.
+Node/workflow packages have namespaced immutable identities, schemas, capability manifests, artifacts, dependency bounds and integrity digests. E13-T02 implements deterministic dependency resolution, exact execution-relevant locks, and a bounded verified offline cache; see [ADR 0018](decisions/0018-deterministic-package-resolution.md). E13-T03 owns the later CLI add/remove/update/verify operations and atomic project-file changes. Go and npm remain authoritative for their own dependency graphs; Blok captures their exact native locks and execution context without acting as a universal installer. Hosted publishing, ownership/moderation/search infrastructure and billing belong to the separate registry product.
 
 App-owned binaries support health/readiness/metrics, bounded admission, signal-driven drain, graceful worker shutdown and durable-volume configuration. Cloud consumes reproducible deployment manifests, artifacts, readiness and operational APIs; framework self-hosting remains first-class. No proprietary service is required for core operation.
 
-Millions of requests per second is a fleet-scale design target, not a bootstrap claim. Partition ownership, fencing, replicated persistence, timers, blobs, load balancing, fairness and resharding require independent failure and capacity tests. Distinguish accepted requests, completed workflows, steps and external calls. Model retention and audit/telemetry cost per event.
+Millions of requests per second is a fleet-scale design target, not a bootstrap claim. Partition ownership, fencing, replicated persistence, timers, blobs, load balancing, fairness and resharding require independent failure and capacity tests. Distinguish accepted requests, completed workflows, steps and external calls. Model retention and audit/telemetry cost per event. ADR 0017 covers only one-host Docker failure and load experiments; those measurements are not fleet RPS or multi-region capacity. A replicated journal must fence each state commit in the same authoritative storage transaction; an ownership log alone is not failover.
 
 Benchmarks include useful native quote HTTP, journaled orders, bounded parallel work, worker equivalents, suspended runs, mixed tenants, slow clients, invalid/large payloads and overload. Publish hardware/topology/configuration, tool versions, warmup, repeated distributions, throughput, p50/p95/p99, CPU, RSS, allocations, queue depth, errors and crash recovery. Use controlled runners/noise policy for regressions. Optimization requires profiles.
 

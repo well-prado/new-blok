@@ -8,7 +8,7 @@ export const quote = defineNode<{ sku: string; quantity: number }, { totalCents:
   input: { type: "object", properties: { sku: { type: "string" }, quantity: { type: "integer", minimum: 1, maximum: 100 } }, required: ["sku", "quantity"] },
   output: { type: "object", properties: { totalCents: { type: "integer", wire: "int64-string" } }, required: ["totalCents"] },
   dependencies: { price: 1500n },
-  execute(_ctx, input, deps) { if (input.sku !== "coffee") throw new DomainError("unknown_sku"); return { totalCents: (BigInt(input.quantity) * deps.price).toString() }; },
+  execute(ctx, input, deps) { ctx.logger.info("quote calculated", { sku: input.sku, api_token: "synthetic-token-value" }); if (input.sku !== "coffee") throw new DomainError("unknown_sku"); return { totalCents: (BigInt(input.quantity) * deps.price).toString() }; },
 });
 const echoSchema = { type: "object", properties: { value: { type: "integer", wire: "int64-string" } }, required: ["value"] } as const;
 export const echo = defineNode<{ value: string }, { value: string }, null>({ name: "fixture/echo", version: "1.0.0", description: "Synthetic int64 echo", input: echoSchema, output: echoSchema, deterministic: true, dependencies: null, execute: (_ctx, input) => input });
@@ -31,4 +31,13 @@ export const provider = defineNode<{ kind: string }, { done: boolean }, { fail(k
   async execute(_ctx, input, deps) { return deps.fail(input.kind); },
 });
 export const panic = defineNode<Record<string, never>, { done: boolean }, null>({ name: "fixture/panic", version: "1.0.0", description: "Synthetic thrown error", input: empty, output: done, dependencies: null, execute() { throw new Error("synthetic-secret-do-not-leak"); } });
-export const nodes = [quote, echo, slow, late, provider, panic];
+const traceSchema = { type: "object", properties: { traceparent: { type: "string" }, tracestate: { type: "string" } }, required: ["traceparent", "tracestate"] } as const;
+// Reports the trace context the worker received (ADR 0020) and logs once, so
+// lineage tests can see it from Go. A call without one reports "". Not
+// deterministic: its output is the caller's (random) trace context.
+export const trace = defineNode<{ label: string }, { traceparent: string; tracestate: string }, null>({
+  name: "fixture/trace", version: "1.0.0", description: "Synthetic trace context echo",
+  input: { type: "object", properties: { label: { type: "string" } }, required: ["label"] }, output: traceSchema, dependencies: null,
+  execute(ctx, input) { ctx.logger.info("trace observed", { label: input.label }); return { traceparent: ctx.trace?.traceparent ?? "", tracestate: ctx.trace?.tracestate ?? "" }; },
+});
+export const nodes = [quote, echo, slow, late, provider, panic, trace];

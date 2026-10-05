@@ -111,6 +111,9 @@ type Binding struct {
 	// messages of a request, counted on the wire before it is decoded, so
 	// a small message cannot decode into a large structure.
 	MaxElements int
+	// Trace opts in to reading the call's traceparent/tracestate metadata
+	// as the parent of the run Handle starts (ADR 0020). Off by default.
+	Trace trigger.TraceIngress
 }
 
 // AllowAuthenticated admits every authenticated principal to a method.
@@ -203,6 +206,9 @@ func check(b Binding) (*binding, error) {
 	}
 	if b.MaxElements <= 0 {
 		b.MaxElements = DefaultMaxElements
+	}
+	if err := b.Trace.Validate(); err != nil {
+		return fail("", "invalid_trace_ingress", err.Error())
 	}
 	if b.Timeout > MaxTimeout || b.MaxConcurrency > MaxConcurrencyLimit || b.MaxRequestBytes > MaxMessageBytesLimit || b.MaxResponseBytes > MaxMessageBytesLimit || b.MaxElements > MaxElementsLimit {
 		return fail("", "bound_exceeded", "timeout, concurrency, message size or element count exceeds its limit")
@@ -481,7 +487,11 @@ func (s *Server) call(ctx context.Context, b *binding, principal trigger.Princip
 	var fired atomic.Int64
 	stop := context.AfterFunc(ctx, func() { fired.Store(time.Now().UnixNano()) })
 	defer stop()
-	output, err := b.Handle(ctx, Call{Method: b.method, Principal: principal, Input: input})
+	// The trace metadata is read only now, after authentication,
+	// authorization and validation, so it cannot change any of them.
+	md, _ := metadata.FromIncomingContext(ctx)
+	traced := b.Trace.Context(ctx, s.application.TracePolicy(), md.Get(trigger.TraceparentField), md.Get(trigger.TracestateField))
+	output, err := b.Handle(traced, Call{Method: b.method, Principal: principal, Input: input})
 	if err == nil && ctx.Err() != nil {
 		// The workflow returned after its deadline or after the client
 		// left: the call has already failed.
@@ -601,9 +611,14 @@ func hasUnknown(message protoreflect.Message) bool {
 
 // statusFor maps a workflow error to a status that carries only a stable
 // code: never the error's text. A call whose context ended at or after its
-// deadline reports DeadlineExceeded even when the client's own cancellation
-// arrived first, as it does when the client's deadline is the earlier one;
-// one canceled before it reports Canceled.
+// deadline reports DeadlineExceeded, even when the client's cancellation is
+// what ended it; one that ended before its deadline reports Canceled.
+//
+// A client whose own, earlier deadline passes resets the stream with the same
+// code as a deliberate cancel. The server's deadline starts when the request
+// arrives, so it falls slightly after the client's: when that reset reaches
+// the server first, the call reports Canceled, and nothing on the wire tells
+// the two apart (#230). The workflow is canceled either way.
 func statusFor(ctx context.Context, err error, ended time.Time) error {
 	deadline, bounded := ctx.Deadline()
 	switch {

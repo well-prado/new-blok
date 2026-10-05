@@ -1,0 +1,597 @@
+{
+  "schemaVersion": 1,
+  "evidenceClass": "synthetic-local-contract-comparison",
+  "provider": {
+    "name": "shared-parity-provider",
+    "version": "1.0.0",
+    "transport": "loopback-http",
+    "externalCalls": false,
+    "idempotencyHeader": "idempotency-key"
+  },
+  "workloadClasses": {
+    "plumbing": "one-step pass-through workflows whose business value is computed by the synthetic provider; they prove input mapping, idempotency headers, error classification, retry, cancellation, delivery and recovery plumbing, not business-logic equivalence",
+    "business-logic": "multi-step workflows whose business values are computed by workflow nodes on each engine and carried between steps; the provider only supplies catalog data and records effects"
+  },
+  "workloads": [
+    {
+      "id": "quote-success",
+      "class": "plumbing",
+      "operation": "quote",
+      "request": {
+        "requestKey": "quote-success",
+        "sku": "coffee",
+        "quantity": 2
+      },
+      "expected": {
+        "output": {
+          "status": 200,
+          "body": {
+            "sku": "coffee",
+            "quantity": 2,
+            "totalCents": 3000,
+            "currency": "USD"
+          }
+        },
+        "errorCode": "",
+        "providerCalls": 1,
+        "committedEffects": 1
+      }
+    },
+    {
+      "id": "quote-invalid-sku",
+      "class": "plumbing",
+      "operation": "quote",
+      "request": {
+        "requestKey": "quote-invalid",
+        "sku": "not-in-catalog",
+        "quantity": 1
+      },
+      "expected": {
+        "output": null,
+        "errorCode": "unknown_sku",
+        "providerCalls": 1,
+        "committedEffects": 0,
+        "oldRunner": {
+          "ok": false,
+          "errorCode": "",
+          "errorMessage": "synthetic unknown sku",
+          "providerCalls": 1,
+          "committedEffects": 0
+        },
+        "newNativeEngine": {
+          "ok": false,
+          "errorCode": "unknown_sku",
+          "errorMessage": "unknown_sku: unknown_sku: synthetic unknown sku",
+          "providerCalls": 1,
+          "committedEffects": 0
+        }
+      }
+    },
+    {
+      "id": "order-duplicate-delivery",
+      "class": "plumbing",
+      "operation": "order",
+      "request": {
+        "requestKey": "order-duplicate",
+        "sku": "coffee",
+        "quantity": 2
+      },
+      "deliveries": 2,
+      "expected": {
+        "normalizedOutput": {
+          "status": 200,
+          "body": {
+            "requestKey": "order-duplicate",
+            "sku": "coffee",
+            "quantity": 2,
+            "totalCents": 3000
+          }
+        },
+        "providerCalls": 2,
+        "committedEffects": 1
+      }
+    },
+    {
+      "id": "job-retry",
+      "class": "plumbing",
+      "operation": "job-retry",
+      "request": {
+        "requestKey": "job-retry",
+        "jobId": "job-108",
+        "sku": "coffee",
+        "quantity": 2
+      },
+      "retry": {
+        "maxAttempts": 2,
+        "firstFailure": "temporary_provider_error"
+      },
+      "expected": {
+        "oldRunner": {
+          "ok": true,
+          "providerCalls": 2,
+          "committedEffects": 1
+        },
+        "newNativeEngine": {
+          "ok": false,
+          "errorCode": "temporary_provider_error",
+          "errorMessage": "temporary_provider_error: temporary_provider_error: synthetic first-attempt failure",
+          "providerCalls": 1,
+          "committedEffects": 0
+        },
+        "newWorkerQueue": {
+          "output": {
+            "status": 200,
+            "body": {
+              "jobId": "job-108",
+              "state": "completed",
+              "totalCents": 3000
+            }
+          },
+          "providerCalls": 2,
+          "committedEffects": 1
+        }
+      }
+    },
+    {
+      "id": "order-reserve-commit-success",
+      "class": "plumbing",
+      "operation": "reserve-commit",
+      "request": {
+        "requestKey": "order-reserve",
+        "sku": "coffee",
+        "quantity": 2
+      },
+      "expected": {
+        "output": {
+          "status": 200,
+          "body": {
+            "requestKey": "order-reserve",
+            "reserved": true
+          }
+        },
+        "providerCalls": 2,
+        "committedEffects": 2
+      }
+    },
+    {
+      "id": "order-cancel-in-flight",
+      "class": "plumbing",
+      "operation": "reserve-commit",
+      "request": {
+        "requestKey": "order-cancel",
+        "sku": "coffee",
+        "quantity": 2
+      },
+      "expected": {
+        "cancellation": {
+          "trigger": "caller disconnects the HTTP request while the reserve provider call is in flight",
+          "reserveCalls": 1,
+          "reserveAbortedByCaller": 1,
+          "commitCalls": 0,
+          "committedEffects": 0,
+          "processServesAfterCancel": true
+        }
+      }
+    },
+    {
+      "id": "webhook-duplicate",
+      "class": "plumbing",
+      "operation": "webhook",
+      "request": {
+        "requestKey": "webhook-108",
+        "eventId": "evt-108",
+        "type": "order.created",
+        "kind": "order.created",
+        "orderId": "order-108"
+      },
+      "deliveries": 2,
+      "expected": {
+        "normalizedOutput": {
+          "eventId": "evt-108",
+          "type": "order.created",
+          "kind": "order.created",
+          "orderId": "order-108",
+          "requestKey": "webhook-108"
+        },
+        "providerCalls": 1,
+        "committedEffects": 1,
+        "duplicateAcknowledged": true
+      }
+    },
+    {
+      "id": "stream-event-and-disconnect",
+      "class": "plumbing",
+      "operation": "stream",
+      "request": {
+        "requestKey": "stream-108",
+        "streamId": "stream-108",
+        "events": [
+          {
+            "id": "1",
+            "event": "order",
+            "data": {
+              "orderId": "order-108",
+              "state": "accepted"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "normalizedEvents": [
+          {
+            "id": "1",
+            "event": "order",
+            "data": {
+              "orderId": "order-108",
+              "state": "accepted"
+            }
+          }
+        ],
+        "oldSSETriggerDisconnectCancelsWorkflow": true,
+        "newSSETriggerDisconnectPreservesAcceptedJob": true,
+        "deliverySemanticsMatch": false
+      }
+    }
+  ],
+  "businessWorkloads": {
+    "class": "business-logic",
+    "rules": "subtotal = unit x quantity; discount = floor(subtotal/10) when quantity >= 10; tax = floor(((subtotal - discount) x 825 + 5000) / 10000); total = subtotal - discount + tax; quantity must be an integer in [1, 100] (invalid_quantity)",
+    "catalog": {
+      "coffee": 1500,
+      "tea": 900
+    },
+    "workloads": [
+      {
+        "id": "quote-computed",
+        "route": "/business-quote",
+        "request": {
+          "requestKey": "bq-small",
+          "sku": "coffee",
+          "quantity": 2
+        },
+        "expected": {
+          "output": {
+            "requestKey": "bq-small",
+            "sku": "coffee",
+            "quantity": 2,
+            "unitCents": 1500,
+            "subtotalCents": 3000,
+            "discountCents": 0,
+            "taxCents": 248,
+            "totalCents": 3248
+          },
+          "providerCalls": 1,
+          "committedEffects": 0
+        }
+      },
+      {
+        "id": "quote-computed-below-bulk",
+        "route": "/business-quote",
+        "request": {
+          "requestKey": "bq-nine",
+          "sku": "tea",
+          "quantity": 9
+        },
+        "expected": {
+          "output": {
+            "requestKey": "bq-nine",
+            "sku": "tea",
+            "quantity": 9,
+            "unitCents": 900,
+            "subtotalCents": 8100,
+            "discountCents": 0,
+            "taxCents": 668,
+            "totalCents": 8768
+          },
+          "providerCalls": 1,
+          "committedEffects": 0
+        }
+      },
+      {
+        "id": "quote-computed-bulk-discount",
+        "route": "/business-quote",
+        "request": {
+          "requestKey": "bq-bulk",
+          "sku": "tea",
+          "quantity": 12
+        },
+        "expected": {
+          "output": {
+            "requestKey": "bq-bulk",
+            "sku": "tea",
+            "quantity": 12,
+            "unitCents": 900,
+            "subtotalCents": 10800,
+            "discountCents": 1080,
+            "taxCents": 802,
+            "totalCents": 10522
+          },
+          "providerCalls": 1,
+          "committedEffects": 0
+        }
+      },
+      {
+        "id": "quote-unknown-sku",
+        "route": "/business-quote",
+        "request": {
+          "requestKey": "bq-unknown",
+          "sku": "matcha",
+          "quantity": 1
+        },
+        "expected": {
+          "errorCode": "unknown_sku",
+          "providerCalls": 1,
+          "committedEffects": 0
+        }
+      },
+      {
+        "id": "quote-invalid-quantity",
+        "route": "/business-quote",
+        "request": {
+          "requestKey": "bq-zero",
+          "sku": "coffee",
+          "quantity": 0
+        },
+        "expected": {
+          "errorCode": "invalid_quantity",
+          "providerCalls": 1,
+          "committedEffects": 0
+        }
+      },
+      {
+        "id": "order-computed",
+        "route": "/business-order",
+        "request": {
+          "requestKey": "bo-coffee",
+          "sku": "coffee",
+          "quantity": 3
+        },
+        "expected": {
+          "output": {
+            "requestKey": "bo-coffee",
+            "sku": "coffee",
+            "quantity": 3,
+            "unitCents": 1500,
+            "subtotalCents": 4500,
+            "discountCents": 0,
+            "taxCents": 371,
+            "totalCents": 4871,
+            "reservationId": "res-bo-coffee-reserve",
+            "orderId": "ord-res-bo-coffee-reserve",
+            "status": "committed"
+          },
+          "providerCalls": 2,
+          "committedEffects": 2,
+          "committedTotalCents": 4871
+        }
+      },
+      {
+        "id": "order-computed-bulk-discount",
+        "route": "/business-order",
+        "request": {
+          "requestKey": "bo-tea",
+          "sku": "tea",
+          "quantity": 10
+        },
+        "expected": {
+          "output": {
+            "requestKey": "bo-tea",
+            "sku": "tea",
+            "quantity": 10,
+            "unitCents": 900,
+            "subtotalCents": 9000,
+            "discountCents": 900,
+            "taxCents": 668,
+            "totalCents": 8768,
+            "reservationId": "res-bo-tea-reserve",
+            "orderId": "ord-res-bo-tea-reserve",
+            "status": "committed"
+          },
+          "providerCalls": 2,
+          "committedEffects": 2,
+          "committedTotalCents": 8768
+        }
+      },
+      {
+        "id": "order-invalid-quantity-before-any-call",
+        "route": "/business-order",
+        "request": {
+          "requestKey": "bo-many",
+          "sku": "coffee",
+          "quantity": 101
+        },
+        "expected": {
+          "errorCode": "invalid_quantity",
+          "providerCalls": 0,
+          "committedEffects": 0
+        }
+      },
+      {
+        "id": "order-unknown-sku-at-reserve",
+        "route": "/business-order",
+        "request": {
+          "requestKey": "bo-unknown",
+          "sku": "matcha",
+          "quantity": 1
+        },
+        "expected": {
+          "errorCode": "unknown_sku",
+          "providerCalls": 1,
+          "committedEffects": 0
+        }
+      }
+    ]
+  },
+  "migratedWorkflows": {
+    "triggerValue": "published Blok 2.x resolves a root `@trigger` reference to ctx.request, the request envelope {body, headers, query, params, method, url}; the converted workflow receives that same value as its input",
+    "request": {
+      "requestKey": "migrated-quote",
+      "sku": "coffee",
+      "quantity": 2
+    },
+    "cases": [
+      {
+        "id": "converted-envelope-quote",
+        "source": {
+          "schemaVersion": "2",
+          "name": "migrated quote",
+          "version": "1.0.0",
+          "trigger": {
+            "http": {}
+          },
+          "steps": [
+            {
+              "id": "load",
+              "use": "catalog-request",
+              "inputs": {
+                "$ref": {
+                  "step": "@trigger",
+                  "path": []
+                }
+              }
+            },
+            {
+              "id": "total",
+              "use": "price",
+              "inputs": {
+                "$ref": {
+                  "step": "load",
+                  "path": [
+                    "body"
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        "expected": {
+          "supported": true,
+          "output": {
+            "sku": "coffee",
+            "totalCents": 3000,
+            "display": "3000 USD"
+          },
+          "providerCalls": 1,
+          "committedEffects": 1
+        }
+      },
+      {
+        "id": "trigger-body-projection-runs-old-but-is-not-converted",
+        "source": {
+          "schemaVersion": "2",
+          "name": "projected quote",
+          "version": "1.0.0",
+          "trigger": {
+            "http": {}
+          },
+          "steps": [
+            {
+              "id": "load",
+              "use": "catalog",
+              "inputs": {
+                "$ref": {
+                  "step": "@trigger",
+                  "path": [
+                    "body"
+                  ]
+                }
+              }
+            },
+            {
+              "id": "total",
+              "use": "price",
+              "inputs": {
+                "$ref": {
+                  "step": "load",
+                  "path": [
+                    "body"
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        "expected": {
+          "supported": false,
+          "code": "unsupported_trigger_projection",
+          "path": "steps[0].inputs",
+          "oldOutput": {
+            "sku": "coffee",
+            "totalCents": 3000,
+            "display": "3000 USD"
+          },
+          "providerCalls": 1,
+          "committedEffects": 1
+        }
+      }
+    ]
+  },
+  "durableRecovery": {
+    "trigger": "the producer process is SIGKILLed after durable acceptance of two submissions with the same job id; a fresh consumer process recovers the work",
+    "providerFailsFirstAttempt": true,
+    "expectedBody": {
+      "state": "completed",
+      "totalCents": 3000
+    },
+    "old": {
+      "adapter": "published PgBossAdapter, pg-boss 10.4.2 standard queue",
+      "storedJobsAfterDuplicateSubmission": 2,
+      "completed": 2,
+      "failed": 1,
+      "providerCalls": 3,
+      "committedEffects": 1
+    },
+    "new": {
+      "adapter": "trigger/worker.Queue on SQLite WAL synchronous=FULL",
+      "storedJobsAfterDuplicateSubmission": 1,
+      "completed": 1,
+      "failed": 1,
+      "attempts": 2,
+      "providerCalls": 2,
+      "committedEffects": 1
+    },
+    "duplicateSubmissionSemanticsMatch": false,
+    "note": "PgBossAdapter maps jobId to pg-boss singletonKey, which a standard pg-boss 10 queue does not deduplicate; both stored jobs execute and only the provider idempotency key keeps the business effect single. The new queue deduplicates the request key at admission."
+  },
+  "midExecutionKill": {
+    "trigger": "the consumer process is SIGKILLed while its provider call is in flight; a fresh consumer must redeliver the accepted job from durable storage",
+    "expectedBody": {
+      "state": "completed",
+      "totalCents": 3000
+    },
+    "old": {
+      "adapter": "published PgBossAdapter, pg-boss 10.4.2 standard queue, per-job expireInSeconds=5",
+      "redelivery": "pg-boss maintenance expires the orphaned active job and retries it; maintenance runs every 120 s by default and PgBossAdapter 2.5.0 exposes no option to change it",
+      "completedByFreshConsumer": 1,
+      "providerCalls": 2,
+      "abortedByKill": 1,
+      "committedEffects": 1
+    },
+    "new": {
+      "adapter": "trigger/worker.Queue on SQLite WAL synchronous=FULL",
+      "redelivery": "the claim commits the started attempt and a 30 s lease before the handler runs; the handler writes and acknowledgment share a second SQLite transaction, which the kill rolls back. The fresh consumer claims the job once the lease expires, as its second attempt",
+      "attemptsNote": "#245: a process-killed attempt consumes MaxAttempts, so the recovered completion is attempt 2",
+      "completedByFreshConsumer": 1,
+      "attempts": 2,
+      "providerCalls": 2,
+      "abortedByKill": 1,
+      "committedEffects": 1
+    }
+  },
+  "recovery": {
+    "new": {
+      "api": "trigger/worker.Queue",
+      "expected": "accepted job remains durable and is processed after process restart"
+    },
+    "old": {
+      "api": "trigger/worker.InMemoryAdapter",
+      "expected": "job is lost after process restart; adapter explicitly has no persistence"
+    },
+    "comparison": "recovery guarantees differ; no workflow replay is inferred from persisted run traces"
+  },
+  "inertia": {
+    "status": "separate-contract-required",
+    "includedInBusinessParity": false,
+    "reason": "Inertia page props, partial reloads, deferred props, flash and redirect semantics require their own client/server protocol contract"
+  }
+}

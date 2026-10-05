@@ -351,8 +351,14 @@ type Call struct {
 	Blobs             []*BlobRef             `protobuf:"bytes,9,rep,name=blobs,proto3" json:"blobs,omitempty"`
 	Principal         string                 `protobuf:"bytes,10,opt,name=principal,proto3" json:"principal,omitempty"`
 	Capabilities      []string               `protobuf:"bytes,11,rep,name=capabilities,proto3" json:"capabilities,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// Optional W3C trace context of the step attempt that dispatched this call
+	// (ADR 0020). Correlation only: it never changes the call's outcome, a
+	// worker that ignores it is conformant, and tracestate is at most 256
+	// bytes. Additive within protocol 1.1: proto3 peers ignore unknown fields.
+	Traceparent   string `protobuf:"bytes,12,opt,name=traceparent,proto3" json:"traceparent,omitempty"`
+	Tracestate    string `protobuf:"bytes,13,opt,name=tracestate,proto3" json:"tracestate,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Call) Reset() {
@@ -460,6 +466,20 @@ func (x *Call) GetCapabilities() []string {
 		return x.Capabilities
 	}
 	return nil
+}
+
+func (x *Call) GetTraceparent() string {
+	if x != nil {
+		return x.Traceparent
+	}
+	return ""
+}
+
+func (x *Call) GetTracestate() string {
+	if x != nil {
+		return x.Tracestate
+	}
+	return ""
 }
 
 type Cancel struct {
@@ -718,6 +738,92 @@ func (x *Result) GetError() *RemoteError {
 	return nil
 }
 
+// Log is scoped to one active call and is optional observability data. Workers
+// may drop records after their per-call bound; it never changes call outcome.
+type Log struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	CallId        string                 `protobuf:"bytes,1,opt,name=call_id,json=callId,proto3" json:"call_id,omitempty"`
+	AttemptId     string                 `protobuf:"bytes,2,opt,name=attempt_id,json=attemptId,proto3" json:"attempt_id,omitempty"`
+	Generation    uint64                 `protobuf:"varint,3,opt,name=generation,proto3" json:"generation,omitempty"`
+	Level         string                 `protobuf:"bytes,4,opt,name=level,proto3" json:"level,omitempty"`
+	Message       string                 `protobuf:"bytes,5,opt,name=message,proto3" json:"message,omitempty"`
+	AttrsJson     []byte                 `protobuf:"bytes,6,opt,name=attrs_json,json=attrsJson,proto3" json:"attrs_json,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Log) Reset() {
+	*x = Log{}
+	mi := &file_runtime_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Log) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Log) ProtoMessage() {}
+
+func (x *Log) ProtoReflect() protoreflect.Message {
+	mi := &file_runtime_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Log.ProtoReflect.Descriptor instead.
+func (*Log) Descriptor() ([]byte, []int) {
+	return file_runtime_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *Log) GetCallId() string {
+	if x != nil {
+		return x.CallId
+	}
+	return ""
+}
+
+func (x *Log) GetAttemptId() string {
+	if x != nil {
+		return x.AttemptId
+	}
+	return ""
+}
+
+func (x *Log) GetGeneration() uint64 {
+	if x != nil {
+		return x.Generation
+	}
+	return 0
+}
+
+func (x *Log) GetLevel() string {
+	if x != nil {
+		return x.Level
+	}
+	return ""
+}
+
+func (x *Log) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+func (x *Log) GetAttrsJson() []byte {
+	if x != nil {
+		return x.AttrsJson
+	}
+	return nil
+}
+
 type Frame struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Types that are valid to be assigned to Body:
@@ -728,6 +834,7 @@ type Frame struct {
 	//	*Frame_Result
 	//	*Frame_Cancel
 	//	*Frame_Drain
+	//	*Frame_Log
 	Body          isFrame_Body `protobuf_oneof:"body"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -735,7 +842,7 @@ type Frame struct {
 
 func (x *Frame) Reset() {
 	*x = Frame{}
-	mi := &file_runtime_proto_msgTypes[9]
+	mi := &file_runtime_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -747,7 +854,7 @@ func (x *Frame) String() string {
 func (*Frame) ProtoMessage() {}
 
 func (x *Frame) ProtoReflect() protoreflect.Message {
-	mi := &file_runtime_proto_msgTypes[9]
+	mi := &file_runtime_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -760,7 +867,7 @@ func (x *Frame) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Frame.ProtoReflect.Descriptor instead.
 func (*Frame) Descriptor() ([]byte, []int) {
-	return file_runtime_proto_rawDescGZIP(), []int{9}
+	return file_runtime_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *Frame) GetBody() isFrame_Body {
@@ -824,6 +931,15 @@ func (x *Frame) GetDrain() *Drain {
 	return nil
 }
 
+func (x *Frame) GetLog() *Log {
+	if x != nil {
+		if x, ok := x.Body.(*Frame_Log); ok {
+			return x.Log
+		}
+	}
+	return nil
+}
+
 type isFrame_Body interface {
 	isFrame_Body()
 }
@@ -852,6 +968,10 @@ type Frame_Drain struct {
 	Drain *Drain `protobuf:"bytes,6,opt,name=drain,proto3,oneof"`
 }
 
+type Frame_Log struct {
+	Log *Log `protobuf:"bytes,7,opt,name=log,proto3,oneof"`
+}
+
 func (*Frame_Hello) isFrame_Body() {}
 
 func (*Frame_Ready) isFrame_Body() {}
@@ -863,6 +983,8 @@ func (*Frame_Result) isFrame_Body() {}
 func (*Frame_Cancel) isFrame_Body() {}
 
 func (*Frame_Drain) isFrame_Body() {}
+
+func (*Frame_Log) isFrame_Body() {}
 
 var File_runtime_proto protoreflect.FileDescriptor
 
@@ -888,7 +1010,7 @@ const file_runtime_proto_rawDesc = "" +
 	"\bcontract\x18\x01 \x01(\v2\x16.blok.runtime.v1.HelloR\bcontract\"5\n" +
 	"\aBlobRef\x12\x16\n" +
 	"\x06digest\x18\x01 \x01(\tR\x06digest\x12\x12\n" +
-	"\x04size\x18\x02 \x01(\x04R\x04size\"\xf6\x02\n" +
+	"\x04size\x18\x02 \x01(\x04R\x04size\"\xb8\x03\n" +
 	"\x04Call\x12\x17\n" +
 	"\acall_id\x18\x01 \x01(\tR\x06callId\x12\x1d\n" +
 	"\n" +
@@ -904,7 +1026,11 @@ const file_runtime_proto_rawDesc = "" +
 	"\x05blobs\x18\t \x03(\v2\x18.blok.runtime.v1.BlobRefR\x05blobs\x12\x1c\n" +
 	"\tprincipal\x18\n" +
 	" \x01(\tR\tprincipal\x12\"\n" +
-	"\fcapabilities\x18\v \x03(\tR\fcapabilities\"`\n" +
+	"\fcapabilities\x18\v \x03(\tR\fcapabilities\x12 \n" +
+	"\vtraceparent\x18\f \x01(\tR\vtraceparent\x12\x1e\n" +
+	"\n" +
+	"tracestate\x18\r \x01(\tR\n" +
+	"tracestate\"`\n" +
 	"\x06Cancel\x12\x17\n" +
 	"\acall_id\x18\x01 \x01(\tR\x06callId\x12\x1d\n" +
 	"\n" +
@@ -928,14 +1054,26 @@ const file_runtime_proto_rawDesc = "" +
 	"generation\x18\x03 \x01(\x04R\n" +
 	"generation\x12\x16\n" +
 	"\x06output\x18\x04 \x01(\fR\x06output\x122\n" +
-	"\x05error\x18\x05 \x01(\v2\x1c.blok.runtime.v1.RemoteErrorR\x05error\"\xb2\x02\n" +
+	"\x05error\x18\x05 \x01(\v2\x1c.blok.runtime.v1.RemoteErrorR\x05error\"\xac\x01\n" +
+	"\x03Log\x12\x17\n" +
+	"\acall_id\x18\x01 \x01(\tR\x06callId\x12\x1d\n" +
+	"\n" +
+	"attempt_id\x18\x02 \x01(\tR\tattemptId\x12\x1e\n" +
+	"\n" +
+	"generation\x18\x03 \x01(\x04R\n" +
+	"generation\x12\x14\n" +
+	"\x05level\x18\x04 \x01(\tR\x05level\x12\x18\n" +
+	"\amessage\x18\x05 \x01(\tR\amessage\x12\x1d\n" +
+	"\n" +
+	"attrs_json\x18\x06 \x01(\fR\tattrsJson\"\xdc\x02\n" +
 	"\x05Frame\x12.\n" +
 	"\x05hello\x18\x01 \x01(\v2\x16.blok.runtime.v1.HelloH\x00R\x05hello\x12.\n" +
 	"\x05ready\x18\x02 \x01(\v2\x16.blok.runtime.v1.ReadyH\x00R\x05ready\x12+\n" +
 	"\x04call\x18\x03 \x01(\v2\x15.blok.runtime.v1.CallH\x00R\x04call\x121\n" +
 	"\x06result\x18\x04 \x01(\v2\x17.blok.runtime.v1.ResultH\x00R\x06result\x121\n" +
 	"\x06cancel\x18\x05 \x01(\v2\x17.blok.runtime.v1.CancelH\x00R\x06cancel\x12.\n" +
-	"\x05drain\x18\x06 \x01(\v2\x16.blok.runtime.v1.DrainH\x00R\x05drainB\x06\n" +
+	"\x05drain\x18\x06 \x01(\v2\x16.blok.runtime.v1.DrainH\x00R\x05drain\x12(\n" +
+	"\x03log\x18\a \x01(\v2\x14.blok.runtime.v1.LogH\x00R\x03logB\x06\n" +
 	"\x04body*\x8f\x01\n" +
 	"\n" +
 	"ErrorClass\x12\x1b\n" +
@@ -964,7 +1102,7 @@ func file_runtime_proto_rawDescGZIP() []byte {
 }
 
 var file_runtime_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_runtime_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
+var file_runtime_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
 var file_runtime_proto_goTypes = []any{
 	(ErrorClass)(0),     // 0: blok.runtime.v1.ErrorClass
 	(*Limits)(nil),      // 1: blok.runtime.v1.Limits
@@ -976,7 +1114,8 @@ var file_runtime_proto_goTypes = []any{
 	(*Drain)(nil),       // 7: blok.runtime.v1.Drain
 	(*RemoteError)(nil), // 8: blok.runtime.v1.RemoteError
 	(*Result)(nil),      // 9: blok.runtime.v1.Result
-	(*Frame)(nil),       // 10: blok.runtime.v1.Frame
+	(*Log)(nil),         // 10: blok.runtime.v1.Log
+	(*Frame)(nil),       // 11: blok.runtime.v1.Frame
 }
 var file_runtime_proto_depIdxs = []int32{
 	1,  // 0: blok.runtime.v1.Hello.limits:type_name -> blok.runtime.v1.Limits
@@ -990,15 +1129,16 @@ var file_runtime_proto_depIdxs = []int32{
 	9,  // 8: blok.runtime.v1.Frame.result:type_name -> blok.runtime.v1.Result
 	6,  // 9: blok.runtime.v1.Frame.cancel:type_name -> blok.runtime.v1.Cancel
 	7,  // 10: blok.runtime.v1.Frame.drain:type_name -> blok.runtime.v1.Drain
-	10, // 11: blok.runtime.v1.Worker.Connect:input_type -> blok.runtime.v1.Frame
-	5,  // 12: blok.runtime.v1.Worker.Invoke:input_type -> blok.runtime.v1.Call
-	10, // 13: blok.runtime.v1.Worker.Connect:output_type -> blok.runtime.v1.Frame
-	9,  // 14: blok.runtime.v1.Worker.Invoke:output_type -> blok.runtime.v1.Result
-	13, // [13:15] is the sub-list for method output_type
-	11, // [11:13] is the sub-list for method input_type
-	11, // [11:11] is the sub-list for extension type_name
-	11, // [11:11] is the sub-list for extension extendee
-	0,  // [0:11] is the sub-list for field type_name
+	10, // 11: blok.runtime.v1.Frame.log:type_name -> blok.runtime.v1.Log
+	11, // 12: blok.runtime.v1.Worker.Connect:input_type -> blok.runtime.v1.Frame
+	5,  // 13: blok.runtime.v1.Worker.Invoke:input_type -> blok.runtime.v1.Call
+	11, // 14: blok.runtime.v1.Worker.Connect:output_type -> blok.runtime.v1.Frame
+	9,  // 15: blok.runtime.v1.Worker.Invoke:output_type -> blok.runtime.v1.Result
+	14, // [14:16] is the sub-list for method output_type
+	12, // [12:14] is the sub-list for method input_type
+	12, // [12:12] is the sub-list for extension type_name
+	12, // [12:12] is the sub-list for extension extendee
+	0,  // [0:12] is the sub-list for field type_name
 }
 
 func init() { file_runtime_proto_init() }
@@ -1006,13 +1146,14 @@ func file_runtime_proto_init() {
 	if File_runtime_proto != nil {
 		return
 	}
-	file_runtime_proto_msgTypes[9].OneofWrappers = []any{
+	file_runtime_proto_msgTypes[10].OneofWrappers = []any{
 		(*Frame_Hello)(nil),
 		(*Frame_Ready)(nil),
 		(*Frame_Call)(nil),
 		(*Frame_Result)(nil),
 		(*Frame_Cancel)(nil),
 		(*Frame_Drain)(nil),
+		(*Frame_Log)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -1020,7 +1161,7 @@ func file_runtime_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_runtime_proto_rawDesc), len(file_runtime_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   10,
+			NumMessages:   11,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

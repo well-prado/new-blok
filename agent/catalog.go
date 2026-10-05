@@ -15,12 +15,12 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/well-prado/new-blok/contract"
+	"github.com/well-prado/new-blok/agent/internal/catalogprogram"
 	"github.com/well-prado/new-blok/contract/schema"
 	"github.com/well-prado/new-blok/contract/tool"
 	"github.com/well-prado/new-blok/flow"
-	"github.com/well-prado/new-blok/internal/engine"
 	"github.com/well-prado/new-blok/node"
+	"github.com/well-prado/new-blok/observe/redact"
 )
 
 type Manifest = tool.Manifest
@@ -33,6 +33,12 @@ var ErrNotAgentSafe = errors.New("agent: tool is not agent-safe")
 var ErrDenied = errors.New("agent: capability denied")
 var ErrCapacity = errors.New("agent: active invocation capacity exceeded")
 
+// ErrSensitiveListing refuses a tool whose model-visible listing (its
+// description, schema literals such as defaults, or its reviewed
+// references) carries an actual credential value, encoded ones included
+// (ADR 0021). Secrets reach a tool only as opaque reference names.
+var ErrSensitiveListing = errors.New("agent: catalog listing carries a credential-shaped value")
+
 type Listing struct {
 	Name, Version, Description       string
 	InputSchema, OutputSchema        json.RawMessage
@@ -43,14 +49,18 @@ type Listing struct {
 }
 
 type binding struct {
-	listing                 Listing
-	manifest                Manifest
-	in, out                 schema.Schema
-	resources               tool.Resources
-	native                  func(context.Context, []byte) ([]byte, error)
-	program                 *contract.InternalProgram
+	listing   Listing
+	manifest  Manifest
+	in, out   schema.Schema
+	resources tool.Resources
+	native    func(context.Context, []byte) ([]byte, error)
+	// program holds a workflow tool's lowered program and its literals. It
+	// runs only through catalog dispatch: package agent cannot name the raw
+	// program, so it cannot run, observe or journal it without the literal
+	// substitution (#260).
+	program                 *catalogprogram.Program
 	children                map[string]binding
-	literals                map[string][]byte
+	steps                   map[string]binding
 	maxDepth, calls, tokens int
 }
 
@@ -147,10 +157,23 @@ func RegisterWorkflow[I, O any](c *Catalog, wf flow.Definition[I, O], inputSchem
 	if len(p.Instructions) == 0 || len(p.Instructions) > 10000 {
 		return ErrBudget
 	}
-	program := contract.InternalProgram{WorkflowID: p.Spec.Name, Version: p.Spec.Version}
+	// One lowering for developer- and agent-authored workflows (#249): the
+	// same rules as flow.Lower, plus the catalog's two extensions — a
+	// literal call input, which dispatch substitutes, and a child workflow
+	// call.
+	instructions := make([]catalogprogram.Instruction, len(p.Instructions))
+	for index, instruction := range p.Instructions {
+		instructions[index] = catalogprogram.Instruction{Kind: instruction.Kind, ID: instruction.ID, Node: instruction.Node.Name, Input: instruction.Input, Literal: instruction.Literal}
+		if instruction.Kind == "child" {
+			instructions[index].Node, _ = instruction.Data["workflow"].(string)
+		}
+	}
+	program, err := catalogprogram.Lower(p.Spec.Name, p.Spec.Version, instructions, p.Output)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrNotAgentSafe, err)
+	}
 	children := map[string]binding{}
-	literals := map[string][]byte{}
-	seen := map[string]bool{}
+	steps := map[string]binding{}
 	m := cloneManifest(parent)
 	c.mu.RLock()
 	registered := make(map[string]binding, len(c.tools))
@@ -158,11 +181,9 @@ func RegisterWorkflow[I, O any](c *Catalog, wf flow.Definition[I, O], inputSchem
 		registered[key] = child
 	}
 	c.mu.RUnlock()
+	literals := program.Literals()
 	maxDepth, calls, tokens := 1, 0, 0
 	for _, instruction := range p.Instructions {
-		if (instruction.Kind != "call" && instruction.Kind != "child") || instruction.ID == "output" || seen[instruction.ID] {
-			return ErrNotAgentSafe
-		}
 		key := instruction.Node.Name + "@" + instruction.Node.Version
 		if instruction.Kind == "child" {
 			key, _ = instruction.Data["workflow"].(string)
@@ -175,7 +196,13 @@ func RegisterWorkflow[I, O any](c *Catalog, wf flow.Definition[I, O], inputSchem
 		if instruction.Kind == "call" && (!bytes.Equal(instruction.Node.InputSchema, child.listing.InputSchema) || !bytes.Equal(instruction.Node.OutputSchema, child.listing.OutputSchema)) {
 			return ErrNotAgentSafe
 		}
+		if literal, ok := literals[instruction.ID]; ok {
+			if err := checkLiteral(instruction.Kind, instruction.ID, key, child, literal); err != nil {
+				return err
+			}
+		}
 		children[key] = child
+		steps[instruction.ID] = child
 		calls += child.calls
 		tokens += child.tokens
 		if calls > 10000 || tokens > 1<<30 {
@@ -191,32 +218,13 @@ func RegisterWorkflow[I, O any](c *Catalog, wf flow.Definition[I, O], inputSchem
 		m.Capabilities = append(m.Capabilities, child.manifest.Capabilities...)
 		m.SecretRefs = append(m.SecretRefs, child.manifest.SecretRefs...)
 		m.Deterministic = m.Deterministic && child.manifest.Deterministic
-		i := contract.InternalInstruction{Index: len(program.Instructions), ID: instruction.ID, Kind: "call", Node: key}
-		switch {
-		case instruction.Input == "$input":
-		case instruction.Input == "$literal" && len(instruction.Literal) > 0:
-			literals[instruction.ID] = append([]byte(nil), instruction.Literal...)
-		default:
-			ref, err := reference(instruction.Input, seen)
-			if err != nil {
-				return err
-			}
-			i.References = []contract.Reference{ref}
-		}
-		program.Instructions = append(program.Instructions, i)
-		seen[instruction.ID] = true
 	}
-	ref, err := reference(p.Output, seen)
-	if err != nil {
-		return err
-	}
-	program.Instructions = append(program.Instructions, contract.InternalInstruction{ID: "output", Kind: "output", References: []contract.Reference{ref}})
 	m.Effects, m.Capabilities, m.SecretRefs = unique(m.Effects), unique(m.Capabilities), unique(m.SecretRefs)
 	b, err := prepare(p.Spec.Name, p.Spec.Version, "composed workflow tool", inputSchema, outputSchema, m, metadata)
 	if err != nil {
 		return err
 	}
-	b.program, b.children, b.literals = &program, children, literals
+	b.program, b.children, b.steps = program, children, steps
 	b.maxDepth, b.calls, b.tokens = maxDepth, calls, tokens
 	b.resources = tool.Resources{TokenLimit: tokens}
 	b.listing.Resources = b.resources
@@ -229,16 +237,25 @@ func RegisterWorkflow[I, O any](c *Catalog, wf flow.Definition[I, O], inputSchem
 	return c.register(b)
 }
 
-func reference(source string, seen map[string]bool) (contract.Reference, error) {
-	source = strings.Replace(source, "$child.", "$step.", 1)
-	if !strings.HasPrefix(source, "$step.") {
-		return contract.Reference{}, ErrNotAgentSafe
+// checkLiteral runs, at registration, the admission dispatch will run on a
+// literal call input (#261): the input-size bound, then the tool's own
+// Normalize. A literal no budget can admit — over the 1 MiB payload limit
+// tool.Budget caps MaxInputBytes at, before or after normalization — is
+// ErrBudget; a literal the tool's schema refuses is ErrNotAgentSafe. Both
+// name the step. The check only validates: the catalog keeps the literal as
+// flow recorded it, and dispatch normalizes it exactly as it did before.
+func checkLiteral(kind, id, key string, child binding, literal []byte) error {
+	if len(literal) > schema.MaxPayloadBytes {
+		return fmt.Errorf("%w: %s %q: literal input is %d bytes, over the %d-byte input limit", ErrBudget, kind, id, len(literal), schema.MaxPayloadBytes)
 	}
-	parts := strings.Split(strings.TrimPrefix(source, "$step."), ".")
-	if !seen[parts[0]] {
-		return contract.Reference{}, ErrNotAgentSafe
+	normal, err := child.in.Normalize(literal)
+	if err != nil {
+		return fmt.Errorf("%w: %s %q: literal input does not satisfy the input schema of %s: %w", ErrNotAgentSafe, kind, id, key, err)
 	}
-	return contract.Reference{Step: parts[0], Path: parts[1:]}, nil
+	if len(normal) > schema.MaxPayloadBytes {
+		return fmt.Errorf("%w: %s %q: literal input normalizes to %d bytes, over the %d-byte input limit", ErrBudget, kind, id, len(normal), schema.MaxPayloadBytes)
+	}
+	return nil
 }
 
 func prepare(name, version, description string, input, output []byte, m Manifest, metadata tool.Metadata) (binding, error) {
@@ -256,6 +273,9 @@ func prepare(name, version, description string, input, output []byte, m Manifest
 	if err != nil {
 		return binding{}, err
 	}
+	if sensitiveListing(description, input, output, metadata) {
+		return binding{}, ErrSensitiveListing
+	}
 	l := Listing{Name: name, Version: version, Description: description, InputSchema: append([]byte(nil), input...), OutputSchema: append([]byte(nil), output...), Effects: unique(m.Effects), CapabilityDigest: hash([]byte(strings.Join(unique(m.Capabilities), "\n"))), Metadata: metadata}
 	raw, _ := json.Marshal(struct {
 		Listing  Listing
@@ -263,6 +283,25 @@ func prepare(name, version, description string, input, output []byte, m Manifest
 	}{l, m})
 	l.ArtifactDigest = hash(raw)
 	return binding{listing: l, manifest: cloneManifest(m), in: in, out: out}, nil
+}
+
+// sensitiveListing is the catalog's enforcement point: everything a model
+// can read in a listing is checked once, at registration, for an actual
+// credential value (redact.Credential). Prose that merely mentions a
+// password or a token limit is a legitimate tool description and is kept.
+func sensitiveListing(description string, input, output []byte, metadata tool.Metadata) bool {
+	for _, text := range []string{description, metadata.Source, metadata.Example, metadata.Test} {
+		if redact.Credential(text) {
+			return true
+		}
+	}
+	for _, raw := range [][]byte{input, output} {
+		value, err := decode(raw)
+		if err != nil || redact.HasCredentialValue(value) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Catalog) register(b binding) error {
@@ -383,46 +422,25 @@ func (c *Catalog) execute(ctx context.Context, b binding, input []byte, s *execu
 		scope := Principal{ID: s.principal.ID, Capabilities: append([]string(nil), b.manifest.Capabilities...), MaxDepth: s.budget.MaxDepth - depth + 1}
 		output, err = b.native(tool.WithScope(tool.WithTokenLimit(ctx, b.resources.TokenLimit), scope), normal)
 	} else {
-		nodes := map[string]node.Any{}
-		// Unique engine keys per instruction preserve literals and versions.
-		program := *b.program
-		program.Instructions = append([]contract.InternalInstruction(nil), b.program.Instructions...)
-		for index, instruction := range program.Instructions {
-			if instruction.Kind != "call" {
-				continue
-			}
-			child := b.children[instruction.Node]
-			literal := b.literals[instruction.ID]
-			key := instruction.ID
-			program.Instructions[index].Node = key
-			n := node.MustDefine[any, any]("agent/dispatch", "1.0.0", func(ctx context.Context, value any) (any, error) {
-				raw, err := json.Marshal(value)
-				if err != nil {
-					return nil, err
-				}
-				if literal != nil {
-					raw = literal
-				}
-				result, err := c.execute(ctx, child, raw, s, depth+1)
-				if err != nil {
-					return nil, err
-				}
-				return decode(result)
-			}, node.Description("admitted tool dispatch"), node.Schemas([]byte(`{"type":"object"}`), []byte(`{"type":"object"}`)),
-				// The child's effects, so the engine knows a later step's
-				// saturation is no longer safe to retry (#190).
-				node.Effects(child.manifest.Effects...))
-			nodes[key] = n.Any()
-		}
 		value, decodeErr := decode(normal)
 		if decodeErr != nil {
 			return nil, decodeErr
 		}
-		result, runErr := engine.New(nodes).WithMaxSteps(s.budget.MaxCalls+1).Run(ctx, program, value)
+		// The program runs only here, through catalog dispatch, which
+		// substitutes each literal (#260).
+		result, runErr := b.program.Run(ctx, value, s.budget.MaxCalls+1,
+			func(id string) []string { return b.steps[id].manifest.Effects },
+			func(ctx context.Context, id string, input []byte) (any, error) {
+				result, err := c.execute(ctx, b.steps[id], input, s, depth+1)
+				if err != nil {
+					return nil, err
+				}
+				return decode(result)
+			})
 		if runErr != nil {
 			return nil, runErr
 		}
-		output, err = json.Marshal(result.Output)
+		output, err = json.Marshal(result)
 	}
 	if err != nil {
 		return nil, err

@@ -1,0 +1,9 @@
+{
+  "fixtureVersion": 1,
+  "synthetic": true,
+  "name": "standby-worker-acquisition-rate",
+  "partitions": 8,
+  "observeMillis": 2000,
+  "retryIntervalMillis": 250,
+  "expected": {"maxLeaseGrantsPerPartitionPerSecond": 5, "acquiredPartitions": 0}
+}

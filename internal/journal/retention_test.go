@@ -40,14 +40,14 @@ func TestCompactionRetainsAuditAndActiveRuns(t *testing.T) {
 	if _, err := j.Run(context.Background(), active.RunID); err != nil {
 		t.Fatalf("active run was compacted: %v", err)
 	}
-	count, err := j.AuditCount(context.Background())
+	count, err := j.TombstoneCount(context.Background())
 	if err != nil || count != 1 {
 		t.Fatalf("audit count=%d err=%v", count, err)
 	}
 	if _, err := j.Compact(context.Background(), time.Unix(200, 0)); err != nil {
 		t.Fatal(err)
 	}
-	count, err = j.AuditCount(context.Background())
+	count, err = j.TombstoneCount(context.Background())
 	if err != nil || count != 1 {
 		t.Fatalf("duplicate audit count=%d err=%v", count, err)
 	}

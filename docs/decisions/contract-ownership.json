@@ -62,9 +62,9 @@
       "id": "registry-trust",
       "question": "How are packages resolved, verified, locked and installed offline?",
       "owner": "E13-T01",
-      "status": "planned",
-      "decision": "Use immutable identities, verified artifacts, deterministic locks, offline cache and atomic changes; do not replace language package managers.",
-      "evidence": ["digest-mismatch-rejected", "offline-lock-resolution", "atomic-install-failure"]
+      "status": "partial",
+      "decision": "E13-T01 defines immutable signed package identity/trust, validates and binds existing node/workflow schemas, carries ordinary node effects/capabilities in node.Descriptor, and accepts the existing tool.Manifest only as an explicit agent-compatible declaration. Missing manifests never imply agent eligibility; workflow documents currently have no aggregate capability field. Offline resolution, lock generation, durable cache, and atomic CLI install/update remain E13-T02–T04; language package managers are not replaced.",
+      "evidence": ["TestPackageMetadataIsRequiredTypedAndCanonical", "TestPackageMetadataTamperingInvalidatesSignature", "TestWorkflowPackageReusesValidatedContractDocument", "TestStoreBindsImmutableVersionsAndReturnsCopies", "TestRegistryProtocolFixtureAgainstLocalMock"]
     },
     {
       "id": "distributed-ownership",
@@ -81,6 +81,14 @@
       "status": "open",
       "decision": "Require behaviorally equivalent application workloads, security/fuzz/chaos evidence and controlled repeated measurements.",
       "evidence": ["current-blok-parity", "live-ai-evaluation", "fleet-load-with-failures"]
+    },
+    {
+      "id": "blok-v2-structural-migration",
+      "question": "Which legacy Blok v2 workflow subset can be structurally converted and exported without changing business behavior?",
+      "owner": "E20-T01",
+      "status": "partial",
+      "decision": "ADR 0019 defines a bounded structural-only subset, pinned node inventory, strict duplicate/unknown-field handling, actionable rejection, and exact representable Export rules. Startup, idle, load and recovery distributions plus independent Review R remain open for E20-T01.",
+      "evidence": ["migration-structural-round-trip", "migration-unsupported-expression", "migration-export-loss-rejected", "current-blok-executable-parity"]
     },
     {
       "id": "trigger-adapter-contract",
@@ -145,6 +153,38 @@
       "status": "implemented",
       "decision": "Only tools the endpoint exposes by name@version, the catalog lists for the caller and whose schemas MCP can carry are visible; each call runs as the principal its own request authenticated, is schema-validated, bounded in concurrency and time, and dispatched through the catalog, where a named approval is only looked up; errors reach the model as stable codes; sessions and calls are bounded globally and per principal; a client cancel, a dropped request or the owner ending its session cancels the work (ADR 0014).",
       "evidence": ["mcp-fixture-cases", "mcp-discovery-and-resources", "mcp-unauthenticated", "mcp-revocation-mid-session", "mcp-session-hijack", "mcp-protocol-versions", "mcp-deadline", "mcp-client-cancel", "mcp-dropped-request-cancel", "mcp-session-end-cancel", "mcp-late-queued-call", "mcp-overload", "mcp-principal-slots", "mcp-session-bounds", "mcp-output-bound", "mcp-draining", "mcp-call-lease", "mcp-shutdown", "mcp-evicted-views", "mcp-view-building", "mcp-listing-panic", "mcp-goroutine-bounds", "mcp-approval-evidence", "mcp-workflow-tool", "mcp-dependency-rule", "mcp-selection-footprint", "mcp-trigger-conformance"]
+    },
+    {
+      "id": "versioned-run-step-inspection",
+      "question": "How are native run and step observations versioned, authorized, redacted, bounded and paginated?",
+      "owner": "E15-T01",
+      "status": "implemented",
+      "decision": "inspection/v1 exposes immutable app-composed Go and Node outcomes, a bounded process-local recorder, and a principal-authorized SQL journal read port for actual waits, attempts, uncertain effects and child lineage; payloads and blobs are separately bounded and redacted/authorized (ADR 0016).",
+      "evidence": ["inspection-actual-go-engine-golden", "inspection-actual-node-success-failure-cancellation-uncertain", "inspection-two-principal-isolation", "inspection-redaction-bounds-pagination", "inspection-recorder-saturation", "inspection-journal-wait-resume-uncertain-lineage", "inspection-authenticated-bounded-blob", "inspection-version-rejection", "inspection-immutable-projection"]
+    },
+    {
+      "id": "live-dev-event-stream",
+      "question": "How does a development reader follow a run live without being able to slow it, see what it may not, or miss a loss without knowing?",
+      "owner": "E15-T02",
+      "status": "implemented",
+      "decision": "An application-selected inspection observer feeds a bounded process-local hub (observe/event, standard library only) served as Server-Sent Events by inspect.NewEventHandler; publication never waits on a reader (a full queue disconnects it), capture of inputs/outputs/logs is off by default and policy-gated per reader, every loss is an in-sequence or cursor-derived gap, late worker logs are followed for a bounded window after the terminal frame, every connection is admitted against reader limits before any replay or durable read, and a run without live history is reconstructed from the journal as the reader and followed live only under its durable owner, within a per-principal recovered budget that never evicts live runs; a run nobody in the process publishes for (a cluster run, reconstructed from store/distributed under the tenant its run record names, or a crashed run) is polled at a bounded interval and ends at its durable terminal state, and an unfinished run idle past a bounded time becomes recyclable by recovered reads (ADR 0016, #263).",
+      "evidence": ["events-actual-http-live-run", "events-disconnect-resume", "events-cursor-gaps-and-rejection", "events-authorization-and-capture", "events-saturation-transient-refusal", "events-stalled-readers-journal-unaffected", "events-late-log-window", "events-actual-node-late-logs", "events-crash-journal-reconstruction", "events-lifetime-bound", "events-fixture-cases", "events-overhead-latency-leak-memory", "events-engine-dependency-boundary", "events-recovered-run-durable-owner", "events-recovered-budget", "events-admission-before-durable-read", "events-error-field-policy", "events-cluster-run-reconstruction", "events-recovered-poll-terminal-end", "events-idle-unfinished-recyclable"]
+    },
+    {
+      "id": "optional-production-telemetry",
+      "question": "How are production traces, metrics and logs exported without engine provider dependencies, unbounded labels, or telemetry affecting execution?",
+      "owner": "E16-T01",
+      "status": "implemented",
+      "decision": "The engine allocates W3C trace context for observed runs under an explicit app TracePolicy and hands it to nodes, worker calls (optional proto fields inside protocol 1.1) and child runs through the stdlib-only contract/observe port; the OpenTelemetry bridge is the separate observe/otel Go module, an inspection.Observer that declares itself payload-free, exports independently selected signals with a fixed label vocabulary, tenant allowlist and series bound, and drops and counts on queue saturation or exporter failure without ever blocking or failing a run (ADR 0020).",
+      "evidence": ["telemetry-no-exporter-footprint", "telemetry-real-otlp-fixture-cases", "telemetry-actual-collector-outage", "telemetry-cardinality-bound", "telemetry-queue-saturation", "telemetry-node-child-lineage", "telemetry-gates-authoritative", "telemetry-mode-latency-rss"]
+    },
+    {
+      "id": "sensitive-data-and-reliable-audit",
+      "question": "How are secrets kept out of framework-owned channels, and how is mandatory audit kept reliable, access-controlled, retained and restored separately from optional telemetry?",
+      "owner": "E16-T02",
+      "status": "implemented",
+      "decision": "contract/audit records approval, reconciliation and deployment decisions (actor, outcome, digests, opaque scope names; no content or secret values) in the decision's own store transaction, so an audit failure refuses the decision and applies nothing; an optional mirror receives copies only after commit; reads are tenant-authorized and digest-verified; retention spares active runs, legal holds and the legal minimum; audit is backed up and restored with durable state; journal compaction erases a run's content past its retention (legal hold and legal minimum respected), leaving digest-only tombstones and reconciliations, with SQLite secure deletion and a log purge (#281). observe/redact is the single redaction boundary (keys, credential text, bounded JSON-in-string/percent/base64 decoding) for inspection, worker logs, telemetry attributes, catalog listings and audit records, covering framework-owned channels only (ADR 0021).",
+      "evidence": ["audit-decision-fixture-cases", "audit-unavailable-before-approval-reconcile-deployment", "audit-optional-mirror-drop", "audit-retention-active-hold-minimum", "audit-run-compaction-legal-hold", "audit-restore-with-durable-state", "audit-tenant-read-denial", "audit-record-secret-refusal", "redaction-encoded-content-fixtures", "inspection-secret-fixtures-real-engine", "inspection-two-principal-two-tenant-denial", "inspection-field-policy-authorized-reader", "telemetry-allowlisted-attributes-opaque", "worker-log-shared-redaction", "catalog-listing-opaque", "audit-verify-owner-cross-check", "audit-legacy-record-readable", "audit-prune-unknown-run-fail-closed", "redaction-strict-refusal-broad-redaction", "inspection-projection-size-gate", "erasure-compacted-run-byte-search", "erasure-reconciled-run-compacts", "erasure-legal-hold-and-minimum-keep-content", "erasure-legacy-migration-idempotent-crash-safe", "erasure-restore-pre-erasure-backup", "store-secure-delete-and-log-purge"]
     }
   ]
 }
