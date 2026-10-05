@@ -514,7 +514,7 @@ It reads the package's syntax, not its types, and it is red on:
 - any import outside the set `Run` needs, so `contract/inspection`,
   `internal/journal`, the event hub and `unsafe` are refused, as are dot
   and blank imports;
-- each allowed package imported more than once, unaliased: a path
+- any allowed package not imported exactly once and unaliased: a path
   imported twice in one file, a path taking two local names across the
   package, or `reflect` or the engine imported under any name but its
   default. The test still tracks every local name a path takes, so a
