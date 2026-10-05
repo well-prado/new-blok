@@ -167,6 +167,16 @@
       "outputRecords": 0,
       "errorRecords": 1,
       "effectRecords": 0
+    },
+    "constructor-spoofing": {
+      "outputRecords": 0,
+      "errorRecords": 5,
+      "effectRecords": 0
+    },
+    "constructor-not-single": {
+      "outputRecords": 0,
+      "errorRecords": 4,
+      "effectRecords": 0
     }
   }
 }

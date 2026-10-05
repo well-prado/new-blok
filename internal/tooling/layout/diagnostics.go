@@ -84,7 +84,7 @@ var remediations = map[string]string{
 	CodeParseFailed:           "fix the syntax error; discovery reads source without building it",
 	CodeDescriptorMissing:     "declare the node with node.Define in Go, or a node.json descriptor for a foreign runtime",
 	CodeDescriptorMultiple:    "keep one node per directory; move the other definition into its own node directory",
-	CodeDescriptorNotStatic:   "write var X = node.Define(...) at package level with literals or package-level string constants, or return node.Define(...) directly from a top-level function with string literals",
+	CodeDescriptorNotStatic:   "write var X = node.Define(...) at package level with literals or package-level string constants, or make a top-level function whose only statement is return node.Define(...) with string literals and no parameter or result named like the import",
 	CodeDescriptorInvalid:     "use a namespaced lower-case name and a major.minor.patch version",
 	CodeDescriptorMisplaced:   "define nodes under a node directory and workflows under a declared workflow path",
 	CodeDescriptorConstrained: "move the Define call and the constants it uses into a file without build constraints or a _GOOS/_GOARCH name",

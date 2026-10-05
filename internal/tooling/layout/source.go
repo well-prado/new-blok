@@ -207,7 +207,7 @@ func (s goSource) definitions(c *collector) (nodes, flows []definition) {
 					c.add(CodeDescriptorConstrained, at, "an unconstrained file", summary.constrained, "a "+kind+" is defined in a build-constrained file; which identity exists depends on the build")
 					continue
 				case !call.accepted:
-					c.add(CodeDescriptorNotStatic, at, "package-level var X = Define(...) or a constructor's direct return", "", "a "+kind+" Define call sits where discovery cannot know it runs, or runs once")
+					c.add(CodeDescriptorNotStatic, at, "package-level var X = Define(...) or a one-statement constructor return", "", "a "+kind+" Define call sits where discovery cannot know it is the framework call, that it runs, or that it runs once")
 					continue
 				}
 				name, whyName := resolve(call.name, call.inFunc)
@@ -274,10 +274,21 @@ func constraint(rel string, file *ast.File) string {
 	return ""
 }
 
-// acceptedCalls finds the two call positions whose execution is certain and
-// single: the whole initializer of a package-level var, and the result of a
-// top-level function's direct return statement (the constructor form blok
-// new writes).
+// acceptedCalls finds the two call positions whose execution, if the
+// enclosing code runs at all, is certain, single and unambiguous:
+//
+//   - the whole initializer of a package-level var: at package scope the
+//     callee and its arguments can only name file- or package-scope
+//     declarations, never a local;
+//   - the only statement of a top-level function, `return X.Define(...)`
+//     (the constructor form blok new writes), provided the function binds
+//     no parameter, named result or type parameter with the name the call
+//     uses for the framework package (or, for a dot import, for Define
+//     itself). A body of exactly one statement leaves no earlier statement
+//     that could bind it, and no statement before or after the return.
+//
+// Whether a constructor is ever called is a call-graph question discovery
+// cannot answer without type checking; ADR 0023 records that limit.
 func acceptedCalls(file *ast.File) (packageVars, constructors map[*ast.CallExpr]bool) {
 	packageVars, constructors = map[*ast.CallExpr]bool{}, map[*ast.CallExpr]bool{}
 	for _, decl := range file.Decls {
@@ -294,19 +305,62 @@ func acceptedCalls(file *ast.File) (packageVars, constructors map[*ast.CallExpr]
 				}
 			}
 		case *ast.FuncDecl:
-			if d.Recv != nil || d.Body == nil {
+			if d.Recv != nil || d.Body == nil || len(d.Body.List) != 1 {
 				continue
 			}
-			for _, statement := range d.Body.List {
-				if ret, ok := statement.(*ast.ReturnStmt); ok && len(ret.Results) > 0 {
-					if call, ok := ret.Results[0].(*ast.CallExpr); ok {
-						constructors[call] = true
-					}
-				}
+			ret, ok := d.Body.List[0].(*ast.ReturnStmt)
+			if !ok || len(ret.Results) != 1 {
+				continue
+			}
+			call, ok := ret.Results[0].(*ast.CallExpr)
+			if !ok {
+				continue
+			}
+			if qualifier := calleeName(call); qualifier != "" && !binds(d.Type, qualifier) {
+				constructors[call] = true
 			}
 		}
 	}
 	return packageVars, constructors
+}
+
+// calleeName is the identifier a call resolves its callee through: the
+// package qualifier of pkg.F(...), or F itself for a dot-imported F(...).
+func calleeName(call *ast.CallExpr) string {
+	fun := call.Fun
+	switch indexed := fun.(type) {
+	case *ast.IndexExpr:
+		fun = indexed.X
+	case *ast.IndexListExpr:
+		fun = indexed.X
+	}
+	switch f := fun.(type) {
+	case *ast.SelectorExpr:
+		if ident, ok := f.X.(*ast.Ident); ok {
+			return ident.Name
+		}
+	case *ast.Ident:
+		return f.Name
+	}
+	return ""
+}
+
+// binds reports whether a function's type parameters, parameters or named
+// results declare name, shadowing the file-scope import inside its body.
+func binds(signature *ast.FuncType, name string) bool {
+	for _, list := range []*ast.FieldList{signature.TypeParams, signature.Params, signature.Results} {
+		if list == nil {
+			continue
+		}
+		for _, field := range list.List {
+			for _, ident := range field.Names {
+				if ident.Name == name {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func calls(file *ast.File, fileSet *token.FileSet) []call {

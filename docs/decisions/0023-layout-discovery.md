@@ -1,7 +1,8 @@
 # ADR 0023: Manifest-based layout discovery
 
 - Status: implementation in review for E12-T01 (#67); revised after the
-  first specialist review (H1, H2, M1, L1–L5)
+  first specialist review (H1, H2, M1, L1–L5) and the second (constructor
+  shadowing and single-statement constructors)
 - Date: 2026-10-05
 - Roadmap: E12-T01 ([#67](https://github.com/well-prado/new-blok/issues/67));
   builds on E11-T01 (#64, `blok new` / `blok generate`, PR #174), the
@@ -85,10 +86,17 @@ exactly once, with the arguments discovery sees:
    node.MustDefine(...)`, `var Node, err = node.Define(...)`); its name and
    version may be string literals, package-level string constants, or `+`
    concatenations of those;
-2. the first result of a direct `return` statement in a top-level function
-   (the constructor `blok new` writes: `return node.Define(...)`); here the
-   name and version must be string **literals**, because an identifier
-   could be a parameter or a local constant shadowing the package one.
+2. the constructor form `blok new` writes: a top-level function (no
+   receiver) whose body is **exactly one statement**,
+   `return node.Define(...)` with that call as the only result. A body of
+   one statement has no earlier statement that could rebind a name, and no
+   code before or after the return that could skip it or add another. The
+   function must not bind the name the call resolves its callee through —
+   the import's name (`node`, or its alias), or `Define`/`MustDefine` for a
+   dot import — as a parameter, named result or type parameter; otherwise
+   `node.Define` may be a decoy's method. Its name and version must be
+   string **literals**, because an identifier could be a parameter or a
+   local constant shadowing the package one.
 
 A Define anywhere else (a closure, an assignment, a nested call, a method)
 is `layout_descriptor_not_static`, as is an identity using a constant that
@@ -277,11 +285,11 @@ No wire, journal, artifact or worker contract changes.
 Focused suites: `go test -count=1 ./internal/tooling/... ./internal/scaffold
 ./cmd/blok`, then the repository gates listed in the PR.
 
-- 33 synthetic `txtar` cases under
+- 35 synthetic `txtar` cases under
   `internal/tooling/layout/testdata/cases`, each with a predeclared exact
   catalog and digest or exact sorted `[code, source]` diagnostics, and
   output/error/effect counts in `testdata/provenance.json` (Apache-2.0,
-  synthetic, no private data); 27 cases are negative.
+  synthetic, no private data); 29 cases are negative.
 - `classic-shop` and `unified-shop` are one application (nested Go node
   files, a shared domain import, a nodejs node beside the Go node, a
   test-only Define that must not count) with different directory names;
@@ -306,7 +314,7 @@ Focused suites: `go test -count=1 ./internal/tooling/... ./internal/scaffold
 - The case-collision test needs a case-sensitive file system; it skips on
   default APFS and passed on a case-sensitive APFS disk image.
 - Mutations, each run against `./internal/tooling/... ./internal/scaffold`
-  on a committed tree and reverted; all 30 turn a test red:
+  on a committed tree and reverted; all 36 turn a test red:
 
 | Mutation | Red test |
 | --- | --- |
@@ -340,6 +348,12 @@ Focused suites: `go test -count=1 ./internal/tooling/... ./internal/scaffold
 | parse error echoes go/parser text | TestParseErrorsEchoNoContent |
 | directories not counted | TestDirectoryBounds |
 | directory listing unbounded | TestDirectoryBounds |
+| constructor shadowing check removed | constructor-spoofing |
+| constructor parameters not checked (`func Decoy(node fake)`, dot-import `Define` parameter) | constructor-spoofing |
+| constructor named results not checked (`func Decoy() (node fake)`) | constructor-spoofing |
+| constructor type parameters not checked | constructor-spoofing |
+| earlier statements allowed (`node := fake{}; return node.Define(...)`) | constructor-spoofing, constructor-not-single |
+| statements after the return allowed (Define after an unconditional return) | constructor-not-single |
 
 ## Limits
 
@@ -354,10 +368,14 @@ Focused suites: `go test -count=1 ./internal/tooling/... ./internal/scaffold
 - Discovery is a snapshot; a tree changing during discovery can produce a
   stale result, though `os.Root` still prevents reads outside the root and
   the open-handle check prevents blocking.
+- Whether a constructor function is ever called, or called once, is a
+  call-graph question discovery cannot answer without type checking. An
+  accepted constructor that the application never calls still contributes
+  its identity to the catalog; a package-level var initializer always runs.
 - Descriptor rules are deliberately narrow: an identity is accepted only
   from a package-level var initializer (literals or single, unconstrained,
-  plain-literal package constants) or a constructor's direct return
-  (literals only). Anything else — a computed name, a closure, a shadowable
+  plain-literal package constants) or a single-statement, unshadowed
+  constructor return (literals only). Anything else — a computed name, a closure, a shadowable
   identifier, a constant declared twice or only in constrained files, a
   Define in a constrained file or a mixed-package directory — is refused,
   even where the program would be valid at run time.
