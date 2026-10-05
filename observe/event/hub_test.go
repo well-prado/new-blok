@@ -544,6 +544,20 @@ func TestRecoveredRunsRecycleTheirOwnBudgetAndNeverEvictLiveRuns(t *testing.T) {
 	if stats := hub.Stats(); stats.Runs != 3 {
 		t.Fatalf("stats=%+v", stats)
 	}
+	// The budget makes a principal recycle its own recovered runs before
+	// capacity would push out another principal's.
+	shared := newHub(t, Config{MaxRuns: 4, RecoveredPerPrincipal: 2})
+	if err := shared.AttachRecovered("bob-old", "bob", "bob", true); err != nil {
+		t.Fatal(err)
+	}
+	for _, runID := range []string{"m-1", "m-2", "m-3", "m-4"} {
+		if err := shared.AttachRecovered(runID, "mallory", "mallory", true); err != nil {
+			t.Fatalf("%s: %v", runID, err)
+		}
+	}
+	if _, err := shared.Subscribe("bob-old", "bob", "", nil); err != nil {
+		t.Fatalf("mallory's reads pushed out bob's recovered run: %v", err)
+	}
 	// With only live runs retained, a recovered read is refused, not served
 	// by evicting one.
 	full := newHub(t, Config{MaxRuns: 2})
