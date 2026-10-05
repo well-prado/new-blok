@@ -330,7 +330,7 @@ func TestClusterRunIsReconstructedThroughTheInspectionStream(t *testing.T) {
 			t.Fatalf("%s frames=%s", reader, inspectionNames(frames))
 		}
 		page := inspectionPage(t, frames[1])
-		if stepStates(page) != "first=completed,approval=completed,second=completed" || len(page.Run.Output) != 0 || strings.Contains(frames[1].Data, `"output"`) || !strings.Contains(frames[1].Data, unavailableTimestamps) {
+		if stepStates(page) != "first=completed,approval=completed,second=completed" || len(page.Run.Output) != 0 || strings.Contains(frames[1].Data, `"output"`) || !strings.Contains(frames[1].Data, unavailableTimestamps) || strings.Contains(frames[1].Data, "0001-01-01") || !strings.Contains(frames[1].Data, `"attempts":[{`) {
 			t.Fatalf("%s reconstruction=%s", reader, frames[1].Data)
 		}
 	}

@@ -527,17 +527,58 @@ func (h *eventHandler) owner(parent context.Context, source RunOwnerSource, prin
 }
 
 type recoveredSnapshot struct {
-	Source        string          `json:"source"`
-	Reconstructed bool            `json:"reconstructed"`
-	Page          inspection.Page `json:"page"`
-	Unavailable   []string        `json:"unavailable"`
+	Source        string       `json:"source"`
+	Reconstructed bool         `json:"reconstructed"`
+	Page          snapshotPage `json:"page"`
+	Unavailable   []string     `json:"unavailable"`
+}
+
+// snapshotPage is an inspection.Page on the snapshot wire: a time the source
+// does not know (the distributed store keeps none) is omitted rather than
+// sent as the zero time. Each shadowing field wins over the embedded one of
+// the same JSON name; every other field is the contract's.
+type snapshotPage struct {
+	inspection.Page
+	Run   snapshotRun    `json:"run"`
+	Steps []snapshotStep `json:"steps"`
+}
+
+type snapshotRun struct {
+	inspection.Run
+	StartedAt  time.Time `json:"startedAt,omitzero"`
+	FinishedAt time.Time `json:"finishedAt,omitzero"`
+}
+
+type snapshotStep struct {
+	inspection.Step
+	StartedAt  time.Time         `json:"startedAt,omitzero"`
+	FinishedAt time.Time         `json:"finishedAt,omitzero"`
+	Attempts   []snapshotAttempt `json:"attempts,omitempty"`
+}
+
+type snapshotAttempt struct {
+	inspection.Attempt
+	StartedAt  time.Time `json:"startedAt,omitzero"`
+	FinishedAt time.Time `json:"finishedAt,omitzero"`
+}
+
+func snapshotWire(page inspection.Page) snapshotPage {
+	out := snapshotPage{Page: page, Run: snapshotRun{Run: page.Run, StartedAt: page.Run.StartedAt, FinishedAt: page.Run.FinishedAt}, Steps: make([]snapshotStep, len(page.Steps))}
+	for i, step := range page.Steps {
+		wire := snapshotStep{Step: step, StartedAt: step.StartedAt, FinishedAt: step.FinishedAt}
+		for _, attempt := range step.Attempts {
+			wire.Attempts = append(wire.Attempts, snapshotAttempt{Attempt: attempt, StartedAt: attempt.StartedAt, FinishedAt: attempt.FinishedAt})
+		}
+		out.Steps[i] = wire
+	}
+	return out
 }
 
 // snapshotFrame encodes a reconstruction with what it could not include, or
 // reports that it does not fit SnapshotBytes.
 func (h *eventHandler) snapshotFrame(page inspection.Page, notes []string) ([]byte, bool) {
 	unavailable := append([]string{"transient transitions", "logs", "payloads the journal does not keep"}, notes...)
-	data, err := json.Marshal(recoveredSnapshot{Source: "journal", Reconstructed: true, Page: page, Unavailable: unavailable})
+	data, err := json.Marshal(recoveredSnapshot{Source: "journal", Reconstructed: true, Page: snapshotWire(page), Unavailable: unavailable})
 	return data, err == nil && len(data) <= h.cfg.SnapshotBytes
 }
 

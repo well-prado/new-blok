@@ -277,10 +277,13 @@ and stops after one step beyond the requested page. Depth is bounded per
 read: a page must start within the first 256 steps (`MaxInspectionSteps`), so
 one read costs at most 256 + limit + 1 step reads (457 for the largest page);
 the page that reaches the bound is marked truncated and offers no next
-cursor, and a page starting beyond it is refused before any read. The stream's
-snapshot is always the first page. The distributed store records no
-timestamps, so run and step times are zero, and every cluster snapshot lists
-`timestamps` as unavailable; step input is not kept (only its digest); a step
+cursor, and a page starting beyond it is refused before any read. A read
+filtered to one step (`Query.StepID`) counts every step it reads, matching or
+not, so it reads at most the first 256; a step not found within them is
+refused, because the bound cannot rule it out. The stream's snapshot is always
+the first page. The distributed store records no timestamps: a snapshot omits
+a time its source does not know rather than sending the zero time, and every
+cluster snapshot lists `timestamps` as unavailable; step input is not kept (only its digest); a step
 record holds only its current attempt. A run whose registered artifact no
 longer matches, or whose input is no longer retained (#265), is shown without
 steps and says which.
@@ -320,7 +323,11 @@ publication continues, so stopping the stream never affects a run.
 **Limits.** One hub per process: a reader connected to another replica sees
 nothing from this one, and a cluster run is visible only through its durable
 reconstruction, at most `RecoveredPoll` late, never as live frames (#263,
-above). The engine serializes observation payloads whenever
+above). A transient source failure on a reader's first read is still
+answered 404, which EventSource does not retry, rather than as a retryable
+response (#282). A cluster run's steps past the replay bound (about 256 plus
+one page) cannot be paged or looked up by step; that needs a store-side step
+index (#283). The engine serializes observation payloads whenever
 any observer is selected, including when the stream discards them; that costs
 CPU, not retention. (ADR 0020 adds `observe.PayloadObserver`, which lets a
 payload-free observer such as the telemetry exporter avoid that cost; the
@@ -397,5 +404,8 @@ under 1–60 ms deadlines returned only full pages or errors, never a short
 page; paging a 300-step run by cursor stopped at a truncated page at the bound
 whose read cost 262 store reads, and a deeper page was refused with no read; a
 follower stopped polling once a publisher claimed its run, an outage skipped
-polls, and a refusal closed the follower. Each guarded behavior was shown to
+polls, and a refusal closed the follower. A step-filtered read of that run
+found a step within the bound in at most 257 step reads and refused one beyond
+it, or a missing one, in as many; a run whose input no longer reproduces it
+reported so. Each guarded behavior was shown to
 fail under a deliberate mutation.

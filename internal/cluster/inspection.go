@@ -20,7 +20,11 @@ const MaxInspectionTenants = 16
 // read replays at most MaxInspectionSteps+limit+1 step records (457 at the
 // largest page of 200), whatever the cursor asks for. A page that reaches
 // the bound is served whole, marked truncated, and offers no next cursor; a
-// page starting beyond it is refused with ErrInspectionDepth.
+// page starting beyond it is refused with ErrInspectionDepth. A read filtered
+// to one step counts every step it reads, matching or not (F2b): it reads at
+// most the first MaxInspectionSteps facts, and a step it has not found
+// within them is refused with ErrInspectionDepth, because the bound cannot
+// rule it out. Paging further needs a store-side step index (#283).
 const MaxInspectionSteps = 256
 
 // ErrInspectionDepth refuses a page that starts beyond MaxInspectionSteps.
@@ -110,9 +114,17 @@ func (s *InspectionSource) ReadInspectionUnavailable(ctx context.Context, reader
 	if fields[inspection.FieldOutput] {
 		run.Output = boundedRaw(record.Output, maxPayload)
 	}
-	steps, notes, err := s.replay(ctx, partition, record, stepID, offset+limit+1, fields, maxPayload)
+	scan := offset + limit + 1
+	if stepID != "" {
+		scan = MaxInspectionSteps
+	}
+	steps, beyond, notes, err := s.replay(ctx, partition, record, stepID, offset+limit+1, scan, fields, maxPayload)
 	if err != nil {
 		return inspection.Run{}, nil, 0, nil, err
+	}
+	if stepID != "" && beyond && len(steps) == 0 {
+		// The step is not within the bound, and the run goes on past it.
+		return inspection.Run{}, nil, 0, nil, ErrInspectionDepth
 	}
 	notes = append([]string{unavailableTimestamps}, notes...)
 	total := len(steps)
@@ -164,33 +176,35 @@ func (s *InspectionSource) locate(ctx context.Context, reader, runID string) (Ru
 	return RunRecord{}, "", ErrNotFound
 }
 
-// replay returns the run's committed step facts, at most budget of them. A
-// store error, a malformed record or an expired context fails it; only the
-// end of the committed journal (or of the budget) ends it normally.
-func (s *InspectionSource) replay(ctx context.Context, partition string, record RunRecord, stepID string, budget int, fields map[inspection.Field]bool, maxPayload int) ([]inspection.Step, []string, error) {
+// replay returns the run's committed step facts matching stepID, at most
+// budget of them, reading at most scan facts in all; beyond reports that it
+// stopped at scan with the run going on. A store error, a malformed record
+// or an expired context fails it; only the end of the committed journal (or
+// of a bound) ends it normally.
+func (s *InspectionSource) replay(ctx context.Context, partition string, record RunRecord, stepID string, budget, scan int, fields map[inspection.Field]bool, maxPayload int) ([]inspection.Step, bool, []string, error) {
 	workflow, ok := s.runtime.workflows[record.Workflow]
 	if !ok || workflow.Program.Digest != record.ArtifactDigest {
 		// Without the exact registered artifact the operation keys cannot
 		// be derived; the run is reported without steps, and says why.
-		return nil, []string{unavailableArtifact}, nil
+		return nil, false, []string{unavailableArtifact}, nil
 	}
 	input, err := workflow.DecodeInput(record.Input)
 	if err != nil {
 		// Includes a terminal record whose input was dropped to fit (#265).
-		return nil, []string{unavailableInput}, nil
+		return nil, false, []string{unavailableInput}, nil
 	}
-	journal := &inspectionJournal{store: s.runtime.store, partition: partition, record: record, stepID: stepID, budget: budget, fields: fields, maxPayload: maxPayload}
+	journal := &inspectionJournal{store: s.runtime.store, partition: partition, record: record, stepID: stepID, budget: budget, scan: scan, fields: fields, maxPayload: maxPayload}
 	_, _ = s.runtime.engine.RunJournaled(ctx, workflow.Program, input, record.RunID, journal)
 	if journal.err != nil {
-		return nil, nil, journal.err
+		return nil, false, nil, journal.err
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, nil, err
+		return nil, false, nil, err
 	}
 	if journal.inputMismatch {
-		return nil, []string{unavailableInput}, nil
+		return nil, false, []string{unavailableInput}, nil
 	}
-	return journal.steps, nil, nil
+	return journal.steps, journal.beyond, nil, nil
 }
 
 // inspectionJournal is a read-only engine.StepJournal and WaitJournal. It
@@ -198,11 +212,16 @@ func (s *InspectionSource) replay(ctx context.Context, partition string, record 
 // journal does on takeover, and records each fact it reads. Every other
 // transition, including dispatch, stops the replay.
 type inspectionJournal struct {
-	store      *distributed.Store
-	partition  string
-	record     RunRecord
-	stepID     string
-	budget     int
+	store     *distributed.Store
+	partition string
+	record    RunRecord
+	stepID    string
+	budget    int
+	// scan bounds every step fact read, matching or not; scanned counts
+	// them, and beyond records that the replay wanted one more.
+	scan       int
+	scanned    int
+	beyond     bool
 	fields     map[inspection.Field]bool
 	maxPayload int
 	steps      []inspection.Step
@@ -246,7 +265,7 @@ func (j *inspectionJournal) VerifyRun(_ context.Context, runID, artifact, inputD
 }
 
 func (j *inspectionJournal) Load(ctx context.Context, identity engine.StepIdentity) (json.RawMessage, bool, error) {
-	if j.matched >= j.budget {
+	if j.exhausted() {
 		return nil, false, errInspectionStop
 	}
 	if !sameStepIdentity(identity, j.record, identity.StepID) {
@@ -296,7 +315,7 @@ func (j *inspectionJournal) stepStatus(persisted stepRecord) inspection.Status {
 }
 
 func (j *inspectionJournal) Await(ctx context.Context, identity engine.WaitIdentity) (engine.WaitResult, bool, error) {
-	if j.matched >= j.budget {
+	if j.exhausted() {
 		return engine.WaitResult{}, false, errInspectionStop
 	}
 	if !sameStepIdentity(identity.Step, j.record, identity.Step.StepID) {
@@ -350,7 +369,20 @@ func (j *inspectionJournal) Fail(context.Context, engine.StepAttempt, []string, 
 	return errInspectionStop
 }
 
+// exhausted reports that the replay has the steps it needs, or has read as
+// many as it may.
+func (j *inspectionJournal) exhausted() bool {
+	if j.scanned >= j.scan {
+		j.beyond = true
+		return true
+	}
+	return j.matched >= j.budget
+}
+
+// add counts every step read against the scan bound, and keeps it if it
+// matches the filter.
 func (j *inspectionJournal) add(step inspection.Step) {
+	j.scanned++
 	if j.stepID != "" && step.ID != j.stepID {
 		return
 	}

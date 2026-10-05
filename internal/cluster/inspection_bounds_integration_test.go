@@ -190,6 +190,45 @@ func TestInspectionDepthIsBoundedPerRead(t *testing.T) {
 		t.Fatalf("a refused deep page still read the store %d times", reads)
 	}
 
+	// A step filter is bounded the same way (review F2b): every step the
+	// replay reads counts, matching or not. A step within the bound is
+	// found; one beyond it, or one the bound cannot rule out, is refused.
+	for _, filter := range []struct {
+		step  string
+		found bool
+	}{{"s0005", true}, {fmt.Sprintf("s%04d", MaxInspectionSteps-1), true}, {fmt.Sprintf("s%04d", steps-1), false}, {"missing", false}} {
+		client.txns.Store(0)
+		_, matched, total, err := source.ReadInspection(ctx, tenant, runID, filter.step, 0, limit, nil, 1024)
+		reads := client.txns.Load()
+		switch {
+		case filter.found && (err != nil || len(matched) != 1 || matched[0].ID != filter.step || total != 1):
+			t.Fatalf("filter %s: %d steps total=%d err=%v", filter.step, len(matched), total, err)
+		case !filter.found && !errors.Is(err, ErrInspectionDepth):
+			t.Fatalf("filter %s beyond the bound: %d steps err=%v", filter.step, len(matched), err)
+		}
+		if reads > int64(1+MaxInspectionSteps+1) {
+			t.Fatalf("filter %s cost %d store reads; bound is %d", filter.step, reads, 1+MaxInspectionSteps+1)
+		}
+	}
+
+	// The run's input no longer reproduces it: a decoder that refuses the
+	// stored input, and one that decodes it to a different value.
+	for name, decode := range map[string]func(json.RawMessage) (any, error){
+		"refused":   func(json.RawMessage) (any, error) { return nil, errors.New("input not retained") },
+		"different": func(json.RawMessage) (any, error) { return integrationOutput{Value: -1}, nil },
+	} {
+		changed := runtime.workflows["chain"]
+		changed.DecodeInput = decode
+		lost, err := New(runtime.store, runtime.engine, map[string]Workflow{"chain": changed}, runtime.limits)
+		if err != nil {
+			t.Fatal(err)
+		}
+		run, none, _, notes, err := lost.InspectionSource(nil).ReadInspectionUnavailable(ctx, tenant, runID, "", 0, limit, nil, 1024)
+		if err != nil || run.Status != inspection.StatusCompleted || len(none) != 0 || !slices.Contains(notes, unavailableInput) {
+			t.Fatalf("input %s: run=%+v steps=%d notes=%v err=%v", name, run, len(none), notes, err)
+		}
+	}
+
 	// The registered artifact no longer matches the run.
 	other := runtime.workflows["chain"]
 	other.Program.Digest = "sha256:" + strings.Repeat("d", 64)
