@@ -4,6 +4,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	sqldriver "database/sql/driver"
 	"errors"
 	"fmt"
 	"io"
@@ -168,6 +169,9 @@ type connection struct {
 	busyTimeout  time.Duration
 	beforeCommit func()
 	afterCommit  func()
+	// restoreHook, test-only, replaces the busy-timeout reset after a log
+	// purge.
+	restoreHook func(context.Context, *sql.Conn) error
 }
 
 func (c *connection) WriteDomain() *store.WriteDomain { return c.writeDomain }
@@ -294,19 +298,29 @@ func (c *connection) PurgeLog(ctx context.Context) error {
 // busy timeout is maxLogPurgeWait, not the store's. A truncating checkpoint
 // holds the write lock while it waits for readers, so waiting the full busy
 // timeout for a long reader would hold every writer that long (#281).
-func (c *connection) purgeLog(ctx context.Context) error {
+func (c *connection) purgeLog(ctx context.Context) (err error) {
 	conn, err := c.database.Conn(ctx)
 	if err != nil {
 		return busy(fmt.Errorf("sqlite: purge log: %w", err), c.writeDomain)
 	}
 	defer conn.Close()
+	// The connection goes back to the pool, so it must leave with the
+	// store's busy timeout, even when ctx is done; one left at the short
+	// wait would fail its later writers busy early. If the timeout cannot
+	// be restored (or was never confirmed lowered), the connection is
+	// discarded instead of returned.
+	defer func() {
+		if restoreErr := c.restoreBusyTimeout(context.WithoutCancel(ctx), conn); restoreErr != nil {
+			discard(conn)
+			if err == nil {
+				err = fmt.Errorf("sqlite: purge log: restore busy timeout: %w", restoreErr)
+			}
+		}
+	}()
 	wait := min(c.busyTimeout, maxLogPurgeWait)
 	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout=%d", wait.Milliseconds())); err != nil {
 		return fmt.Errorf("sqlite: purge log: %w", err)
 	}
-	// The connection goes back to the pool; restore the store's timeout even
-	// when ctx is done.
-	defer conn.ExecContext(context.WithoutCancel(ctx), fmt.Sprintf("PRAGMA busy_timeout=%d", c.busyTimeout.Milliseconds()))
 	var blocked, frames, copied int
 	if err := conn.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&blocked, &frames, &copied); err != nil {
 		return busy(fmt.Errorf("sqlite: purge log: %w", err), c.writeDomain)
@@ -315,6 +329,23 @@ func (c *connection) purgeLog(ctx context.Context) error {
 		return store.WithWriteDomain(fmt.Errorf("sqlite: purge log: %w: a reader still uses the log", store.ErrBusy), c.writeDomain)
 	}
 	return nil
+}
+
+// restoreBusyTimeout sets conn back to the store's busy timeout. Tests
+// replace it through restoreHook to make the reset fail.
+func (c *connection) restoreBusyTimeout(ctx context.Context, conn *sql.Conn) error {
+	if c.restoreHook != nil {
+		return c.restoreHook(ctx, conn)
+	}
+	_, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout=%d", c.busyTimeout.Milliseconds()))
+	return err
+}
+
+// discard closes conn's driver connection instead of returning it to the
+// pool: database/sql drops a connection whose Raw callback reports
+// sqldriver.ErrBadConn.
+func discard(conn *sql.Conn) {
+	_ = conn.Raw(func(any) error { return sqldriver.ErrBadConn })
 }
 
 // PurgeFree rebuilds the database with VACUUM, which leaves no free page and

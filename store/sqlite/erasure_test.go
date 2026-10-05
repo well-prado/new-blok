@@ -184,3 +184,125 @@ func TestPurgeLogRefusesWhileAReaderNeedsIt(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// pooledBusyTimeouts checks out every connection the pool may hold (it is
+// capped at 8) and returns each one's busy timeout in milliseconds.
+func pooledBusyTimeouts(t *testing.T, ctx context.Context, database store.Database) []int {
+	t.Helper()
+	pool := database.(*connection).database
+	var conns []*sql.Conn
+	defer func() {
+		for _, conn := range conns {
+			_ = conn.Close()
+		}
+	}()
+	var timeouts []int
+	for range 8 {
+		conn, err := pool.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conns = append(conns, conn)
+		var timeout int
+		if err := conn.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&timeout); err != nil {
+			t.Fatal(err)
+		}
+		timeouts = append(timeouts, timeout)
+	}
+	return timeouts
+}
+
+// holdReader keeps a read snapshot open on database until release closes.
+func holdReader(t *testing.T, ctx context.Context, database store.Database) (release func()) {
+	t.Helper()
+	held, done, finished := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+	go func() {
+		finished <- database.WithTx(ctx, func(tx *sql.Tx) error {
+			var n int
+			if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM content").Scan(&n); err != nil {
+				return err
+			}
+			close(held)
+			<-done
+			return nil
+		})
+	}()
+	<-held
+	return func() {
+		close(done)
+		if err := <-finished; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestPurgeRestoresEveryPooledBusyTimeout: the purge lowers its own
+// connection's busy timeout to wait briefly for readers. That connection
+// returns to the pool, so after every purge, blocked or not, each pooled
+// connection must be back at the store's timeout; one left at the short
+// wait would fail its later writers busy early.
+func TestPurgeRestoresEveryPooledBusyTimeout(t *testing.T) {
+	ctx := context.Background()
+	const timeout = 2 * time.Second
+	database, err := (Backend{BusyTimeout: timeout}).Open(ctx, filepath.Join(t.TempDir(), "timeouts.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	writeAndDelete(t, ctx, func(query string, args ...any) error {
+		return database.WithTx(ctx, func(tx *sql.Tx) error {
+			_, err := tx.ExecContext(ctx, query, args...)
+			return err
+		})
+	})
+	purger, _ := store.PurgerOf(database)
+	if err := purger.PurgeLog(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// A reader blocks the purge only while the log holds frames.
+	if err := database.WithTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, "INSERT INTO content (id, value) VALUES (4, 'after the first purge')")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	release := holdReader(t, ctx, database)
+	blocked := purger.PurgeLog(ctx)
+	release()
+	if !errors.Is(blocked, store.ErrBusy) {
+		t.Fatalf("fixture: the purge beside a reader must be blocked, got %v", blocked)
+	}
+	if err := purger.PurgeFree(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for i, got := range pooledBusyTimeouts(t, ctx, database) {
+		if got != int(timeout.Milliseconds()) {
+			t.Fatalf("pooled connection %d busy_timeout=%dms after purges, want %dms", i, got, timeout.Milliseconds())
+		}
+	}
+}
+
+// TestPurgeDiscardsAConnectionItCannotRestore: when the timeout reset
+// fails, the purge reports it and the connection never returns to the pool.
+func TestPurgeDiscardsAConnectionItCannotRestore(t *testing.T) {
+	ctx := context.Background()
+	const timeout = 2 * time.Second
+	database, err := (Backend{BusyTimeout: timeout}).Open(ctx, filepath.Join(t.TempDir(), "discard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	database.(*connection).restoreHook = func(context.Context, *sql.Conn) error {
+		return errors.New("synthetic reset failure")
+	}
+	purger, _ := store.PurgerOf(database)
+	if err := purger.PurgeLog(ctx); err == nil || !strings.Contains(err.Error(), "restore busy timeout") {
+		t.Fatalf("purge with a failed reset: %v, want the reset failure reported", err)
+	}
+	database.(*connection).restoreHook = nil
+	for i, got := range pooledBusyTimeouts(t, ctx, database) {
+		if got != int(timeout.Milliseconds()) {
+			t.Fatalf("pooled connection %d busy_timeout=%dms: an unrestored connection returned to the pool", i, got)
+		}
+	}
+}
