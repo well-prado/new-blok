@@ -26,7 +26,7 @@ func TestJournalTransitionsWaitForConcurrentWriter(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer db.Close()
-			j, err := New(ctx, db, Config{})
+			j, err := New(ctx, db, Config{Audit: newTestAudit(t, db)})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -87,7 +87,7 @@ func TestJournalTransitionsWaitForConcurrentWriter(t *testing.T) {
 				case "artifact-register":
 					return j.RegisterArtifact(ctx, ArtifactRecord{Digest: "artifact", Version: "1.0.0", ManifestJSON: []byte(`{}`)})
 				case "reconcile":
-					_, err := j.reconcileOnce(ctx, op.Key, "operator", "synthetic receipt", []byte(`{}`))
+					_, _, err := j.reconcileOnce(ctx, op.Key, "operator", "synthetic receipt", []byte(`{}`))
 					return err
 				case "compact":
 					report, err := j.Compact(ctx, time.Now().Add(time.Hour))
