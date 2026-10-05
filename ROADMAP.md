@@ -1,6 +1,6 @@
 # New Blok — delivery roadmap
 
-Revision 2 · 2026-10-03 · framework implementation and native Windows gates
+Revision 3 · 2026-10-05 · native Windows gates deferred to a separate Windows track (#297)
 
 ## 1. Goal and current state
 
@@ -16,7 +16,7 @@ Go is native. Node.js is the first external runtime, followed by the old framewo
 
 ## 3. Milestones and release evidence
 
-### Native Windows is mandatory, not a WSL workaround
+### Native Windows is a planned platform, tracked separately (deferred 2026-10-05)
 
 Windows is a first-class planned platform alongside macOS/Linux. Native Windows 11 x64 is the initial required baseline; publish other OS/architecture claims only after execution evidence. Ordinary installation and development must not require WSL, Bash, Docker, Unix utilities or administrator privileges. Go-only apps must not require Node. PowerShell installation, paths/permissions/file-lock semantics, Ctrl+C, bounded child-process tree cleanup, SQLite crash/reopen and actual Go/Node worker conformance require native Windows tests. Cross-compilation and Linux/container tests cannot certify Windows support.
 
@@ -24,10 +24,27 @@ Windows is a first-class planned platform alongside macOS/Linux. Native Windows 
 native Windows lifecycle/conformance gate. On 2026-10-03 the maintainer explicitly
 authorized M4 completion and merges without Windows execution; this defers the
 evidence, not the Windows support requirement. [E11-T05 / #157](https://github.com/well-prado/new-blok/issues/157)
-owns the M6 easy-install/newcomer workflow. M6 and M9 cannot advertise supported Windows installation/release until
-their native clean-machine evidence passes. These are requirements, not claims
+owns the M6 easy-install/newcomer workflow. These are requirements, not claims
 that current Unix validation already proves Windows works. Keep local Windows
 validation separate from the current prohibition on consuming GitHub Actions.
+
+**Deferral (maintainer decision, 2026-10-05, [#297](https://github.com/well-prado/new-blok/issues/297)).**
+Native Windows evidence no longer gates any roadmap issue or milestone. The
+Windows work continues as a separate Windows track: #156 (lifecycle and
+conformance), #157 (installation and newcomer workflow), and the Windows-only
+defects #214 and #226. Concretely:
+
+- An issue closes when its non-Windows acceptance criteria have current
+  executable evidence. Its "Native Windows roadmap gate" checklist becomes a
+  Windows-track follow-up, recorded on the issue, instead of a closing condition.
+- No milestone, release note, README or document may claim Windows support,
+  installation or certification until the Windows track's native evidence
+  passes. Releases made before then list Windows as unverified.
+- Cross-platform hygiene stays required on every change: `GOOS=windows go vet`
+  for arm64 and amd64, and builds that compile for Windows. These still certify
+  nothing.
+- The decision is reversible: restoring the gate means reverting this section
+  and invariant 11.
 
 Milestones are capability gates without artificial dates. M0–M1 establish a native application; M2–M3 establish recoverable work; M4 establishes Node.js; M5–M7 expand adapters/tooling/AI/inspection; M8 proves distributed coverage; M9 gates production release. Task milestones may precede an epic's final milestone when later work consumes a foundation.
 
@@ -42,7 +59,7 @@ Milestones are capability gates without artificial dates. M0–M1 establish a na
 | [M6 — Developer tooling and package ecosystem](https://github.com/well-prado/new-blok/milestone/7) | CLI scaffold/generate/check/dev/test/inspect and node/workflow installation work in both layouts with deterministic locks, offline cache, atomic changes and trusted artifacts. Generic nodes and recipes use the same contracts. Clean-machine native PowerShell installation and newcomer evidence passes #157. |
 | [M7 — AI tools, Studio APIs and observability](https://github.com/well-prado/new-blok/milestone/8) | Agents discover and compose nodes/workflows under enforced policy, including custom nodes. Versioned authorized notebook inspection and optional production telemetry are consumed by contract fixtures without placing Studio/Cloud UI here. |
 | [M8 — Distributed deployment and runtime coverage](https://github.com/well-prado/new-blok/milestone/9) | Self-hosted deployment contracts, multi-version routing, fenced ownership and resharding pass failures. Every target worker runs actual conformance on a published matrix. Capacity evidence includes distributed topology and overload. |
-| [M9 — Production release and ecosystem handoff](https://github.com/well-prado/new-blok/milestone/10) | Executable current-Blok parity, live-model DX evaluation, controlled native/worker/durable/fleet benchmarks, security review and signed reproducible releases pass. Publish supported limits and separate Studio/registry/Cloud handoffs. Native Windows gates #156/#157 and verified Windows artifacts/instructions are release blockers. |
+| [M9 — Production release and ecosystem handoff](https://github.com/well-prado/new-blok/milestone/10) | Executable current-Blok parity, live-model DX evaluation, controlled native/worker/durable/fleet benchmarks, security review and signed reproducible releases pass. Publish supported limits and separate Studio/registry/Cloud handoffs. Native Windows gates #156/#157 are deferred (#297); a release made before they pass lists Windows as unverified and ships no Windows support claim. |
 
 ## 4. Execution model and project fields
 
@@ -70,7 +87,7 @@ Read [architecture.md](docs/architecture.md) and [AGENTS.md](AGENTS.md). Each ta
 8. Debug telemetry can sample/drop with visible policy. Required audit/state uses reliable paths. Secret references stay opaque, data redaction is explicit, all fixtures are synthetic.
 9. Performance claims disclose workload/topology/guarantees, versions, raw repeated samples, warmup, distributions, saturation and failures. Equal step counts or no-op timing cannot establish application parity.
 10. CLI installs packages atomically with verified identities/locks/artifacts; native language managers still own language dependencies. Hosted ecosystem products remain separate.
-11. Windows portability and easy native installation are required alongside macOS/Linux. Each affected worker, CLI, filesystem/store and release issue inherits the Windows evidence gates above; platform-specific skips cannot silently waive them.
+11. Windows portability and easy native installation remain planned alongside macOS/Linux, but since 2026-10-05 (#297) their native evidence is a separate Windows track, not a closing gate. Each affected issue records its Windows checklist as a Windows-track follow-up; no document may claim Windows support until that evidence passes, and platform-specific skips must still be explicit, never silent.
 
 ## 6. Definition of Done
 
