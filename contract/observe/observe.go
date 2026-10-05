@@ -126,9 +126,10 @@ func lowerHex(text string) ([]byte, bool) {
 // printable ASCII members. It checks size and character set, not vendor
 // key grammar: tracestate is forwarded, never interpreted.
 func ValidTracestate(value string) bool {
-	if len(value) > MaxTracestateBytes {
-		return false
-	}
+	return len(value) <= MaxTracestateBytes && printable(value)
+}
+
+func printable(value string) bool {
 	for i := 0; i < len(value); i++ {
 		if value[i] < 0x20 || value[i] > 0x7e {
 			return false
@@ -229,6 +230,130 @@ func (p TracePolicy) Root(parent TraceContext) Span {
 		flags = FlagSampled
 	}
 	return Span{TraceContext: TraceContext{TraceID: id, SpanID: NewSpanID(), Flags: flags}}
+}
+
+// MaxTraceparentBytes bounds an inbound traceparent value. Version 00 is
+// exactly 55 bytes; a later version may append fields, which are read only
+// up to this bound.
+const MaxTraceparentBytes = 256
+
+// ExtractTrace reads an inbound W3C trace context from the values of a
+// carrier's traceparent and tracestate fields, one entry per header line,
+// metadata value or message header as received. It never fails: anything
+// it cannot use is ignored, so a malformed header can never refuse work.
+//
+//   - Exactly one traceparent value is used. None, or more than one (W3C
+//     defines a single traceparent field), yields no context at all.
+//   - The value must be at most MaxTraceparentBytes of printable ASCII,
+//     including any fields a later version appends, and parse with
+//     ParseTraceparent (version ff, upper-case hex and all-zero ids are
+//     rejected).
+//   - Exactly one tracestate value that ValidTracestate accepts is kept.
+//     More than one, an oversized one or a non-printable one is dropped,
+//     and the traceparent is still used, as W3C allows. Values are never
+//     merged.
+//   - The tracestate is forwarded to exporters and workers, so every list
+//     member the shared credential pattern (SensitiveText) flags is dropped
+//     (FilterTracestate); the other members are kept.
+//
+// The context is correlation data, never authority.
+func ExtractTrace(traceparent, tracestate []string) (TraceContext, bool) {
+	if len(traceparent) != 1 || len(traceparent[0]) > MaxTraceparentBytes || !printable(traceparent[0]) {
+		return TraceContext{}, false
+	}
+	parsed, err := ParseTraceparent(traceparent[0])
+	if err != nil {
+		return TraceContext{}, false
+	}
+	parsed.Flags &= FlagSampled
+	if len(tracestate) == 1 && ValidTracestate(tracestate[0]) {
+		parsed.State = FilterTracestate(tracestate[0], SensitiveText)
+	}
+	return parsed, true
+}
+
+// FilterTracestate returns state without the list members sensitive
+// reports true for (nil means SensitiveText). Members are checked one by
+// one, so a credential in one vendor's entry does not discard the others;
+// if what remains is still flagged as a whole, nothing is kept. An invalid
+// state yields "". A state with nothing to drop is returned unchanged;
+// otherwise the kept members are joined with "," (W3C allows the optional
+// whitespace around members to be removed).
+func FilterTracestate(state string, sensitive func(string) bool) string {
+	if sensitive == nil {
+		sensitive = SensitiveText
+	}
+	if state == "" || !ValidTracestate(state) {
+		return ""
+	}
+	members := strings.Split(state, ",")
+	kept := make([]string, 0, len(members))
+	dropped := false
+	for _, member := range members {
+		member = strings.Trim(member, " \t")
+		if member != "" && sensitive(member) {
+			dropped = true
+			continue
+		}
+		if member != "" {
+			kept = append(kept, member)
+		}
+	}
+	out := state
+	if dropped {
+		out = strings.Join(kept, ",")
+	}
+	if out != "" && sensitive(out) {
+		return ""
+	}
+	return out
+}
+
+// InboundSampling says what an inbound trace context's sampled flag means
+// to the run it parents (ADR 0020).
+type InboundSampling uint8
+
+const (
+	// IgnoreInboundSampling, the zero value, keeps the inbound trace id and
+	// parent span but decides sampling locally: the run is sampled with
+	// probability Ratio, drawn independently of anything the caller sent,
+	// so a forged sampled flag or a crafted trace id cannot raise the
+	// sample rate.
+	IgnoreInboundSampling InboundSampling = iota
+	// HonorInboundSampling keeps the caller's sampled flag, as OpenTelemetry
+	// ParentBased sampling does. Choose it only when callers are trusted to
+	// decide how much the application records.
+	HonorInboundSampling
+)
+
+// Valid reports whether s is a defined policy.
+func (s InboundSampling) Valid() bool {
+	return s == IgnoreInboundSampling || s == HonorInboundSampling
+}
+
+// Inbound returns the parent a run admitted with the inbound context remote
+// joins, with its sampled flag decided by sampling. It reports false, and
+// nothing is joined, when tracing is disabled, remote is not valid or
+// sampling is not a defined policy: an application that traces nothing
+// propagates nothing it received.
+func (p TracePolicy) Inbound(remote TraceContext, sampling InboundSampling) (TraceContext, bool) {
+	if !p.Enabled() || !remote.TraceID.IsValid() || !remote.SpanID.IsValid() || !sampling.Valid() {
+		return TraceContext{}, false
+	}
+	remote.State = FilterTracestate(remote.State, SensitiveText)
+	switch sampling {
+	case HonorInboundSampling:
+		remote.Flags &= FlagSampled
+	default:
+		remote.Flags = 0
+		// A fresh random id, never the caller's: Samples is deterministic
+		// in its argument, and a caller that chose trace ids under the
+		// ratio would otherwise be sampled every time.
+		if p.Samples(NewTraceID()) {
+			remote.Flags = FlagSampled
+		}
+	}
+	return remote, true
 }
 
 // NewTraceID returns a random non-zero trace id. Ids correlate; they are not

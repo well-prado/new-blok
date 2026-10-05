@@ -380,22 +380,3 @@ func TestPruneTombstonesHoldDigestsAndKinds(t *testing.T) {
 		}
 	}
 }
-
-// TestRedeliveredReconciliationUnderAnotherTenantSucceeds: a re-delivery is
-// a duplicate whatever tenant context carries it; an existing record is not
-// rewritten, so it cannot conflict.
-func TestRedeliveredReconciliationUnderAnotherTenantSucceeds(t *testing.T) {
-	r := newRig(t, rigOptions{})
-	_, op := r.uncertainEffect("tenants")
-	first := audit.WithTenant(r.ctx, "tenant-a")
-	if _, err := r.journal.Reconcile(first, op.Key, "operator:bob", "evidence", []byte(`{"ok":true}`), true); err != nil {
-		t.Fatal(err)
-	}
-	again, err := r.journal.Reconcile(audit.WithTenant(r.ctx, "tenant-b"), op.Key, "operator:bob", "evidence", []byte(`{"ok":true}`), true)
-	if err != nil || !again.Duplicate {
-		t.Fatalf("re-delivery under another tenant: %+v err=%v", again, err)
-	}
-	if n := r.count(`SELECT COUNT(*) FROM audit_records_v1 WHERE tenant = 'tenant-a'`); n != 1 {
-		t.Fatalf("original record rewritten: tenant-a records=%d", n)
-	}
-}

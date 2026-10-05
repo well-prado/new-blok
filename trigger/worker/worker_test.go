@@ -893,7 +893,7 @@ func TestAttemptAccountingLeavesAnotherClaimAlone(t *testing.T) {
 			// the check above is not vacuous.
 			if err := database.WithTx(ctx, func(tx *sql.Tx) error {
 				var err error
-				job, err = scanJob(tx.QueryRowContext(ctx, `SELECT job_id, request_key, kind, payload_json, attempt, max_attempts, deferrals, principal_json, state, error_text FROM worker_jobs WHERE request_key = 'accounted'`))
+				job, err = scanJob(tx.QueryRowContext(ctx, `SELECT `+jobColumns+` FROM worker_jobs WHERE request_key = 'accounted'`))
 				return err
 			}); err != nil {
 				t.Fatal(err)

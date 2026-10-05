@@ -40,6 +40,9 @@ type Endpoint struct {
 	Timeout      time.Duration
 	Authenticate func(*http.Request) (Principal, error)
 	Handle       func(context.Context, Input) (any, error)
+	// Trace opts in to reading the request's traceparent/tracestate as the
+	// parent of the run Handle starts (ADR 0020). Off by default.
+	Trace trigger.TraceIngress
 }
 
 type Server struct {
@@ -58,6 +61,9 @@ func New(application *app.Application, endpoints []Endpoint) (*Server, error) {
 	for index, endpoint := range endpoints {
 		if endpoint.Method == "" || endpoint.Path == "" || endpoint.Handle == nil {
 			return nil, fmt.Errorf("invalid_endpoint: %s %s", endpoint.Method, endpoint.Path)
+		}
+		if err := endpoint.Trace.Validate(); err != nil {
+			return nil, fmt.Errorf("invalid_endpoint: %s %s: %w", endpoint.Method, endpoint.Path, err)
 		}
 		key := strings.ToUpper(endpoint.Method) + " " + normalizePath(endpoint.Path)
 		if previous, ok := seen[key]; ok {
@@ -132,6 +138,9 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		ctx, cancel = context.WithTimeout(ctx, endpoint.Timeout)
 		defer cancel()
 	}
+	// The trace context is read only now, after routing, admission,
+	// authentication and validation, so it cannot change any of them.
+	ctx = endpoint.Trace.Context(ctx, s.application.TracePolicy(), request.Header.Values(trigger.TraceparentField), request.Header.Values(trigger.TracestateField))
 	input := Input{Body: body, Params: params, Query: request.URL.Query(), Principal: principal}
 	result, err := endpoint.Handle(ctx, input)
 	if err != nil {
