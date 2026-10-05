@@ -128,14 +128,15 @@ func TestAdmissionCapsBoundTenantAndPartitionAcrossIngressAndTakeover(t *testing
 			MonopolizerFull       int    `json:"monopolizerAdmissionFull"`
 			SecondAccepted        int    `json:"secondTenantAccepted"`
 			SecondFull            int    `json:"secondTenantAdmissionFull"`
-			ThirdWhileFull        string `json:"thirdTenantWhilePartitionFull"`
+			ThirdWithRoom         string `json:"thirdTenantWhilePartitionHasRoom"`
+			FourthWhileFull       string `json:"fourthTenantWhilePartitionFull"`
 			DuplicateWhileFull    string `json:"duplicateWhileFull"`
 			ActiveWhenFull        int    `json:"activeRunsWhenFull"`
 			ActiveAfterTakeover   int    `json:"activeRunsAfterTakeover"`
 			FirstFinishedTenant   string `json:"firstFinishedTenant"`
 			ActiveAfterOneFinish  int    `json:"activeRunsAfterOneFinish"`
 			MonopolizerReadmitted string `json:"monopolizerReadmittedAfterFinish"`
-			ThirdAfterRefill      string `json:"thirdTenantAfterRefill"`
+			FourthAfterRefill     string `json:"fourthTenantAfterRefill"`
 			ExternalEffects       int    `json:"externalEffects"`
 			HTTPOverCap           int    `json:"httpOverTenantCapStatus"`
 			HTTPRetryAfter        string `json:"httpRetryAfter"`
@@ -160,8 +161,8 @@ func TestAdmissionCapsBoundTenantAndPartitionAcrossIngressAndTakeover(t *testing
 		t.Fatal(err)
 	}
 	const partition = "p-0000"
-	tenants := tenantsInPartition(ingress[0], partition, "capacity-tenant", 3)
-	monopolizer, second, third := tenants[0], tenants[1], tenants[2]
+	tenants := tenantsInPartition(ingress[0], partition, "capacity-tenant", 4)
+	monopolizer, second, third, fourth := tenants[0], tenants[1], tenants[2], tenants[3]
 	type submission struct {
 		tenant, key string
 		admission   Admission
@@ -217,8 +218,12 @@ func TestAdmissionCapsBoundTenantAndPartitionAcrossIngressAndTakeover(t *testing
 			return "duplicate"
 		}
 	}
-	if got := outcome(ingress[1].Admit(ctx, Submission{Tenant: third, RequestKey: "third-0", Workflow: "acceptance-effect", Input: json.RawMessage(`{"value":100}`)})); got != fixture.Expected.ThirdWhileFull {
-		t.Fatalf("third tenant while partition full=%s, fixture %s", got, fixture.Expected.ThirdWhileFull)
+	// The monopolizer's rejected backlog leaves partition room for others.
+	if got := outcome(ingress[1].Admit(ctx, Submission{Tenant: third, RequestKey: "third-0", Workflow: "acceptance-effect", Input: json.RawMessage(`{"value":100}`)})); got != fixture.Expected.ThirdWithRoom {
+		t.Fatalf("third tenant while partition has room=%s, fixture %s", got, fixture.Expected.ThirdWithRoom)
+	}
+	if got := outcome(ingress[0].Admit(ctx, Submission{Tenant: fourth, RequestKey: "fourth-0", Workflow: "acceptance-effect", Input: json.RawMessage(`{"value":110}`)})); got != fixture.Expected.FourthWhileFull {
+		t.Fatalf("fourth tenant while partition full=%s, fixture %s", got, fixture.Expected.FourthWhileFull)
 	}
 	firstKey := acceptedKeys[monopolizer][0]
 	var firstInput string
@@ -244,14 +249,14 @@ func TestAdmissionCapsBoundTenantAndPartitionAcrossIngressAndTakeover(t *testing
 	if err != nil || len(after) != fixture.Expected.ActiveAfterTakeover || strings.Join(after, ",") != strings.Join(before, ",") {
 		t.Fatalf("active runs after takeover=%v err=%v; before=%v fixture %d", after, err, before, fixture.Expected.ActiveAfterTakeover)
 	}
-	if got := outcome(ingress[1].Admit(ctx, Submission{Tenant: third, RequestKey: "third-1", Workflow: "acceptance-effect", Input: json.RawMessage(`{"value":101}`)})); got != fixture.Expected.ThirdWhileFull {
-		t.Fatalf("third tenant after takeover=%s, fixture %s", got, fixture.Expected.ThirdWhileFull)
+	if got := outcome(ingress[1].Admit(ctx, Submission{Tenant: fourth, RequestKey: "fourth-1", Workflow: "acceptance-effect", Input: json.RawMessage(`{"value":111}`)})); got != fixture.Expected.FourthWhileFull {
+		t.Fatalf("fourth tenant after takeover=%s, fixture %s", got, fixture.Expected.FourthWhileFull)
 	}
 	finished, err := ingress[0].processOne(ctx, successor)
 	if err != nil || finished.State != "completed" {
 		t.Fatalf("successor finished=%+v err=%v", finished, err)
 	}
-	finishedTenant := map[string]string{monopolizer: "monopolizer", second: "second", third: "third"}[finished.Tenant]
+	finishedTenant := map[string]string{monopolizer: "monopolizer", second: "second", third: "third", fourth: "fourth"}[finished.Tenant]
 	if finishedTenant != fixture.Expected.FirstFinishedTenant {
 		t.Fatalf("first finished tenant=%s, fixture %s", finishedTenant, fixture.Expected.FirstFinishedTenant)
 	}
@@ -262,8 +267,8 @@ func TestAdmissionCapsBoundTenantAndPartitionAcrossIngressAndTakeover(t *testing
 	if got := outcome(ingress[1].Admit(ctx, Submission{Tenant: monopolizer, RequestKey: "monopolizer-after-finish", Workflow: "acceptance-effect", Input: json.RawMessage(`{"value":200}`)})); got != fixture.Expected.MonopolizerReadmitted {
 		t.Fatalf("monopolizer after its slot was released=%s, fixture %s", got, fixture.Expected.MonopolizerReadmitted)
 	}
-	if got := outcome(ingress[0].Admit(ctx, Submission{Tenant: third, RequestKey: "third-2", Workflow: "acceptance-effect", Input: json.RawMessage(`{"value":102}`)})); got != fixture.Expected.ThirdAfterRefill {
-		t.Fatalf("third tenant after refill=%s, fixture %s", got, fixture.Expected.ThirdAfterRefill)
+	if got := outcome(ingress[0].Admit(ctx, Submission{Tenant: fourth, RequestKey: "fourth-2", Workflow: "acceptance-effect", Input: json.RawMessage(`{"value":112}`)})); got != fixture.Expected.FourthAfterRefill {
+		t.Fatalf("fourth tenant after refill=%s, fixture %s", got, fixture.Expected.FourthAfterRefill)
 	}
 	if got := ledger.total("effect"); got != fixture.Expected.ExternalEffects {
 		t.Fatalf("external effects=%d, fixture %d", got, fixture.Expected.ExternalEffects)

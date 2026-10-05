@@ -475,7 +475,8 @@ func TestPausedOwnerProcessCannotCommitAfterTakeover(t *testing.T) {
 	if tokenData, err := os.ReadFile(ready); err == nil {
 		_, _ = fmt.Sscan(string(tokenData), &staleOwner.Token)
 	}
-	oldCommitted, newCommitted := committedByFence(t, ctx, store, partition, "paused-race", staleOwner, newOwner)
+	_, newCommitted := committedByFence(t, ctx, store, partition, "paused-race", staleOwner, newOwner)
+	oldCommitted, _ := committedByFence(t, ctx, store, partition, "paused-stale-write", staleOwner, newOwner)
 	processErrors := map[string]struct{}{}
 	if string(label) != "committed" {
 		processErrors[string(label)] = struct{}{}
@@ -537,7 +538,8 @@ func runPausedOwnerHelper() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	label := "committed"
-	if err := store.Commit(ctx, owner, "paused-race", "state", []byte(`{"winner":"old"}`)); err != nil {
+	// A distinct event identity: only the owner fence can reject this write.
+	if err := store.Commit(ctx, owner, "paused-stale-write", "state", []byte(`{"winner":"old"}`)); err != nil {
 		label = errorLabel(err)
 	}
 	return os.WriteFile(os.Getenv("BLOK_DISTRIBUTED_RESULT"), []byte(label), 0o600)
