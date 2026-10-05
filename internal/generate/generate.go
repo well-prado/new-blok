@@ -9,6 +9,7 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	"reflect"
 	"sort"
 	"strings"
 )
@@ -80,8 +81,16 @@ func Source(source []byte, options Options) ([]byte, error) {
 			if err != nil {
 				return nil, fmt.Errorf("%s.%s: %w", name, field.Name(), err)
 			}
-			fieldName := field.Name()
-			fmt.Fprintf(&output, "func (r %sRef) %s() flow.Ref[%s] { return flow.Select[%s, %s](r.value, %q) }\n\n", name, fieldName, fieldType, name, fieldType, lowerFirst(fieldName))
+			key, encoded := jsonKey(field.Name(), structure.Tag(index))
+			if !encoded {
+				continue
+			}
+			if strings.Contains(key, ".") {
+				// A reference path splits on dots, so this key could never be
+				// selected; an accessor would compile and fail at run time.
+				return nil, fmt.Errorf("%s.%s: json key %q contains '.', which a workflow reference cannot select", name, field.Name(), key)
+			}
+			fmt.Fprintf(&output, "func (r %sRef) %s() flow.Ref[%s] { return flow.Select[%s, %s](r.value, %q) }\n\n", name, field.Name(), fieldType, name, fieldType, key)
 		}
 		fmt.Fprintf(&output, "type %sArgs struct {\n", name)
 		for index := 0; index < structure.NumFields(); index++ {
@@ -133,9 +142,21 @@ func renderType(typeValue types.Type) (string, error) {
 	}
 }
 
-func lowerFirst(value string) string {
-	if value == "" {
-		return value
+// jsonKey is the key encoding/json writes for a struct field, which is what
+// a workflow reference selects: the json tag's name when it has one,
+// otherwise the Go field name exactly. A field tagged "-" is never encoded,
+// so it gets no accessor (#240).
+func jsonKey(field, tag string) (string, bool) {
+	value, tagged := reflect.StructTag(tag).Lookup("json")
+	if !tagged {
+		return field, true
 	}
-	return strings.ToLower(value[:1]) + value[1:]
+	name, _, _ := strings.Cut(value, ",")
+	if value == "-" {
+		return "", false
+	}
+	if name == "" {
+		return field, true
+	}
+	return name, true
 }
