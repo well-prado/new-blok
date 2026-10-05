@@ -55,7 +55,7 @@ func gapReason(t *testing.T, frame *Frame) string {
 func TestConfigBoundsAreValidatedAndDefaulted(t *testing.T) {
 	hub := newHub(t, Config{})
 	got := hub.Config()
-	if got.MaxRuns != DefaultMaxRuns || got.QueueDepth != DefaultQueueDepth || got.LateWindow != DefaultLateWindow || got.RunBytes != DefaultRunBytes {
+	if got.MaxRuns != DefaultMaxRuns || got.QueueDepth != DefaultQueueDepth || got.LateWindow != DefaultLateWindow || got.RunBytes != DefaultRunBytes || got.IdleTimeout != DefaultIdleTimeout {
 		t.Fatalf("defaults=%+v", got)
 	}
 	for name, config := range map[string]Config{
@@ -68,6 +68,8 @@ func TestConfigBoundsAreValidatedAndDefaulted(t *testing.T) {
 		"late window":         {LateWindow: MaxLateWindow + time.Second},
 		"negative window":     {LateWindow: -time.Second},
 		"per-run over max":    {MaxSubscribers: 2, SubscribersPerRun: 3, SubscribersPerPrincipal: 1},
+		"idle over max":       {IdleTimeout: MaxIdleTimeout + time.Second},
+		"negative idle":       {IdleTimeout: -time.Second},
 	} {
 		if _, err := New(config); err == nil {
 			t.Errorf("%s: config accepted: %+v", name, config)
@@ -663,5 +665,117 @@ func TestRecoveredRunBecomesLiveOnItsOwnersFirstPublication(t *testing.T) {
 	}
 	if _, err := budget.Subscribe("alice-run", "alice", "", nil); err != nil {
 		t.Fatalf("bob's budget still covered alice's live run, which his next read recycled: %v", err)
+	}
+}
+
+// TestIdleUnfinishedRunsBecomeRecyclableOnlyPastTheIdleBound is the #263
+// addendum at the hub: an unfinished run without publications or followers
+// for IdleTimeout may be recycled by a recovered read; a followed one, or one
+// within the bound, may not. A follower leaving is activity and restarts the
+// bound.
+func TestIdleUnfinishedRunsBecomeRecyclableOnlyPastTheIdleBound(t *testing.T) {
+	start := func(t *testing.T) (*Hub, *fakeClock) {
+		clock := &fakeClock{now: time.Date(2026, 10, 5, 0, 0, 0, 0, time.UTC)}
+		hub := newHub(t, Config{MaxRuns: 1, IdleTimeout: time.Minute, Clock: clock.Now})
+		if _, err := hub.Publish("suspended", "carol", Item{Name: "run.started", Data: []byte(`{}`), Start: true}); err != nil {
+			t.Fatal(err)
+		}
+		return hub, clock
+	}
+	t.Run("quiet", func(t *testing.T) {
+		hub, clock := start(t)
+		clock.Advance(59 * time.Second)
+		if err := hub.AttachRecovered("old", "alice", "alice", true); !errors.Is(err, ErrSaturated) {
+			t.Fatalf("within the idle bound: %v", err)
+		}
+		clock.Advance(time.Second)
+		if err := hub.AttachRecovered("old", "alice", "alice", true); err != nil {
+			t.Fatalf("past the idle bound: %v", err)
+		}
+		if stats := hub.Stats(); stats.IdleRecycled != 1 || stats.EvictedRuns != 1 || stats.Runs != 1 {
+			t.Fatalf("stats=%+v", stats)
+		}
+		// The suspended run resumes: it comes back behind an evicted gap.
+		if _, err := hub.Publish("suspended", "carol", step(1)); err != nil {
+			t.Fatal(err)
+		}
+		replay, err := hub.Subscribe("suspended", "carol", "", nil)
+		if err != nil || len(replay.Frames) == 0 || gapReason(t, replay.Frames[0]) != GapEvicted {
+			t.Fatalf("resumed replay=%+v err=%v", replay, err)
+		}
+	})
+	t.Run("followed", func(t *testing.T) {
+		hub, clock := start(t)
+		replay, err := hub.Subscribe("suspended", "carol", "", nil)
+		if err != nil || replay.Subscriber == nil {
+			t.Fatalf("subscribe=%+v err=%v", replay, err)
+		}
+		clock.Advance(time.Hour)
+		if err := hub.AttachRecovered("old", "alice", "alice", true); !errors.Is(err, ErrSaturated) {
+			t.Fatalf("a followed run was recycled: %v", err)
+		}
+		// Its follower leaving is activity: the bound starts again.
+		hub.Unsubscribe(replay.Subscriber, "client_closed")
+		clock.Advance(59 * time.Second)
+		if err := hub.AttachRecovered("old", "alice", "alice", true); !errors.Is(err, ErrSaturated) {
+			t.Fatalf("recycled %s after its follower left: %v", 59*time.Second, err)
+		}
+		clock.Advance(time.Second)
+		if err := hub.AttachRecovered("old", "alice", "alice", true); err != nil {
+			t.Fatalf("past the idle bound after its follower left: %v", err)
+		}
+	})
+	t.Run("publishing", func(t *testing.T) {
+		hub, clock := start(t)
+		clock.Advance(50 * time.Second)
+		if _, err := hub.Publish("suspended", "carol", step(1)); err != nil {
+			t.Fatal(err)
+		}
+		clock.Advance(50 * time.Second)
+		if err := hub.AttachRecovered("old", "alice", "alice", true); !errors.Is(err, ErrSaturated) {
+			t.Fatalf("a run that published %s ago was recycled: %v", 50*time.Second, err)
+		}
+	})
+}
+
+// TestFinishRecoveredClosesOnlyAnUnclaimedAttachment: a durable source's
+// terminal report closes a recovered attachment for later readers, but never
+// a run its trusted publisher has claimed.
+func TestFinishRecoveredClosesOnlyAnUnclaimedAttachment(t *testing.T) {
+	hub := newHub(t, Config{})
+	if err := hub.AttachRecovered("old", "alice", "alice", false); err != nil {
+		t.Fatal(err)
+	}
+	replay, err := hub.Subscribe("old", "alice", "", nil)
+	if err != nil || replay.Subscriber == nil || !replay.Recovered || !hub.Recovered(replay.Subscriber) {
+		t.Fatalf("replay=%+v err=%v", replay, err)
+	}
+	if !hub.FinishRecovered(replay.Subscriber) {
+		t.Fatal("unclaimed attachment not finished")
+	}
+	hub.Unsubscribe(replay.Subscriber, "recovered_terminal")
+	later, err := hub.Subscribe("old", "alice", "", nil)
+	if err != nil || later.Subscriber != nil || !later.Finished || later.Gap == nil || later.Gap.Reason != GapUnavailable {
+		t.Fatalf("later reader replay=%+v err=%v", later, err)
+	}
+
+	if err := hub.AttachRecovered("resumed", "alice", "alice", false); err != nil {
+		t.Fatal(err)
+	}
+	follower, err := hub.Subscribe("resumed", "alice", "", nil)
+	if err != nil || follower.Subscriber == nil {
+		t.Fatalf("follower=%+v err=%v", follower, err)
+	}
+	if _, err := hub.Publish("resumed", "alice", step(1)); err != nil {
+		t.Fatal(err)
+	}
+	if hub.Recovered(follower.Subscriber) || hub.FinishRecovered(follower.Subscriber) {
+		t.Fatal("a claimed run is still treated as recovered")
+	}
+	if _, err := hub.Publish("resumed", "alice", step(2)); err != nil {
+		t.Fatalf("the live run was closed: %v", err)
+	}
+	if hub.Recovered(nil) || hub.FinishRecovered(nil) {
+		t.Fatal("nil subscriber")
 	}
 }
