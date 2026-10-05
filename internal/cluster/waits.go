@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -138,7 +139,7 @@ func (r *Runtime) DeliverSignal(ctx context.Context, tenant, waitID, signalID, p
 		return SignalResult{}, ErrWaitNotFound
 	}
 	if wait.State == "signaled" && wait.SignalID == signalID {
-		if wait.Principal != principal || string(wait.Payload) != string(payload) {
+		if wait.Principal != principal || !samePayload(wait.Payload, payload) {
 			return SignalResult{}, ErrRequestConflict
 		}
 		return SignalResult{Accepted: true, Duplicate: true}, nil
@@ -198,7 +199,7 @@ func (r *Runtime) DeliverSignal(ctx context.Context, tenant, waitID, signalID, p
 			return SignalResult{}, ErrRequestConflict
 		}
 		if latest.State == "signaled" && latest.SignalID == signalID {
-			if latest.Principal != principal || string(latest.Payload) != string(payload) {
+			if latest.Principal != principal || !samePayload(latest.Payload, payload) {
 				return SignalResult{}, ErrRequestConflict
 			}
 			return SignalResult{Accepted: true, Duplicate: true}, nil
@@ -219,6 +220,19 @@ func (r *Runtime) DeliverSignal(ctx context.Context, tenant, waitID, signalID, p
 		wait, revision = latest, latestRevision
 	}
 	return SignalResult{}, fmt.Errorf("%w: signal transition contention exceeded retry budget", ErrUnavailable)
+}
+
+// samePayload reports whether a signal payload read back from a wait record
+// is the payload a retry carries. The record holds the payload as
+// json.Marshal wrote it: compacted, with '<', '>' and '&' HTML-escaped. The
+// retry carries the raw request bytes, so it is encoded the same way before
+// the bytes are compared. A retry differing only in whitespace or escaping is
+// therefore the same signal, while reordered keys or any other change is a
+// different one (#259). This is the comparison commitLateSignal already
+// makes, and the stored bytes are unchanged (ADR 0019).
+func samePayload(stored, incoming json.RawMessage) bool {
+	encoded, err := json.Marshal(incoming)
+	return err == nil && bytes.Equal(stored, encoded)
 }
 
 func (r *Runtime) commitLateSignal(ctx context.Context, owner distributed.Owner, tenant, waitID, signalID, principal string, payload json.RawMessage) error {
@@ -291,17 +305,34 @@ func (r *Runtime) FireDueWaits(ctx context.Context, owner distributed.Owner, now
 			if readErr != nil {
 				return fired, readErr
 			}
+			closeWaitOnly := run.State == "accepted" || isTerminal(run.State)
 			if run.State == "waiting" || run.State == "running" {
-				run.State, run.OwnerID, run.Fence = "accepted", owner.ID, owner.Token
-				encodedRun, _ := json.Marshal(run)
+				readmitted := run
+				readmitted.State, readmitted.OwnerID, readmitted.Fence = "accepted", owner.ID, owner.Token
+				encodedRun, _ := json.Marshal(readmitted)
 				_, commitErr = r.store.CommitFencedWaitStates(ctx, owner, []distributed.StateMutation{
 					{StateID: timer.StateID, ExpectedRevision: revision, State: encoded},
 					{StateID: run.RunID, ExpectedRevision: runRevision, State: encodedRun},
 				}, timerMutation, eventID, "wait.timed_out", encoded)
-			} else if run.State == "accepted" {
-				_, commitErr = r.store.CommitFencedWaitStates(ctx, owner, []distributed.StateMutation{{StateID: timer.StateID, ExpectedRevision: revision, State: encoded}}, timerMutation, eventID, "wait.timed_out", encoded)
-			} else {
+				if errors.Is(commitErr, distributed.ErrRecordTooLarge) {
+					// The timed-out wait record is small, so the run record
+					// is what overflows: a run stored without #254's
+					// headroom that this owner's ID pushes over the bound.
+					// It can never be re-admitted, so it fails (releasing
+					// its slots) and its wait closes below (#265).
+					if _, err := r.finish(ctx, owner, run, "failed", recordTooLargeCode, nil); err != nil {
+						return fired, err
+					}
+					closeWaitOnly = true
+				}
+			} else if !closeWaitOnly {
 				continue
+			}
+			if closeWaitOnly {
+				// The run is already runnable or terminal: only the wait
+				// closes. A terminal run's open wait is the remainder of a
+				// failure above interrupted before this commit.
+				_, commitErr = r.store.CommitFencedWaitStates(ctx, owner, []distributed.StateMutation{{StateID: timer.StateID, ExpectedRevision: revision, State: encoded}}, timerMutation, eventID, "wait.timed_out", encoded)
 			}
 		} else {
 			_, commitErr = r.store.CommitFencedWaitStates(ctx, owner, []distributed.StateMutation{{StateID: timer.StateID, ExpectedRevision: revision, State: encoded}}, timerMutation, eventID, "wait.timed_out", encoded)

@@ -1,0 +1,33 @@
+{
+  "fixtureVersion": 1,
+  "synthetic": true,
+  "name": "runtime-grown-record-overflow-is-a-terminal-failure",
+  "limits": {"partitions": 1, "partitionAdmissions": 8, "tenantAdmissions": 4, "ownerTTLMillis": 2000},
+  "oversizedOutputBytes": 600000,
+  "finishInputBytes": 300000,
+  "timerTimeoutMillis": 3000,
+  "maxTerminalMillis": 10000,
+  "expected": {
+    "state": "failed",
+    "effectfulState": "uncertain",
+    "errorCode": "record_too_large",
+    "oversizedInvocations": 1,
+    "dispatchInvocations": 0,
+    "headroomlessInvocations": 0,
+    "followUpState": "completed",
+    "followUpOutput": "{\"text\":\"aaok\"}",
+    "followUpInvocations": 1,
+    "activeRunsAfter": 0,
+    "dueTimersAfter": 0,
+    "waitStateAfterTimer": "timed_out"
+  },
+  "outage": {
+    "failureClass": "persistence",
+    "stateAfterOutage": "running",
+    "activeRunsAfterOutage": 1,
+    "finalState": "completed",
+    "finalOutput": "{\"text\":\"aaok\"}",
+    "minInvocations": 1,
+    "maxInvocations": 2
+  }
+}

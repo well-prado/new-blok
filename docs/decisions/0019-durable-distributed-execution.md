@@ -138,7 +138,8 @@ record. Three things are bounded, all before a transaction is sent:
   name limit) at its worst encoding (six bytes each), plus a maximal fence.
   Claim, suspension, takeover by a longer owner ID, and signal or timer
   re-admission therefore never outgrow the bound. Terminal output and error
-  codes are not covered yet (#265).
+  codes are not reserved; a terminal record that does not fit falls back to
+  a smaller one instead (#265, below).
 
 The store reports each case as `distributed.ErrRecordTooLarge`, as a
 `*RecordTooLargeError` that names the record (a state ID, the event payload,
@@ -149,7 +150,7 @@ or the whole request). The runtime classifies it by whose record it is:
 | Admission input, or a run record that leaves no metadata headroom | `ErrInvalid` | 400, no `Retry-After` |
 | A signal's wait record, its event, or its late-signal record | `ErrInvalid` | 400, no `Retry-After` |
 | A signal transaction over the request bound | `ErrInvalid`: the run record alone fits with room to spare, so only a large signal pushes it over, and a smaller signal is accepted | 400, no `Retry-After` |
-| A run record the runtime grew (unreachable for runs admitted with headroom; possible for a run stored without it) | `ErrRecordOverflow`: definite, and not the caller's fault | 500, no `Retry-After` |
+| A run record the runtime grew, on a signal (unreachable for runs admitted with headroom; possible for a run stored without it) | `ErrRecordOverflow`: definite, and not the caller's fault | 500, no `Retry-After` |
 | A genuine storage outage | `ErrUnavailable` | 503 + `Retry-After` (unchanged) |
 
 400 rather than 413, because both handlers already answer a body over the
@@ -180,12 +181,92 @@ Compatibility classification for #254: behavioral, and additive in the API.
   digest of any input containing those characters. A request or late signal
   retried across a rolling upgrade could then be reported as a conflict.
 
+### Runtime-grown records inside a run (#265)
+
+A run's own records can outgrow the bound after admission: a step's committed
+output, a step's dispatch record (it carries the node's declared effects,
+which the descriptor does not bound), the terminal run record (input plus
+output), and, for a run stored without the headroom above, its run record
+once a claim or a timer re-admission writes a longer owner ID. Retrying any of
+these can never fit, so each one ends the run as a terminal failure with
+error code `record_too_large`, releases its admission slots in the same
+transaction, and frees the tenant's place for its next run. It used to stay
+`running`, re-execute its node and block the partition indefinitely.
+
+| Over-bound record | Outcome |
+|---|---|
+| Pure step output (committed record) | Run `failed`, `record_too_large`; the node ran once and its step is left `retryable` |
+| Step dispatch record | Run `failed`, `record_too_large`, before the node is invoked |
+| Effectful step output | Run `uncertain`, `record_too_large`: the effect ran, so it is not reported as a plain failure |
+| Terminal run record | Fallback below; a completed run whose output does not fit becomes `failed`, `record_too_large` |
+| Run record at claim (stored without headroom) | Run `failed`, `record_too_large`, without executing |
+| Run record at timer re-admission (stored without headroom) | Run `failed`, `record_too_large`; the wait closes `timed_out` and leaves the due-timer index |
+
+The journal reports a size rejection of a step record as `ErrRecordOverflow`.
+The engine still wraps it in its `persistence` class, which is the class the
+runtime retries; the runtime treats a `persistence` error caused by
+`ErrRecordOverflow` as terminal and every other `persistence` error (a quorum
+loss, a timeout, a fenced-out write) as retryable, exactly as before. Only
+`distributed.ErrRecordTooLarge` produces `ErrRecordOverflow`, and the store
+reports it only for a size decided before sending or etcd's or gRPC's own size
+rejection, never for an outage.
+
+A run must still be failed when its own run record can no longer be written.
+`finish` therefore tries, in one fenced transition, the intended terminal
+record, then (for a completed run) a failure without output, then that record
+without its input. The dropped input is stored as `null`; the input digest
+stays, and it is what a retried request key is compared with. A terminal run is
+never replayed, so nothing reads the input again. Every field left in the
+minimal record is a fixed-size digest, a name the store bounds at 180 bytes,
+the request key (bounded at admission) or the registered workflow name, so it
+fits unless that name alone approaches the bound, which is reported as
+`ErrRecordOverflow`. The state of a failed or uncertain run is never rewritten;
+only its input can be dropped. A run admitted with headroom keeps its input
+unless the error code or output it ends with exceeds that headroom.
+
+A timer that re-admits a run stored without headroom first fails the run, then
+closes the wait in a second transition. If the owner stops between them, the
+next poll finds the wait still due and its run terminal, and closes the wait
+alone, so the due-timer index never keeps an entry for a terminal run.
+
+Limits: a signal to a run stored without headroom keeps #254's behavior (500,
+nothing written, the run stays waiting). If its wait has a timeout, the timer
+then fails the run; a wait without one keeps the run and its slots until an
+operator intervenes. The overflow depends on the current owner's ID, so a
+deployment with shorter owner IDs may claim a run another would fail; this
+decision fails it rather than wait for a different owner.
+
+Compatibility classification for #265: behavioral, no API change. Runs whose
+records exceed the bound now end `failed` (or `uncertain` for an effectful
+step) with `record_too_large` instead of staying `running`. A terminal record
+may carry `"input": null` when the input does not fit beside its terminal
+metadata. Persisted bytes of every record that fits are unchanged, and so are
+the retry decisions for every other error.
+
 Timer and signal records are persisted as fenced, tenant-scoped transitions;
 signal/timer races have one committed winner. A journaled wait now suspends the
 run after its committed prefix, then a signal or due timer atomically records
 the outcome and re-admits the same run for replay/resumption. A signal arriving
 before its wait is committed is not buffered. Signal delivery still does not
 invoke an external consumer.
+
+A retried signal is a duplicate when it has the same signal ID, the same
+principal and the same payload, where "same payload" means the same JSON text
+in the form the store persists: compacted, with `<`, `>` and `&` HTML-escaped
+(#259). Both checks against a signalled wait record, on a retry and after a
+lost race, therefore encode the incoming payload that way before comparing it
+with the stored one, which is the comparison the late-signal record already
+made. A retry differing only in whitespace, or in writing `<`, `>` and `&`
+either literally or as the lowercase `\u003c`, `\u003e` and `\u0026` escapes
+the store itself produces, is acknowledged as a duplicate. Any other spelling
+difference is a 409 even when the decoded value is equal (an uppercase-hex
+escape such as `\u003C`, `\/` for `/`, `\u00e9` for `é`, `1.0` for `1`), as are
+reordered keys and any changed value, because the payload is kept as an opaque
+JSON text, not a decoded value. The HTTP body limit is checked before the
+duplicate comparison, so a retry whose added whitespace pushes a body at the
+limit over it is refused as too large rather than acknowledged. Admission is unaffected:
+it digests the typed decoder's encoding, so its retries already compare by
+value. No stored byte or digest changes.
 
 The immutable transition log has no per-event compactor in this slice. Its
 retention contract is therefore explicit but not size-bounded: events remain
