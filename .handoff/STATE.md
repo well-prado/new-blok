@@ -6,7 +6,7 @@ Goal: (1) merge every open PR; (2) finish epic #7 [E07] "Durable state, recovery
 Hard rules: RULES.md here (laptop paths valid again on the laptop). CLOUD-RULES.md + goenv.sh are only for cloud sessions.
 
 ## Ready to merge (run on the laptop; the cloud gh token was invalid, so nothing was merged)
-Merge in this order (independent; any order works, but re-check each head first):
+Merge (independent; any order works, but re-check each head first). #322 is below:
 ```
 bash .handoff/waiver-merge.sh 327 ef7a177f6cd72048e7e3c1dc3e99dd2ab408511e   # #321 journal audit stamp — Review R round 3: APPROVE
 bash .handoff/waiver-merge.sh 326 9ce9a33c240d454fdb7f52a7391349e50799628a   # #320 WAL first open — Review R round 2: APPROVE
@@ -15,14 +15,14 @@ Each must print PROTECTION IDENTICAL. After merging: move #320/#321 to Done on P
 - #327 optional nits left as is (would need another review round): test name `…BeforeAnyAuditRowIsRead` slightly overclaims (discarded reads of tenant/digest columns aren't counted; ADR states the limit); helper comment says the rebuild "changes nothing a reader sees" (schema drops UNIQUE/CHECK/indexes).
 - #326 non-blocking should-fixes filed as #346 (root re-exec on private TMPDIR fails instead of skipping; theoretical timer race in TestCancelledOpenStopsRetrying).
 
-## #322 (#66 blok dev) — NOT ready
-- Head b301012 (round-1 fixes, all 9 findings addressed). Review R round 2: REQUEST CHANGES:
-  - BLOCKER: finding 3 incomplete — watch.go:142 ignores links named `_x`/`testdata`/`node_modules` but Go builds through them (reproduced end to end). Only leading-`.` names are safe.
-  - should-fix: harmless out-of-project links (LICENSE, docs) now block every build while `blok check` passes; scan-cost delay `ScanDuty*scanTook` is unbounded (3 s stall → 30 s); `scanFailures = 0` reset untested.
-  - nits: several untested claims (backoff cap, ScanDuty, EvalSymlinks root, stopApp exited branches, resume redaction/quoting), signal-ignore claim only true for SIGHUP/SIGINT, macOS only vetted, PR evidence on go1.27.0.
-- A cloud agent was fixing these when this note was written; see the "Update" section at the bottom (if absent, the agent didn't finish: check `git log origin/codex/66-dev-watch-reload` for commits after b301012, and the PR body).
-- After the fix: independent Review R round 3, then merge with waiver-merge.sh.
-- Node worker reload test (TestDevNodeWorkerReload) can only run on the laptop (npm blocked in cloud).
+## #322 (#66 blok dev) — READY (Review R round 4: APPROVE)
+```
+bash .handoff/waiver-merge.sh 322 ebc8cecfb5039f6f981181b1f353f674ed5eb623
+```
+- History: 7206cde → b301012 (round-1 fixes) → d851b6f (round-2) → ebc8cec (round-3). The round-4 review was delta-only and approved.
+- Full gate run once on ebc8cec: everything passes except inspect #345, which fails on main too.
+- Non-blocking follow-ups filed as #347: absolute link targets written through a symlinked parent are refused (macOS /var vs /private/var), and the project_unreadable branch of importsOf is untested.
+- Only on the laptop: TestDevNodeWorkerReload (npm is blocked in the cloud) and a real macOS run of the round-2/3 fixes, which so far were only vetted for darwin, not run. Run `go test -count=1 ./internal/tooling/devtool ./cmd/blok` on the Mac before or after the merge.
 
 ## Working rule (see RULES.md, "Keep changes small and validate the delta")
 Small stacked PRs, delta-only review rounds, targeted tests while iterating, and the full gate once before merge. Apply it to all E07-T08+ work, and split T10 (#333) per construct.
@@ -58,8 +58,8 @@ Small stacked PRs, delta-only review rounds, targeted tests while iterating, and
 
 ## Laptop to-dos
 1. Run the two merges above.
-2. Add #331–#346 to Project 15 (Backlog). The cloud GitHub connector has no project tools. #320/#321 → Done after merge.
-3. Finish #322 (see above) — Review R round 3, then merge.
+2. Add #331–#347 to Project 15 (Backlog). The cloud GitHub connector has no project tools. #320/#321 → Done after merge.
+3. Merge #322 (command above), after running the devtool and cmd/blok tests on the Mac.
 4. Restore stash 5ece76a in Deskree/blok if not yet done (`git stash apply 5ece76a`).
 5. Start E07-T08+.
 
