@@ -237,8 +237,9 @@ func reconciliationTenant(stored sql.NullString) (tenant string, owned bool) {
 // then hand every row to the system tenant. A journal with no row without
 // a tenant reads nothing of audit's and is not refused for it. A row the
 // repair leaves unowned (its record pruned or unverifiable) is tried again
-// on every open, so under a newer audit every open is refused while it
-// exists (ADR 0003, #321).
+// on every open and is never deleted, so under a newer audit every open is
+// refused while it exists: for good, unless its record verifies again or
+// an operator sets its tenant by hand (ADR 0003, #321).
 func backfillReconciliationTenants(ctx context.Context, tx *sql.Tx) error {
 	rows, err := tx.QueryContext(ctx, `SELECT operation_key FROM journal_reconciliations WHERE tenant IS NULL ORDER BY operation_key`)
 	if err != nil {

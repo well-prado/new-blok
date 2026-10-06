@@ -289,9 +289,14 @@ without a tenant, and gives no row a tenant. The check runs before the
 repair reads any audit record, and before it asks whether
 `audit_records_v1` exists: a newer audit may keep its records elsewhere,
 and "no audit table" would hand every such row to the system tenant. The
-#321 PR shows both, red on the commit before this change and red under a
-mutant that reads the record first and checks the stamp only before
-writing.
+#321 PR shows each order separately. A mutant that checks the stamp only
+after the table probe fails the test whose newer audit moved its records
+out of `audit_records_v1`; that shows the check must precede the probe,
+and says nothing about the record reads, which it still precedes. A
+tripwire test, in which reading any record of `audit_records_v1` fails,
+shows the check precedes the record reads: it fails under a mutant that
+reads the record first and checks the stamp only before writing, which
+the other tests do not catch.
 
 It refuses rather than skipping the repair because #291 refuses every
 stamp it does not understand, and a composed `audit.Journal` would already
@@ -299,22 +304,38 @@ refuse the same database. The journal also has no channel for a non-fatal
 diagnostic, and a skip reported nowhere is the unchecked read this
 replaces.
 
-When the refusal applies. A row without a tenant is one of these:
+When the refusal applies. The check cannot tell rows apart without
+reading audit, so it refuses for any row without a tenant. What an open
+the stamp does not refuse does with that row differs (ADR 0021 §8):
 
-- one a binary from before #286 wrote, which an open by a binary that
-  supports the stamped audit version repairs from its record;
-- one from before #286 whose record was pruned before the upgrade, or
-  whose record fails verification. The repair leaves these without a
-  tenant by design (owned by nobody, ADR 0021) and tries them again on
-  every open.
+- a row a binary from before #286 wrote whose verified audit record is
+  still there: the repair gives it that record's tenant, once;
+- such a row with no audit record and no prune tombstone (it predates
+  audit, or audit was never composed): the repair gives it the system
+  tenant `""`, once;
+- such a row whose record was pruned (a tombstone proves it had a
+  tenant), or whose record fails verification: the repair gives it no
+  tenant, by design (owned by nobody, ADR 0021 §8), and tries it again on
+  every open. Nothing in the framework repairs it: a pruned record never
+  comes back, and an unverifiable one is repaired only if it verifies
+  again. The journal never deletes a reconciliation row either;
+  compaction erases its content in place and keeps the row, tenant still
+  `NULL`.
 
-So a database with a row of the second kind refuses every journal-only
-open under a newer audit stamp, for as long as the row exists, although
-the binary that supports that audit version opens it and leaves the row
-unowned. Before #321 these opens succeeded. A database with no row
-without a tenant reads nothing of audit's and is never refused for
-audit's stamp, so a journal-only binary (`examples/deploy` composes no
-audit) on such a database is not stopped by an audit-only upgrade.
+So a database with a row of the last kind refuses every journal-only
+open under a newer audit stamp, permanently: every open of a binary whose
+audit support is older than the stamp, on every restart, for as long as
+the row exists, which in the framework is for good. A binary that
+supports that audit version opens the database, and with this release's
+repair it leaves the row unowned too: it ends the refusal only for
+itself. The ways out are that binary, a backup taken before the audit
+upgrade, or the out-of-framework tenant assignment ADR 0021 §8 describes
+for an operator who knows the deciding tenant. Before #321 these opens
+succeeded. A database with no row without a tenant reads nothing of
+audit's and is never refused for audit's stamp, so a journal-only binary
+(`examples/deploy` composes no audit) on such a database is not stopped
+by an audit-only upgrade. The #321 PR pins the permanent refusal in a
+test, red under a mutant that refuses only for a row it would write.
 
 This release keeps the wider refusal rather than narrowing it. To tell a
 row the repair already gave up on from one an older binary wrote since,
@@ -327,12 +348,13 @@ No audit version 2 exists yet, and ADR 0006 already says one version per
 store. The refusal names audit and both versions. The remedy is the one
 #291 gives for any downgrade below a raised version: run a binary that
 supports that audit version, or restore a backup taken before the
-upgrade. If a future audit version makes this reachable, the marker is
+upgrade; for a row of the last kind above, nothing else in the framework
+ends it. If a future audit version makes this reachable, the marker is
 the change to make with it.
 
 | Change | Class | Migration |
 | --- | --- | --- |
-| `journal.New` refuses with `store.NewerSchemaError{Component: "audit"}` when the tenant repair finds a reconciliation without a tenant (from before #286: unrepaired, or with a pruned or unverifiable record) and audit is stamped newer than supported (#321) | behavioral (breaking for downgrades) | None for a database this release's audit understands. Otherwise run a binary that supports that audit version (it repairs what it can and leaves the rest unowned), or restore a backup taken before the upgrade |
+| `journal.New` refuses with `store.NewerSchemaError{Component: "audit"}` when the tenant repair finds a reconciliation without a tenant (from before #286: unrepaired, or with a pruned or unverifiable record) and audit is stamped newer than supported (#321) | behavioral (breaking for downgrades) | None for a database this release's audit understands. Otherwise run a binary that supports that audit version, or restore a backup taken before the upgrade. That binary gives a row its verified record's tenant, or `""` when it has no record and no tombstone; a row whose record was pruned or fails verification stays unowned, so every open by the older binary stays refused for good |
 | `audit.CheckSchema` | additive | None |
 
 ## Alternatives considered

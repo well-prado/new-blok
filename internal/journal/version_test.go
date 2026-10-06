@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/well-prado/new-blok/contract/audit"
@@ -276,6 +278,48 @@ func tripwireAuditRecords(t *testing.T, database store.Database) {
 		`DROP TABLE audit_records_untripped`,
 		`ALTER TABLE audit_records_v1 ADD COLUMN record BLOB GENERATED ALWAYS AS (json_extract(trip, '$')) VIRTUAL`,
 	)
+	// The wire is armed: the rows are all still there and readable by id,
+	// and reading a record fails with SQLite's JSON error, nothing else.
+	var ids int
+	if err := database.WithTx(context.Background(), func(tx *sql.Tx) error {
+		if err := tx.QueryRow(`SELECT COUNT(id) FROM audit_records_v1`).Scan(&ids); err != nil {
+			return err
+		}
+		var record []byte
+		err := tx.QueryRow(`SELECT record FROM audit_records_v1 LIMIT 1`).Scan(&record)
+		if !errorTreeContains(err, "malformed JSON") {
+			return fmt.Errorf("reading a record gave %v, want SQLite's malformed JSON error", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("tripwire not armed: %v", err)
+	}
+	if ids == 0 {
+		t.Fatal("tripwire not armed: audit_records_v1 has no rows to trip on")
+	}
+}
+
+// errorTreeContains reports whether err, or any error it wraps (audit's
+// unavailable error keeps its store cause behind a fixed message), says
+// text.
+func errorTreeContains(err error, text string) bool {
+	if err == nil {
+		return false
+	}
+	if strings.Contains(err.Error(), text) {
+		return true
+	}
+	switch wrapped := err.(type) {
+	case interface{ Unwrap() error }:
+		return errorTreeContains(wrapped.Unwrap(), text)
+	case interface{ Unwrap() []error }:
+		for _, inner := range wrapped.Unwrap() {
+			if errorTreeContains(inner, text) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // TestNewerAuditSchemaIsCheckedBeforeAnyAuditRecordIsRead (#321): "never
@@ -291,10 +335,10 @@ func TestNewerAuditSchemaIsCheckedBeforeAnyAuditRecordIsRead(t *testing.T) {
 
 	execAll(t, database, `UPDATE blok_schema_versions SET version = 1 WHERE component = 'audit'`)
 	opened, err := New(context.Background(), database, Config{})
-	if opened != nil || !errors.Is(err, audit.ErrUnavailable) {
-		t.Fatalf("the tripwire is not live: reading the record under an understood stamp gave journal=%v err=%v, want audit.ErrUnavailable", opened != nil, err)
+	if opened != nil || !errors.Is(err, audit.ErrUnavailable) || !errorTreeContains(err, "malformed JSON") {
+		t.Fatalf("the tripwire is not live: reading the record under an understood stamp gave journal=%v err=%v, want audit.ErrUnavailable caused by the tripwire's malformed JSON", opened != nil, err)
 	}
-	t.Logf("tripwire live under stamp 1: %v", err)
+	t.Logf("tripwire live under stamp 1: %v (caused by SQLite's malformed JSON)", err)
 }
 
 // TestUnrepairableRowsKeepAJournalOnlyOpenRefusedUnderANewerAudit pins a
