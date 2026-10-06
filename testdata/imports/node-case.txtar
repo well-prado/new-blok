@@ -1,0 +1,26 @@
+Specifiers must match on-disk names exactly, so resolution is the same on
+case-sensitive and case-insensitive file systems. A mis-cased helper of
+the node's own leaves it unverified; a mis-cased path into node b is also
+a node import.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+-- nodes/nodejs/a/node.json --
+{"name":"shop/a","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/a/index.ts --
+import { helper } from "./Helper.js";
+export const a = helper;
+-- nodes/nodejs/a/helper.ts --
+export const helper = 1;
+-- nodes/nodejs/b/node.json --
+{"name":"shop/b","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/b/index.ts --
+export const b = 1;
+-- nodes/nodejs/c/node.json --
+{"name":"shop/c","version":"1.0.0","runtime":"nodejs"}
+-- nodes/nodejs/c/index.ts --
+import { b } from "../B/index.js";
+export const c = b;
+-- @expect --
+{"nodes":[["nodes/nodejs/a","unverified"],["nodes/nodejs/b","verified"],["nodes/nodejs/c","violation"]],"diagnostics":[["ownership_import_case_mismatch","nodes/nodejs/a/index.ts:1"],["ownership_import_case_mismatch","nodes/nodejs/c/index.ts:1"],["ownership_node_imports_node","nodes/nodejs/c/index.ts:1"]]}

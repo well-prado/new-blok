@@ -1,0 +1,48 @@
+Alias evasion in Go: go.mod replaces a second module path with node b's
+directory, so example.com/billing is node b under another name. Discovery
+sees an external module; module-path resolution through the replace
+directive finds b. A replace to a shared directory stays legal, and a
+replace to another module (not a local path) stays external.
+-- blok.json --
+{"name":"shop","module":"example.com/shop","runtime":"go","layout":"unified","triggers":["http"],"types":""}
+-- go.mod --
+module example.com/shop
+
+require (
+	example.com/billing v0.0.0
+	example.com/money v0.0.0
+	example.com/upstream v1.0.0
+)
+
+replace example.com/billing => ./nodes/go/b
+
+replace (
+	example.com/money => ./lib/money // shared code
+	example.com/upstream => example.com/fork v1.0.1
+)
+-- lib/money/money.go --
+package money
+
+const Unit = 100
+-- nodes/go/a/a.go --
+package a
+
+import (
+	"github.com/well-prado/new-blok/node"
+
+	"example.com/billing"
+	"example.com/money"
+	"example.com/upstream"
+)
+
+var _, _, _ = billing.Node, money.Unit, upstream.X
+
+var Node = node.MustDefine("shop/a", "1.0.0", nil)
+-- nodes/go/b/b.go --
+package billing
+
+import "github.com/well-prado/new-blok/node"
+
+var Node = node.MustDefine("shop/b", "1.0.0", nil)
+-- @expect --
+{"nodes":[["nodes/go/a","violation"],["nodes/go/b","verified"]],"diagnostics":[["ownership_node_imports_node","nodes/go/a/a.go:6"]]}
