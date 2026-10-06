@@ -39,3 +39,12 @@ Disk: `df -h /System/Volumes/Data` — stop and report if under 20 GB free.
 
 ## Reporting back
 End with: final head SHA (full), what changed, validation results (each command: pass/fail), RED proofs, anything unresolved. Be honest about anything skipped.
+
+## Keep changes small and validate the delta (added 2026-10-06)
+Reason: #322 (~7,000 lines) cost one to three hours per review round because every round re-checked everything.
+- **Small PRs.** Aim for a few hundred lines per PR. Split large tasks into stacked PRs up front, one reviewable piece each. For example, E07-T10 (#333) is one PR per construct: Each, Choose, TryFinally, Parallel, Child. Each stacked PR still links its issue (`Refs #N`; the last one says `Fixes #N`).
+- **Delta-only review rounds.** The first Review R covers the whole PR. Later rounds review only `git diff <last-reviewed-head>..<new-head>` against the previous round's findings. A later round never re-reviews the whole PR.
+- **Targeted tests while iterating.** Per fix, show the new test RED first and run only the packages the change touches.
+- **Full gate once.** Run the whole-repo validation block above (gofmt, diff --check, mod verify, vet including both Windows arches, both builds, `go test ./...`, `go test -race ./...`, plus any module suites touched) once, on the final head, before merge.
+- **No repeated flakiness batches by default.** Run `-count=N` repeats only for a test that is new, timing-sensitive, or has flaked before.
+- **New non-blocking findings in a later round become issues,** not another round. Blockers and should-fix items on the changed lines are still fixed in the PR.

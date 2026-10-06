@@ -24,6 +24,9 @@ Each must print PROTECTION IDENTICAL. After merging: move #320/#321 to Done on P
 - After the fix: independent Review R round 3, then merge with waiver-merge.sh.
 - Node worker reload test (TestDevNodeWorkerReload) can only run on the laptop (npm blocked in cloud).
 
+## Working rule (see RULES.md, "Keep changes small and validate the delta")
+Small stacked PRs, delta-only review rounds, targeted tests while iterating, and the full gate once before merge. Apply it to all E07-T08+ work, and split T10 (#333) per construct.
+
 ## E07 (epic #7)
 - Two requirement-by-requirement audits done on origin/main 018af7b: `.handoff/E07-AUDIT1-REPORT.md` (#43–#46) and `.handoff/E07-AUDIT2-REPORT.md` (#47–#49 + epic gates + backlog mapping).
 - Verdict: epic cannot close. 10 defects (D1–D10), integration gap (single-host engine never uses internal/journal; lowering rejects control flow), several ticked boxes weaker than they look.
