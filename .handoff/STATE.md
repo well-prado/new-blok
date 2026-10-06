@@ -11,7 +11,7 @@ Merge (independent; any order works, but re-check each head first). #322 is belo
 bash .handoff/waiver-merge.sh 327 ef7a177f6cd72048e7e3c1dc3e99dd2ab408511e   # #321 journal audit stamp — Review R round 3: APPROVE
 bash .handoff/waiver-merge.sh 326 9ce9a33c240d454fdb7f52a7391349e50799628a   # #320 WAL first open — Review R round 2: APPROVE
 ```
-Each must print PROTECTION IDENTICAL. After merging: move #320/#321 to Done on Project 15, and merge origin/main into #322's branch if it is still open.
+Each must print PROTECTION IDENTICAL. After merging: move #320/#321 to Done on Project 15, No need to merge main into #322 first: the waiver drops the strict up-to-date check, and the three PRs touch different files. If GitHub reports a conflict, merge main into the branch, re-run the full gate, and use the new head SHA.
 - #327 optional nits left as is (would need another review round): test name `…BeforeAnyAuditRowIsRead` slightly overclaims (discarded reads of tenant/digest columns aren't counted; ADR states the limit); helper comment says the rebuild "changes nothing a reader sees" (schema drops UNIQUE/CHECK/indexes).
 - #326 non-blocking should-fixes filed as #346 (root re-exec on private TMPDIR fails instead of skipping; theoretical timer race in TestCancelledOpenStopsRetrying).
 
