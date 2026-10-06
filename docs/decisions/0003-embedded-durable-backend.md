@@ -10,7 +10,7 @@ port; the engine does not import `store/sqlite` or any database driver.
 
 The SQLite configuration used by the port is:
 
-- WAL journal mode;
+- WAL journal mode, set once per file when it is opened (#320, below);
 - `synchronous=FULL`;
 - a 5-second busy timeout on every pooled connection, configurable through
   `sqlite.Backend.BusyTimeout`, that also bounds the writer queue (#214);
@@ -262,6 +262,32 @@ refuses an incompatible format.
 - A newer binary's migration is not reversible by an older one: the
   refusal tells the operator to restore a pre-upgrade backup, and a backup
   carries the stamp with it (`VACUUM INTO` copies the table).
+
+## Switching a new file to WAL (#320)
+
+WAL is a property of the file, stored in its header. Before #320 the DSN
+asked every pooled connection to switch to WAL as it connected, and
+`configure` ran `PRAGMA journal_mode=WAL` once more without reading its
+answer. That switch reads page 1 and then writes it, and the write is the
+read-then-write upgrade described under Decision: SQLite skips the busy
+handler for it. When several handles or processes opened the same brand-new
+file at once, the losers failed `database is locked` at once, with none of
+their busy timeout used, and `Open` failed with an error that was not
+`store.ErrBusy`.
+
+`Open` now switches a file path to WAL on a connection of its own, which is
+discarded afterwards. It retries the switch while it fails busy, pausing
+between attempts (1 ms doubling to 50 ms), and gives up when the busy timeout
+is spent, so the whole switch takes at most one busy timeout. It reads the
+mode SQLite answers and fails unless it is `wal`. Pooled connections no
+longer switch on connect: they open the file in the WAL mode it already
+stores. `:memory:` is unchanged (`journal_mode=MEMORY`, no switch).
+
+| Change | Class | Migration |
+| --- | --- | --- |
+| `Open` retries the WAL switch while it fails busy, bounded by `BusyTimeout`, and then fails with `store.ErrBusy` (#320) | behavioral (bug fix) | None. Concurrent first opens of one new file now succeed. A first open that still cannot switch, because another connection holds the file for the whole busy timeout, fails `store.ErrBusy` after that timeout instead of an immediate non-`ErrBusy` `database is locked` error. A cancelled `ctx` ends the wait at once with `ctx.Err()` joined to the busy error. Errors other than busy, such as an unwritable path, still return at once |
+| `Open` fails unless the file ends up in WAL (#320) | behavioral | None for files this backend creates. Before, the answer of `PRAGMA journal_mode=WAL` was ignored, so a file SQLite would not switch opened in its old mode; it is now refused with an error naming the mode it stayed in |
+| Pooled connections no longer request WAL when they connect; they rely on the mode persisted in the file (#320) | behavioral (internal) | None. `Open` switches the file before it returns a handle, and SQLite keeps WAL in the file across connections and restarts |
 
 ## Alternatives considered
 

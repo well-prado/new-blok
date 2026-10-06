@@ -131,6 +131,11 @@ func configure(ctx context.Context, database *sql.DB, path string, timeout time.
 // to WAL.
 const maxWALSwitchPause = 50 * time.Millisecond
 
+// walSwitchRetrying, test-only, is called each time enableWAL is about to
+// pause before another attempt, with the number of attempts that failed busy
+// so far.
+var walSwitchRetrying func(failed int)
+
 // enableWAL switches the file to WAL, and fails unless it is in WAL
 // afterwards. WAL is a property of the file, so every later connection to it
 // opens in WAL.
@@ -157,7 +162,7 @@ func enableWAL(ctx context.Context, database *sql.DB, timeout time.Duration) err
 	defer conn.Close()
 	defer discard(conn)
 	pause := time.Millisecond
-	for {
+	for failed := 1; ; failed++ {
 		var mode string
 		_, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout=%d", max(time.Until(deadline), 0).Milliseconds()))
 		if err == nil {
@@ -173,6 +178,9 @@ func enableWAL(ctx context.Context, database *sql.DB, timeout time.Duration) err
 		remaining := time.Until(deadline)
 		if !errors.Is(err, store.ErrBusy) || remaining <= 0 {
 			return err
+		}
+		if walSwitchRetrying != nil {
+			walSwitchRetrying(failed)
 		}
 		timer := time.NewTimer(min(pause, remaining))
 		select {
