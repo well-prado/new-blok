@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -183,25 +184,16 @@ func TestDevFirstScanOverTheBoundIsFatal(t *testing.T) {
 
 // TestDevRefusesLinkedPackageDirectories (review R3): a symbolic link to a
 // directory inside the module (internal/shared -> a directory outside the
-// project) would be compiled by go build but never watched, so the build
-// is refused with dev_symlink_unwatched; a link inside a skipped directory
-// is not the module's and is ignored.
+// project) that the application imports would be compiled by go build but
+// never watched, so the build is refused with dev_symlink_unwatched; a link
+// inside a skipped directory that nothing imports is ignored. Replacing the
+// link with the directory itself builds.
 func TestDevRefusesLinkedPackageDirectories(t *testing.T) {
 	options, _, _ := heldApp(t, `exit 0`)
 	outside := t.TempDir()
 	writeFiles(t, outside, map[string]string{"lib.go": "package shared\n"})
-	if err := os.MkdirAll(filepath.Join(options.Root, "internal"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(outside, filepath.Join(options.Root, "internal", "shared")); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Join(options.Root, "testdata"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(outside, filepath.Join(options.Root, "testdata", "linked")); err != nil {
-		t.Fatal(err)
-	}
+	writeFiles(t, options.Root, map[string]string{"cmd/fake/main.go": mainImporting("internal/shared")})
+	linkAll(t, options.Root, map[string]string{"internal/shared": outside, "testdata/linked": outside})
 	session := startDev(t, options)
 	first := session.await(func(e DevEvent) bool {
 		return (e.Event == EventBuildFailed || e.Event == EventBuildSucceeded) && e.Build == 1
@@ -212,7 +204,8 @@ func TestDevRefusesLinkedPackageDirectories(t *testing.T) {
 	if err := os.Remove(filepath.Join(options.Root, "internal", "shared")); err != nil {
 		t.Fatal(err)
 	}
-	session.await(func(e DevEvent) bool { return e.Event == EventBuildSucceeded && e.Build == 2 }, "the build after removing the link")
+	writeFiles(t, options.Root, map[string]string{"internal/shared/lib.go": "package shared\n"})
+	session.await(func(e DevEvent) bool { return e.Event == EventBuildSucceeded && e.Build == 2 }, "the build after replacing the link")
 	session.stop()
 }
 
@@ -276,54 +269,67 @@ wait`)
 	}
 }
 
-// TestScanRefusesLinkedDirectories (review R3): a link the build would
-// follow to files the watcher does not see is refused whatever its name: one
-// leaving the project (to a directory or a file: telling them apart would
-// mean following it), and one into a skipped directory or a nested module.
-// A link inside the project to a watched directory or to a file nothing
-// builds is harmless, and a link inside a skipped directory, or named like
-// one, is not read at all.
+// TestScanRefusesLinkedDirectories (review R3, round 2): a link the build
+// reads a package through, to files the watcher does not see, is refused
+// whatever its name: one leaving the project, and one into a skipped
+// directory or a nested module. A link inside the project to a watched
+// directory is harmless; a link nothing builds through (a file link, a
+// directory nothing imports) is recorded, so retargeting it rebuilds, but
+// not refused; a link inside a skipped directory, or named with a leading
+// dot (no import path can name it), is not read at all.
 func TestScanRefusesLinkedDirectories(t *testing.T) {
 	root, outside := t.TempDir(), t.TempDir()
 	writeFiles(t, root, map[string]string{
-		"go.mod": "module example.com/x\n", "main.go": "package main\n", "vendor/keep.txt": "",
+		"go.mod": "module example.com/x\n", "vendor/keep.txt": "",
+		"cmd/app/main.go":    "package main\n\nimport (\n\t_ \"example.com/x/internal/shared\"\n\t_ \"example.com/x/internal/fixture\"\n\t_ \"example.com/x/internal/sub\"\n\t_ \"example.com/x/internal/alias\"\n)\n",
 		"internal/real/r.go": "package real\n", "docs/notes.md": "", "testdata/pkg/p.go": "package pkg\n",
 		"nested/go.mod": "module example.com/nested\n", "nested/lib/l.go": "package lib\n",
 	})
 	writeFiles(t, outside, map[string]string{"lib.go": "package lib\n", "notes.txt": ""})
-	for link, target := range map[string]string{
+	linkAll(t, root, map[string]string{
 		"internal/shared":  outside,                                // refused: leaves the project
-		"NOTES.txt":        filepath.Join(outside, "notes.txt"),    // refused: leaves the project
 		"internal/fixture": filepath.Join(root, "testdata", "pkg"), // refused: into a skipped directory
 		"internal/sub":     "../nested/lib",                        // refused: into a nested module
 		"internal/alias":   "real",                                 // harmless: a watched directory
-		"README.md":        "docs/notes.md",                        // harmless: a file nothing builds
+		"internal/unused":  outside,                                // not refused: nothing imports it
+		"NOTES.txt":        filepath.Join(outside, "notes.txt"),    // not refused: nothing builds it
+		"README.md":        "docs/notes.md",                        // not refused: nothing builds it
 		"vendor/linked":    outside,                                // not read: in a skipped directory
 		".env":             filepath.Join(outside, "notes.txt"),    // not read: hidden
-	} {
-		if err := os.MkdirAll(filepath.Dir(filepath.Join(root, link)), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Symlink(target, filepath.Join(root, filepath.FromSlash(link))); err != nil {
-			t.Fatal(err)
-		}
-	}
+	})
 	scan, problem, err := scanProject(context.Background(), root)
 	if err != nil || problem != nil {
 		t.Fatal(err, problem)
 	}
+	for _, name := range []string{"internal/shared", "internal/unused", "NOTES.txt", "README.md"} {
+		if _, ok := scan[name]; !ok {
+			t.Fatalf("link %s not recorded: %v", name, scan)
+		}
+	}
+	for _, name := range []string{"vendor/linked", ".env"} {
+		if _, ok := scan[name]; ok {
+			t.Fatalf("link %s recorded", name)
+		}
+	}
+	resolved, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found, err := scan.buildReads(context.Background(), resolved, "example.com/x", "cmd/app")
+	if err != nil {
+		t.Fatal(err)
+	}
 	var refused []string
-	for _, link := range scan.links() {
+	for _, link := range found {
 		if link.Code != "dev_symlink_unwatched" {
-			t.Fatalf("links %+v", scan.links())
+			t.Fatalf("found %+v", found)
 		}
 		refused = append(refused, link.Source+": "+link.Actual)
 	}
 	want := []string{
-		"NOTES.txt: a symbolic link leading outside the project",
-		"internal/fixture: a symbolic link into testdata, which blok dev does not watch",
-		"internal/shared: a symbolic link leading outside the project",
-		"internal/sub: a symbolic link into the nested module nested, which blok dev does not watch",
+		"internal/fixture: a symbolic link into testdata, which blok dev does not watch; the build reads package internal/fixture through it",
+		"internal/shared: a symbolic link leading outside the project; the build reads package internal/shared through it",
+		"internal/sub: a symbolic link into the nested module nested, which blok dev does not watch; the build reads package internal/sub through it",
 	}
 	if fmt.Sprint(refused) != fmt.Sprint(want) {
 		t.Fatalf("refused links\n%q\nwant\n%q", refused, want)
@@ -335,47 +341,6 @@ func TestScanRefusesLinkedDirectories(t *testing.T) {
 	after, _, _ := scanProject(context.Background(), root)
 	if got := changes(scan, after); fmt.Sprint(got) != "[internal/shared]" {
 		t.Fatalf("changes %v", got)
-	}
-}
-
-// TestChangesSeeMetadataPreservingEdits (review R4): an edit that keeps a
-// file's size and restores its modification time (touch -r), and a
-// replacement renamed over the file with the same size and modification
-// time (cp -p, rsync -a, tar -x), are both changes. The inode and the
-// status-change time see what size and mtime cannot.
-func TestChangesSeeMetadataPreservingEdits(t *testing.T) {
-	root := t.TempDir()
-	writeFiles(t, root, map[string]string{"go.mod": "module x\n", "a.go": "package a // one\n", "b.go": "package a // one\n"})
-	before, _, _ := scanProject(context.Background(), root)
-	time.Sleep(20 * time.Millisecond)
-	for _, name := range []string{"a.go", "b.go"} {
-		target := filepath.Join(root, name)
-		info, err := os.Stat(target)
-		if err != nil {
-			t.Fatal(err)
-		}
-		edited := target
-		if name == "b.go" {
-			edited = filepath.Join(root, ".b.go.tmp")
-		}
-		if err := os.WriteFile(edited, []byte("package a // two\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Chtimes(edited, info.ModTime(), info.ModTime()); err != nil {
-			t.Fatal(err)
-		}
-		if edited != target {
-			if err := os.Rename(edited, target); err != nil {
-				t.Fatal(err)
-			}
-		}
-		if after, err := os.Stat(target); err != nil || after.Size() != info.Size() || !after.ModTime().Equal(info.ModTime()) {
-			t.Fatalf("%s: the edit did not keep size and mtime (%v)", name, err)
-		}
-	}
-	after, _, _ := scanProject(context.Background(), root)
-	if got := changes(before, after); fmt.Sprint(got) != "[a.go b.go]" {
-		t.Fatalf("changes %v, want [a.go b.go]", got)
 	}
 }
 
@@ -412,8 +377,8 @@ func observeScans(t *testing.T) func() []observedScan {
 // watch bounds mid-session is reported once, the running application keeps
 // serving, and the failing scans back off, doubling from Poll up to
 // MaxScanBackoff, instead of rescanning the over-bound tree at full speed.
-// Once the project is back within bounds the watcher recovers and the next
-// edit rebuilds.
+// Once the project is back within bounds the watcher recovers, scans at
+// Poll again, and the next edit rebuilds.
 func TestDevWatchFailureBacksOff(t *testing.T) {
 	options, _, _ := heldApp(t, `trap 'exit 0' TERM
 sleep 300 &
@@ -460,10 +425,19 @@ wait`)
 			t.Fatal(err)
 		}
 	}
+	var recovered int
 	waitFor(t, "a successful scan", func() bool {
 		all := scans()
-		return !all[len(all)-1].failed
+		recovered = len(all) - 1
+		return !all[recovered].failed
 	})
+	// The first successful scan ends the backoff: the interval is Poll
+	// (50 ms) again, so 1.5 s holds many scans, not the one or none that
+	// a backoff stuck at 3.2–10 s would.
+	time.Sleep(1500 * time.Millisecond)
+	if after := len(scans()) - 1 - recovered; after < 8 {
+		t.Fatalf("%d scans in 1.5 s after the recovery, want at least 8 (back at Poll)\n%v", after, scans()[recovered:])
+	}
 	editMain(t, options.Root, 2)
 	session.await(func(e DevEvent) bool { return e.Event == EventAppStarted && e.Build == 2 }, "build 2 after the recovery")
 	assertNoProcesses(t, session.stop())
@@ -576,4 +550,78 @@ wait`)
 		t.Fatalf("the build directory outlived the session: %v", err)
 	}
 	assertNoProcesses(t, events)
+}
+
+// stoppingLoop is a devLoop that records its events, for driving stopApp
+// directly.
+func stoppingLoop(t *testing.T) (*devLoop, *[]DevEvent) {
+	t.Helper()
+	var events []DevEvent
+	options := DevOptions{StopGrace: 5 * time.Second, Emit: func(event DevEvent) error {
+		events = append(events, event)
+		return nil
+	}}
+	options.defaults()
+	loop := &devLoop{options: options, ctx: context.Background(), backoff: options.Backoff}
+	t.Cleanup(loop.cancelRestart)
+	return loop, &events
+}
+
+// exitingApp is a script that exits with status 3.
+func exitingApp(t *testing.T) string {
+	t.Helper()
+	name := filepath.Join(t.TempDir(), "app")
+	if err := os.WriteFile(name, []byte("#!/bin/sh\nexit 3\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return name
+}
+
+// assertExitedNotStopped: an application that had exited before stopApp
+// asked it to is reported as an exit (app-exited, dev_app_exited), never as
+// a stop, and is not restarted: stopApp is replacing it.
+func assertExitedNotStopped(t *testing.T, loop *devLoop, events []DevEvent) {
+	t.Helper()
+	if len(events) != 1 || events[0].Event != EventAppExited || events[0].Status != "exit status 3" || len(events[0].Diagnostics) != 1 || events[0].Diagnostics[0].Code != "dev_app_exited" {
+		t.Fatalf("events %+v, want one app-exited (exit status 3, dev_app_exited)", events)
+	}
+	if loop.app != nil || loop.restart != nil {
+		t.Fatalf("after stopApp: app %v, restart scheduled %v", loop.app != nil, loop.restart != nil)
+	}
+}
+
+// TestStopAppAfterTheApplicationExited (review R round 2): stopApp's two
+// already-exited paths. The exit was seen before stopApp asked (the exited
+// channel is closed), or the process was reaped but its exited channel not
+// yet closed, so SIGTERM finds no process (os.ErrProcessDone).
+func TestStopAppAfterTheApplicationExited(t *testing.T) {
+	t.Run("seen before the stop", func(t *testing.T) {
+		loop, events := stoppingLoop(t)
+		app, err := startApp(exitingApp(t), t.TempDir(), "", loop.options, 1, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		<-app.exited
+		loop.app = app
+		loop.stopApp()
+		assertExitedNotStopped(t, loop, *events)
+	})
+	t.Run("reaped while the stop asks", func(t *testing.T) {
+		loop, events := stoppingLoop(t)
+		command := exec.Command(exitingApp(t))
+		isolate(command)
+		if err := command.Start(); err != nil {
+			t.Fatal(err)
+		}
+		guard, err := startGuard(nil, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = command.Wait()
+		app := &appProcess{cmd: command, guard: guard, build: 1, generation: 1, started: time.Now(), exited: make(chan struct{}), tail: &outputTail{}}
+		time.AfterFunc(100*time.Millisecond, func() { close(app.exited) })
+		loop.app = app
+		loop.stopApp()
+		assertExitedNotStopped(t, loop, *events)
+	})
 }

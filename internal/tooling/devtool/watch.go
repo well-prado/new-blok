@@ -3,8 +3,11 @@ package devtool
 import (
 	"context"
 	"errors"
+	"go/parser"
+	"go/token"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -36,9 +39,6 @@ type stamp struct {
 	mode    fs.FileMode
 	inode   uint64
 	change  int64
-	// unwatched is set on a symbolic link the build would follow to files
-	// the watcher does not see; see linkProblem.
-	unwatched string
 }
 
 func stampOf(info fs.FileInfo) stamp {
@@ -67,9 +67,10 @@ func watchedFile(rel string) bool {
 	return strings.HasSuffix(rel, ".go")
 }
 
-// skippedDir is a directory the go command and layout discovery never read
-// as part of the module: hidden and underscore directories, vendor,
-// testdata and node_modules.
+// skippedDir is a directory the walk does not enter, as ./... and layout
+// discovery do not: hidden and underscore directories, vendor, testdata and
+// node_modules. The go command still builds a package in one when it is
+// imported; buildReads refuses that build.
 func skippedDir(name string) bool {
 	return strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") || name == "vendor" || name == "testdata" || name == "node_modules"
 }
@@ -83,27 +84,18 @@ var watchBounds = struct{ files, entries int }{MaxWatchedFiles, MaxWatchEntries}
 // scanProject records every watched file under root. It reads directory
 // entries with Lstat semantics and never follows a symbolic link (ADR
 // 0023): a link is recorded as the link itself, so adding, removing or
-// retargeting one triggers a rebuild, whose layout discovery then reports
-// it; nothing outside root is ever stat-ed, so a file a link points to
-// outside the project is never watched. Nested modules are not walked.
+// retargeting one triggers a rebuild; nothing outside root is ever stat-ed,
+// so a file a link points to outside the project is never watched. Nested
+// modules are not walked.
 //
-// A link the build would follow to files the watcher does not see is
-// recorded too, whatever its name, and refused by links(): a link that is
-// itself a watched file, and one (to a directory or a file) that leaves the
-// root or leads into a skipped directory or a nested module. Telling a
-// linked directory from a linked file would mean following the link, so
-// the name does not matter; a link inside the root to a watched location,
-// or to a file nothing builds, is harmless and ignored.
+// Every link is recorded, whatever its name, except one whose name starts
+// with a dot, which no import path can name: the go command imports
+// through a directory named _x, testdata or node_modules, at any depth,
+// although ./... skips them. Whether the build reads through a link is
+// decided at build time by buildReads, from the imports.
 func scanProject(ctx context.Context, root string) (snapshot, *diagnostic.Diagnostic, error) {
 	result := snapshot{}
 	visited := 0
-	var fsRoot *os.Root
-	var resolved string
-	defer func() {
-		if fsRoot != nil {
-			_ = fsRoot.Close()
-		}
-	}()
 	err := filepath.WalkDir(root, func(name string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			// A directory removed while it is walked is a change the next
@@ -137,23 +129,11 @@ func scanProject(ctx context.Context, root string) (snapshot, *diagnostic.Diagno
 		}
 		relative = filepath.ToSlash(relative)
 		link := entry.Type()&fs.ModeSymlink != 0
-		problem := ""
 		switch {
-		case link && skippedDir(entry.Name()):
+		case link && strings.HasPrefix(entry.Name(), "."):
 			return nil
-		case link && !watchedFile(relative):
-			if fsRoot == nil {
-				if fsRoot, err = os.OpenRoot(root); err != nil {
-					return err
-				}
-				if resolved, err = filepath.EvalSymlinks(root); err != nil {
-					return err
-				}
-			}
-			if problem = linkProblem(fsRoot, resolved, relative); problem == "" {
-				return nil
-			}
-		case !watchedFile(relative) || !(entry.Type().IsRegular() || link):
+		case link:
+		case !watchedFile(relative) || !entry.Type().IsRegular():
 			return nil
 		}
 		info, err := entry.Info()
@@ -166,9 +146,7 @@ func scanProject(ctx context.Context, root string) (snapshot, *diagnostic.Diagno
 		if len(result) >= watchBounds.files {
 			return errWatchLimit
 		}
-		item := stampOf(info)
-		item.unwatched = problem
-		result[relative] = item
+		result[relative] = stampOf(info)
 		return nil
 	})
 	if errors.Is(err, errWatchLimit) {
@@ -209,50 +187,176 @@ func (s snapshot) refresh(root, rel string) {
 	s[rel] = stampOf(info)
 }
 
-// linkProblem says why the link at rel, which is not itself a watched file,
-// would make the build read files the watcher does not see, or returns ""
-// when it cannot. It resolves the link with layout.ClassifyLink, which only
-// reads inside the root and decides an escape lexically; absRoot is the
-// root's symlink-resolved path.
-func linkProblem(fsRoot *os.Root, absRoot, rel string) string {
-	code, target := layout.ClassifyLink(fsRoot, absRoot, rel)
-	switch code {
-	case layout.CodeSymlinkEscape:
-		return "a symbolic link leading outside the project"
-	case layout.CodeSymlinkAlias:
-		elements := strings.Split(target, "/")
-		for index := range elements {
-			prefix := strings.Join(elements[:index+1], "/")
-			if skippedDir(elements[index]) {
-				return "a symbolic link into " + prefix + ", which blok dev does not watch"
-			}
-			if _, err := fsRoot.Lstat(filepath.FromSlash(prefix + "/go.mod")); err == nil {
-				return "a symbolic link into the nested module " + prefix + ", which blok dev does not watch"
-			}
-		}
-	}
-	// A dangling link or a cycle gives the build nothing to read: a package
-	// behind it fails to build, and whatever later appears at its target
-	// inside the root is watched there.
-	return ""
-}
-
-// links reports every watched path that is a symbolic link. The go command
-// would follow a linked source file wherever it points, and blok dev never
-// follows a link (ADR 0023), so it could not watch what it would build:
-// such a build is refused. Layout discovery classifies the links it meets
-// in node and workflow directories itself; this covers the rest of the
-// module (cmd, internal, …).
-func (s snapshot) links() []diagnostic.Diagnostic {
+// buildReads reports every path the build of the main package (project-
+// relative) would read from files blok dev does not watch, and so could
+// not rebuild after an edit to them; such a build is refused.
+//
+//   - A watched file that is a symbolic link (a linked .go file, go.mod, …):
+//     the go command follows it wherever it points (dev_symlink_unwatched).
+//   - A link the build reads a package through: the main package and every
+//     package of the module it imports, transitively (build constraints
+//     ignored, test files excluded), are resolved one path element at a
+//     time with layout.ClassifyLink, which reads only inside the root. A
+//     link that leaves the project, or leads into a skipped directory or a
+//     nested module, is refused (dev_symlink_unwatched).
+//   - A package in a directory the walk skips (_x, testdata, node_modules,
+//     at any depth): the go command builds it when it is imported, but the
+//     watcher never sees it (dev_package_unwatched).
+//
+// A link nothing builds through (a LICENSE or docs link) is never read by
+// the build and is not refused. Files the build reads that are not Go
+// source (//go:embed patterns, cgo and assembly files) are not watched at
+// all (ADR 0026, Limits); nor is dependency code (the module cache,
+// vendor, local replace targets). root is the root's symlink-resolved
+// path, module go.mod's module path.
+func (s snapshot) buildReads(ctx context.Context, root, module, main string) ([]diagnostic.Diagnostic, error) {
 	var found []diagnostic.Diagnostic
+	sources := map[string][]string{} // symlink-free directory -> its non-test Go files
 	for name, item := range s {
 		switch {
-		case item.unwatched != "":
-			found = append(found, diagnostic.Diagnostic{Code: "dev_symlink_unwatched", Source: name, Expected: "a directory or file inside the project", Actual: item.unwatched, Remediation: "replace the link with the directory or file itself; blok dev never follows a link, so it cannot watch what the build would read through it", Message: "a symbolic link would build files blok dev does not watch"})
-		case item.mode&fs.ModeSymlink != 0:
+		case item.mode&fs.ModeSymlink != 0 && watchedFile(name):
 			found = append(found, diagnostic.Diagnostic{Code: "dev_symlink_unwatched", Source: name, Expected: "a regular file inside the project", Actual: "a symbolic link", Remediation: "replace the link with the file itself; blok dev never follows a link, so it cannot watch or build what one points to", Message: "a watched source file is a symbolic link"})
+		case item.mode.IsRegular() && goSource(name):
+			sources[path.Dir(name)] = append(sources[path.Dir(name)], name)
+		}
+	}
+	if module == "" {
+		diagnostic.Sort(found)
+		return found, nil
+	}
+	fsRoot, err := os.OpenRoot(root)
+	if err != nil {
+		return nil, err
+	}
+	defer fsRoot.Close()
+	type finding struct{ code, source string }
+	reported := map[finding]bool{}
+	report := func(item diagnostic.Diagnostic) {
+		if key := (finding{item.Code, item.Source}); !reported[key] {
+			reported[key] = true
+			found = append(found, item)
+		}
+	}
+	queue, queued, parsed := []string{main}, map[string]bool{main: true}, map[string]bool{}
+	for len(queue) > 0 {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		dir := queue[0]
+		queue = queue[1:]
+		resolved, problem := resolvePackage(fsRoot, root, dir)
+		if problem != nil {
+			report(*problem)
+			continue
+		}
+		if resolved == "" || parsed[resolved] {
+			continue
+		}
+		parsed[resolved] = true
+		for _, file := range sources[resolved] {
+			for _, imported := range importsOf(root, file) {
+				rel, ok := inModule(module, imported)
+				if ok && !queued[rel] {
+					queued[rel] = true
+					queue = append(queue, rel)
+				}
+			}
 		}
 	}
 	diagnostic.Sort(found)
-	return found
+	return found, nil
+}
+
+// goSource is a Go file the go command compiles into the application: not
+// a test, and not a name it ignores (a leading _ or .).
+func goSource(rel string) bool {
+	base := path.Base(rel)
+	return strings.HasSuffix(base, ".go") && !strings.HasSuffix(base, "_test.go") && !strings.HasPrefix(base, "_") && !strings.HasPrefix(base, ".")
+}
+
+// inModule is the project-relative directory of an import path of module,
+// "." for the module's root package.
+func inModule(module, imported string) (string, bool) {
+	if imported == module {
+		return ".", true
+	}
+	rel, ok := strings.CutPrefix(imported, module+"/")
+	if !ok || !validRelative(rel) {
+		return "", false
+	}
+	return rel, true
+}
+
+// importsOf is the import paths of a Go file; none when it cannot be read
+// or parsed, which fails the build itself.
+func importsOf(root, rel string) []string {
+	data, err := readBounded(filepath.Join(root, filepath.FromSlash(rel)), MaxSourceFileBytes)
+	if err != nil {
+		return nil
+	}
+	file, _ := parser.ParseFile(token.NewFileSet(), rel, data, parser.ImportsOnly)
+	if file == nil {
+		return nil
+	}
+	var imports []string
+	for _, spec := range file.Imports {
+		if value, err := strconv.Unquote(spec.Path.Value); err == nil {
+			imports = append(imports, value)
+		}
+	}
+	return imports
+}
+
+// resolvePackage resolves the package directory dir the way the go command
+// reaches it, one element at a time, and returns its symlink-free path, or
+// the reason the build would read it from files the watcher does not see.
+// It returns "" and no problem for a directory that does not exist (or a
+// dangling link or a cycle): the build fails on its own.
+func resolvePackage(fsRoot *os.Root, root, dir string) (string, *diagnostic.Diagnostic) {
+	if dir == "." {
+		return ".", nil
+	}
+	linkProblem := func(link, why string) *diagnostic.Diagnostic {
+		return &diagnostic.Diagnostic{Code: "dev_symlink_unwatched", Source: link, Expected: "a package directory inside the project, without symbolic links", Actual: why + "; the build reads package " + dir + " through it", Remediation: "replace the link with the directory itself, or stop importing through it; blok dev never follows a link, so it cannot watch what the build would read through it", Message: "a symbolic link would build files blok dev does not watch"}
+	}
+	resolved := ""
+	for _, element := range strings.Split(dir, "/") {
+		here := path.Join(resolved, element)
+		info, err := fsRoot.Lstat(filepath.FromSlash(here))
+		if err != nil {
+			return "", nil
+		}
+		if info.Mode()&fs.ModeSymlink == 0 {
+			if skippedDir(element) {
+				return "", &diagnostic.Diagnostic{Code: "dev_package_unwatched", Source: dir, Expected: "a package outside the directories blok dev skips (., _, vendor, testdata, node_modules)", Actual: "in " + here + ", which blok dev does not watch; the build imports it", Remediation: "move the package out of " + here + ", or stop importing it; blok dev would not rebuild after an edit to it", Message: "the build imports a package blok dev does not watch"}
+			}
+			resolved = here
+			continue
+		}
+		code, target := layout.ClassifyLink(fsRoot, root, here)
+		switch code {
+		case layout.CodeSymlinkEscape:
+			return "", linkProblem(here, "a symbolic link leading outside the project")
+		case layout.CodeSymlinkAlias:
+		default:
+			return "", nil
+		}
+		if target != "" {
+			elements := strings.Split(target, "/")
+			for index := range elements {
+				prefix := strings.Join(elements[:index+1], "/")
+				if skippedDir(elements[index]) {
+					return "", linkProblem(here, "a symbolic link into "+prefix+", which blok dev does not watch")
+				}
+				if _, err := fsRoot.Lstat(filepath.FromSlash(prefix + "/go.mod")); err == nil {
+					return "", linkProblem(here, "a symbolic link into the nested module "+prefix+", which blok dev does not watch")
+				}
+			}
+		}
+		resolved = target
+	}
+	if resolved == "" {
+		return ".", nil
+	}
+	return resolved, nil
 }

@@ -73,6 +73,7 @@ var Codes = []Code{
 	// blok dev (ADR 0026).
 	{"dev_main_package_missing", devOnly},
 	{"dev_symlink_unwatched", devOnly},
+	{"dev_package_unwatched", devOnly},
 	{"dev_build_dir_unavailable", devOnly},
 	{"dev_bindings_write_failed", devOnly},
 	{"dev_app_start_failed", devOnly},

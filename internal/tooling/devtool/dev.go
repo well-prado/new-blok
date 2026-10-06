@@ -64,13 +64,15 @@ const (
 
 // Watcher cost bounds (ADR 0026).
 const (
-	// ScanDuty bounds the watcher's share of one CPU: the next scan waits at
-	// least ScanDuty times as long as the last one took, so scanning uses at
-	// most 1/ScanDuty of a CPU however large the project is.
+	// ScanDuty bounds the watcher's share of one CPU: the next scan waits
+	// ScanDuty times as long as the last one took (up to MaxScanBackoff), so
+	// scanning uses at most 1/ScanDuty of a CPU while a scan takes up to
+	// MaxScanBackoff/ScanDuty (1 s).
 	ScanDuty = 10
-	// MaxScanBackoff bounds how far the interval between scans grows while
-	// they fail (doubling from Poll), and so how long a repair waits to be
-	// seen.
+	// MaxScanBackoff bounds how far the interval between scans grows, while
+	// they fail (doubling from Poll) or after a slow or stalled one
+	// (ScanDuty), and so how long an edit or a repair waits to be seen,
+	// unless Poll itself is longer.
 	MaxScanBackoff = 10 * time.Second
 )
 
@@ -137,7 +139,10 @@ type DevEvent struct {
 	// shell command that runs the kept executable of the newest earlier
 	// build that did not refuse the durable state, so its runs can be
 	// finished while blok dev keeps running (it removes the executables
-	// when it ends). Empty when no such build is kept.
+	// when it ends). Empty when no such build is kept, or when the command
+	// looks like it holds a credential (observe/redact): redaction would
+	// leave no command, so it is omitted and the diagnostic's remediation
+	// says so.
 	Resume string `json:"resume,omitempty"`
 	// ExitCode is blok dev's own exit code, on the final stopped event.
 	ExitCode *int `json:"exitCode,omitempty"`
@@ -356,10 +361,12 @@ func (l *devLoop) observeScan(took time.Duration, failed bool) {
 
 // nextScan is the delay before the next scan: Poll, stretched to ScanDuty
 // times the last scan's duration, and doubled for every consecutive failed
-// scan up to MaxScanBackoff, so a project the watcher cannot read is not
-// rescanned at full speed.
+// scan, each up to MaxScanBackoff, so a project the watcher cannot read, or
+// reads slowly, is not rescanned at full speed, and a scan that stalled
+// (a stopped process, a cold cache) does not postpone the next one by ten
+// times the stall.
 func (l *devLoop) nextScan() time.Duration {
-	delay := max(l.options.Poll, ScanDuty*l.scanTook)
+	delay := max(l.options.Poll, min(ScanDuty*l.scanTook, MaxScanBackoff))
 	if l.scanFailures > 0 {
 		backoff := l.options.Poll
 		for range l.scanFailures {
@@ -514,8 +521,9 @@ func (l *devLoop) compile(number int) (binary string, regenerated []string, prob
 	if len(found) > 0 {
 		return "", nil, found, false
 	}
-	if linked := l.scan.links(); len(linked) > 0 {
-		return "", nil, linked, false
+	main, missing := l.mainPackage(workspace)
+	if missing != nil {
+		return "", nil, []diagnostic.Diagnostic{*missing}, false
 	}
 	plan, problem, skipped := planBindings(workspace)
 	switch {
@@ -535,9 +543,22 @@ func (l *devLoop) compile(number int) (binary string, regenerated []string, prob
 		l.scan.refresh(l.root, plan.path)
 		regenerated = []string{plan.path}
 	}
-	main, problem := l.mainPackage(workspace)
-	if problem != nil {
-		return "", regenerated, []diagnostic.Diagnostic{*problem}, false
+	module := workspace.Module
+	if module == "" {
+		module = moduleOf(filepath.Join(l.root, "go.mod"))
+	}
+	// The build must not read files the watcher does not see, the
+	// regenerated bindings' imports included. l.root is symlink-resolved
+	// (run), as layout.ClassifyLink requires.
+	unwatched, err := l.scan.buildReads(l.ctx, l.root, module, main)
+	if err != nil {
+		if l.ctx.Err() != nil {
+			return "", regenerated, nil, false
+		}
+		return "", regenerated, []diagnostic.Diagnostic{{Code: "project_unreadable", Expected: "a readable project directory", Actual: relativeText(errorText(err), l.root), Remediation: "make the project readable; blok dev keeps watching", Message: "the project could not be read"}}, false
+	}
+	if len(unwatched) > 0 {
+		return "", regenerated, unwatched, false
 	}
 	dir := filepath.Join(l.buildDir, "build-"+strconv.Itoa(number))
 	if err := os.Mkdir(dir, 0o700); err != nil {
@@ -694,8 +715,16 @@ func (l *devLoop) durableIncompatible(build int, event *DevEvent) diagnostic.Dia
 	}
 	fixes := []string{"revert the change: Go builds are reproducible, so the reverted build is the one that admitted the runs, and blok dev starts it on save"}
 	if kept, ok := l.resumable(build); ok {
-		event.Resume = redact.Message(resumeCommand(l.root, kept.path, l.options.Args))
-		fixes = append(fixes, "or, while blok dev keeps running (it keeps build "+strconv.Itoa(kept.number)+"'s executable until it ends), finish the runs with it in another terminal: "+event.Resume+" — then stop it and save to rebuild")
+		keeping := "or, while blok dev keeps running (it keeps build " + strconv.Itoa(kept.number) + "'s executable until it ends), finish the runs with it in another terminal: "
+		// Redaction would replace the whole command with text that is not
+		// a command, so a credential-shaped one is omitted instead, and the
+		// remediation says how to run the executable without showing it.
+		if command := resumeCommand(l.root, kept.path, l.options.Args); !redact.Sensitive(command) {
+			event.Resume = command
+			fixes = append(fixes, keeping+command+" — then stop it and save to rebuild")
+		} else {
+			fixes = append(fixes, keeping+"run "+redact.String(kept.path)+" from the project root with the application's arguments (the command is not shown: it looks like it holds a credential) — then stop it and save to rebuild")
+		}
 	}
 	fixes = append(fixes, "or finish or discard the retained runs with the application's own tools (for example, remove its development journal)")
 	problem.Remediation = strings.Join(fixes, "; ")

@@ -44,13 +44,14 @@ blok dev [--json] [--package DIR] [directory] [-- application arguments]
    modification time and mode, and on Linux and macOS by inode and
    status-change time too.
 2. **Build.** Layout discovery (ADR 0023) runs first; any `layout_*`
-   diagnostic fails the build. A watched source file that is a symbolic
-   link fails it too (`dev_symlink_unwatched`, below). Stale or missing
+   diagnostic fails the build. Stale or missing
    bindings for the manifest's `types` file are **regenerated** with the
    same `generate.Source` and atomic `generate.WriteFile` that `blok
    generate` uses (a hand-written bindings file is refused,
    `bindings_not_generated`); the write is recorded in the snapshot so it
-   is not mistaken for an edit. Then `go build -o <new path> ./<main
+   is not mistaken for an edit. A build that would read files the watcher
+   does not see is refused (`dev_symlink_unwatched`,
+   `dev_package_unwatched`, below). Then `go build -o <new path> ./<main
    package>` runs through the ADR 0024 go command: `GOTOOLCHAIN=local`,
    `GOPROXY=off`, `GOFLAGS=-mod=readonly` (or `-mod=vendor`), `GOWORK=off`,
    its own process group, its pipe guard, interrupt then kill after 5 s.
@@ -82,32 +83,51 @@ The watch set is derived from the project as layout discovery sees it:
 `blok.json`, `go.mod`, `go.sum`, every non-test `.go` file of the module,
 and every file under a node root (`layout.NodeRoot`: a foreign node's
 `node.json`, `.mjs`, … restart its worker too). `_test.go` files are not
-built into the application and never restart it. Directories the go
-command and discovery skip are skipped: `.`/`_` prefixes, `vendor`,
-`testdata`, `node_modules`, and nested modules.
+built into the application and never restart it. The walk skips the
+directories `./...` skips (`.`/`_` prefixes, `vendor`, `testdata`), and
+`node_modules` and nested modules.
+
+Skipping a directory in the walk does not stop the go command from
+reading it: `./...` skips `_x` and `testdata`, but an **import** of
+`example.com/app/internal/_x` builds it, and so does an import through a
+directory named `testdata` or `node_modules`, at any depth. So before each
+`go build` blok dev resolves what the build reads: the main package and,
+transitively, every package of the module it imports (import declarations
+parsed from the watched files; build constraints are ignored, so a file
+for another platform counts too; test files do not). A build is refused
+when it would read Go source the watcher does not see:
+
+- **`dev_symlink_unwatched`**: a watched file that is a symbolic link (a
+  linked `.go` file, `go.mod`, `go.sum`, …), wherever it points; or a
+  link that an imported package directory (or the main package) is
+  reached through, whatever its name (`_ext`, `testdata`,
+  `node_modules`, …), that leaves the root or leads into a skipped
+  directory or a nested module. Each path element is resolved by
+  `layout.ClassifyLink`, which reads only inside the root and decides an
+  escape lexically, against the root resolved once at start (blok dev
+  started through a link to the project, or under macOS's `/var`, still
+  sees an absolute in-project target as inside). A link inside the
+  root that leads back to a watched directory is harmless.
+- **`dev_package_unwatched`**: an imported package in a real directory
+  the walk skips (`_x`, `internal/testdata/p`, `web/node_modules/n`):
+  an edit to it would not rebuild.
 
 Symbolic links follow ADR 0023: they are never followed. The walk reads
-directory entries with `Lstat` semantics and records a link as the link
-itself, so adding, removing or retargeting one is a change; nothing
-outside the root is ever stat-ed, so editing a file a link points to
-outside the project changes nothing. Because `go build` *would* follow a
-link, a build is refused with `dev_symlink_unwatched` when the walk
-meets a link it would follow to files the watcher does not see (layout
-discovery's own `layout_symlink_*` codes cover node and workflow
-directories first):
+directory entries with `Lstat` semantics and records every link as the
+link itself, whatever its name (except a name starting with `.`, which no
+import path can name), so adding, removing or retargeting one is a change
+and rebuilds; nothing outside the root is ever stat-ed, so editing a file a
+link points to outside the project changes nothing — which is why a build
+through such a link is refused rather than served stale.
 
-- a link that is itself a watched file (a linked `.go` file, …);
-- any other link, whatever its name, that leaves the root (decided
-  lexically by `layout.ClassifyLink`, which reads only inside the root):
-  telling a linked package directory from a linked file would mean
-  following it;
-- a link inside the root into a skipped directory or a nested module.
-
-A link inside the root to a watched directory or to a file nothing builds
-(`README.md` → `docs/…`) is harmless and ignored, and so is a link inside a
-skipped directory or named like one (`.env`). A dangling link or a cycle
-gives the build nothing to read. The root itself is resolved once, as
-discovery resolves it.
+A link the build does not read through is **not** refused: a
+`LICENSE -> ../LICENSE` or `docs -> ../docs` link in a monorepo, or a
+linked directory nothing imports, builds normally (`blok check` agrees).
+What the go command reads besides imported packages' `.go` files —
+`//go:embed` patterns, cgo and assembly sources and headers — is not
+watched at all, linked or not (Limits), so a link to such a file is no
+worse than the file itself. Dependency code (the module cache, `vendor/`,
+a local `replace` target) is not watched either.
 
 The watcher **polls** the tree. No dependency was added: fsnotify-style
 kernel notification needs one watch per directory (inotify limits),
@@ -124,12 +144,17 @@ same everywhere and its cost is bounded. One scan visits at most
 - **Mid-session** it is reported once (`watch-failed`, `running` still
   serving) and the previous snapshot stays; the failing scans **back off**,
   the interval doubling from `Poll` up to `MaxScanBackoff` (10 s), until a
-  scan succeeds again. Before this, a project over the bound was
-  rescanned in full every 250 ms: about 61% of a CPU, measured in review.
-- **The interval adapts to the scan's cost**: the next scan starts no
-  sooner than `ScanDuty` (10) times the last scan's duration after it, so
-  scanning takes at most about a tenth of one CPU however large the project
-  is, at the price of noticing edits later in a large tree.
+  scan succeeds again; the first successful scan returns it to `Poll`.
+  Before this, a project over the bound was rescanned in full every
+  250 ms: about 61% of a CPU, measured in review.
+- **The interval adapts to the scan's cost**: the next scan starts
+  `ScanDuty` (10) times the last scan's duration after it, but never more
+  than `MaxScanBackoff` (10 s) later, so scanning takes at most about a
+  tenth of one CPU while a scan takes up to 1 s, at the price of noticing
+  edits later in a large tree. A scan that stalled (the process stopped
+  with Ctrl+Z, a cold cache) does not postpone the next one by ten times
+  the stall: whatever happens, an edit is seen within 10 s (or `Poll`, if
+  that is longer).
 
 Cost, measured with `BenchmarkScanAtTheBounds` (`go test -run '^$' -bench
 ScanAtTheBounds -count 5 ./internal/tooling/devtool`, linux/amd64, 4
@@ -233,9 +258,13 @@ the reverted build is byte-identical to the one that admitted the runs and
 adopts them); finish the runs with the kept executable of the newest
 earlier build that did not refuse, using the exact command in the event's
 `resume` field (`cd <root> && <kept executable> <application
-arguments>`, quoted for a POSIX shell and redacted), run in another
+arguments>`, each word quoted for a POSIX shell), run in another
 terminal while blok dev keeps running, since the executable is removed
-when the session ends; or finish or discard the runs with the
+when the session ends. When the command looks like it holds a credential
+(`observe/redact`), redaction would leave no command, so `resume` is
+omitted and the remediation names the kept executable, says to run it
+from the project root with the application's arguments, and says why the
+command is not shown; or finish or discard the runs with the
 application's own tools. An application exiting 65 for another reason is
 reported the same way, which is why the code is reserved for this meaning
 under `BLOK_DEV`.
@@ -284,12 +313,15 @@ changing an event's or exit code's meaning, requires `v2`.
 | 4 | an event could not be written (a closed pipe included); the application is stopped first |
 
 The first signal stops blok dev gracefully; any further one forces the
-application down. A signal blok dev was started with ignored stays
-ignored (it is not caught, which would un-ignore it): `nohup blok dev &`,
-which starts it with SIGHUP ignored (and, from a non-interactive shell,
-SIGINT too), keeps running when the terminal closes, as nohup promises,
-and SIGTERM still stops it. The application inherits the ignored
-disposition, as under nohup. SIGPIPE is caught, not ignored, so a closed output pipe
+application down. SIGHUP or SIGINT, when blok dev was started with it
+ignored, stays ignored (it is not caught, which would un-ignore it):
+`nohup blok dev &`, which starts it with SIGHUP ignored (and, from a
+non-interactive shell, SIGINT too), keeps running when the terminal
+closes, as nohup promises, and SIGTERM still stops it. The application
+inherits the ignored disposition, as under nohup. Only those two: the Go
+runtime reports an inherited ignore (`signal.Ignored`) for SIGHUP and
+SIGINT alone, and installs its own handler for SIGTERM and SIGQUIT, so
+those always stop blok dev, even if it was started with them ignored. SIGPIPE is caught, not ignored, so a closed output pipe
 is exit 4 while the application inherits SIGPIPE's default disposition (an
 ignored signal would stay ignored in it).
 
@@ -304,7 +336,8 @@ same: layout's `layout_*` codes, `project_unreadable`,
 | Code | Condition |
 | --- | --- |
 | `dev_main_package_missing` | the main package (`--package`, default `./cmd/<blok.json name>`) is not a directory inside the root |
-| `dev_symlink_unwatched` | a watched source path is a symbolic link |
+| `dev_symlink_unwatched` | a watched source file is a symbolic link, or the build reads an imported package through a link that leaves the root or leads into a skipped directory or a nested module |
+| `dev_package_unwatched` | the build imports a package in a directory the watcher skips (`_x`, `testdata`, `node_modules`) |
 | `dev_build_dir_unavailable` | the private build directory cannot be created |
 | `dev_bindings_write_failed` | regenerated bindings cannot be written |
 | `dev_app_start_failed` | the built executable cannot be started |
@@ -321,7 +354,7 @@ in the source and the tables of ADRs 0024 and 0026 identical.
 - **Additive**: the `blok dev` command; `devtool.Dev`, `DevOptions`,
   `DevEvent` and the `blok-dev/v1` event stream, a new machine-readable
   contract; the `BLOK_DEV` and `BLOK_DEV_GENERATION` environment contract;
-  eight `dev_*` diagnostic codes; `generate.WriteFile`;
+  nine `dev_*` diagnostic codes; `generate.WriteFile`;
   `deployment.ErrRetainedIncompatible`, `deployment.ExitRetainedIncompatible`,
   `deployment.ExitCode` and `app.RetainedIncompatibleError`.
 - **Behavioural, examples only**: `examples/deploy`'s durable deployment
@@ -360,10 +393,17 @@ runs across the two layouts) and the Go+Node and durable fixtures beside it.
   offers the newest earlier build that did not refuse. A multi-version
   manager is later work (architecture §7, M8).
 - On systems other than Linux and macOS, polling cannot see an edit that
-  keeps a file's size and restores its modification time; files a Go
-  package embeds (`//go:embed`) are not watched unless a node root owns
-  them. The watcher's reaction time grows with the project's scan cost
-  (`ScanDuty`), and while scans fail with the backoff (up to 10 s).
+  keeps a file's size and restores its modification time. Files a Go
+  package embeds (`//go:embed`), and cgo and assembly sources and headers,
+  are not watched unless a node root owns them; nor is dependency code
+  (the module cache, `vendor/`, a local `replace` target): run blok dev
+  again after changing them. The watcher's reaction time grows with the
+  project's scan cost (`ScanDuty`) and while scans fail (the backoff), up
+  to 10 s either way.
+- Telling whether the build reads through a link parses the import
+  declarations of the packages the build reaches, at every build; build
+  constraints are ignored, so a link imported only by a file for another
+  platform is refused too (conservatively).
 - After the application exits, its group is swept by process-group id.
   The id is reserved while any member lives; a group with no members left
   could in principle be reused between the reap and the sweep (the sweep
@@ -377,7 +417,10 @@ runs across the two layouts) and the Go+Node and durable fixtures beside it.
   removes the build directory (0700, executables only).
 - Verified on macOS (darwin/arm64) and Linux (linux/arm64, the
   `golang:1.27.1` container image), Go 1.27.1; the Go+Node worker test ran
-  on macOS only (Node 24.21.0), the container has no Node. amd64 hosts are
-  not run here. Windows has no process group, guard or graceful stop here: the
+  on macOS only (Node 24.21.0), the container has no Node. The second
+  review round's changes (what the build reads through links and skipped
+  directories, the capped scan interval, the omitted resume command) ran
+  on Linux only (linux/amd64, Go 1.27.1, no Node); on macOS they are
+  vetted (`GOOS=darwin go vet`), not run. Windows has no process group, guard or graceful stop here: the
   application is killed outright and its children may outlive it —
   unverified, and owned by the Windows track (#156, #157).

@@ -50,14 +50,15 @@ func writeFiles(t *testing.T, root string, files map[string]string) {
 
 // TestScanStaysInsideTheProject: skipped directories and nested modules are
 // not read, a linked directory is not entered, and a linked source file is
-// recorded as a link, never stat-ed through. Both links leave the project,
-// so both are refused (dev_symlink_unwatched): the build would read what
-// they point to, which the watcher never sees.
+// recorded as a link, never stat-ed through. Both links leave the project
+// and the build reads both (the linked file, and the linked directory as
+// an imported package), so both are refused (dev_symlink_unwatched): the
+// build would read what they point to, which the watcher never sees.
 func TestScanStaysInsideTheProject(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir()
 	writeFiles(t, root, map[string]string{
-		"go.mod": "module example.com/x\n", "blok.json": "{}", "main.go": "package main\n",
+		"go.mod": "module example.com/x\n", "blok.json": "{}", "main.go": "package main\n\nimport _ \"example.com/x/linkdir\"\n",
 		"vendor/v/v.go": "package v\n", "testdata/t.go": "package t\n", ".hidden/h.go": "package h\n",
 		"_skip/s.go": "package s\n", "web/node_modules/m/m.go": "package m\n",
 		"nested/go.mod": "module example.com/nested\n", "nested/n.go": "package n\n",
@@ -87,7 +88,14 @@ func TestScanStaysInsideTheProject(t *testing.T) {
 		t.Fatalf("watched %v, want %v", sortedCopy(got), want)
 	}
 	if runtime.GOOS != "windows" {
-		links := scan.links()
+		resolved, err := filepath.EvalSymlinks(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		links, err := scan.buildReads(context.Background(), resolved, "example.com/x", ".")
+		if err != nil {
+			t.Fatal(err)
+		}
 		if len(links) != 2 || links[0].Code != "dev_symlink_unwatched" || links[0].Source != "linkdir" || links[1].Code != "dev_symlink_unwatched" || links[1].Source != "linked.go" {
 			t.Fatalf("links %+v", links)
 		}
@@ -282,6 +290,101 @@ func BenchmarkScanAtTheBounds(b *testing.B) {
 	for b.Loop() {
 		if _, problem, err := scanProject(context.Background(), root); err != nil || problem != nil {
 			b.Fatal(err, problem)
+		}
+	}
+}
+
+// TestNextScanInterval pins the watcher's pacing with literal values, so a
+// change to ScanDuty (10) or MaxScanBackoff (10 s) fails here: the pause
+// after a scan is ScanDuty times its duration but never past 10 s, however
+// long a scan stalled (a stopped process, a cold cache); failed scans
+// double it from Poll up to 10 s; and one successful scan returns it to
+// Poll.
+func TestNextScanInterval(t *testing.T) {
+	const poll = 250 * time.Millisecond
+	for _, item := range []struct {
+		took     time.Duration
+		failures int
+		want     time.Duration
+	}{
+		{time.Millisecond, 0, poll},
+		{100 * time.Millisecond, 0, time.Second},
+		{900 * time.Millisecond, 0, 9 * time.Second},
+		{3 * time.Second, 0, 10 * time.Second},
+		{30 * time.Second, 0, 10 * time.Second},
+		{time.Millisecond, 1, 500 * time.Millisecond},
+		{time.Millisecond, 2, time.Second},
+		{time.Millisecond, 5, 8 * time.Second},
+		{time.Millisecond, 6, 10 * time.Second},
+		{time.Millisecond, 1000, 10 * time.Second},
+		{30 * time.Second, 3, 10 * time.Second},
+	} {
+		loop := &devLoop{options: DevOptions{Poll: poll}, scanTook: item.took, scanFailures: item.failures}
+		if got := loop.nextScan(); got != item.want {
+			t.Errorf("a scan of %s after %d failures: next in %s, want %s", item.took, item.failures, got, item.want)
+		}
+	}
+	loop := &devLoop{options: DevOptions{Poll: poll}}
+	for range 6 {
+		loop.observeScan(time.Millisecond, true)
+	}
+	if got := loop.nextScan(); got != 10*time.Second {
+		t.Fatalf("after 6 failed scans: next in %s, want 10s", got)
+	}
+	loop.observeScan(time.Millisecond, false)
+	if got := loop.nextScan(); got != poll {
+		t.Fatalf("after a successful scan: next in %s, want Poll (%s)", got, poll)
+	}
+}
+
+// TestResumeCommandIsQuotedOrOmitted: the resume command of a
+// dev_durable_incompatible refusal is a POSIX shell command whose words
+// are quoted, and when redaction would replace it (a credential-shaped
+// argument), it is omitted, never replaced by text that is not a command:
+// the remediation names the kept executable and says why.
+func TestResumeCommandIsQuotedOrOmitted(t *testing.T) {
+	loop := &devLoop{root: "/work/my app", kept: []keptBuild{{number: 2, path: "/tmp/blok-dev-1/build-2/app"}}}
+	loop.options.Args = []string{"--flag", "it's quoted"}
+	var event DevEvent
+	problem := loop.durableIncompatible(3, &event)
+	want := `cd '/work/my app' && /tmp/blok-dev-1/build-2/app --flag 'it'\''s quoted'`
+	if event.Resume != want || !strings.Contains(problem.Remediation, want) {
+		t.Fatalf("resume %q, remediation %q; want %q in both", event.Resume, problem.Remediation, want)
+	}
+	const secret = "ghp_0123456789abcdefghijABCDEFGHIJ012345"
+	loop.options.Args = []string{"--token=" + secret}
+	event = DevEvent{}
+	problem = loop.durableIncompatible(3, &event)
+	if event.Resume != "" {
+		t.Fatalf("a credential-shaped resume command was kept as %q", event.Resume)
+	}
+	for _, text := range []string{secret, redact.Marker, redact.MessageMarker} {
+		if strings.Contains(problem.Remediation, text) {
+			t.Fatalf("remediation holds %q: %s", text, problem.Remediation)
+		}
+	}
+	if !strings.Contains(problem.Remediation, "/tmp/blok-dev-1/build-2/app") || !strings.Contains(problem.Remediation, "not shown") {
+		t.Fatalf("remediation does not name the kept executable or say why the command is not shown: %s", problem.Remediation)
+	}
+}
+
+// TestShellQuote: a word is left bare only when it is made of characters a
+// POSIX shell gives no meaning to; every other word is single-quoted.
+func TestShellQuote(t *testing.T) {
+	for _, bare := range []string{"app", "/tmp/blok-dev-1/build-2/app", "--flag=a,b:c+d@e%f", "x_y-z.1"} {
+		if got := shellQuote(bare); got != bare {
+			t.Errorf("shellQuote(%q) = %q, want it bare", bare, got)
+		}
+	}
+	for word, want := range map[string]string{"": "''", "a b": "'a b'", "it's": `'it'\''s'`} {
+		if got := shellQuote(word); got != want {
+			t.Errorf("shellQuote(%q) = %q, want %q", word, got, want)
+		}
+	}
+	for _, special := range []string{"$", ";", "&", "|", "`", "*", "?", "~", "(", ")", "<", ">", "\\", "\"", "'", "!", "#", "{", "}", "[", "]", "\n", "\t", " "} {
+		word := "a" + special + "b"
+		if got := shellQuote(word); !strings.HasPrefix(got, "'") {
+			t.Errorf("shellQuote(%q) = %q, want it quoted", word, got)
 		}
 	}
 }

@@ -467,16 +467,18 @@ Options:
                   application's output goes to standard error
   --package DIR   the main package to build (default ./cmd/<blok.json name>)
 
-Signals blok dev was started with ignored stay ignored, so nohup blok dev &
-outlives the terminal.
+SIGHUP and SIGINT stay ignored when blok dev was started with them ignored,
+so nohup blok dev & outlives the terminal; SIGTERM and SIGQUIT always stop it.
 
 Exit codes: 130 stopped by a signal, 1 project unreadable or too large to
 watch, 2 usage, 3 go or the process guard unavailable, 4 output not written.`
 
 // executeDev runs blok dev. The first SIGINT, SIGTERM, SIGHUP or SIGQUIT
-// stops it gracefully; any further one forces the application down. A
-// signal blok was started with ignored stays ignored: nohup blok dev &
-// survives the terminal closing, as nohup promises.
+// stops it gracefully; any further one forces the application down.
+// SIGHUP or SIGINT, when blok was started with it ignored, stays ignored:
+// nohup blok dev & survives the terminal closing, as nohup promises. The Go
+// runtime reports an inherited ignore for those two alone (signal.Ignored);
+// SIGTERM and SIGQUIT always stop blok dev.
 func executeDev(args []string, stdout, stderr io.Writer) int {
 	signals := make(chan os.Signal, 4)
 	// Notify with no signals would catch every signal.
