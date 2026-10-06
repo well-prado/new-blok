@@ -3,15 +3,19 @@ package journal
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/well-prado/new-blok/contract/audit"
 	"github.com/well-prado/new-blok/store"
 	"github.com/well-prado/new-blok/store/sqlite"
+	sqlitedriver "modernc.org/sqlite"
 )
 
 // asBinary stands in for a binary that supports journal schema version.
@@ -253,14 +257,55 @@ func requireAuditRefusal(t *testing.T, database store.Database) {
 	}
 }
 
-// tripwireAuditRecords rebuilds audit_records_v1 so that reading any
-// record's content fails: record becomes a virtual column computed from
-// text that is not JSON, so every SELECT that returns it errors, while
-// the table, its ids and its other columns stay as they were. A repair
-// that reads the record before it checks the stamp then fails with
-// audit's ErrUnavailable instead of the stamp's refusal.
-func tripwireAuditRecords(t *testing.T, database store.Database) {
+// auditReads counts, per tripwire tag, the audit values SQLite computed for
+// a statement. A tripwire computes one column of an audit table through
+// blok_test_audit_read(tag, value), which returns value unchanged and
+// counts the call against tag. SQLite computes a virtual column only for a
+// statement that uses it, once per row it reads, so the count is the
+// number of times anything read that column, whatever it then did with the
+// value or any error: a read whose result is discarded counts too.
+var auditReads sync.Map // tag -> *atomic.Int64
+
+func init() {
+	sqlitedriver.MustRegisterDeterministicScalarFunction("blok_test_audit_read", 2, func(_ *sqlitedriver.FunctionContext, args []driver.Value) (driver.Value, error) {
+		tag, ok := args[0].(string)
+		if !ok {
+			return nil, fmt.Errorf("blok_test_audit_read: tag is %T, want string", args[0])
+		}
+		counter, _ := auditReads.LoadOrStore(tag, new(atomic.Int64))
+		counter.(*atomic.Int64).Add(1)
+		return args[1], nil
+	})
+}
+
+func auditReadCount(tag string) int64 {
+	if counter, ok := auditReads.Load(tag); ok {
+		return counter.(*atomic.Int64).Load()
+	}
+	return 0
+}
+
+// auditTripwires names the counters of one database's two tripwires.
+type auditTripwires struct{ records, tombstones string }
+
+func (w auditTripwires) reads() (records, tombstones int64) {
+	return auditReadCount(w.records), auditReadCount(w.tombstones)
+}
+
+// tripwireAuditReads rebuilds the two audit tables the tenant repair reads
+// so that every read is counted, and changes nothing a reader sees:
+// audit_records_v1.record (what audit.StoredTenant verifies and reads the
+// tenant from) and audit_pruned_v1.kind (what audit.Pruned matches a
+// tombstone on) become virtual columns computed through
+// blok_test_audit_read from the stored value. Rows, ids, digests and
+// values stay as they were, so a record still verifies. The tombstone's
+// kind is declared without a type: declared TEXT, it was also computed
+// once per row by the PRAGMA integrity_check journal.New runs before the
+// schema transaction, which is not a read by the repair.
+func tripwireAuditReads(t *testing.T, database store.Database) auditTripwires {
 	t.Helper()
+	wires := auditTripwires{records: t.Name() + "#records", tombstones: t.Name() + "#tombstones"}
+	literal := func(tag string) string { return "'" + strings.ReplaceAll(tag, "'", "''") + "'" }
 	execAll(t, database,
 		`ALTER TABLE audit_records_v1 RENAME TO audit_records_untripped`,
 		`CREATE TABLE audit_records_v1 (
@@ -271,74 +316,161 @@ func tripwireAuditRecords(t *testing.T, database store.Database) {
 			tenant_seq INTEGER NOT NULL,
 			run_id TEXT NOT NULL,
 			recorded_at INTEGER NOT NULL,
-			trip TEXT NOT NULL DEFAULT 'not json',
+			stored BLOB NOT NULL,
+			record BLOB GENERATED ALWAYS AS (blok_test_audit_read(`+literal(wires.records)+`, stored)) VIRTUAL,
 			digest TEXT NOT NULL)`,
-		`INSERT INTO audit_records_v1 (seq, id, kind, tenant, tenant_seq, run_id, recorded_at, digest)
-			SELECT seq, id, kind, tenant, tenant_seq, run_id, recorded_at, digest FROM audit_records_untripped`,
+		`INSERT INTO audit_records_v1 (seq, id, kind, tenant, tenant_seq, run_id, recorded_at, stored, digest)
+			SELECT seq, id, kind, tenant, tenant_seq, run_id, recorded_at, record, digest FROM audit_records_untripped`,
 		`DROP TABLE audit_records_untripped`,
-		`ALTER TABLE audit_records_v1 ADD COLUMN record BLOB GENERATED ALWAYS AS (json_extract(trip, '$')) VIRTUAL`,
+		`ALTER TABLE audit_pruned_v1 RENAME TO audit_pruned_untripped`,
+		`CREATE TABLE audit_pruned_v1 (
+			id_digest TEXT PRIMARY KEY,
+			stored_kind TEXT NOT NULL,
+			kind GENERATED ALWAYS AS (blok_test_audit_read(`+literal(wires.tombstones)+`, stored_kind)) VIRTUAL,
+			pruned_at INTEGER NOT NULL)`,
+		`INSERT INTO audit_pruned_v1 (id_digest, stored_kind, pruned_at) SELECT id_digest, kind, pruned_at FROM audit_pruned_untripped`,
+		`DROP TABLE audit_pruned_untripped`,
 	)
-	// The wire is armed: the rows are all still there and readable by id,
-	// and reading a record fails with SQLite's JSON error, nothing else.
-	var ids int
+	// The wires are armed: reading each column of each row counts once
+	// and returns the stored value, and each record still matches its
+	// digest.
+	var records, tombstones int64
 	if err := database.WithTx(context.Background(), func(tx *sql.Tx) error {
-		if err := tx.QueryRow(`SELECT COUNT(id) FROM audit_records_v1`).Scan(&ids); err != nil {
+		recordsBefore, tombstonesBefore := wires.reads()
+		rows, err := tx.Query(`SELECT record, digest FROM audit_records_v1`)
+		if err != nil {
 			return err
 		}
-		var record []byte
-		err := tx.QueryRow(`SELECT record FROM audit_records_v1 LIMIT 1`).Scan(&record)
-		if !errorTreeContains(err, "malformed JSON") {
-			return fmt.Errorf("reading a record gave %v, want SQLite's malformed JSON error", err)
+		for rows.Next() {
+			var record []byte
+			var digest string
+			if err := rows.Scan(&record, &digest); err != nil {
+				rows.Close()
+				return err
+			}
+			if audit.Digest(record) != digest {
+				rows.Close()
+				return fmt.Errorf("a tripwired record no longer matches its digest")
+			}
+			records++
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(`SELECT COUNT(kind) FROM audit_pruned_v1`).Scan(&tombstones); err != nil {
+			return err
+		}
+		recordsAfter, tombstonesAfter := wires.reads()
+		if recordsAfter-recordsBefore != records || tombstonesAfter-tombstonesBefore != tombstones {
+			return fmt.Errorf("reading %d records and %d tombstones counted %d and %d", records, tombstones, recordsAfter-recordsBefore, tombstonesAfter-tombstonesBefore)
 		}
 		return nil
 	}); err != nil {
 		t.Fatalf("tripwire not armed: %v", err)
 	}
-	if ids == 0 {
-		t.Fatal("tripwire not armed: audit_records_v1 has no rows to trip on")
+	return wires
+}
+
+// pruneReconciliationRecord leaves the database's one reconciliation as
+// audit.Prune leaves a pruned decision: its record deleted and its
+// tombstone written.
+func pruneReconciliationRecord(t *testing.T, database store.Database) {
+	t.Helper()
+	if err := database.WithTx(context.Background(), func(tx *sql.Tx) error {
+		var key string
+		if err := tx.QueryRow(`SELECT operation_key FROM journal_reconciliations`).Scan(&key); err != nil {
+			return err
+		}
+		id := "reconcile:" + key
+		if _, err := tx.Exec(`DELETE FROM audit_records_v1 WHERE id = ?`, id); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`INSERT INTO audit_pruned_v1 (id_digest, kind, pruned_at) VALUES (?, ?, 1)`, audit.Digest([]byte(id)), string(audit.KindReconciliation))
+		return err
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 
-// errorTreeContains reports whether err, or any error it wraps (audit's
-// unavailable error keeps its store cause behind a fixed message), says
-// text.
-func errorTreeContains(err error, text string) bool {
-	if err == nil {
-		return false
-	}
-	if strings.Contains(err.Error(), text) {
-		return true
-	}
-	switch wrapped := err.(type) {
-	case interface{ Unwrap() error }:
-		return errorTreeContains(wrapped.Unwrap(), text)
-	case interface{ Unwrap() []error }:
-		for _, inner := range wrapped.Unwrap() {
-			if errorTreeContains(inner, text) {
-				return true
+// TestNewerAuditSchemaIsCheckedBeforeAnyAuditRowIsRead (#321): "the repair
+// reads no audit row under a stamp it does not understand", made
+// observable. Every read of a record (audit.StoredTenant) or a tombstone
+// (audit.Pruned) is counted, including one whose result or error is
+// discarded. Under an audit-2 stamp each refused open counts zero reads of
+// either. With stamp 1 restored, the same open reads the record and
+// repairs the row to tenant-a, or, when the record was pruned, reads the
+// tombstone and leaves the row unowned: each wire is live where the repair
+// needs it.
+func TestNewerAuditSchemaIsCheckedBeforeAnyAuditRowIsRead(t *testing.T) {
+	for _, shape := range []struct {
+		name   string
+		pruned bool
+		want   string
+	}{
+		{name: "record kept", want: "tenant-a"},
+		{name: "record pruned", pruned: true, want: "<null>"},
+	} {
+		t.Run(shape.name, func(t *testing.T) {
+			database := untenantedReconciliation(t)
+			if shape.pruned {
+				pruneReconciliationRecord(t, database)
 			}
+			wires := tripwireAuditReads(t, database)
+			execAll(t, database, `UPDATE blok_schema_versions SET version = 2 WHERE component = 'audit'`)
+			records, tombstones := wires.reads()
+			for range 2 {
+				requireAuditRefusal(t, database)
+			}
+			if r, p := wires.reads(); r != records || p != tombstones {
+				t.Fatalf("refused opens under audit 2 read audit rows: %d record reads, %d tombstone reads, want 0 and 0", r-records, p-tombstones)
+			}
+
+			execAll(t, database, `UPDATE blok_schema_versions SET version = 1 WHERE component = 'audit'`)
+			if _, err := New(context.Background(), database, Config{}); err != nil {
+				t.Fatalf("audit-1 open over the tripwired tables: %v", err)
+			}
+			if got := reconciliationTenants(t, database); len(got) != 1 || got[0] != shape.want {
+				t.Fatalf("repair under an understood stamp: tenants=%q, want [%s]", got, shape.want)
+			}
+			r, p := wires.reads()
+			live := r - records
+			if shape.pruned {
+				live = p - tombstones
+			}
+			if live < 1 {
+				t.Fatalf("the tripwire is not live: the audit-1 repair counted %d record reads and %d tombstone reads", r-records, p-tombstones)
+			}
+			t.Logf("audit 2: 0 reads; audit 1: %d record reads, %d tombstone reads", r-records, p-tombstones)
+		})
+	}
+}
+
+// TestUnreadableAuditStampRefusesTheTenantRepair (#321): an audit stamp
+// the repair cannot read is not "no stamp". journal.New refuses with the
+// read's error, naming audit's schema version, and gives the row no
+// tenant; once the stamp reads again, the repair finds tenant-a, so the
+// refusal withheld a repair.
+func TestUnreadableAuditStampRefusesTheTenantRepair(t *testing.T) {
+	database := untenantedReconciliation(t)
+	execAll(t, database, `UPDATE blok_schema_versions SET version = 'unreadable' WHERE component = 'audit'`)
+	for range 2 {
+		refused, err := New(context.Background(), database, Config{})
+		tenants := reconciliationTenants(t, database)
+		var newer *store.NewerSchemaError
+		if refused != nil || err == nil || errors.As(err, &newer) || !strings.Contains(err.Error(), "audit schema version") {
+			t.Fatalf("journal opened over an unreadable audit stamp: journal=%v err=%v, reconciliation tenants now %q", refused != nil, err, tenants)
+		}
+		if len(tenants) != 1 || tenants[0] != "<null>" {
+			t.Fatalf("a refused open changed who owns the reconciliation: tenants=%q", tenants)
 		}
 	}
-	return false
-}
-
-// TestNewerAuditSchemaIsCheckedBeforeAnyAuditRecordIsRead (#321): "never
-// reads audit rows" made observable. The record of the row to repair is a
-// tripwire: reading it fails. Under an audit-2 stamp the open must be
-// refused for the stamp, which it can only be if no record was read
-// first; with stamp 1 restored the same open trips, so the wire is live.
-func TestNewerAuditSchemaIsCheckedBeforeAnyAuditRecordIsRead(t *testing.T) {
-	database := untenantedReconciliation(t)
-	tripwireAuditRecords(t, database)
-	execAll(t, database, `UPDATE blok_schema_versions SET version = 2 WHERE component = 'audit'`)
-	requireAuditRefusal(t, database)
-
 	execAll(t, database, `UPDATE blok_schema_versions SET version = 1 WHERE component = 'audit'`)
-	opened, err := New(context.Background(), database, Config{})
-	if opened != nil || !errors.Is(err, audit.ErrUnavailable) || !errorTreeContains(err, "malformed JSON") {
-		t.Fatalf("the tripwire is not live: reading the record under an understood stamp gave journal=%v err=%v, want audit.ErrUnavailable caused by the tripwire's malformed JSON", opened != nil, err)
+	if _, err := New(context.Background(), database, Config{}); err != nil {
+		t.Fatal(err)
 	}
-	t.Logf("tripwire live under stamp 1: %v (caused by SQLite's malformed JSON)", err)
+	if got := reconciliationTenants(t, database); len(got) != 1 || got[0] != "tenant-a" {
+		t.Fatalf("repair under a readable stamp: tenants=%q, want [tenant-a]", got)
+	}
 }
 
 // TestUnrepairableRowsKeepAJournalOnlyOpenRefusedUnderANewerAudit pins a
@@ -355,17 +487,8 @@ func TestUnrepairableRowsKeepAJournalOnlyOpenRefusedUnderANewerAudit(t *testing.
 		name   string
 		damage func(t *testing.T, database store.Database, key string)
 	}{
-		{name: "record pruned", damage: func(t *testing.T, database store.Database, key string) {
-			id := "reconcile:" + key
-			if err := database.WithTx(ctx, func(tx *sql.Tx) error {
-				if _, err := tx.Exec(`DELETE FROM audit_records_v1 WHERE id = ?`, id); err != nil {
-					return err
-				}
-				_, err := tx.Exec(`INSERT INTO audit_pruned_v1 (id_digest, kind, pruned_at) VALUES (?, ?, 1)`, audit.Digest([]byte(id)), string(audit.KindReconciliation))
-				return err
-			}); err != nil {
-				t.Fatal(err)
-			}
+		{name: "record pruned", damage: func(t *testing.T, database store.Database, _ string) {
+			pruneReconciliationRecord(t, database)
 		}},
 		{name: "record fails verification", damage: func(t *testing.T, database store.Database, _ string) {
 			execAll(t, database, `UPDATE audit_records_v1 SET tenant = 'tenant-b' WHERE tenant = 'tenant-a'`)

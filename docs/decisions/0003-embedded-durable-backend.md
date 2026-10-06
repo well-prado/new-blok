@@ -292,11 +292,25 @@ and "no audit table" would hand every such row to the system tenant. The
 #321 PR shows each order separately. A mutant that checks the stamp only
 after the table probe fails the test whose newer audit moved its records
 out of `audit_records_v1`; that shows the check must precede the probe,
-and says nothing about the record reads, which it still precedes. A
-tripwire test, in which reading any record of `audit_records_v1` fails,
-shows the check precedes the record reads: it fails under a mutant that
-reads the record first and checks the stamp only before writing, which
-the other tests do not catch.
+and says nothing about the record and tombstone reads, which it still
+precedes. A tripwire test counts every read of a record's content
+(`audit_records_v1.record`, which `audit.StoredTenant` verifies and reads
+the tenant from) and of a tombstone's kind (`audit_pruned_v1.kind`, which
+`audit.Pruned` matches on), a read whose result is discarded included.
+Under the newer stamp the refused opens count zero of either; with the
+stamp restored, the same open counts the read the repair needs: the
+record, and the row gets its tenant, or, when the record was pruned, the
+tombstone, and the row stays unowned. It fails under a mutant that reads
+every record and discards the result before the check, under one that
+looks up every tombstone before the check, and under one that reads the
+record first and checks the stamp only before writing; that last mutant
+also fails the test of rows the repair leaves unowned, whose opens then
+never reach the check and succeed. The tripwire counts those two columns
+only: a read that touches neither, such as a row count or a lookup by id
+alone, is not counted. A stamp the check cannot read refuses the open
+with the read's error, naming audit's schema version, and gives no row a
+tenant; a check that took an unreadable stamp for no stamp fails that
+test, where the repair would give the row its record's tenant.
 
 It refuses rather than skipping the repair because #291 refuses every
 stamp it does not understand, and a composed `audit.Journal` would already

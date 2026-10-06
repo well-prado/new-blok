@@ -468,6 +468,10 @@ tenant IS NULL`); that is outside the framework, which does not verify the
 choice. To avoid the state, open the journal with this release before
 running `audit.Journal.Prune` on an upgraded database, and do not prune
 with an older binary afterwards.
+A row left unowned also costs a binary whose audit support is older than
+the database's audit stamp: every journal-only open it makes is refused
+for as long as the row exists, because the repair would have to read
+audit to retry it (#321, ADR 0003 "Cross-component reads").
 
 **Migration.** Opening a journal adds the nullable `tenant` column inside
 the schema transaction, after the #281 migration, and then fixes every row
