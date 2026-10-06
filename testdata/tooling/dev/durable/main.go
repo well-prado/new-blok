@@ -39,6 +39,9 @@ func run() error {
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		// A journal retaining runs this executable cannot adopt exits with
+		// deployment.ExitRetainedIncompatible, which blok dev reports as
+		// dev_durable_incompatible instead of restarting it (ADR 0026).
+		os.Exit(deployment.ExitCode(err))
 	}
 }

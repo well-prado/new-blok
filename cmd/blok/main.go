@@ -467,14 +467,22 @@ Options:
                   application's output goes to standard error
   --package DIR   the main package to build (default ./cmd/<blok.json name>)
 
-Exit codes: 130 stopped by a signal, 1 project unreadable, 2 usage,
-3 go or the process guard unavailable, 4 output not written.`
+Signals blok dev was started with ignored stay ignored, so nohup blok dev &
+outlives the terminal.
+
+Exit codes: 130 stopped by a signal, 1 project unreadable or too large to
+watch, 2 usage, 3 go or the process guard unavailable, 4 output not written.`
 
 // executeDev runs blok dev. The first SIGINT, SIGTERM, SIGHUP or SIGQUIT
-// stops it gracefully; any further one forces the application down.
+// stops it gracefully; any further one forces the application down. A
+// signal blok was started with ignored stays ignored: nohup blok dev &
+// survives the terminal closing, as nohup promises.
 func executeDev(args []string, stdout, stderr io.Writer) int {
 	signals := make(chan os.Signal, 4)
-	signal.Notify(signals, toolSignals...)
+	// Notify with no signals would catch every signal.
+	if caught := notIgnored(toolSignals); len(caught) > 0 {
+		signal.Notify(signals, caught...)
+	}
 	defer signal.Stop(signals)
 	defer catchBrokenPipe()()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -500,6 +508,18 @@ func executeDev(args []string, stdout, stderr io.Writer) int {
 		}
 	}()
 	return guarded("dev", stderr, func() int { return runDev(ctx, force, args, stdout, stderr) })
+}
+
+// notIgnored is signals without those the process inherited as ignored.
+// Notify would un-ignore them.
+func notIgnored(signals []os.Signal) []os.Signal {
+	var result []os.Signal
+	for _, item := range signals {
+		if !signal.Ignored(item) {
+			result = append(result, item)
+		}
+	}
+	return result
 }
 
 func runDev(ctx context.Context, force <-chan struct{}, args []string, stdout, stderr io.Writer) int {

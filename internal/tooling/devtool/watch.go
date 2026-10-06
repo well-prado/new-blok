@@ -26,11 +26,24 @@ const (
 
 // stamp is what a scan records about one watched path: enough to see an
 // edit, a replacement (an editor's write-and-rename), a deletion or a
-// retargeted link, without reading the file.
+// retargeted link, without reading the file. On Unix it adds the inode and
+// the status-change time, which an edit that keeps the size and restores
+// the modification time (touch -r, cp -p, rsync -a, tar -x) still changes;
+// elsewhere both are zero (stamp_other.go).
 type stamp struct {
 	size    int64
 	modTime int64
 	mode    fs.FileMode
+	inode   uint64
+	change  int64
+	// unwatched is set on a symbolic link the build would follow to files
+	// the watcher does not see; see linkProblem.
+	unwatched string
+}
+
+func stampOf(info fs.FileInfo) stamp {
+	inode, change := fileIdentity(info)
+	return stamp{size: info.Size(), modTime: info.ModTime().UnixNano(), mode: info.Mode(), inode: inode, change: change}
 }
 
 // snapshot maps project-relative, slash-separated paths to their stamps.
@@ -73,9 +86,24 @@ var watchBounds = struct{ files, entries int }{MaxWatchedFiles, MaxWatchEntries}
 // retargeting one triggers a rebuild, whose layout discovery then reports
 // it; nothing outside root is ever stat-ed, so a file a link points to
 // outside the project is never watched. Nested modules are not walked.
+//
+// A link the build would follow to files the watcher does not see is
+// recorded too, whatever its name, and refused by links(): a link that is
+// itself a watched file, and one (to a directory or a file) that leaves the
+// root or leads into a skipped directory or a nested module. Telling a
+// linked directory from a linked file would mean following the link, so
+// the name does not matter; a link inside the root to a watched location,
+// or to a file nothing builds, is harmless and ignored.
 func scanProject(ctx context.Context, root string) (snapshot, *diagnostic.Diagnostic, error) {
 	result := snapshot{}
 	visited := 0
+	var fsRoot *os.Root
+	var resolved string
+	defer func() {
+		if fsRoot != nil {
+			_ = fsRoot.Close()
+		}
+	}()
 	err := filepath.WalkDir(root, func(name string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			// A directory removed while it is walked is a change the next
@@ -108,7 +136,24 @@ func scanProject(ctx context.Context, root string) (snapshot, *diagnostic.Diagno
 			return err
 		}
 		relative = filepath.ToSlash(relative)
-		if !watchedFile(relative) || !(entry.Type().IsRegular() || entry.Type()&fs.ModeSymlink != 0) {
+		link := entry.Type()&fs.ModeSymlink != 0
+		problem := ""
+		switch {
+		case link && skippedDir(entry.Name()):
+			return nil
+		case link && !watchedFile(relative):
+			if fsRoot == nil {
+				if fsRoot, err = os.OpenRoot(root); err != nil {
+					return err
+				}
+				if resolved, err = filepath.EvalSymlinks(root); err != nil {
+					return err
+				}
+			}
+			if problem = linkProblem(fsRoot, resolved, relative); problem == "" {
+				return nil
+			}
+		case !watchedFile(relative) || !(entry.Type().IsRegular() || link):
 			return nil
 		}
 		info, err := entry.Info()
@@ -121,7 +166,9 @@ func scanProject(ctx context.Context, root string) (snapshot, *diagnostic.Diagno
 		if len(result) >= watchBounds.files {
 			return errWatchLimit
 		}
-		result[relative] = stamp{size: info.Size(), modTime: info.ModTime().UnixNano(), mode: info.Mode()}
+		item := stampOf(info)
+		item.unwatched = problem
+		result[relative] = item
 		return nil
 	})
 	if errors.Is(err, errWatchLimit) {
@@ -159,7 +206,35 @@ func (s snapshot) refresh(root, rel string) {
 		delete(s, rel)
 		return
 	}
-	s[rel] = stamp{size: info.Size(), modTime: info.ModTime().UnixNano(), mode: info.Mode()}
+	s[rel] = stampOf(info)
+}
+
+// linkProblem says why the link at rel, which is not itself a watched file,
+// would make the build read files the watcher does not see, or returns ""
+// when it cannot. It resolves the link with layout.ClassifyLink, which only
+// reads inside the root and decides an escape lexically; absRoot is the
+// root's symlink-resolved path.
+func linkProblem(fsRoot *os.Root, absRoot, rel string) string {
+	code, target := layout.ClassifyLink(fsRoot, absRoot, rel)
+	switch code {
+	case layout.CodeSymlinkEscape:
+		return "a symbolic link leading outside the project"
+	case layout.CodeSymlinkAlias:
+		elements := strings.Split(target, "/")
+		for index := range elements {
+			prefix := strings.Join(elements[:index+1], "/")
+			if skippedDir(elements[index]) {
+				return "a symbolic link into " + prefix + ", which blok dev does not watch"
+			}
+			if _, err := fsRoot.Lstat(filepath.FromSlash(prefix + "/go.mod")); err == nil {
+				return "a symbolic link into the nested module " + prefix + ", which blok dev does not watch"
+			}
+		}
+	}
+	// A dangling link or a cycle gives the build nothing to read: a package
+	// behind it fails to build, and whatever later appears at its target
+	// inside the root is watched there.
+	return ""
 }
 
 // links reports every watched path that is a symbolic link. The go command
@@ -171,7 +246,10 @@ func (s snapshot) refresh(root, rel string) {
 func (s snapshot) links() []diagnostic.Diagnostic {
 	var found []diagnostic.Diagnostic
 	for name, item := range s {
-		if item.mode&fs.ModeSymlink != 0 {
+		switch {
+		case item.unwatched != "":
+			found = append(found, diagnostic.Diagnostic{Code: "dev_symlink_unwatched", Source: name, Expected: "a directory or file inside the project", Actual: item.unwatched, Remediation: "replace the link with the directory or file itself; blok dev never follows a link, so it cannot watch what the build would read through it", Message: "a symbolic link would build files blok dev does not watch"})
+		case item.mode&fs.ModeSymlink != 0:
 			found = append(found, diagnostic.Diagnostic{Code: "dev_symlink_unwatched", Source: name, Expected: "a regular file inside the project", Actual: "a symbolic link", Remediation: "replace the link with the file itself; blok dev never follows a link, so it cannot watch or build what one points to", Message: "a watched source file is a symbolic link"})
 		}
 	}

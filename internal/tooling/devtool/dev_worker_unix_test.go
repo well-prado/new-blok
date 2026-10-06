@@ -20,6 +20,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/well-prado/new-blok/contract/deployment"
 )
 
 // fixtureProject is a real scaffolded application whose main package is
@@ -315,10 +317,13 @@ func readFile(t *testing.T, name string) []byte {
 // deployment through blok dev, in both layouts. An order admitted under
 // build 1 waits in the journal while the code changes: build 2 is a new
 // executable at a new path with a new digest, and the application's own
-// retained-artifact check refuses to adopt the run (it exits, and blok dev
-// backs off) instead of serving it under the new code. Reverting the edit
-// builds byte-identical code, which adopts the run; the order is processed
-// exactly once.
+// retained-artifact check refuses to adopt the run instead of serving it
+// under the new code. The refusal is structured (exit status
+// deployment.ExitRetainedIncompatible): blok dev reports
+// dev_durable_incompatible, does not restart build 2, keeps build 1's
+// executable unchanged and prints the command that runs it, which does
+// adopt the run. Reverting the edit builds byte-identical code, which
+// adopts the run too; the order is processed exactly once.
 func TestDevDurableRunIsNotRelabelled(t *testing.T) {
 	for _, layout := range []string{"classic", "unified"} {
 		t.Run(layout, func(t *testing.T) {
@@ -353,13 +358,48 @@ func TestDevDurableRunIsNotRelabelled(t *testing.T) {
 			second := session.await(func(e DevEvent) bool { return e.Event == EventAppStarted && e.Build == 2 }, "build 2 started")
 			secondExecutable := executableOf(t, second.PID)
 			refused := session.await(func(e DevEvent) bool { return e.Event == EventAppExited && e.Build == 2 }, "build 2 refusing the retained run")
-			if !strings.Contains(strings.Join(refused.Output, "\n"), "retained journal incompatible") || refused.Status != "exit status 1" {
+			if !strings.Contains(strings.Join(refused.Output, "\n"), "retained journal incompatible") {
 				t.Fatalf("build 2 adopted or mishandled the retained run: %+v\n%s", refused.DevEvent, session.dump())
 			}
-			session.await(func(e DevEvent) bool { return e.Event == EventRestartScheduled && e.Build == 2 }, "backoff")
+			// The refusal is structured (deployment.ExitRetainedIncompatible),
+			// reported as such, and not crash-looped: blok dev waits for the
+			// next change, and keeps build 1, which admitted the run.
+			if refused.Status != "exit status "+strconv.Itoa(deployment.ExitRetainedIncompatible) || len(refused.Diagnostics) != 1 || refused.Diagnostics[0].Code != "dev_durable_incompatible" {
+				t.Fatalf("the refusal was not reported as dev_durable_incompatible: %+v\n%s", refused.DevEvent, session.dump())
+			}
 			if secondExecutable == firstExecutable {
 				t.Fatalf("build 2 reused build 1's executable path %s", firstExecutable)
 			}
+			if refused.Resume == "" || !strings.Contains(refused.Resume, firstExecutable) || !strings.Contains(refused.Diagnostics[0].Remediation, refused.Resume) {
+				t.Fatalf("no command resumes the run with build 1's executable %s: %+v\n%s", firstExecutable, refused.DevEvent, session.dump())
+			}
+			if digest := fileDigest(t, firstExecutable); digest != firstDigest {
+				t.Fatalf("build 1's executable changed: %s, was %s", digest, firstDigest)
+			}
+			time.Sleep(2 * time.Second)
+			for _, event := range session.snapshot() {
+				if event.Build == 2 && (event.Event == EventRestartScheduled || event.Event == EventAppStarted && event.PID != second.PID) {
+					t.Fatalf("build 2 was restarted after a deterministic refusal: %+v\n%s", event.DevEvent, session.dump())
+				}
+			}
+			// The printed command, run by a shell as a developer would in
+			// another terminal while blok dev waits, resumes the run with the
+			// kept executable: it adopts the journal and is ready. SIGTERM
+			// (Ctrl+C's sibling) to the shell's process group stops it.
+			resumed := exec.Command("/bin/sh", "-c", refused.Resume)
+			resumed.Env = env
+			resumed.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			if err := resumed.Start(); err != nil {
+				t.Fatal(err)
+			}
+			group := resumed.Process.Pid
+			t.Cleanup(func() { _ = syscall.Kill(-group, syscall.SIGKILL) })
+			ready()
+			if err := syscall.Kill(-group, syscall.SIGTERM); err != nil {
+				t.Fatal(err)
+			}
+			_ = resumed.Wait()
+			waitFor(t, "the resumed executable to stop", func() bool { return syscall.Kill(-group, 0) != nil })
 
 			applyEdits(t, dir, []fixtureEdit{{File: "cmd/shop/main.go", Replace: [2]string{`"durable fixture v2"`, `"durable fixture v1"`}}}, placeholders(layout))
 			third := session.await(func(e DevEvent) bool { return e.Event == EventAppStarted && e.Build == 3 }, "build 3 started")

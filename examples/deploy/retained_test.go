@@ -3,6 +3,7 @@ package deploy
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
@@ -213,8 +214,14 @@ func TestActualRetainedJournalFaultsRejectAdmissionAndColdStart(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := d.Run(context.Background(), nil); err == nil || !strings.Contains(err.Error(), "retained journal incompatible") {
+			err = d.Run(context.Background(), nil)
+			if err == nil || !strings.Contains(err.Error(), "retained journal incompatible") {
 				t.Fatalf("cold fault: %v", err)
+			}
+			// The refusal is structured, so blok dev can tell it from a crash
+			// without reading the message (ADR 0026).
+			if !errors.Is(err, deployment.ErrRetainedIncompatible) || deployment.ExitCode(err) != deployment.ExitRetainedIncompatible {
+				t.Fatalf("cold fault is not deployment.ErrRetainedIncompatible (exit %d): %v", deployment.ExitCode(err), err)
 			}
 			if got := retainedCounts(t, db); got != before {
 				t.Fatalf("cold startup changed work: %v -> %v", before, got)

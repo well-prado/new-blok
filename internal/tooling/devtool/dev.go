@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/well-prado/new-blok/contract/deployment"
 	"github.com/well-prado/new-blok/internal/diagnostic"
 	"github.com/well-prado/new-blok/internal/generate"
 	"github.com/well-prado/new-blok/observe/redact"
@@ -40,7 +41,9 @@ const (
 
 // Defaults for DevOptions' zero durations.
 const (
-	// DefaultPoll is how often the watcher scans the project.
+	// DefaultPoll is how often the watcher scans the project, at the
+	// most: the interval stretches to ScanDuty times the last scan's
+	// duration, and backs off while scans fail (ADR 0026).
 	DefaultPoll = 250 * time.Millisecond
 	// DefaultQuiet is how long the project must stay unchanged before a
 	// rebuild starts, so a burst of saves becomes one build.
@@ -58,6 +61,24 @@ const (
 	DefaultMaxBackoff  = 30 * time.Second
 	DefaultStableAfter = 10 * time.Second
 )
+
+// Watcher cost bounds (ADR 0026).
+const (
+	// ScanDuty bounds the watcher's share of one CPU: the next scan waits at
+	// least ScanDuty times as long as the last one took, so scanning uses at
+	// most 1/ScanDuty of a CPU however large the project is.
+	ScanDuty = 10
+	// MaxScanBackoff bounds how far the interval between scans grows while
+	// they fail (doubling from Poll), and so how long a repair waits to be
+	// seen.
+	MaxScanBackoff = 10 * time.Second
+)
+
+// KeptBuilds is how many executables of earlier successful builds blok dev
+// keeps on disk until it ends, besides the current build's and the newest
+// one that ran without refusing its durable state (ADR 0026), so a run
+// admitted under an earlier build can be finished with it.
+const KeptBuilds = 5
 
 // Bounds on what one event carries.
 const (
@@ -112,6 +133,12 @@ type DevEvent struct {
 	// Output is the redacted tail of the application's standard error.
 	Output      []string                `json:"output,omitempty"`
 	Diagnostics []diagnostic.Diagnostic `json:"diagnostics,omitempty"`
+	// Resume is, on an app-exited event with dev_durable_incompatible, the
+	// shell command that runs the kept executable of the newest earlier
+	// build that did not refuse the durable state, so its runs can be
+	// finished while blok dev keeps running (it removes the executables
+	// when it ends). Empty when no such build is kept.
+	Resume string `json:"resume,omitempty"`
 	// ExitCode is blok dev's own exit code, on the final stopped event.
 	ExitCode *int `json:"exitCode,omitempty"`
 }
@@ -190,26 +217,47 @@ type devLoop struct {
 	options DevOptions
 	ctx     context.Context
 	root    string
-	// buildDir holds the executables; it is removed on exit.
+	// buildDir holds the executables; it is removed on exit, and by guard,
+	// the session's process guard, if blok dev is killed.
 	buildDir string
+	guard    *processGuard
 
 	scan       snapshot
 	scanFailed bool
-	pending    map[string]bool
-	firstSeen  time.Time
-	lastSeen   time.Time
+	// scanFailures counts consecutive failed scans; scanTook is how long
+	// the last scan took. Both set the delay before the next one.
+	scanFailures int
+	scanTook     time.Duration
+	pending      map[string]bool
+	firstSeen    time.Time
+	lastSeen     time.Time
 
 	builds, generation int
 	// good is the last executable that compiled, and goodBuild its number.
 	good      string
 	goodBuild int
-	app       *appProcess
-	backoff   time.Duration
-	restart   *time.Timer
+	// kept are the executables of earlier successful builds still on disk,
+	// oldest first; refused marks builds whose application refused its
+	// durable state (dev_durable_incompatible).
+	kept    []keptBuild
+	refused map[int]bool
+	app     *appProcess
+	backoff time.Duration
+	restart *time.Timer
 
 	fatal    int
 	writeErr error
 }
+
+// keptBuild is one successful build's executable.
+type keptBuild struct {
+	number int
+	path   string
+}
+
+// scanObserver, when set (by a test), is told how long each scan took and
+// whether it failed. It runs on the loop's goroutine.
+var scanObserver func(took time.Duration, failed bool)
 
 func (l *devLoop) emit(event DevEvent) {
 	if l.writeErr != nil {
@@ -243,15 +291,31 @@ func (l *devLoop) run() (int, error) {
 	if l.buildDir, err = os.MkdirTemp("", "blok-dev-"); err != nil {
 		return l.stop(ExitTool, diagnostic.Diagnostic{Code: "dev_build_dir_unavailable", Expected: "a private temporary directory for executables", Actual: errorText(err), Remediation: "make the temporary directory (TMPDIR) writable", Message: "blok dev could not create a directory for its builds"})
 	}
-	if !l.rescan() {
+	// The session's own guard removes the build directory if blok dev is
+	// killed while no application, and so no application guard, is alive.
+	if l.guard, err = startGuard(nil, l.buildDir); err != nil {
+		return l.stop(ExitTool, diagnostic.Diagnostic{Code: "process_guard_unavailable", Expected: "a runnable " + guardShell, Actual: errorText(err), Remediation: "make " + guardShell + " available; blok dev runs only under a guard that cleans up if blok dies", Message: "the process guard could not be started"})
+	}
+	// A project that cannot be watched from the start is not run at all:
+	// blok dev would serve code it could never rebuild.
+	started := time.Now()
+	current, problem, err := scanProject(l.ctx, l.root)
+	l.observeScan(time.Since(started), err != nil || problem != nil)
+	if err != nil && l.ctx.Err() != nil {
 		return l.finish()
 	}
-	// A first scan that fails is reported and retried by every poll; the
-	// first one that succeeds counts every watched file as changed.
+	if err != nil {
+		return l.stop(ExitFindings, diagnostic.Diagnostic{Code: "project_unreadable", Expected: "a readable project directory", Actual: relativeText(errorText(err), l.root), Remediation: "make the project readable, then run blok dev again", Message: "the project could not be scanned"})
+	}
+	if problem != nil {
+		problem.Remediation += "; then run blok dev again"
+		return l.stop(ExitFindings, *problem)
+	}
+	l.scan = current
 	l.emit(DevEvent{Event: EventWatching, Files: len(l.scan)})
 	l.build(nil)
-	ticker := time.NewTicker(l.options.Poll)
-	defer ticker.Stop()
+	poll := time.NewTimer(l.nextScan())
+	defer poll.Stop()
 	for l.fatal == 0 && l.writeErr == nil {
 		var exited <-chan struct{}
 		if l.app != nil {
@@ -265,22 +329,57 @@ func (l *devLoop) run() (int, error) {
 		case <-l.ctx.Done():
 			return l.finish()
 		case <-exited:
-			l.exited()
+			l.exited(true)
 		case <-restart:
 			l.restart = nil
 			l.launch()
-		case <-ticker.C:
+		case <-poll.C:
 			l.poll()
+			poll.Reset(l.nextScan())
 		}
 	}
 	return l.finish()
+}
+
+// observeScan records one scan's cost and outcome.
+func (l *devLoop) observeScan(took time.Duration, failed bool) {
+	l.scanTook = took
+	if failed {
+		l.scanFailures++
+	} else {
+		l.scanFailures = 0
+	}
+	if scanObserver != nil {
+		scanObserver(took, failed)
+	}
+}
+
+// nextScan is the delay before the next scan: Poll, stretched to ScanDuty
+// times the last scan's duration, and doubled for every consecutive failed
+// scan up to MaxScanBackoff, so a project the watcher cannot read is not
+// rescanned at full speed.
+func (l *devLoop) nextScan() time.Duration {
+	delay := max(l.options.Poll, ScanDuty*l.scanTook)
+	if l.scanFailures > 0 {
+		backoff := l.options.Poll
+		for range l.scanFailures {
+			if backoff >= MaxScanBackoff {
+				break
+			}
+			backoff *= 2
+		}
+		delay = max(delay, min(backoff, MaxScanBackoff))
+	}
+	return delay
 }
 
 // rescan replaces the snapshot. A failed scan keeps the previous one and is
 // reported once, when the watcher goes from working to failing. It returns
 // false only when blok dev is being stopped.
 func (l *devLoop) rescan() bool {
+	started := time.Now()
 	current, problem, err := scanProject(l.ctx, l.root)
+	l.observeScan(time.Since(started), err != nil || problem != nil)
 	if err != nil && l.ctx.Err() != nil {
 		return false
 	}
@@ -348,7 +447,12 @@ func (l *devLoop) build(changed []string) {
 	if l.ctx.Err() != nil {
 		return
 	}
-	if len(problems) > 0 || binary == "" {
+	failed := len(problems) > 0 || binary == ""
+	// The application may have exited on its own while the build ran. That
+	// is an exit, never a stop: it is reported as such, and restarted with
+	// backoff only when no new build replaces it.
+	l.collectExit(failed)
+	if failed {
 		if binary == "" && len(problems) == 0 {
 			problems = append(problems, toolchainError("go build failed without a diagnostic"))
 		}
@@ -362,10 +466,38 @@ func (l *devLoop) build(changed []string) {
 	l.stopApp()
 	l.cancelRestart()
 	if l.good != "" {
-		_ = os.RemoveAll(filepath.Dir(l.good))
+		l.kept = append(l.kept, keptBuild{number: l.goodBuild, path: l.good})
 	}
 	l.good, l.goodBuild, l.backoff = binary, number, l.options.Backoff
+	l.prune()
 	l.launch()
+}
+
+// prune deletes the executables of earlier builds beyond the KeptBuilds
+// most recent, except the one a dev_durable_incompatible refusal would
+// resume. None of them is running: only the current build ever runs.
+func (l *devLoop) prune() {
+	resume, pinned := l.resumable(l.goodBuild + 1)
+	kept := l.kept[:0]
+	for index, item := range l.kept {
+		if index >= len(l.kept)-KeptBuilds || pinned && item.number == resume.number {
+			kept = append(kept, item)
+			continue
+		}
+		_ = os.RemoveAll(filepath.Dir(item.path))
+	}
+	l.kept = kept
+}
+
+// resumable is the newest kept build before build that did not refuse its
+// durable state.
+func (l *devLoop) resumable(build int) (keptBuild, bool) {
+	for index := len(l.kept) - 1; index >= 0; index-- {
+		if item := l.kept[index]; item.number < build && !l.refused[item.number] {
+			return item, true
+		}
+	}
+	return keptBuild{}, false
 }
 
 // compile runs layout discovery, regenerates stale bindings and builds the
@@ -417,7 +549,7 @@ func (l *devLoop) compile(number int) (binary string, regenerated []string, prob
 	}
 	toolchain := &goDiagnostics{root: l.root}
 	run, err := runGo(l.ctx, goCommand{
-		binary: l.options.goBinary(), dir: l.root, args: []string{"build", "-o", output, "./" + main}, env: l.options.Env,
+		binary: l.options.goBinary(), dir: l.root, args: []string{"build", "-o", output, "./" + main}, env: l.options.Env, remove: l.buildDir,
 		stderr: func(line []byte) {
 			l.options.observe("stderr", line)
 			toolchain.line(string(line))
@@ -485,7 +617,9 @@ func (l *devLoop) cancelRestart() {
 
 // launch starts the last executable that compiled.
 func (l *devLoop) launch() {
-	if l.good == "" || l.app != nil || l.writeErr != nil {
+	// A stop requested while the previous application drained, or while a
+	// restart was due, starts nothing.
+	if l.good == "" || l.app != nil || l.writeErr != nil || l.ctx.Err() != nil {
 		return
 	}
 	l.generation++
@@ -504,21 +638,86 @@ func (l *devLoop) launch() {
 	}
 }
 
+// collectExit reports the application as exited if it has exited on its
+// own, without waiting; restart says whether it may be restarted.
+func (l *devLoop) collectExit(restart bool) {
+	if l.app == nil {
+		return
+	}
+	select {
+	case <-l.app.exited:
+		l.exited(restart)
+	default:
+	}
+}
+
 // exited handles an application that stopped on its own: a clean exit
-// waits for the next change, anything else restarts with backoff.
-func (l *devLoop) exited() {
+// waits for the next change, and so does a refusal of the durable state
+// (deployment.ExitRetainedIncompatible), which no restart of the same
+// executable can change; anything else restarts with backoff, when restart
+// is set.
+func (l *devLoop) exited(restart bool) {
 	app := l.app
 	l.app = nil
 	app.reap()
 	status := app.cmd.ProcessState
 	event := DevEvent{Event: EventAppExited, Build: app.build, Generation: app.generation, Status: status.String(), Output: app.tail.lines()}
-	if status.Success() {
+	switch {
+	case status.Success():
+		l.emit(event)
+		return
+	case status.ExitCode() == deployment.ExitRetainedIncompatible:
+		if l.refused == nil {
+			l.refused = map[int]bool{}
+		}
+		l.refused[app.build] = true
+		event.Diagnostics = []diagnostic.Diagnostic{l.durableIncompatible(app.build, &event)}
 		l.emit(event)
 		return
 	}
 	event.Diagnostics = []diagnostic.Diagnostic{{Code: "dev_app_exited", Expected: "the application to keep running", Actual: status.String(), Remediation: "fix the failure the application reports (its output is above); blok dev restarts it with backoff and rebuilds on the next change", Message: "the application exited unexpectedly"}}
 	l.emit(event)
-	l.scheduleRestart(time.Since(app.started))
+	if restart {
+		l.scheduleRestart(time.Since(app.started))
+	}
+}
+
+// durableIncompatible is the diagnostic for build's refusal of the durable
+// state, with event.Resume set when an earlier build is kept to finish
+// its runs.
+func (l *devLoop) durableIncompatible(build int, event *DevEvent) diagnostic.Diagnostic {
+	problem := diagnostic.Diagnostic{
+		Code:     "dev_durable_incompatible",
+		Expected: "an application that can adopt the runs its durable state retains",
+		Actual:   "exit status " + strconv.Itoa(deployment.ExitRetainedIncompatible) + ": the application refused its retained runs as incompatible with this build",
+		Message:  "the application cannot resume runs admitted under an earlier build; blok dev does not restart it",
+	}
+	fixes := []string{"revert the change: Go builds are reproducible, so the reverted build is the one that admitted the runs, and blok dev starts it on save"}
+	if kept, ok := l.resumable(build); ok {
+		event.Resume = redact.Message(resumeCommand(l.root, kept.path, l.options.Args))
+		fixes = append(fixes, "or, while blok dev keeps running (it keeps build "+strconv.Itoa(kept.number)+"'s executable until it ends), finish the runs with it in another terminal: "+event.Resume+" — then stop it and save to rebuild")
+	}
+	fixes = append(fixes, "or finish or discard the retained runs with the application's own tools (for example, remove its development journal)")
+	problem.Remediation = strings.Join(fixes, "; ")
+	return problem
+}
+
+// resumeCommand is a POSIX shell command that runs executable with args
+// from root.
+func resumeCommand(root, executable string, args []string) string {
+	words := []string{"cd", shellQuote(root), "&&", shellQuote(executable)}
+	for _, arg := range args {
+		words = append(words, shellQuote(arg))
+	}
+	return strings.Join(words, " ")
+}
+
+// shellQuote quotes a word for a POSIX shell.
+func shellQuote(word string) string {
+	if word != "" && strings.Trim(word, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_./=:,+@%") == "" {
+		return word
+	}
+	return "'" + strings.ReplaceAll(word, "'", `'\''`) + "'"
 }
 
 // scheduleRestart waits out the current backoff, then doubles it. A run
@@ -536,12 +735,17 @@ func (l *devLoop) scheduleRestart(ran time.Duration) {
 
 // stopApp stops the running application, bounded by StopGrace.
 func (l *devLoop) stopApp() {
+	if l.collectExit(false); l.app == nil {
+		return
+	}
 	app := l.app
-	if app == nil {
+	killed, done := app.stop(l.options.StopGrace, l.options.Force)
+	if done {
+		// It had exited before it was asked to: an exit, not a stop.
+		l.exited(false)
 		return
 	}
 	l.app = nil
-	killed := app.stop(l.options.StopGrace, l.options.Force)
 	event := DevEvent{Event: EventAppStopped, Build: app.build, Generation: app.generation, Status: app.cmd.ProcessState.String()}
 	if killed {
 		event.Diagnostics = []diagnostic.Diagnostic{{Code: "dev_app_stop_timeout", Expected: "the application to exit within " + l.options.StopGrace.String() + " of SIGTERM", Actual: "still running; its process group was killed", Remediation: "make the application drain and exit on SIGTERM or os.Interrupt within the grace period", Message: "the application did not stop in time"}}
@@ -587,6 +791,10 @@ func (l *devLoop) cleanup() {
 	if l.buildDir != "" {
 		_ = os.RemoveAll(l.buildDir)
 		l.buildDir = ""
+	}
+	if l.guard != nil {
+		l.guard.release()
+		l.guard = nil
 	}
 }
 
@@ -644,12 +852,16 @@ func startApp(executable, root, buildDir string, options DevOptions, generation,
 
 // stop asks the application alone to exit, so it can drain the workers it
 // owns, and kills its process group if it has not exited after grace or
-// when force receives. It reports whether the group had to be killed.
-func (a *appProcess) stop(grace time.Duration, force <-chan struct{}) bool {
-	_ = terminate(a.cmd.Process)
+// when force receives. It reports whether the group had to be killed, and
+// done when the application had already exited and been reaped, so it was
+// never asked.
+func (a *appProcess) stop(grace time.Duration, force <-chan struct{}) (killed, done bool) {
+	if err := terminate(a.cmd.Process); errors.Is(err, os.ErrProcessDone) {
+		<-a.exited
+		return false, true
+	}
 	timer := time.NewTimer(grace)
 	defer timer.Stop()
-	killed := false
 	select {
 	case <-a.exited:
 	case <-timer.C:
@@ -662,7 +874,7 @@ func (a *appProcess) stop(grace time.Duration, force <-chan struct{}) bool {
 		<-a.exited
 	}
 	a.reap()
-	return killed
+	return killed, false
 }
 
 // kill ends the application's group at once (a panic, or cleanup).

@@ -50,7 +50,9 @@ func writeFiles(t *testing.T, root string, files map[string]string) {
 
 // TestScanStaysInsideTheProject: skipped directories and nested modules are
 // not read, a linked directory is not entered, and a linked source file is
-// recorded as a link, never stat-ed through.
+// recorded as a link, never stat-ed through. Both links leave the project,
+// so both are refused (dev_symlink_unwatched): the build would read what
+// they point to, which the watcher never sees.
 func TestScanStaysInsideTheProject(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir()
@@ -75,7 +77,7 @@ func TestScanStaysInsideTheProject(t *testing.T) {
 	}
 	want := []string{"blok.json", "go.mod", "main.go"}
 	if runtime.GOOS != "windows" {
-		want = append(want, "linked.go")
+		want = append(want, "linkdir", "linked.go")
 	}
 	var got []string
 	for name := range scan {
@@ -86,7 +88,7 @@ func TestScanStaysInsideTheProject(t *testing.T) {
 	}
 	if runtime.GOOS != "windows" {
 		links := scan.links()
-		if len(links) != 1 || links[0].Code != "dev_symlink_unwatched" || links[0].Source != "linked.go" {
+		if len(links) != 2 || links[0].Code != "dev_symlink_unwatched" || links[0].Source != "linkdir" || links[1].Code != "dev_symlink_unwatched" || links[1].Source != "linked.go" {
 			t.Fatalf("links %+v", links)
 		}
 		// Editing the file the link points to is not a change.
@@ -245,6 +247,41 @@ func TestMainPackageMustBeInsideTheRoot(t *testing.T) {
 		}
 		if got != want {
 			t.Errorf("package %q: %q, want %q", requested, got, want)
+		}
+	}
+}
+
+// BenchmarkScanAtTheBounds measures one watcher scan of a project near the
+// watch bounds: 19,801 watched files (MaxWatchedFiles is 20,000) among
+// 99,102 directory entries (MaxWatchEntries is 100,000). ADR 0026 records
+// the result.
+func BenchmarkScanAtTheBounds(b *testing.B) {
+	root := b.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module example.com/x\n"), 0o644); err != nil {
+		b.Fatal(err)
+	}
+	for group := range 99 {
+		dir := filepath.Join(root, "internal", fmt.Sprintf("p%02d", group))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			b.Fatal(err)
+		}
+		for index := range 1000 {
+			name := fmt.Sprintf("f%04d.txt", index)
+			if index%5 == 0 {
+				name = fmt.Sprintf("f%04d.go", index)
+			}
+			if err := os.WriteFile(filepath.Join(dir, name), nil, 0o644); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+	scan, problem, err := scanProject(context.Background(), root)
+	if err != nil || problem != nil || len(scan) != 19801 {
+		b.Fatal(len(scan), err, problem)
+	}
+	for b.Loop() {
+		if _, problem, err := scanProject(context.Background(), root); err != nil || problem != nil {
+			b.Fatal(err, problem)
 		}
 	}
 }

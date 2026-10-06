@@ -31,14 +31,16 @@ func terminate(process *os.Process) error {
 }
 
 // guardScript waits for its standard input to close and then kills the
-// process group named by $1. Only blok holds the pipe's write end, and the
+// process group named by $1, if any. Only blok holds the pipe's write end, and the
 // kernel closes it whenever blok exits, however it exits — SIGKILL
 // included — so the go command and its test binaries cannot outlive blok.
 // It writes "kill -KILL -PGID" without "--": dash (Debian's /bin/sh)
 // rejects "--" there as an illegal number, bash (macOS's) accepts both.
 // When $2 is set (blok dev's private build directory) it is removed after
-// the group is dead, so a killed blok dev leaves no executables behind.
-const guardScript = `read line; kill -KILL "-$1" 2>/dev/null; [ -z "$2" ] || rm -rf -- "$2"`
+// the group is dead. blok dev's session guard names no group, only the
+// directory, so a killed blok dev leaves no executables behind even when
+// nothing else was running.
+const guardScript = `read line; [ -z "$1" ] || kill -KILL "-$1" 2>/dev/null; [ -z "$2" ] || rm -rf -- "$2"`
 
 // guardShell runs the guard; a variable only so a test can make it absent.
 var guardShell = "/bin/sh"
@@ -51,12 +53,18 @@ type processGuard struct {
 	pipe    *os.File
 }
 
+// startGuard starts a guard for target's process group (nil: none) that
+// also removes the directory remove ("": none).
 func startGuard(target *os.Process, remove string) (*processGuard, error) {
 	reader, writer, err := os.Pipe()
 	if err != nil {
 		return nil, err
 	}
-	command := exec.Command(guardShell, "-c", guardScript, "blok-guard", strconv.Itoa(target.Pid), remove)
+	group := ""
+	if target != nil {
+		group = strconv.Itoa(target.Pid)
+	}
+	command := exec.Command(guardShell, "-c", guardScript, "blok-guard", group, remove)
 	command.Stdin = reader
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	err = command.Start()

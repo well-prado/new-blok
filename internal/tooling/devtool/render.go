@@ -211,6 +211,9 @@ func WriteDevHuman(w io.Writer, event DevEvent) error {
 	for _, item := range event.Diagnostics {
 		writeDiagnostic(out, item)
 	}
+	if event.Resume != "" {
+		fmt.Fprintf(out, "  resume: %s\n", event.Resume)
+	}
 	return out.Flush()
 }
 

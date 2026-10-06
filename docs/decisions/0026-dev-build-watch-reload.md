@@ -41,7 +41,8 @@ blok dev [--json] [--package DIR] [directory] [-- application arguments]
 ### The loop
 
 1. **Scan.** The watcher records every watched file (below) by size,
-   modification time and mode.
+   modification time and mode, and on Linux and macOS by inode and
+   status-change time too.
 2. **Build.** Layout discovery (ADR 0023) runs first; any `layout_*`
    diagnostic fails the build. A watched source file that is a symbolic
    link fails it too (`dev_symlink_unwatched`, below). Stale or missing
@@ -56,10 +57,15 @@ blok dev [--json] [--package DIR] [directory] [-- application arguments]
    Its standard error becomes the same diagnostics `check` and `test`
    report (`go_compile_error` at `file:line:col`, `go_module_missing`, …).
 3. **Replace.** Only a build that compiles replaces the running
-   application: blok dev stops it (below), deletes its executable, and
-   starts the new one. A build that fails emits `build-failed` with its
-   diagnostics and `running: N`, and build N **keeps serving**. There is
-   no in-process reload of Go code.
+   application: blok dev stops it (below), keeps its executable (below)
+   and starts the new one. A build that fails emits `build-failed` with
+   its diagnostics and `running: N`, and build N **keeps serving**. There
+   is no in-process reload of Go code. An application that exited on its
+   own while the build ran is reported as `app-exited` (with
+   `dev_app_exited`), never as `app-stopped`: after a failed build it is
+   restarted with backoff and `running` is 0; after a successful one the
+   new build replaces it without a restart. A stop requested while the
+   old application drains, or while a restart is due, starts nothing.
 4. **Watch.** Every poll rescans. Changes accumulate until the project has
    been quiet for `Quiet` (300 ms), or until `MaxWait` (2 s) after the
    first change, then one build starts with all of them. Builds never
@@ -85,10 +91,23 @@ directory entries with `Lstat` semantics and records a link as the link
 itself, so adding, removing or retargeting one is a change; nothing
 outside the root is ever stat-ed, so editing a file a link points to
 outside the project changes nothing. Because `go build` *would* follow a
-linked source file, any watched link fails the build with
-`dev_symlink_unwatched` (layout discovery's own `layout_symlink_*` codes
-cover node and workflow directories first). The root itself is resolved
-once, as discovery resolves it.
+link, a build is refused with `dev_symlink_unwatched` when the walk
+meets a link it would follow to files the watcher does not see (layout
+discovery's own `layout_symlink_*` codes cover node and workflow
+directories first):
+
+- a link that is itself a watched file (a linked `.go` file, …);
+- any other link, whatever its name, that leaves the root (decided
+  lexically by `layout.ClassifyLink`, which reads only inside the root):
+  telling a linked package directory from a linked file would mean
+  following it;
+- a link inside the root into a skipped directory or a nested module.
+
+A link inside the root to a watched directory or to a file nothing builds
+(`README.md` → `docs/…`) is harmless and ignored, and so is a link inside a
+skipped directory or named like one (`.env`). A dangling link or a cycle
+gives the build nothing to read. The root itself is resolved once, as
+discovery resolves it.
 
 The watcher **polls** the tree. No dependency was added: fsnotify-style
 kernel notification needs one watch per directory (inotify limits),
@@ -97,10 +116,37 @@ and container file systems, and differs per OS; a stat walk behaves the
 same everywhere and its cost is bounded. One scan visits at most
 `MaxWatchEntries` (100,000) directory entries and records at most
 `MaxWatchedFiles` (20,000) files; past either it reports
-`layout_limit_exceeded` once and keeps the previous snapshot. A scan of the
-starter is nine stats every 250 ms. An edit that keeps a file's size and
-lands within the file system's timestamp granularity is not seen (APFS and
-ext4 record nanoseconds).
+`layout_limit_exceeded`.
+
+- **At the first scan** a project past the bounds (or unreadable) is
+  fatal: blok dev emits `watch-failed` and ends with exit 1, before any
+  build, rather than run an application it could never rebuild.
+- **Mid-session** it is reported once (`watch-failed`, `running` still
+  serving) and the previous snapshot stays; the failing scans **back off**,
+  the interval doubling from `Poll` up to `MaxScanBackoff` (10 s), until a
+  scan succeeds again. Before this, a project over the bound was
+  rescanned in full every 250 ms: about 61% of a CPU, measured in review.
+- **The interval adapts to the scan's cost**: the next scan starts no
+  sooner than `ScanDuty` (10) times the last scan's duration after it, so
+  scanning takes at most about a tenth of one CPU however large the project
+  is, at the price of noticing edits later in a large tree.
+
+Cost, measured with `BenchmarkScanAtTheBounds` (`go test -run '^$' -bench
+ScanAtTheBounds -count 5 ./internal/tooling/devtool`, linux/amd64, 4
+vCPUs, warm page cache): one scan at the bounds (20,000 watched files among
+100,000 entries) takes 162–181 ms (five samples), so a project that size is
+rescanned about every 1.6–1.8 s; a scan of the starter is nine stats, and its
+interval stays at `Poll` (250 ms).
+
+The stamp is size, modification time and mode, plus, on Linux and macOS,
+the inode and the status-change time (ctime). An edit that keeps the size
+and restores the modification time (`touch -r`, `cp -p`, `rsync -a`,
+`tar -x`) still changes the ctime, which no system call sets back, and a
+replacement renamed over the file has a new inode, so both are seen.
+Anything else that changes a watched file's ctime (`chmod`, a new hard
+link, an extended attribute) also counts as a change and rebuilds. Other
+systems, Windows included, keep the size, modification time and mode stamp
+and do not see such an edit (unverified there, #297).
 
 ### The application process
 
@@ -112,8 +158,12 @@ ext4 record nanoseconds).
   (SIGKILL included), the guard sees end-of-file and kills the
   application's process group: the application and every process it
   started (its Node worker, any child), since a child stays in its
-  parent's group unless it leaves it. It then removes blok dev's private
-  build directory, so a killed blok dev leaves no executables behind.
+  parent's group unless it leaves it (`setsid`, a daemon: see Limits).
+  It then removes blok dev's private build directory. The go command's
+  guard does the same for a build, and blok dev keeps a third guard for
+  the whole session, which names no group and only removes the build
+  directory, so a killed blok dev leaves no executables behind even when
+  neither a build nor the application is running.
 - **Stopping** sends SIGTERM to the application alone, so it can drain:
   finish the requests it accepted and stop the workers it owns through
   their supervisors (ADR 0004's drain). After `StopGrace` (10 s), or at
@@ -132,54 +182,91 @@ ext4 record nanoseconds).
   under `go run`. The last 20 lines of its standard error (1 KiB each) are
   kept for the `app-exited` event, redacted as a block (ADR 0024).
 - **Restarts.** An application that exits on its own with status 0 is left
-  stopped until the next change. Any other exit emits `app-exited` with
-  `dev_app_exited`, its status and output tail, then `restart-scheduled`:
-  500 ms, 1 s, 2 s, … up to 30 s, reset after a 10 s run or a new build.
-  At the cap that is two starts a minute, whatever the application does.
+  stopped until the next change. So is one that exits with
+  `deployment.ExitRetainedIncompatible` (below). Any other exit emits
+  `app-exited` with `dev_app_exited`, its status and output tail, then
+  `restart-scheduled`: 500 ms, 1 s, 2 s, … up to 30 s, reset after a 10 s
+  run or a new build. At the cap that is two starts a minute, whatever the
+  application does.
 
 ### Executables, artifact identity and durable runs
 
 Each build writes a new executable, `build-<n>/<name>`, in a private
 (0700) temporary directory created for the session; no path is ever
-reused, no executable is written while anything runs it, a replaced one
-is deleted only after its process has exited, and the directory is removed
-when blok dev ends (on a panic too). blok dev never names or claims an
-artifact identity: it sets no digest, version or label. An application
-that binds its artifact to its own executable (as `examples/deploy`'s
-durable deployment does, `NativeBinaryDigest` over `os.Executable()`)
-therefore sees new code as a new identity, and its own retained-artifact
-check (ADR 0009, #48) decides what to do with runs admitted under the old
-one. blok dev retains no old executables for old runs: an application
-whose readiness refuses a retained run exits, blok dev reports it and backs
-off, and the developer reverts or migrates. Go builds are reproducible, so
-reverting the edit rebuilds the identical executable, which adopts the run.
+reused and no executable is written while anything runs it. blok dev never
+names or claims an artifact identity: it sets no digest, version or label.
+An application that binds its artifact to its own executable (as
+`examples/deploy`'s durable deployment does, `NativeBinaryDigest` over
+`os.Executable()`) therefore sees new code as a new identity, and its own
+retained-artifact check (ADR 0009, #48) decides what to do with runs
+admitted under the old one.
+
+**Kept executables.** A replaced build's executable is not deleted: blok
+dev keeps the executables of the `KeptBuilds` (5) most recent earlier
+successful builds, plus the newest earlier one whose application did not
+refuse its durable state, until the session ends; then the whole
+directory is removed (on a panic too, and by the session guard if blok dev
+is killed). Older ones are deleted once a newer build replaces them; none
+of them is running, since only the current build ever runs. That bounds
+the directory to seven executables.
+
+**A deterministic refusal is not a crash.** An application whose durable
+state retains runs it cannot adopt (another artifact identity, an unknown
+checkpoint codec, a missing or changed retained manifest) will refuse them
+on every start of the same executable, so restarting it is pointless. The
+contract is structured, never parsed from output: the application exits
+with `deployment.ExitRetainedIncompatible` (65, sysexits' `EX_DATAERR`),
+which `deployment.ExitCode` returns for any error matching
+`deployment.ErrRetainedIncompatible`. `app.RetainedArtifactProbe` wraps
+every refusal decided by the retained journal's content as
+`*app.RetainedIncompatibleError`, and leaves an error reading the journal
+as it is; the application maps the first to
+`deployment.ErrRetainedIncompatible` (`examples/deploy` does, and reports
+the second as "retained journal unreadable", an ordinary exit 1 that is
+restarted with backoff). `app` does not import `contract/deployment`,
+which links `net` and would break the footprint of applications without a
+listener. On exit
+65 blok dev emits `app-exited` with `dev_durable_incompatible`, schedules
+no restart and waits for the next change. The diagnostic's remediation
+names three ways out: revert the change (Go builds are reproducible, so
+the reverted build is byte-identical to the one that admitted the runs and
+adopts them); finish the runs with the kept executable of the newest
+earlier build that did not refuse, using the exact command in the event's
+`resume` field (`cd <root> && <kept executable> <application
+arguments>`, quoted for a POSIX shell and redacted), run in another
+terminal while blok dev keeps running, since the executable is removed
+when the session ends; or finish or discard the runs with the
+application's own tools. An application exiting 65 for another reason is
+reported the same way, which is why the code is reserved for this meaning
+under `BLOK_DEV`.
 
 ### The event stream (`blok-dev/v1`)
 
 ```json
 {"version": "blok-dev/v1", "event": "…", "build": 2, "generation": 3, "pid": 4242,
  "files": 9, "changed": [], "regenerated": [], "running": 1, "status": "exit status 1",
- "delayMs": 500, "output": [], "diagnostics": [], "exitCode": 130}
+ "delayMs": 500, "output": [], "diagnostics": [], "resume": "cd … && …", "exitCode": 130}
 ```
 
 | Event | Meaning |
 | --- | --- |
 | `watching` | the first scan; `files` watched |
-| `watch-failed` | a scan failed (once per failure); the previous snapshot stays |
+| `watch-failed` | a scan failed (once per failure); the previous snapshot stays. At the first scan it is followed by `stopped` (exit 1) |
 | `changed` | `files` paths changed; up to 20 listed in `changed` |
 | `build-started` | build `build` began |
 | `build-failed` | build `build` failed with `diagnostics`; `running` keeps serving (0: none) |
 | `build-succeeded` | build `build` compiled; `regenerated` lists rewritten bindings |
 | `app-started` | build `build` started as `pid` with `generation` |
 | `app-stopped` | blok dev stopped it; `status`, and `dev_app_stop_timeout` if killed |
-| `app-exited` | it exited on its own; `status`, `output`, `dev_app_exited` unless status 0 |
+| `app-exited` | it exited on its own (during a build too); `status`, `output`, `dev_app_exited` unless status 0, or `dev_durable_incompatible` and `resume` for status 65 |
 | `restart-scheduled` | it restarts after `delayMs` |
 | `stopped` | blok dev ended with `exitCode` |
 
 With `--json` each event is one JSON line on standard output. Without it
 each is one `blok dev: …` line, followed by its diagnostics in ADR 0024's
 human form (`<source>: <code>: <message>`, `expected:`, `actual:`, `fix:`)
-and its output tail as `  | …` lines. Every diagnostic passes
+and its output tail as `  | …` lines, and a `resume` field as an
+`  resume: …` line. Every diagnostic passes
 `observe/redact` as it is emitted, whatever produced it, and is ordered by
 `diagnostic.Sort`; changed paths pass `redact.String`. Versioning follows
 ADR 0024: a consumer rejects an unknown `version`; adding a field, an
@@ -191,13 +278,18 @@ changing an event's or exit code's meaning, requires `v2`.
 | Code | Meaning |
 | --- | --- |
 | 130 | stopped by SIGINT, SIGTERM, SIGHUP or SIGQUIT (the normal end; no diagnostic) |
-| 1 | the project directory cannot be read (`project_unreadable`) |
+| 1 | the project directory cannot be read (`project_unreadable`), or cannot be watched at the first scan (`layout_limit_exceeded`) |
 | 2 | usage error: one stderr line, nothing started |
-| 3 | the go command or the process guard cannot start, or a panic (the group is killed first) |
+| 3 | the go command, the build directory or a process guard (the session's included) cannot start, or a panic (the group is killed first) |
 | 4 | an event could not be written (a closed pipe included); the application is stopped first |
 
 The first signal stops blok dev gracefully; any further one forces the
-application down. SIGPIPE is caught, not ignored, so a closed output pipe
+application down. A signal blok dev was started with ignored stays
+ignored (it is not caught, which would un-ignore it): `nohup blok dev &`,
+which starts it with SIGHUP ignored (and, from a non-interactive shell,
+SIGINT too), keeps running when the terminal closes, as nohup promises,
+and SIGTERM still stops it. The application inherits the ignored
+disposition, as under nohup. SIGPIPE is caught, not ignored, so a closed output pipe
 is exit 4 while the application inherits SIGPIPE's default disposition (an
 ignored signal would stay ignored in it).
 
@@ -218,6 +310,7 @@ same: layout's `layout_*` codes, `project_unreadable`,
 | `dev_app_start_failed` | the built executable cannot be started |
 | `dev_app_exited` | the application exited on its own with a failure status |
 | `dev_app_stop_timeout` | the application did not exit within the grace and its group was killed |
+| `dev_durable_incompatible` | the application exited with `deployment.ExitRetainedIncompatible`: its durable state retains runs this build cannot adopt; not restarted |
 
 `devtool.Codes` registers every code with the commands that raise it;
 `TestCodeRegistryMatchesSourceAndADR` keeps the registry, the code literals
@@ -228,7 +321,14 @@ in the source and the tables of ADRs 0024 and 0026 identical.
 - **Additive**: the `blok dev` command; `devtool.Dev`, `DevOptions`,
   `DevEvent` and the `blok-dev/v1` event stream, a new machine-readable
   contract; the `BLOK_DEV` and `BLOK_DEV_GENERATION` environment contract;
-  seven `dev_*` diagnostic codes; `generate.WriteFile`.
+  eight `dev_*` diagnostic codes; `generate.WriteFile`;
+  `deployment.ErrRetainedIncompatible`, `deployment.ExitRetainedIncompatible`,
+  `deployment.ExitCode` and `app.RetainedIncompatibleError`.
+- **Behavioural, examples only**: `examples/deploy`'s durable deployment
+  returns `deployment.ErrRetainedIncompatible` (same message as before)
+  for a refusal decided by the journal's content, and "retained journal
+  unreadable" when the journal cannot be read; its command exits with
+  `deployment.ExitCode` (65 for the refusal, 1 otherwise, as before).
 - **Behavioural, none for existing commands**: `check`, `test`, `inspect`,
   `new`, `generate` and `version` keep their output, exit codes and
   diagnostics. `blok generate` now writes through `generate.WriteFile`,
@@ -238,7 +338,9 @@ in the source and the tables of ADRs 0024 and 0026 identical.
   unchanged).
 - **Unchanged**: `internal/tooling/layout`, `internal/runtime`,
   `runtime/worker`, the worker protocol and every wire, journal and
-  artifact contract. No dependency is added.
+  artifact contract. `app.RetainedArtifactProbe` refuses exactly what it
+  refused before, with the same messages; only the error's type is new. No
+  dependency is added.
 
 ## Evidence
 
@@ -251,23 +353,28 @@ runs across the two layouts) and the Go+Node and durable fixtures beside it.
 - Go code is rebuilt and the process replaced; nothing is reloaded in
   process. Requests that arrive while one process is stopping and the next
   is starting are refused (connection refused), never queued or repeated.
-- blok dev retains no executable for old runs; a durable application that
-  refuses a retained run stays down (with backoff) until the code adopts
-  it. A multi-version manager is later work (architecture §7, M8).
-- Polling cannot see an edit that keeps a file's size within one timestamp
-  tick; files a Go package embeds (`//go:embed`) are not watched unless a
-  node root owns them.
+- blok dev keeps old executables only for the session, and runs only one
+  build at a time: a durable application that refuses a retained run stays
+  down until the code adopts it or the developer finishes the runs with the
+  kept executable. It does not tell which earlier build admitted a run; it
+  offers the newest earlier build that did not refuse. A multi-version
+  manager is later work (architecture §7, M8).
+- On systems other than Linux and macOS, polling cannot see an edit that
+  keeps a file's size and restores its modification time; files a Go
+  package embeds (`//go:embed`) are not watched unless a node root owns
+  them. The watcher's reaction time grows with the project's scan cost
+  (`ScanDuty`), and while scans fail with the backoff (up to 10 s).
 - After the application exits, its group is swept by process-group id.
   The id is reserved while any member lives; a group with no members left
   could in principle be reused between the reap and the sweep (the sweep
   then finds no process or, in a pathological wrap-around, an unrelated
   group). The guard closes the same window for blok dev's own death.
 - A descendant that leaves the application's process group (`setsid`, a
-  daemon) is not the application's to stop and is not swept.
-- If blok dev is killed outright while no application is running (every
-  build so far failed, or a restart is pending), no guard is alive and its
-  private build directory (0700, executables only) is left in the
-  temporary directory.
+  daemon) is not the application's to stop: it is neither swept nor
+  killed by the guard, on any stop, Ctrl+C or SIGKILL included.
+- The guards are `/bin/sh` processes in their own process groups: if they
+  are killed too (a `kill -9` of every process, an OOM kill), nothing
+  removes the build directory (0700, executables only).
 - Verified on macOS (darwin/arm64) and Linux (linux/arm64, the
   `golang:1.27.1` container image), Go 1.27.1; the Go+Node worker test ran
   on macOS only (Node 24.21.0), the container has no Node. amd64 hosts are

@@ -78,6 +78,7 @@ var Codes = []Code{
 	{"dev_app_start_failed", devOnly},
 	{"dev_app_exited", devOnly},
 	{"dev_app_stop_timeout", devOnly},
+	{"dev_durable_incompatible", devOnly},
 }
 
 var (

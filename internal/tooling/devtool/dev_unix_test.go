@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -46,6 +47,7 @@ type devCase struct {
 		Starts             *int    `json:"starts"`
 		MaxStarts          int     `json:"maxStarts"`
 		Stops              int     `json:"stops"`
+		RacingStopBuilds   []int   `json:"racingStopBuilds"`
 		Exits              *int    `json:"exits"`
 		MinExits           int     `json:"minExits"`
 		Regenerated        int     `json:"regenerated"`
@@ -180,6 +182,13 @@ func (s *devSession) stop() []timedEvent {
 	if s.code != ExitInterrupted || s.err != nil {
 		s.t.Fatalf("exit %d (%v); want %d\n%s", s.code, s.err, ExitInterrupted, s.dump())
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]timedEvent(nil), s.events...)
+}
+
+// snapshot returns every event so far, without stopping the session.
+func (s *devSession) snapshot() []timedEvent {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]timedEvent(nil), s.events...)
@@ -348,7 +357,7 @@ func checkDevExpectations(t *testing.T, item devCase, events []timedEvent, names
 	t.Helper()
 	want := item.Expected
 	count := map[string]int{}
-	regenerated, stopTimeouts := 0, 0
+	regenerated, stopTimeouts, racingStops := 0, 0, 0
 	var delays []int64
 	var diagnostics []string
 	var buildDone time.Time
@@ -365,6 +374,12 @@ func checkDevExpectations(t *testing.T, item devCase, events []timedEvent, names
 				diagnostics = append(diagnostics, problem.Code+" "+problem.Source)
 			}
 		case EventAppStopped:
+			if slices.Contains(want.RacingStopBuilds, event.Build) {
+				racingStops++
+				if event.Status != "signal: terminated" && event.Status != "exit status 0" {
+					t.Errorf("build %d reported as stopped with %q: a crash reported as a stop", event.Build, event.Status)
+				}
+			}
 			for _, problem := range event.Diagnostics {
 				if problem.Code != "dev_app_stop_timeout" {
 					continue
@@ -395,7 +410,7 @@ func checkDevExpectations(t *testing.T, item devCase, events []timedEvent, names
 	}
 	check("builds", count[EventBuildStarted], want.Builds)
 	check("failed builds", count[EventBuildFailed], want.FailedBuilds)
-	check("stops", count[EventAppStopped], want.Stops)
+	check("stops", count[EventAppStopped]-racingStops, want.Stops)
 	check("regenerated", regenerated, want.Regenerated)
 	check("stop timeouts", stopTimeouts, want.StopTimeouts)
 	if want.Starts != nil {

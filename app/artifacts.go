@@ -64,27 +64,46 @@ func RetainedArtifactProbe(expected artifact.Manifest, checkpointDigest string, 
 	}
 	return func(ctx context.Context) error {
 		return inventory(ctx, func(item RetainedArtifact) error {
-			if len(item.ManifestJSON) == 0 {
-				return errors.New("deployment: required retained artifact missing")
-			}
-			var retained artifact.Manifest
-			if err := json.Unmarshal(item.ManifestJSON, &retained); err != nil {
-				return err
-			}
-			actual, err := retained.Digest()
-			if err != nil {
-				return err
-			}
-			if actual != item.ArtifactDigest || actual != digest {
-				return errors.New("deployment: retained executable unavailable or incompatible")
-			}
-			if item.CheckpointPresent {
-				if item.CheckpointDigest != checkpointDigest {
-					return errors.New("deployment: incompatible retained checkpoint codec")
-				}
-				return artifact.VerifyCheckpoint(retained, artifact.Checkpoint{ArtifactDigest: item.CheckpointArtifact, CheckpointFormat: expected.CheckpointFormat})
+			if err := verifyRetained(item, digest, checkpointDigest, expected.CheckpointFormat); err != nil {
+				return &RetainedIncompatibleError{Err: err}
 			}
 			return nil
 		})
 	}, nil
+}
+
+// RetainedIncompatibleError is a RetainedArtifactProbe refusal decided by
+// the retained journal's content, not by reading it: the same executable
+// refuses the same journal every time. An error reading the inventory is
+// returned as it is. An application maps it to
+// deployment.ErrRetainedIncompatible (examples/deploy does); app does not
+// import contract/deployment, which would link the net package into every
+// application.
+type RetainedIncompatibleError struct{ Err error }
+
+func (e *RetainedIncompatibleError) Error() string { return e.Err.Error() }
+func (e *RetainedIncompatibleError) Unwrap() error { return e.Err }
+
+func verifyRetained(item RetainedArtifact, digest, checkpointDigest, checkpointFormat string) error {
+	if len(item.ManifestJSON) == 0 {
+		return errors.New("deployment: required retained artifact missing")
+	}
+	var retained artifact.Manifest
+	if err := json.Unmarshal(item.ManifestJSON, &retained); err != nil {
+		return err
+	}
+	actual, err := retained.Digest()
+	if err != nil {
+		return err
+	}
+	if actual != item.ArtifactDigest || actual != digest {
+		return errors.New("deployment: retained executable unavailable or incompatible")
+	}
+	if item.CheckpointPresent {
+		if item.CheckpointDigest != checkpointDigest {
+			return errors.New("deployment: incompatible retained checkpoint codec")
+		}
+		return artifact.VerifyCheckpoint(retained, artifact.Checkpoint{ArtifactDigest: item.CheckpointArtifact, CheckpointFormat: checkpointFormat})
+	}
+	return nil
 }
