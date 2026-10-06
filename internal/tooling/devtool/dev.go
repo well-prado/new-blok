@@ -69,10 +69,10 @@ const (
 	// scanning uses at most 1/ScanDuty of a CPU while a scan takes up to
 	// MaxScanBackoff/ScanDuty (1 s).
 	ScanDuty = 10
-	// MaxScanBackoff bounds how far the interval between scans grows, while
+	// MaxScanBackoff bounds how far the pause between scans grows, while
 	// they fail (doubling from Poll) or after a slow or stalled one
-	// (ScanDuty), and so how long an edit or a repair waits to be seen,
-	// unless Poll itself is longer.
+	// (ScanDuty), unless Poll itself is longer. An edit or a repair waits
+	// that pause plus the scans' own duration to be seen.
 	MaxScanBackoff = 10 * time.Second
 )
 

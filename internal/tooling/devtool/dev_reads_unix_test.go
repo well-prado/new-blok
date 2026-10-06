@@ -206,3 +206,134 @@ func TestShellQuoteRoundTrips(t *testing.T) {
 		t.Fatalf("the shell read\n%q\nwant\n%q", got, words)
 	}
 }
+
+// TestDevReadsTheImportsOfLargeFiles (review R round 3, should-fix 1): a
+// Go file past MaxSourceFileBytes is still compiled by the go command, so
+// its imports are followed like any other file's: a link it imports
+// through that leaves the project is refused. A file whose imports do not
+// end within the bound is refused rather than skipped
+// (layout_limit_exceeded).
+func TestDevReadsTheImportsOfLargeFiles(t *testing.T) {
+	options, _, _ := heldApp(t, `exit 0`)
+	outside := t.TempDir()
+	writeFiles(t, outside, map[string]string{"pkg/p.go": "package p\n"})
+	linkAll(t, options.Root, map[string]string{"_ext": filepath.Join(outside, "pkg")})
+	code := strings.Repeat("var _ = 1\n", MaxSourceFileBytes/10+1)
+	comments := strings.Repeat("// filler\n", MaxSourceFileBytes/10+1)
+	writeFiles(t, options.Root, map[string]string{
+		"internal/big/big.go":   "package big\n\nimport _ \"example.com/fake/_ext\"\n\n" + code,
+		"internal/huge/huge.go": comments + "package huge\n\nimport _ \"fmt\"\n",
+		"cmd/fake/main.go":      mainImporting("internal/big", "internal/huge"),
+	})
+	event, found, session := firstBuild(t, options)
+	want := "[dev_symlink_unwatched _ext layout_limit_exceeded internal/huge/huge.go]"
+	if event != EventBuildFailed || fmt.Sprint(found) != want {
+		t.Fatalf("build 1 %s %v, want build-failed %s\n%s", event, found, want, session.dump())
+	}
+	session.stop()
+}
+
+// TestImportsOfReadsTheHeaderWithinItsBound: importsOf reads a file's
+// imports from at most importHeaderBytes of it, and refuses (never
+// guesses) when the header does not provably end within them: a cut
+// inside the import keyword, or right after an import declaration that
+// another may follow.
+func TestImportsOfReadsTheHeaderWithinItsBound(t *testing.T) {
+	root := t.TempDir()
+	header := "package p\n\nimport \"a\"\n"
+	for name, item := range map[string]struct {
+		content string
+		want    string
+	}{
+		"whole.go":          {header + "import \"b\"\n", "[a b] <nil>"},
+		"long-body.go":      {header + "func f() {}\n" + strings.Repeat("// x\n", 64), "[a] <nil>"},
+		"cut-in-keyword.go": {header + strings.Repeat("\n", 64-len(header)-3) + "import \"b\"\n", "[] layout_limit_exceeded"},
+		"cut-after-decl.go": {header + strings.Repeat("\n", 64-len(header)) + "import \"b\"\n", "[] layout_limit_exceeded"},
+		"cut-in-comment.go": {header + "/*" + strings.Repeat("x", 64) + "*/\nimport \"b\"\n", "[] layout_limit_exceeded"},
+		"long-comment.go":   {strings.Repeat("// x\n", 64) + header, "[] layout_limit_exceeded"},
+		"syntax-error.go":   {"package p\n\nimport \"a\"\nimport )\n", "[a] <nil>"},
+	} {
+		writeFiles(t, root, map[string]string{name: item.content})
+		fsRoot, err := os.OpenRoot(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		saved := importHeaderBytes
+		importHeaderBytes = 64
+		imports, problem := importsOf(fsRoot, name)
+		importHeaderBytes = saved
+		fsRoot.Close()
+		code := "<nil>"
+		if problem != nil {
+			code = problem.Code
+		}
+		if got := fmt.Sprintf("%v %s", append([]string{}, imports...), code); got != item.want {
+			t.Errorf("%s: %s, want %s", name, got, item.want)
+		}
+	}
+}
+
+// TestDevRefusesChainsThroughUnwatchedLinks (review R round 3, nit a): the
+// build reads a package through every link of a chain, so every hop must
+// be a link the walk records. A hop whose name starts with a dot, or that
+// sits inside a skipped directory, is not watched (retargeting it would
+// not rebuild), so a build through it is refused; a chain of watched links
+// builds, and retargeting its middle hop rebuilds.
+func TestDevRefusesChainsThroughUnwatchedLinks(t *testing.T) {
+	options, _, _ := heldApp(t, `trap 'exit 0' TERM
+sleep 300 &
+wait`)
+	writeFiles(t, options.Root, map[string]string{
+		"internal/a/a.go": "package a\n", "internal/b/b.go": "package b\n", "internal/c/c.go": "package c\n", "internal/d/d.go": "package d\n",
+		"_x/keep.txt":      "",
+		"cmd/fake/main.go": mainImporting("dotted", "skipped", "chained"),
+	})
+	linkAll(t, options.Root, map[string]string{
+		"dotted": ".cur", ".cur": filepath.Join("internal", "a"),
+		"skipped": filepath.Join("_x", "l"), "_x/l": filepath.Join("..", "internal", "b"),
+		"chained": "hop", "hop": filepath.Join("internal", "c"),
+	})
+	event, found, session := firstBuild(t, options)
+	if want := "[dev_symlink_unwatched dotted dev_symlink_unwatched skipped]"; event != EventBuildFailed || fmt.Sprint(found) != want {
+		t.Fatalf("build 1 %s %v, want build-failed %s\n%s", event, found, want, session.dump())
+	}
+	writeFiles(t, options.Root, map[string]string{"cmd/fake/main.go": mainImporting("chained")})
+	second := session.await(func(e DevEvent) bool {
+		return (e.Event == EventBuildFailed || e.Event == EventBuildSucceeded) && e.Build == 2
+	}, "build 2 to finish")
+	if second.Event != EventBuildSucceeded {
+		t.Fatalf("build 2 through watched links: %+v\n%s", second.DevEvent, session.dump())
+	}
+	hop := filepath.Join(options.Root, "hop")
+	if err := os.Remove(hop); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("internal", "d"), hop); err != nil {
+		t.Fatal(err)
+	}
+	changed := session.await(func(e DevEvent) bool { return e.Event == EventChanged }, "the retargeted hop to be seen")
+	if fmt.Sprint(changed.Changed) != "[hop]" {
+		t.Fatalf("changed %v, want [hop]\n%s", changed.Changed, session.dump())
+	}
+	session.await(func(e DevEvent) bool { return e.Event == EventBuildSucceeded && e.Build == 3 }, "build 3 after the retarget")
+	assertNoProcesses(t, session.stop())
+}
+
+// TestDevFollowsTheModuleRootPackage (review R round 3, nit b): an import
+// of the module path itself builds the package at the module root, whose
+// imports are followed like any other package's.
+func TestDevFollowsTheModuleRootPackage(t *testing.T) {
+	options, _, _ := heldApp(t, `exit 0`)
+	outside := t.TempDir()
+	writeFiles(t, outside, map[string]string{"pkg/p.go": "package p\n"})
+	linkAll(t, options.Root, map[string]string{"_ext": filepath.Join(outside, "pkg")})
+	writeFiles(t, options.Root, map[string]string{
+		"root.go":          "package fake\n\nimport _ \"example.com/fake/_ext\"\n",
+		"cmd/fake/main.go": "package main\n\nimport _ \"example.com/fake\"\n\nfunc main() {}\n",
+	})
+	event, found, session := firstBuild(t, options)
+	if want := "[dev_symlink_unwatched _ext]"; event != EventBuildFailed || fmt.Sprint(found) != want {
+		t.Fatalf("build 1 %s %v, want build-failed %s\n%s", event, found, want, session.dump())
+	}
+	session.stop()
+}

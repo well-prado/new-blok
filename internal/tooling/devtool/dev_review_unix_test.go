@@ -344,6 +344,47 @@ func TestScanRefusesLinkedDirectories(t *testing.T) {
 	}
 }
 
+// TestChangesSeeMetadataPreservingEdits (review R4): an edit that keeps a
+// file's size and restores its modification time (touch -r), and a
+// replacement renamed over the file with the same size and modification
+// time (cp -p, rsync -a, tar -x), are both changes. The inode and the
+// status-change time see what size and mtime cannot.
+func TestChangesSeeMetadataPreservingEdits(t *testing.T) {
+	root := t.TempDir()
+	writeFiles(t, root, map[string]string{"go.mod": "module x\n", "a.go": "package a // one\n", "b.go": "package a // one\n"})
+	before, _, _ := scanProject(context.Background(), root)
+	time.Sleep(20 * time.Millisecond)
+	for _, name := range []string{"a.go", "b.go"} {
+		target := filepath.Join(root, name)
+		info, err := os.Stat(target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		edited := target
+		if name == "b.go" {
+			edited = filepath.Join(root, ".b.go.tmp")
+		}
+		if err := os.WriteFile(edited, []byte("package a // two\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(edited, info.ModTime(), info.ModTime()); err != nil {
+			t.Fatal(err)
+		}
+		if edited != target {
+			if err := os.Rename(edited, target); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if after, err := os.Stat(target); err != nil || after.Size() != info.Size() || !after.ModTime().Equal(info.ModTime()) {
+			t.Fatalf("%s: the edit did not keep size and mtime (%v)", name, err)
+		}
+	}
+	after, _, _ := scanProject(context.Background(), root)
+	if got := changes(before, after); fmt.Sprint(got) != "[a.go b.go]" {
+		t.Fatalf("changes %v, want [a.go b.go]", got)
+	}
+}
+
 // observedScan is one scan the loop reported to scanObserver.
 type observedScan struct {
 	at     time.Time // when it finished

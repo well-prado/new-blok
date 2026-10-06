@@ -3,8 +3,11 @@ package devtool
 import (
 	"context"
 	"errors"
+	"go/ast"
 	"go/parser"
+	"go/scanner"
 	"go/token"
+	"io"
 	"io/fs"
 	"os"
 	"path"
@@ -198,10 +201,16 @@ func (s snapshot) refresh(root, rel string) {
 //     ignored, test files excluded), are resolved one path element at a
 //     time with layout.ClassifyLink, which reads only inside the root. A
 //     link that leaves the project, or leads into a skipped directory or a
-//     nested module, is refused (dev_symlink_unwatched).
+//     nested module, or whose chain goes through a link the walk does not
+//     record (a dot name, or inside a skipped directory), is refused
+//     (dev_symlink_unwatched).
 //   - A package in a directory the walk skips (_x, testdata, node_modules,
 //     at any depth): the go command builds it when it is imported, but the
 //     watcher never sees it (dev_package_unwatched).
+//   - A Go file whose imports cannot be read: unreadable
+//     (project_unreadable), or with import declarations that do not end
+//     within importHeaderBytes (layout_limit_exceeded). importsOf reads only
+//     a file's header, so a file of any size is followed, never skipped.
 //
 // A link nothing builds through (a LICENSE or docs link) is never read by
 // the build and is not refused. Files the build reads that are not Go
@@ -244,7 +253,7 @@ func (s snapshot) buildReads(ctx context.Context, root, module, main string) ([]
 		}
 		dir := queue[0]
 		queue = queue[1:]
-		resolved, problem := resolvePackage(fsRoot, root, dir)
+		resolved, problem := s.resolvePackage(fsRoot, root, dir)
 		if problem != nil {
 			report(*problem)
 			continue
@@ -254,7 +263,12 @@ func (s snapshot) buildReads(ctx context.Context, root, module, main string) ([]
 		}
 		parsed[resolved] = true
 		for _, file := range sources[resolved] {
-			for _, imported := range importsOf(root, file) {
+			imports, problem := importsOf(fsRoot, file)
+			if problem != nil {
+				report(*problem)
+				continue
+			}
+			for _, imported := range imports {
 				rel, ok := inModule(module, imported)
 				if ok && !queued[rel] {
 					queued[rel] = true
@@ -287,24 +301,89 @@ func inModule(module, imported string) (string, bool) {
 	return rel, true
 }
 
-// importsOf is the import paths of a Go file; none when it cannot be read
-// or parsed, which fails the build itself.
-func importsOf(root, rel string) []string {
-	data, err := readBounded(filepath.Join(root, filepath.FromSlash(rel)), MaxSourceFileBytes)
-	if err != nil {
-		return nil
+// importHeaderBytes bounds how much of one Go file importsOf reads: its
+// header (comments, package clause, imports) must end within it. A
+// variable only so a test can lower it.
+var importHeaderBytes = MaxSourceFileBytes
+
+// importsOf is the import paths of the Go file rel. Like the go command, it
+// reads only the file's header, so a file of any size is read for its
+// imports, never skipped; at most importHeaderBytes are read. It never
+// fails open: a file it cannot read, or whose import declarations do not
+// end within the bound, is a problem that refuses the build, since the
+// build would read imports blok dev did not see. A syntax error in a
+// header read whole is not: the go command reads the same header and
+// fails the build itself; the imports parsed before the error still count.
+func importsOf(fsRoot *os.Root, rel string) ([]string, *diagnostic.Diagnostic) {
+	unreadable := func(err error) *diagnostic.Diagnostic {
+		return &diagnostic.Diagnostic{Code: "project_unreadable", Source: rel, Expected: "a readable Go source file", Actual: errorText(err), Remediation: "make the file readable; blok dev reads every built file's imports and keeps watching", Message: "the project could not be read"}
 	}
-	file, _ := parser.ParseFile(token.NewFileSet(), rel, data, parser.ImportsOnly)
-	if file == nil {
-		return nil
+	file, err := fsRoot.Open(filepath.FromSlash(rel))
+	if err != nil {
+		return nil, unreadable(err)
+	}
+	defer file.Close()
+	if info, err := file.Stat(); err != nil || !info.Mode().IsRegular() {
+		if err == nil {
+			err = &fs.PathError{Op: "read", Path: path.Base(rel), Err: fs.ErrInvalid}
+		}
+		return nil, unreadable(err)
+	}
+	data, err := io.ReadAll(io.LimitReader(file, int64(importHeaderBytes)+1))
+	if err != nil {
+		return nil, unreadable(err)
+	}
+	truncated := len(data) > importHeaderBytes
+	if truncated {
+		data = data[:importHeaderBytes]
+	}
+	files := token.NewFileSet()
+	parsed, parseErr := parser.ParseFile(files, rel, data, parser.ImportsOnly)
+	if truncated && (parseErr != nil || parsed == nil || !headerEnds(files, parsed, data)) {
+		return nil, &diagnostic.Diagnostic{Code: layout.CodeLimitExceeded, Source: rel, Expected: "import declarations ending within the file's first " + strconv.Itoa(importHeaderBytes) + " bytes", Actual: "they do not", Remediation: "shorten the comments before the package clause or the import list; blok dev reads only a file's header for its imports", Message: "blok dev cannot read the imports of a Go file the build compiles"}
+	}
+	if parsed == nil {
+		return nil, nil
 	}
 	var imports []string
-	for _, spec := range file.Imports {
+	for _, spec := range parsed.Imports {
 		if value, err := strconv.Unquote(spec.Path.Value); err == nil {
 			imports = append(imports, value)
 		}
 	}
-	return imports
+	return imports, nil
+}
+
+// headerEnds reports whether data, a file's first bytes, holds its whole
+// header: after the last import declaration (or the package clause) comes
+// a token that is not import and ends before data does. A file cut inside
+// its imports, or right after one (the next might be another), does not.
+func headerEnds(files *token.FileSet, parsed *ast.File, data []byte) bool {
+	end := parsed.Name.End()
+	if len(parsed.Decls) > 0 {
+		end = parsed.Decls[len(parsed.Decls)-1].End()
+	}
+	offset := files.Position(end).Offset
+	var reader scanner.Scanner
+	failed := false
+	rest := data[offset:]
+	reader.Init(token.NewFileSet().AddFile("", -1, len(rest)), rest, func(token.Position, string) { failed = true }, 0)
+	for {
+		at, tok, literal := reader.Scan()
+		if failed {
+			return false
+		}
+		switch tok {
+		case token.SEMICOLON:
+			continue
+		case token.EOF, token.IMPORT, token.ILLEGAL:
+			return false
+		}
+		if literal == "" {
+			literal = tok.String()
+		}
+		return int(at)-1+len(literal) < len(rest)
+	}
 }
 
 // resolvePackage resolves the package directory dir the way the go command
@@ -312,7 +391,7 @@ func importsOf(root, rel string) []string {
 // the reason the build would read it from files the watcher does not see.
 // It returns "" and no problem for a directory that does not exist (or a
 // dangling link or a cycle): the build fails on its own.
-func resolvePackage(fsRoot *os.Root, root, dir string) (string, *diagnostic.Diagnostic) {
+func (s snapshot) resolvePackage(fsRoot *os.Root, root, dir string) (string, *diagnostic.Diagnostic) {
 	if dir == "." {
 		return ".", nil
 	}
@@ -341,6 +420,14 @@ func resolvePackage(fsRoot *os.Root, root, dir string) (string, *diagnostic.Diag
 		default:
 			return "", nil
 		}
+		// Every link the chain goes through is read too: each must be one
+		// the walk records, so retargeting it rebuilds. A link whose name
+		// starts with a dot, or inside a skipped directory, is not.
+		for _, hop := range linkHops(fsRoot, root, here) {
+			if item, ok := s[hop]; !ok || item.mode&fs.ModeSymlink == 0 {
+				return "", linkProblem(here, "a symbolic link resolved through the link "+hop+", which blok dev does not watch")
+			}
+		}
 		if target != "" {
 			elements := strings.Split(target, "/")
 			for index := range elements {
@@ -359,4 +446,52 @@ func resolvePackage(fsRoot *os.Root, root, dir string) (string, *diagnostic.Diag
 		return ".", nil
 	}
 	return resolved, nil
+}
+
+// maxHops bounds linkHops; layout.ClassifyLink has already refused a loop.
+const maxHops = 255
+
+// linkHops is every symbolic link that resolving rel goes through, as
+// symlink-free project-relative paths, in order: rel itself first. It reads
+// only inside the root, as layout.ClassifyLink does, and is called only for
+// a link ClassifyLink resolved inside the root.
+func linkHops(fsRoot *os.Root, absRoot, rel string) []string {
+	pending := strings.Split(rel, "/")
+	var resolved, hops []string
+	for len(pending) > 0 && len(hops) <= maxHops {
+		element := pending[0]
+		pending = pending[1:]
+		switch element {
+		case "", ".":
+			continue
+		case "..":
+			if len(resolved) > 0 {
+				resolved = resolved[:len(resolved)-1]
+			}
+			continue
+		}
+		candidate := path.Join(append(append([]string(nil), resolved...), element)...)
+		info, err := fsRoot.Lstat(filepath.FromSlash(candidate))
+		if err != nil {
+			return hops
+		}
+		if info.Mode()&fs.ModeSymlink == 0 {
+			resolved = append(resolved, element)
+			continue
+		}
+		hops = append(hops, candidate)
+		target, err := fsRoot.Readlink(filepath.FromSlash(candidate))
+		if err != nil {
+			return hops
+		}
+		if filepath.IsAbs(target) || filepath.VolumeName(target) != "" {
+			inside, err := filepath.Rel(absRoot, filepath.Clean(target))
+			if err != nil {
+				return hops
+			}
+			resolved, target = nil, inside
+		}
+		pending = append(strings.Split(filepath.ToSlash(target), "/"), pending...)
+	}
+	return hops
 }

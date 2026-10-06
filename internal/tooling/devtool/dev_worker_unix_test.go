@@ -393,6 +393,16 @@ func TestDevDurableRunIsNotRelabelled(t *testing.T) {
 				t.Fatal(err)
 			}
 			group := resumed.Process.Pid
+			// The resumed application is under the same pipe guard blok dev
+			// gives its own: the test binary holds the pipe, so however it
+			// dies (a -timeout panic, SIGQUIT, SIGKILL) the guard kills the
+			// group and nothing outlives the test.
+			guard, err := startGuard(resumed.Process, "")
+			if err != nil {
+				_ = syscall.Kill(-group, syscall.SIGKILL)
+				t.Fatal(err)
+			}
+			t.Cleanup(guard.release)
 			t.Cleanup(func() { _ = syscall.Kill(-group, syscall.SIGKILL) })
 			ready()
 			if err := syscall.Kill(-group, syscall.SIGTERM); err != nil {

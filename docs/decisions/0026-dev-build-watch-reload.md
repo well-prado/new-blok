@@ -44,7 +44,9 @@ blok dev [--json] [--package DIR] [directory] [-- application arguments]
    modification time and mode, and on Linux and macOS by inode and
    status-change time too.
 2. **Build.** Layout discovery (ADR 0023) runs first; any `layout_*`
-   diagnostic fails the build. Stale or missing
+   diagnostic fails the build. The main package is resolved next
+   (`dev_main_package_missing`), before anything is written: a build that
+   cannot run never rewrites the project. Stale or missing
    bindings for the manifest's `types` file are **regenerated** with the
    same `generate.Source` and atomic `generate.WriteFile` that `blok
    generate` uses (a hand-written bindings file is refused,
@@ -107,10 +109,22 @@ when it would read Go source the watcher does not see:
   escape lexically, against the root resolved once at start (blok dev
   started through a link to the project, or under macOS's `/var`, still
   sees an absolute in-project target as inside). A link inside the
-  root that leads back to a watched directory is harmless.
+  root that leads back to a watched directory is harmless when every link
+  of its chain is one the walk records: the build reads through each
+  hop, so a chain through a link the walk does not record (a name
+  starting with `.`, as in `alias -> .cur -> internal/a`, or a link
+  inside a skipped directory, as in `alias -> _x/l -> internal/a`) is
+  refused, since retargeting that hop would not rebuild. A chain of
+  recorded links builds, and retargeting any of its hops rebuilds.
 - **`dev_package_unwatched`**: an imported package in a real directory
   the walk skips (`_x`, `internal/testdata/p`, `web/node_modules/n`):
   an edit to it would not rebuild.
+- A file whose imports cannot be read never lets the build through: like
+  the go command, blok dev reads only a Go file's header (comments,
+  package clause, imports), so a file of any size is followed, never
+  skipped. A file it cannot read is `project_unreadable`; one whose
+  import declarations do not provably end within its first 1 MiB
+  (`MaxSourceFileBytes`) is `layout_limit_exceeded` (Limits).
 
 Symbolic links follow ADR 0023: they are never followed. The walk reads
 directory entries with `Lstat` semantics and records every link as the
@@ -153,8 +167,13 @@ same everywhere and its cost is bounded. One scan visits at most
   tenth of one CPU while a scan takes up to 1 s, at the price of noticing
   edits later in a large tree. A scan that stalled (the process stopped
   with Ctrl+Z, a cold cache) does not postpone the next one by ten times
-  the stall: whatever happens, an edit is seen within 10 s (or `Poll`, if
-  that is longer).
+  the stall: whatever happens, the pause between the end of one scan and
+  the start of the next is at most 10 s (or `Poll`, if that is longer).
+  An edit is seen by the first scan that reaches the file after it, so
+  the wait is that pause plus the scans' own duration (the one in
+  progress and the next; in a project at the bounds, under 0.2 s each,
+  measured below), plus a build already running; then the debounce
+  (`Quiet`, `MaxWait`) applies.
 
 Cost, measured with `BenchmarkScanAtTheBounds` (`go test -run '^$' -bench
 ScanAtTheBounds -count 5 ./internal/tooling/devtool`, linux/amd64, 4
@@ -397,13 +416,20 @@ runs across the two layouts) and the Go+Node and durable fixtures beside it.
   package embeds (`//go:embed`), and cgo and assembly sources and headers,
   are not watched unless a node root owns them; nor is dependency code
   (the module cache, `vendor/`, a local `replace` target): run blok dev
-  again after changing them. The watcher's reaction time grows with the
+  again after changing them. The pause between scans grows with the
   project's scan cost (`ScanDuty`) and while scans fail (the backoff), up
-  to 10 s either way.
+  to 10 s either way; the time to notice an edit adds the scans' own
+  duration to that pause.
 - Telling whether the build reads through a link parses the import
   declarations of the packages the build reaches, at every build; build
   constraints are ignored, so a link imported only by a file for another
-  platform is refused too (conservatively).
+  platform is refused too (conservatively). A Go file's imports are read
+  from at most its first 1 MiB: a file whose import declarations do not
+  provably end there (a longer leading comment, a cut right after an
+  import that another may follow) is refused with
+  `layout_limit_exceeded`, although the go command would build it. A
+  chain of links through a link the walk does not record is refused even
+  when it ends in a watched directory.
 - After the application exits, its group is swept by process-group id.
   The id is reserved while any member lives; a group with no members left
   could in principle be reused between the reap and the sweep (the sweep
@@ -418,9 +444,9 @@ runs across the two layouts) and the Go+Node and durable fixtures beside it.
 - Verified on macOS (darwin/arm64) and Linux (linux/arm64, the
   `golang:1.27.1` container image), Go 1.27.1; the Go+Node worker test ran
   on macOS only (Node 24.21.0), the container has no Node. The second
-  review round's changes (what the build reads through links and skipped
-  directories, the capped scan interval, the omitted resume command) ran
-  on Linux only (linux/amd64, Go 1.27.1, no Node); on macOS they are
+  and third review rounds' changes (what the build reads through links,
+  link chains and skipped directories, the header-only import read, the
+  capped scan interval, the omitted resume command) ran on Linux only (linux/amd64, Go 1.27.1, no Node); on macOS they are
   vetted (`GOOS=darwin go vet`), not run. Windows has no process group, guard or graceful stop here: the
   application is killed outright and its children may outlive it —
   unverified, and owned by the Windows track (#156, #157).
