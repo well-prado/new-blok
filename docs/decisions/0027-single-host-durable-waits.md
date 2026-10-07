@@ -291,8 +291,9 @@ storage, and only an application that runs durable workflows links the
 resumer (`internal/journal`'s other importers, such as `agent/policy`, do
 not gain a scheduler).
 
-- `New(Config{Journal, Engine, Workflows, Interval, Batch, Workers, Lease,
-  Clock})`: `Workflows` maps a workflow name to its program and an input
+- `New(Config{Journal, Engine, Workflows, Interval, Batch, Workers, Clock,
+  RenewEvery, MaxRetries, OnError, Settled})`; the lease length is the
+  journal's own (`WakeupLease`), never configured twice: `Workflows` maps a workflow name to its program and an input
   decoder, as `internal/cluster` does; a run executes only the program
   whose digest is its admitted artifact (another is left, not failed: a
   different build may know it).
@@ -302,7 +303,7 @@ not gain a scheduler).
   timers), `InterruptedRuns` (below), each up to `Batch`, executed by at
   most `Workers` at a time.
 - An execution decodes the run's input, runs `RunJournaled` through
-  `ForRun(run, token).WithInput(...)`, renews the lease every third of its
+  `ForRun(run, token)`, renews the lease every third of its
   length (an `ErrLeaseLost` renewal cancels it), and settles: a completed
   run through `RunJournal.CompleteRun`, a workflow failure through
   `FailRun`, an uncertain effect through `MarkRunUncertain`; a suspension
@@ -312,19 +313,30 @@ not gain a scheduler).
   goroutine ends; the run is a waiting row and a released lease
   (`TestSuspendedRunsHoldNoGoroutine`: 500 suspended runs, no goroutine
   growth; slice C2's benchmarks measure 10,000).
-- **Interrupted runs.** `Journal.InterruptedRuns` leases live runs that
-  were leased before, hold no live lease and have neither an open nor a
-  fired wait: their execution stopped without suspending or ending (the
-  holder died, lost its lease, or was stopped), including after it
-  consumed a wakeup. A run admitted and never leased is its admitter's.
+- **Interrupted runs.** `Journal.InterruptedRuns` leases live runs of the
+  resumer's workflows that hold no live lease and have neither an open nor
+  a fired wait, and either were leased before (the holder died, lost its
+  lease, or was stopped, including after it consumed a wakeup) or were
+  admitted over a lease ago and never leased (the admitter crashed before
+  `Start`). The resumer scans for them once per third of a lease.
+- **Workers before leases.** A sweep takes at most as many runs as there
+  are free workers, and `Start` waits for a free worker before leasing:
+  a lease is never held by a run waiting for a worker, so it cannot lapse
+  and be taken again in the same process.
+- **Settlement.** Conflicts no retry can fix (`journal.Permanent`: another
+  engine input, a changed wait plan, a canceled wait, an oversize result)
+  and workflow errors fail the run with a diagnostic; a transient fault
+  leaves it to be retried at the scan's pace, `MaxRetries` times in a row,
+  then fails it (`retries_exhausted`). A panicking input decoder fails the
+  run; a panicking `Settled` is reported, not fatal. Sweep and settlement
+  errors go to `OnError` and are returned by `Sweep`.
 - **Shutdown.** `Close(ctx)` stops sweeping, waits for running executions
-  until `ctx` ends, then cancels the rest; every execution releases its
-  lease as it ends, so another resumer takes its run at once (as an
-  interrupted run, or a woken one if its wakeup was not yet consumed).
-- **Typed inputs.** A typed input encodes its fields in declaration order,
-  not the admitted JSON's; `RunJournal.WithInput` lets `VerifyRun` accept
-  it when it is the same JSON value as the admitted input (C1 compared the
-  sorted-key encoding only, so a two-field typed input could not run).
+  until `ctx` ends, then cancels the rest and returns at once; every
+  execution releases its lease as it returns (one stuck in a node that
+  ignores cancellation, when that node returns), so another resumer takes
+  its run. `Start` after `Close` is `ErrClosed`.
+- **Typed inputs** run whatever their decode reshapes: the run's engine
+  input is fixed at admission or first execution (slice C1).
 
 ## Compatibility
 
@@ -418,9 +430,13 @@ round 2, `TestEveryValidInputRuns`, `TestEngineInputIsFixedOnce`,
   first open by this binary remaps that wait to `fired` and a holder may
   then list and execute the same run: a double-resume window that lasts
   until the old process stops. Upgrade by stopping old processes first.
-- `InterruptedRuns` scans live runs without an index on their state; a
-  run that keeps failing with a journal fault, or whose workflow is not
-  registered, is taken again every sweep (least recently leased first).
+- `InterruptedRuns` reads the live runs of the resumer's workflows once
+  per third of a lease, without an index on their state (a follow-up). A
+  woken run whose workflow is not registered here is re-leased by every
+  sweep and released (another build may know it).
+- Transient-retry counts are kept in memory; a restart starts them again.
+- An application that admits a resumer workflow's runs through another
+  executor must start them within a lease, or the resumer takes them.
 - The resumer settles what the engine reports; an application's admission
   path calls `Start` (no admission is wired to it in this slice).
 - Every step is at the `root` iteration until #333 passes iteration paths

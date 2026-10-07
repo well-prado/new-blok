@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
