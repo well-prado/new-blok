@@ -25,5 +25,17 @@ All are labelled, on Project 15 (Backlog unless noted). None is an E07 sub-issue
 | #382 | Cluster wait IDs need the iteration; stable identity encoding | #380 R1 | MUST land before T10 slice 2 (durable loops) |
 | #386 | Run-level step/concurrency budget; O(n²) join rows | #383 R1 | before untrusted input drives loops / before T10 slice 3 |
 
-## To file (found at handoff, not yet filed)
+## Filed 2026-10-07 late session
+| #389 | Audit retry after Prune skips the content check | #387 R1 | |
+| #390 | Audit Verify never reports a tombstone whose decision is missing | #387 R1 | |
+| #391 | Pin the full wait-ID derivation chain end to end | #380 R3 | |
+| #392 | Long caller-supplied attempt ids collapse iteration attempts in inspection | #383 R2 | |
+| #396 | Cluster suspend commit ignores the loop iteration | #395 work | MUST land before durable cluster loops (#333) |
+
+## To file (found at handoff 2, not yet filed)
+- #393 R1: ErrChildPrincipalMismatch vs ErrChildRunNotFound is an existence oracle once #333 Child surfaces it.
+- #384: Sweep marks the interrupted-run scan done even when no worker slot was free → up to 1/3 lease extra delay under saturation.
+- ADR 0027 on main still says "ADR 0031" in ~3 places (T10 is ADR 0028).
+
+## Previously "to file" (now filed as #389/#390)
 - From #387 Review R round 1 (follow-ups, not blockers): (a) a retry after a prune skips the content check — a tombstone keeps only id digest + kind, so a different-tenant retry that was ErrConflict before the prune succeeds after it; (b) the audit cross-check never reports a tombstone whose decision is missing (e.g. after a mixed point-in-time restore).
