@@ -290,7 +290,18 @@ func TestInterruptedRunIsTakenAgain(t *testing.T) {
 	if got := r.runRow(run); got != "accepted|a|acknowledged" {
 		t.Fatalf("while the dead holder's lease lasts: %s", got)
 	}
-	r.clock.Advance(31 * time.Second)
+	// Interrupted runs are looked for a third of a lease (10 s) apart, not
+	// every sweep: a scan at +25 s (lease live), then at +31 s the lapsed
+	// lease is not looked at yet, and at +36 s it is.
+	r.clock.Advance(25 * time.Second)
+	r.resumer.Sweep(r.ctx)
+	token := r.row(`SELECT lease_token FROM journal_runs WHERE run_id = ?`, run)
+	r.clock.Advance(6 * time.Second)
+	r.resumer.Sweep(r.ctx)
+	if got := r.row(`SELECT lease_token FROM journal_runs WHERE run_id = ?`, run); got != token {
+		t.Fatalf("6 s after the last scan the run was taken (token %s, was %s); want not looked at yet", got, token)
+	}
+	r.clock.Advance(5 * time.Second)
 	r.resumer.Sweep(r.ctx)
 	r.await(1)
 	if got := r.runRow(run); got != "completed|-|acknowledged" || fmt.Sprint(r.outcomesOf(run)) != "[suspended completed]" {
