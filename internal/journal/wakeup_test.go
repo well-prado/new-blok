@@ -2,6 +2,7 @@ package journal
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/well-prado/new-blok/contract/signal"
+	"github.com/well-prado/new-blok/store"
 	"github.com/well-prado/new-blok/store/sqlite"
 )
 
@@ -232,43 +234,195 @@ func TestLegacyResumedWaitsBecomeFiredOrAcknowledged(t *testing.T) {
 	}
 }
 
-// TestClaimLeavesARunAnotherHolderResumes: while holder a resumes a run
-// under a lease, a second wait of that run falls due; holder b's timer
-// claim fires it but does not take it, so b never resumes the run a is
-// resuming. Once a's lease lapses the run is listed with both wakeups.
-func TestClaimLeavesARunAnotherHolderResumes(t *testing.T) {
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "held.db")
-	database, a := newJournalAtPath(t, path, Config{Holder: "a", WakeupLease: 5 * time.Minute})
-	defer database.Close()
-	second, err := (sqlite.Backend{}).Open(ctx, path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer second.Close()
-	b, err := New(ctx, second, Config{Holder: "b"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	admitted, err := a.Admit(ctx, AdmissionRequest{RequestKey: "held", Workflow: "orders", ArtifactDigest: "sha256:artifact", Input: []byte(`{}`)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i, due := range []time.Time{fixtureBase, fixtureBase.Add(time.Minute)} {
-		if _, err := a.ScheduleWait(ctx, WaitRequest{RunID: admitted.RunID, WaitID: fmt.Sprintf("branch-%d", i), Name: "timer", InvocationPath: "branch", IterationPath: fmt.Sprint(i), DueAt: due}); err != nil {
+// twoHolders opens two journals with their own handles on one file.
+func twoHolders(t *testing.T, a, b Config) (*Journal, *Journal) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "holders.db")
+	journals := make([]*Journal, 2)
+	for i, config := range []Config{a, b} {
+		database, err := (sqlite.Backend{}).Open(context.Background(), path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { database.Close() })
+		if journals[i], err = New(context.Background(), database, config); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if claimed, err := a.ClaimDueWaits(ctx, fixtureBase, 10); err != nil || !reflect.DeepEqual(waitIDs(claimed), []string{"branch-0@a"}) {
-		t.Fatalf("a claimed=%v err=%v", waitIDs(claimed), err)
+	return journals[0], journals[1]
+}
+
+func admitWaiting(t *testing.T, j *Journal, key string, waits map[string]time.Time) string {
+	t.Helper()
+	admitted, err := j.Admit(context.Background(), AdmissionRequest{RequestKey: key, Workflow: "orders", ArtifactDigest: "sha256:artifact", Input: []byte(`{}`)})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if claimed, err := b.ClaimDueWaits(ctx, fixtureBase.Add(time.Minute), 10); err != nil || len(claimed) != 0 {
-		t.Fatalf("b claimed %v from a run a holds; err=%v", waitIDs(claimed), err)
+	for id, due := range waits {
+		if _, err := j.ScheduleWait(context.Background(), WaitRequest{RunID: admitted.RunID, WaitID: id, Name: id, InvocationPath: id, IterationPath: "root", DueAt: due}); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if w, err := b.Wait(ctx, "branch-1"); err != nil || w.State != waitFired || w.LeaseOwner != "" {
-		t.Fatalf("branch-1=%+v err=%v; want fired, unleased", w, err)
+	return admitted.RunID
+}
+
+// TestRunLeaseOutlivesAcknowledgement is Review R's two probes on #366: a
+// holder that acknowledges a wakeup is still executing the run, so a timer
+// claim or a resumption listing by another holder must not hand the run
+// out again, whatever wakes it meanwhile. The lease is on the run: renewal
+// extends it, only its holder renews or releases it, release hands the run
+// on at once, and a lease left to lapse hands it on then.
+func TestRunLeaseOutlivesAcknowledgement(t *testing.T) {
+	ctx := context.Background()
+	a, b := twoHolders(t, Config{Holder: "a", WakeupLease: 5 * time.Minute}, Config{Holder: "b", WakeupLease: 5 * time.Minute})
+	run := admitWaiting(t, a, "running", map[string]time.Time{"w1": fixtureBase, "w2": fixtureBase.Add(time.Minute), "w3": fixtureBase.Add(time.Hour)})
+	at := func(d time.Duration) time.Time { return fixtureBase.Add(d) }
+	expect := func(label string, listed []WaitRecord, err error, want ...string) {
+		t.Helper()
+		if err != nil || !reflect.DeepEqual(waitIDs(listed), append([]string{}, want...)) {
+			t.Fatalf("%s: %v err=%v; want %v", label, waitIDs(listed), err, want)
+		}
 	}
-	if listed, err := b.PendingResumptions(ctx, fixtureBase.Add(5*time.Minute+time.Second), 10); err != nil || !reflect.DeepEqual(waitIDs(listed), []string{"branch-0@b", "branch-1@b"}) {
-		t.Fatalf("after a's lease lapsed: listed=%v err=%v", waitIDs(listed), err)
+	claimed, err := a.ClaimDueWaits(ctx, at(0), 10)
+	expect("a claims w1", claimed, err, "w1@a")
+	if err := a.AcknowledgeWait(ctx, "w1"); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err = b.ClaimDueWaits(ctx, at(time.Minute), 10)
+	expect("b's claim while a still runs it", claimed, err)
+	if result, err := b.Signal(ctx, signal.Envelope{RunID: run, SignalID: "s3", Name: "w3", Principal: "operator", Payload: []byte(`{}`)}, true); err != nil || result != delivered {
+		t.Fatalf("signal=%+v err=%v", result, err)
+	}
+	listed, err := b.PendingResumptions(ctx, at(time.Minute+time.Second), 10)
+	expect("b's listing while a still runs it", listed, err)
+	if err := a.RenewRunLease(ctx, run, at(4*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	listed, err = b.PendingResumptions(ctx, at(6*time.Minute), 10)
+	expect("b's listing after a renewed past its first lease", listed, err)
+	for _, change := range []func() error{
+		func() error { return b.RenewRunLease(ctx, run, at(6*time.Minute)) },
+		func() error { return b.ReleaseRunLease(ctx, run) },
+	} {
+		if err := change(); !errors.Is(err, ErrLeaseLost) {
+			t.Fatalf("b changing a's lease: err=%v; want ErrLeaseLost", err)
+		}
+	}
+	if err := a.ReleaseRunLease(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	listed, err = b.PendingResumptions(ctx, at(6*time.Minute), 10)
+	expect("b's listing once a released", listed, err, "w2@b", "w3@b")
+	listed, err = a.PendingResumptions(ctx, at(11*time.Minute+time.Second), 10)
+	expect("a's listing once b's lease lapsed", listed, err, "w2@a", "w3@a")
+}
+
+// TestAnyLiveLeaseHoldsTheRun: a holder's own live lease holds a run too.
+// Two journals sharing one holder name (a misconfiguration: Config.Holder
+// must be unique per process) never both get a run, and inside one journal
+// a resumption listing and a timer claim never both get it. On 2b92980 a
+// claim ignored a lease under its own holder name.
+func TestAnyLiveLeaseHoldsTheRun(t *testing.T) {
+	ctx := context.Background()
+	first, second := twoHolders(t, Config{Holder: "same"}, Config{Holder: "same"})
+	run := admitWaiting(t, first, "run", map[string]time.Time{"s": fixtureBase.Add(time.Hour), "t": fixtureBase})
+	if _, err := first.Signal(ctx, signal.Envelope{RunID: run, SignalID: "s1", Name: "s", Principal: "operator", Payload: []byte(`{}`)}, true); err != nil {
+		t.Fatal(err)
+	}
+	if listed, err := first.PendingResumptions(ctx, fixtureBase, 10); err != nil || !reflect.DeepEqual(waitIDs(listed), []string{"s@same"}) {
+		t.Fatalf("first listing=%v err=%v", waitIDs(listed), err)
+	}
+	for label, j := range map[string]*Journal{"another journal under the same holder": second, "the journal that listed it": first} {
+		if claimed, err := j.ClaimDueWaits(ctx, fixtureBase, 10); err != nil || len(claimed) != 0 {
+			t.Fatalf("%s claimed %v; err=%v", label, waitIDs(claimed), err)
+		}
+		if listed, err := j.PendingResumptions(ctx, fixtureBase, 10); err != nil || len(listed) != 0 {
+			t.Fatalf("%s listed %v; err=%v", label, waitIDs(listed), err)
+		}
+	}
+}
+
+// TestClaimSkipsEndedRuns: a due wait of a run that has ended (here
+// uncertain, which does not require the run to be quiescent) is not
+// fired, claimed or leased.
+func TestClaimSkipsEndedRuns(t *testing.T) {
+	ctx := context.Background()
+	database, j := newJournal(t, "ended.db", Config{Holder: "a"})
+	defer database.Close()
+	run := admitWaiting(t, j, "uncertain", map[string]time.Time{"w1": fixtureBase})
+	if err := j.MarkRunUncertain(ctx, run, "timeout", "uncertain"); err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := j.ClaimDueWaits(ctx, fixtureBase.Add(time.Minute), 10); err != nil || len(claimed) != 0 {
+		t.Fatalf("claimed %v from an ended run; err=%v", waitIDs(claimed), err)
+	}
+	if got := oneRow(t, database, `SELECT w.state || '|' || COALESCE(r.lease_owner, '') FROM journal_waits w JOIN journal_runs r ON r.run_id = w.run_id`); got != "waiting|" {
+		t.Fatalf("wait|lease=%s; want waiting and unleased", got)
+	}
+}
+
+// TestPendingResumptionsIsFair: with room for one run per listing and two
+// runs never acknowledged, listings a lease period apart alternate between
+// them (least recently leased first), instead of the run that fired first
+// every time.
+func TestPendingResumptionsIsFair(t *testing.T) {
+	ctx := context.Background()
+	database, j := newJournal(t, "fair.db", Config{Holder: "a", Clock: ticking(fixtureBase)})
+	defer database.Close()
+	for _, key := range []string{"poison", "other"} {
+		run := admitWaiting(t, j, key, map[string]time.Time{key: fixtureBase.Add(time.Hour)})
+		if _, err := j.Signal(ctx, signal.Envelope{RunID: run, SignalID: key, Name: key, Principal: "operator", Payload: []byte(`{}`)}, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var order []string
+	for period := range 5 {
+		listed, err := j.PendingResumptions(ctx, fixtureBase.Add(time.Duration(period)*31*time.Second), 1)
+		if err != nil || len(listed) != 1 {
+			t.Fatalf("period %d: %v err=%v", period, waitIDs(listed), err)
+		}
+		order = append(order, listed[0].WaitID)
+	}
+	if want := []string{"poison", "other", "poison", "other", "poison"}; !reflect.DeepEqual(order, want) {
+		t.Fatalf("listed %v; want %v", order, want)
+	}
+}
+
+// TestReopenDoesNotWaitForAWriter: reopening a migrated journal only reads,
+// so another handle holding the write lock does not delay it.
+func TestReopenDoesNotWaitForAWriter(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "busy.db")
+	database, j := newJournalAtPath(t, path, Config{})
+	defer database.Close()
+	admitWaiting(t, j, "run", map[string]time.Time{"w": fixtureBase})
+	held, release := make(chan struct{}), make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- database.WithTx(store.Writer(ctx), func(tx *sql.Tx) error {
+			if _, err := tx.ExecContext(ctx, `UPDATE journal_runs SET run_id = run_id WHERE 0`); err != nil {
+				return err
+			}
+			close(held)
+			<-release
+			return nil
+		})
+	}()
+	<-held
+	go func() { time.Sleep(1500 * time.Millisecond); close(release) }()
+	start := time.Now()
+	other, err := (sqlite.Backend{}).Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	if _, err := New(ctx, other, Config{}); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > 750*time.Millisecond {
+		t.Fatalf("reopen took %v while another handle held the writer", elapsed)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }

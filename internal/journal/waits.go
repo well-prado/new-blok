@@ -11,9 +11,10 @@ import (
 )
 
 // A wait is waiting until a timer claim or a signal fires it. A fired wait
-// is a wakeup the run has not yet consumed: it stays listed by
-// PendingResumptions, under a lease, until AcknowledgeWait records that
-// the engine committed the step the wait resumed (#332, defect D1).
+// is a wakeup the run has not yet consumed: it stays fired until
+// AcknowledgeWait records that the engine committed the step the wait
+// resumed, and PendingResumptions lists it whenever no holder has its run
+// under a live run lease (#332, defect D1).
 const (
 	waitWaiting      = "waiting"
 	waitFired        = "fired"
@@ -49,8 +50,8 @@ type WaitRequest struct {
 }
 
 // WaitRecord is a stored wait. A wait written before #332 has empty paths.
-// LeaseOwner and LeaseUntil name the holder resuming a fired wait and when
-// its lease lapses; both are empty when no holder has it.
+// LeaseOwner and LeaseUntil are the lease on the wait's run: the holder
+// executing it and when that lapses; both are empty when none has it.
 type WaitRecord struct {
 	WaitID         string
 	RunID          string
@@ -65,8 +66,15 @@ type WaitRecord struct {
 	LeaseUntil     time.Time
 }
 
-// waitColumns is what scanWait reads.
-const waitColumns = `wait_id, run_id, name, COALESCE(invocation_path, ''), COALESCE(iteration_path, ''), due_at, state, signal_id, payload_json, COALESCE(lease_owner, ''), COALESCE(lease_until, 0)`
+// waitColumns is what scanWait reads, from journal_waits w joined to its
+// run r (waitsWithRun).
+const (
+	waitColumns  = `w.wait_id, w.run_id, w.name, COALESCE(w.invocation_path, ''), COALESCE(w.iteration_path, ''), w.due_at, w.state, w.signal_id, w.payload_json, COALESCE(r.lease_owner, ''), COALESCE(r.lease_until, 0)`
+	waitsWithRun = ` FROM journal_waits w JOIN journal_runs r ON r.run_id = w.run_id`
+)
+
+// ErrLeaseLost: another holder has the run, or this holder no longer does.
+var ErrLeaseLost = errors.New("journal: the run lease is held by another holder")
 
 type SignalResult struct {
 	Accepted  bool
@@ -220,100 +228,80 @@ func (j *Journal) SignalWait(ctx context.Context, envelope signal.Envelope, targ
 	return result, err
 }
 
-// ClaimDueWaits fires up to limit waits due at now and returns the ones it
-// leased to this journal's holder, until now plus the wakeup lease: the
-// caller resumes their runs. A claim whose holder dies before AcknowledgeWait is listed
-// again by PendingResumptions once its lease lapses.
+// ClaimDueWaits fires up to limit waits of live runs due at now, and takes
+// the run lease (until now plus the wakeup lease) of each of their runs no
+// holder has under a live lease, this one included. It returns the waits
+// of the runs it leased: the caller executes those runs. A fired wait of a
+// run already held stays fired for its holder, or for PendingResumptions
+// once that lease lapses or is released.
 func (j *Journal) ClaimDueWaits(ctx context.Context, now time.Time, limit int) ([]WaitRecord, error) {
 	if limit <= 0 {
 		return nil, errors.New("journal: wait claim limit must be positive")
 	}
-	until := now.Add(j.lease).UTC()
 	var records []WaitRecord
 	err := j.withTx(ctx, "wait-claim", func(tx *sql.Tx) error {
-		rows, err := tx.QueryContext(ctx, `SELECT `+waitColumns+` FROM journal_waits WHERE state = ? AND due_at <= ? ORDER BY due_at, wait_id LIMIT ?`, waitWaiting, now.UTC().UnixNano(), limit)
+		due, err := queryStrings(ctx, tx, `SELECT w.wait_id`+waitsWithRun+` WHERE w.state = ? AND w.due_at <= ? AND r.state = ? ORDER BY w.due_at, w.wait_id LIMIT ?`, waitWaiting, now.UTC().UnixNano(), runAccepted, limit)
 		if err != nil {
 			return err
 		}
-		defer rows.Close()
-		for rows.Next() {
-			record, err := scanWait(rows)
-			if err != nil {
-				return err
-			}
-			// Another holder resuming the run keeps it: the wait fires
-			// unleased and is that holder's to consume, or listed by
-			// PendingResumptions once its lease lapses.
-			var held bool
-			if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM journal_waits WHERE run_id = ? AND state = ? AND lease_owner <> ? AND lease_until > ?)`, record.RunID, waitFired, j.holder, now.UTC().UnixNano()).Scan(&held); err != nil {
-				return err
-			}
-			owner, leaseUntil := any(j.holder), any(until.UnixNano())
-			if held {
-				owner, leaseUntil = nil, nil
-			}
-			if _, err := tx.ExecContext(ctx, `UPDATE journal_waits SET state = ?, fired_at = ?, lease_owner = ?, lease_until = ?, updated_at = ? WHERE wait_id = ? AND state = ?`, waitFired, j.now(), owner, leaseUntil, j.now(), record.WaitID, waitWaiting); err != nil {
-				return err
-			}
-			if !held {
-				record.State, record.LeaseOwner, record.LeaseUntil = waitFired, j.holder, until
-				records = append(records, record)
-			}
-		}
-		return rows.Err()
-	})
-	return records, err
-}
-
-// PendingResumptions lists the fired, unacknowledged waits of up to limit
-// live runs that no holder is resuming: none of the run's fired waits holds
-// a lease that lasts past now. In the same write-first transaction it
-// leases every fired wait of those runs to this journal's holder until now
-// plus the wakeup lease, so concurrent callers never resume one run twice
-// while a lease lasts. Run it on start, and periodically, to resume the
-// runs whose wakeup a crash interrupted.
-func (j *Journal) PendingResumptions(ctx context.Context, now time.Time, limit int) ([]WaitRecord, error) {
-	if limit <= 0 {
-		return nil, errors.New("journal: resumption limit must be positive")
-	}
-	at, until := now.UTC().UnixNano(), now.Add(j.lease).UTC()
-	var records []WaitRecord
-	err := j.withTx(ctx, "wait-lease", func(tx *sql.Tx) error {
-		rows, err := tx.QueryContext(ctx, `SELECT w.run_id FROM journal_waits w JOIN journal_runs r ON r.run_id = w.run_id
-			WHERE w.state = ? AND r.state = ? AND NOT EXISTS (SELECT 1 FROM journal_waits l WHERE l.run_id = w.run_id AND l.state = ? AND l.lease_until > ?)
-			GROUP BY w.run_id ORDER BY MIN(w.fired_at), w.run_id LIMIT ?`, waitFired, runAccepted, waitFired, at, limit)
-		if err != nil {
-			return err
-		}
-		var runs []string
-		for rows.Next() {
+		leased := map[string]bool{}
+		for _, waitID := range due {
 			var run string
-			if err := rows.Scan(&run); err != nil {
-				rows.Close()
+			if err := tx.QueryRowContext(ctx, `UPDATE journal_waits SET state = ?, fired_at = ?, updated_at = ? WHERE wait_id = ? AND state = ? RETURNING run_id`, waitFired, j.now(), j.now(), waitID, waitWaiting).Scan(&run); err != nil {
 				return err
 			}
-			runs = append(runs, run)
-		}
-		if err := rows.Close(); err != nil {
-			return err
-		}
-		for _, run := range runs {
-			if _, err := tx.ExecContext(ctx, `UPDATE journal_waits SET lease_owner = ?, lease_until = ?, updated_at = ? WHERE run_id = ? AND state = ?`, j.holder, until.UnixNano(), j.now(), run, waitFired); err != nil {
-				return err
+			if _, seen := leased[run]; !seen {
+				if leased[run], err = j.takeRunLease(ctx, tx, run, now); err != nil {
+					return err
+				}
 			}
-			leased, err := tx.QueryContext(ctx, `SELECT `+waitColumns+` FROM journal_waits WHERE run_id = ? AND state = ? ORDER BY fired_at, rowid`, run, waitFired)
-			if err != nil {
-				return err
-			}
-			for leased.Next() {
-				record, err := scanWait(leased)
+			if leased[run] {
+				record, err := scanWait(tx.QueryRowContext(ctx, `SELECT `+waitColumns+waitsWithRun+` WHERE w.wait_id = ?`, waitID))
 				if err != nil {
-					leased.Close()
 					return err
 				}
 				records = append(records, record)
 			}
-			if err := leased.Close(); err != nil {
+		}
+		return nil
+	})
+	return records, err
+}
+
+// PendingResumptions takes the run lease of up to limit live runs that have
+// a fired wait and no live run lease, and returns those runs' fired waits:
+// the caller executes them. Runs leased least recently come first, so a
+// run whose resumption never finishes cannot starve the others. Run it on
+// start, and periodically, to resume the runs whose wakeup a crash or a
+// lapsed lease interrupted.
+func (j *Journal) PendingResumptions(ctx context.Context, now time.Time, limit int) ([]WaitRecord, error) {
+	if limit <= 0 {
+		return nil, errors.New("journal: resumption limit must be positive")
+	}
+	var records []WaitRecord
+	err := j.withTx(ctx, "wait-lease", func(tx *sql.Tx) error {
+		runs, err := queryStrings(ctx, tx, `SELECT w.run_id`+waitsWithRun+` WHERE w.state = ? AND r.state = ? AND (r.lease_until IS NULL OR r.lease_until <= ?)
+			GROUP BY w.run_id ORDER BY COALESCE(MAX(r.leased_at), 0), MIN(w.fired_at), w.run_id LIMIT ?`, waitFired, runAccepted, now.UTC().UnixNano(), limit)
+		if err != nil {
+			return err
+		}
+		for _, run := range runs {
+			if _, err := j.takeRunLease(ctx, tx, run, now); err != nil {
+				return err
+			}
+			rows, err := tx.QueryContext(ctx, `SELECT `+waitColumns+waitsWithRun+` WHERE w.run_id = ? AND w.state = ? ORDER BY w.fired_at, w.rowid`, run, waitFired)
+			if err != nil {
+				return err
+			}
+			for rows.Next() {
+				record, err := scanWait(rows)
+				if err != nil {
+					rows.Close()
+					return err
+				}
+				records = append(records, record)
+			}
+			if err := rows.Close(); err != nil {
 				return err
 			}
 		}
@@ -322,10 +310,77 @@ func (j *Journal) PendingResumptions(ctx context.Context, now time.Time, limit i
 	return records, err
 }
 
+// takeRunLease leases a live run to this holder until now plus the wakeup
+// lease, when no holder (this one included) has it under a live lease. A
+// holder that wants to keep a run it holds renews it instead.
+func (j *Journal) takeRunLease(ctx context.Context, tx *sql.Tx, runID string, now time.Time) (bool, error) {
+	result, err := tx.ExecContext(ctx, `UPDATE journal_runs SET lease_owner = ?, lease_until = ?, leased_at = ? WHERE run_id = ? AND state = ? AND (lease_until IS NULL OR lease_until <= ?)`, j.holder, now.Add(j.lease).UTC().UnixNano(), now.UTC().UnixNano(), runID, runAccepted, now.UTC().UnixNano())
+	if err != nil {
+		return false, err
+	}
+	changed, err := result.RowsAffected()
+	return changed == 1, err
+}
+
+// RenewRunLease extends this holder's lease on a run it is executing to now
+// plus the wakeup lease. A run another holder has taken over, or one with
+// no lease, is ErrLeaseLost.
+func (j *Journal) RenewRunLease(ctx context.Context, runID string, now time.Time) error {
+	return j.changeRunLease(ctx, "run-lease-renew", runID, `lease_until = ?`, now.Add(j.lease).UTC().UnixNano())
+}
+
+// ReleaseRunLease gives up this holder's lease on a run, so the next holder
+// may take it at once. A run with no lease is a no-op; one another holder
+// has is ErrLeaseLost.
+func (j *Journal) ReleaseRunLease(ctx context.Context, runID string) error {
+	return j.changeRunLease(ctx, "run-lease-release", runID, `lease_owner = NULL, lease_until = NULL`)
+}
+
+func (j *Journal) changeRunLease(ctx context.Context, name, runID, set string, args ...any) error {
+	return j.withTx(ctx, name, func(tx *sql.Tx) error {
+		var owner sql.NullString
+		if err := tx.QueryRowContext(ctx, `SELECT lease_owner FROM journal_runs WHERE run_id = ?`, runID).Scan(&owner); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if !owner.Valid && name == "run-lease-release" {
+			return nil
+		}
+		if owner.String != j.holder {
+			return ErrLeaseLost
+		}
+		_, err := tx.ExecContext(ctx, `UPDATE journal_runs SET `+set+` WHERE run_id = ? AND lease_owner = ?`, append(args, runID, j.holder)...)
+		return err
+	})
+}
+
+func queryStrings(ctx context.Context, tx *sql.Tx, query string, args ...any) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var values []string
+	for rows.Next() {
+		var value string
+		if err := rows.Scan(&value); err != nil {
+			return nil, err
+		}
+		values = append(values, value)
+	}
+	return values, rows.Err()
+}
+
 // AcknowledgeWait records that the engine committed the step a fired wait
 // resumed: the wakeup is consumed and the wait leaves PendingResumptions.
 // Acknowledging it again is a no-op; a wait that has not fired is
-// ErrWaitNotFired.
+// ErrWaitNotFired. It does not touch the run lease: the holder is still
+// executing the run, and renews or releases the lease itself. It does not
+// check the lease holder either: a holder whose lease was taken over can
+// still acknowledge (slice C acknowledges inside the resumed step's own
+// transaction, checked against the run lease).
 func (j *Journal) AcknowledgeWait(ctx context.Context, waitID string) error {
 	if waitID == "" {
 		return errors.New("journal: wait ID is required")
@@ -342,7 +397,7 @@ func (j *Journal) AcknowledgeWait(ctx context.Context, waitID string) error {
 		case waitAcknowledged:
 			return nil
 		case waitFired:
-			_, err := tx.ExecContext(ctx, `UPDATE journal_waits SET state = ?, lease_owner = NULL, lease_until = NULL, updated_at = ? WHERE wait_id = ? AND state = ?`, waitAcknowledged, j.now(), waitID, waitFired)
+			_, err := tx.ExecContext(ctx, `UPDATE journal_waits SET state = ?, updated_at = ? WHERE wait_id = ? AND state = ?`, waitAcknowledged, j.now(), waitID, waitFired)
 			return err
 		default:
 			return ErrWaitNotFired
@@ -374,7 +429,7 @@ func (j *Journal) Wait(ctx context.Context, waitID string) (WaitRecord, error) {
 	var record WaitRecord
 	err := j.withRead(ctx, func(tx *sql.Tx) error {
 		var err error
-		record, err = scanWait(tx.QueryRowContext(ctx, `SELECT `+waitColumns+` FROM journal_waits WHERE wait_id = ?`, waitID))
+		record, err = scanWait(tx.QueryRowContext(ctx, `SELECT `+waitColumns+waitsWithRun+` WHERE w.wait_id = ?`, waitID))
 		return err
 	})
 	if errors.Is(err, sql.ErrNoRows) {
