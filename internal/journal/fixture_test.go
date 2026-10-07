@@ -46,17 +46,20 @@ type journalFixtureCrash struct {
 
 const journalFixtureSchema = "journal/v2"
 
-// journalFixtureRunners runs each case the file must declare. A runner
-// returns the case's observation; its type is the type the case's expect
+// journalFixtureRunners runs each case the file must declare: run returns
+// the case's observation, a value of kind, the type the case's expect
 // object decodes into.
-var journalFixtureRunners = map[string]func(*testing.T) any{
-	"concurrent duplicate admission": runDuplicateAdmissionFixture,
-	"committed result replay":        runCommittedReplayFixture,
-	"uncertain external outcome":     runUncertainOutcomeFixture,
-	"new replay lineage":             runReplayLineageFixture,
-	"stale attempt result":           runStaleAttemptFixture,
-	"integrity failure":              runIntegrityFailureFixture,
-	"write failure":                  runWriteFailureFixture,
+var journalFixtureRunners = map[string]struct {
+	kind reflect.Type
+	run  func(*testing.T) any
+}{
+	"concurrent duplicate admission": {reflect.TypeFor[duplicateAdmissionObservation](), runDuplicateAdmissionFixture},
+	"committed result replay":        {reflect.TypeFor[committedReplayObservation](), runCommittedReplayFixture},
+	"uncertain external outcome":     {reflect.TypeFor[uncertainOutcomeObservation](), runUncertainOutcomeFixture},
+	"new replay lineage":             {reflect.TypeFor[replayLineageObservation](), runReplayLineageFixture},
+	"stale attempt result":           {reflect.TypeFor[staleAttemptObservation](), runStaleAttemptFixture},
+	"integrity failure":              {reflect.TypeFor[integrityFailureObservation](), runIntegrityFailureFixture},
+	"write failure":                  {reflect.TypeFor[writeFailureObservation](), runWriteFailureFixture},
 }
 
 // The cases and crash barriers the file must declare, in order: a case
@@ -122,30 +125,15 @@ func decodeJournalFixtures(raw []byte) (journalFixtures, error) {
 // decodeJournalExpectation decodes a case's expect object into a fresh
 // value of the type its runner observes.
 func decodeJournalExpectation(fixture journalFixtureCase) (any, error) {
-	run, ok := journalFixtureRunners[fixture.Name]
+	runner, ok := journalFixtureRunners[fixture.Name]
 	if !ok {
 		return nil, errors.New("no runner")
 	}
-	kind, ok := journalFixtureTypes[fixture.Name]
-	if !ok || run == nil {
-		return nil, errors.New("no observation type")
-	}
-	expected := reflect.New(kind)
+	expected := reflect.New(runner.kind)
 	if err := strictJSON(fixture.Expect, expected.Interface()); err != nil {
 		return nil, err
 	}
 	return expected.Elem().Interface(), nil
-}
-
-// journalFixtureTypes is the observation type of each runner.
-var journalFixtureTypes = map[string]reflect.Type{
-	"concurrent duplicate admission": reflect.TypeFor[duplicateAdmissionObservation](),
-	"committed result replay":        reflect.TypeFor[committedReplayObservation](),
-	"uncertain external outcome":     reflect.TypeFor[uncertainOutcomeObservation](),
-	"new replay lineage":             reflect.TypeFor[replayLineageObservation](),
-	"stale attempt result":           reflect.TypeFor[staleAttemptObservation](),
-	"integrity failure":              reflect.TypeFor[integrityFailureObservation](),
-	"write failure":                  reflect.TypeFor[writeFailureObservation](),
 }
 
 // strictJSON decodes raw into value, refusing unknown fields and content
@@ -178,16 +166,14 @@ func strictJSON(raw []byte, value any) error {
 	return nil
 }
 
-// TestJournalFixtureGuards proves the loader's guards can fail: every
-// declared case has a runner and an observation type and vice versa, and
-// each mutation of today's fixture is refused.
+// TestJournalFixtureGuards proves the loader's guards can fail: the
+// declared cases are exactly the runners, the declared barriers exactly the
+// barrier transitions, and each mutation of today's fixture is refused.
 func TestJournalFixtureGuards(t *testing.T) {
 	declared := slices.Clone(journalFixtureCases)
 	sort.Strings(declared)
-	for name, set := range map[string][]string{"runners": keysOf(journalFixtureRunners), "observation types": keysOf(journalFixtureTypes)} {
-		if !slices.Equal(set, declared) {
-			t.Fatalf("%s %q, want exactly the declared cases %q", name, set, declared)
-		}
+	if runners := keysOf(journalFixtureRunners); !slices.Equal(runners, declared) {
+		t.Fatalf("runners %q, want exactly the declared cases %q", runners, declared)
 	}
 	barriers := keysOf(journalFixtureBarriers)
 	order := slices.Clone(journalFixtureBarrierOrder)
@@ -242,10 +228,12 @@ func TestJournalFixtureCases(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			observed := journalFixtureRunners[fixture.Name](t)
+			observed := journalFixtureRunners[fixture.Name].run(t)
 			if !reflect.DeepEqual(observed, expected) {
 				got, _ := json.Marshal(observed)
-				t.Fatalf("observed %s, fixture expects %s", got, fixture.Expect)
+				var want bytes.Buffer
+				_ = json.Compact(&want, fixture.Expect)
+				t.Fatalf("observed %s, fixture expects %s", got, want.Bytes())
 			}
 		})
 	}
