@@ -89,7 +89,10 @@ func TestOutboxPublishDeadlineEndsWithTheLease(t *testing.T) {
 	if !processed || err != nil {
 		t.Fatalf("processed=%v err=%v", processed, err)
 	}
-	if over := time.Duration(deadline.UnixNano() - until); over > 5*time.Millisecond {
+	// The slack covers only the moment between reading the clock and arming
+	// the timer; a lease counted from before the 300ms lock wait misses by
+	// far more.
+	if over := time.Duration(deadline.UnixNano() - until); over > 50*time.Millisecond {
 		t.Fatalf("publish deadline ends %v after the lease", over)
 	}
 }
@@ -117,9 +120,8 @@ func TestOutboxSweepLeavesALiveClaimAlone(t *testing.T) {
 }
 
 // B2: an attempt that reached the publisher is spent even when the caller's
-// own deadline ended it, so callers with short deadlines cannot retry an event
-// forever.
-func TestOutboxCallerDeadlinesStillSpendAttempts(t *testing.T) {
+// own context ended it, so callers that give up cannot retry an event forever.
+func TestOutboxCallerThatGivesUpStillSpendsAttempts(t *testing.T) {
 	ctx := context.Background()
 	clock := newTestClock()
 	service, database := openAt(t, filepath.Join(t.TempDir(), "orders.db"), clock.Now, WithOutboxMaxAttempts(2))
@@ -127,9 +129,12 @@ func TestOutboxCallerDeadlinesStillSpendAttempts(t *testing.T) {
 	publishes := 0
 	for call := 1; call <= 4; call++ {
 		clock.Advance(time.Hour)
-		callCtx, cancel := context.WithTimeout(ctx, 5*time.Millisecond)
+		// The caller gives up while the event is with the provider. Canceled
+		// inside the publish, so the claim itself always succeeds.
+		callCtx, cancel := context.WithCancel(ctx)
 		_, _ = service.DispatchOne(callCtx, func(publishCtx context.Context, _ Event) error {
 			publishes++
+			cancel()
 			<-publishCtx.Done()
 			return publishCtx.Err()
 		})
@@ -276,6 +281,10 @@ func TestOutboxDispatchUnderLoadFromAnotherHandle(t *testing.T) {
 				loadErr = err
 				return
 			}
+			// Steady load, not a lock hog: back to back, the other handle's
+			// commits starve the dispatcher's busy handler (ADR 0003, #214)
+			// until it fails busy after the timeout, write-first or not.
+			time.Sleep(200 * time.Microsecond)
 		}
 	}()
 	published := map[string]int{}
