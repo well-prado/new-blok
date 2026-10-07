@@ -52,7 +52,14 @@ The owning operation chooses a deterministic ID (`approval:<decision>`,
 `reconcile:<operation>`, a fresh id per deployment decision) and a
 deterministic time (the decision's own), so a retried decision produces the
 identical record: appending it again is a no-op and reports that nothing was
-inserted, and different content under the same ID is `ErrConflict`.
+inserted, and different content under the same ID is `ErrConflict`. An ID
+`Prune` retired (§4) is never written again: appending a record of the same
+kind under it is the same no-op, whether or not the record passes today's
+validation, and one of another kind is `ErrConflict` (#294). A decision made
+for the first time must write its record, so an owner that finds nothing
+inserted there (its record id already exists or has a tombstone, which only
+a partial restore or a hand edit leaves) refuses the decision with
+`ErrConflict` and applies nothing.
 
 | Decision | Record | Actor | Digests / refs |
 | --- | --- | --- | --- |
@@ -89,8 +96,12 @@ A refused decision can be retried once the store recovers; the retry writes
 the decision and its record exactly once. A re-delivered approval or
 reconciliation whose record is missing (it predates audit) writes that
 record. A re-delivered reconciliation whose record exists is a duplicate
-and never rewrites it. A backfilled record, whether a re-delivery or
-compaction (§7) writes it, takes the decision's own tenant, or the system
+and never rewrites it. A record `Prune` removed (§4) is not missing in this
+sense: its tombstone says it existed and retention ended it, so a
+re-delivered reconciliation, a retried approval or a compaction backfill
+answers as before and writes nothing (#294), even when the record was
+accepted under an older sensitivity rule that today's `Validate` refuses.
+A backfilled record, whether a re-delivery or compaction (§7) writes it, takes the decision's own tenant, or the system
 tenant `""` when that is unknown, never the tenant of whoever re-delivers
 or compacts (§8).
 
@@ -120,8 +131,9 @@ users denied each other.
 `audit.Journal.Prune(ctx, cutoff, activity)` deletes records committed
 strictly before `cutoff`, in bounded batches (256 per transaction), leaves
 a tombstone (`audit_pruned_v1`) holding the **sha256 of the record id** and
-its kind (ids are application-chosen and may carry personal data), and
-never:
+its kind (ids are application-chosen and may carry personal data), which
+also retires the id: `Append` never writes it again (§1, #294). It never
+deletes:
 
 - a record younger than `Config.MinRetention`, the application's legal
   minimum, whatever cutoff it is given;
@@ -150,7 +162,14 @@ carry audit and durable state together, from the same point in time.
 After a restore, `audit.Journal.Verify(ctx, owners...)` proves two things:
 
 1. **Integrity** (`ErrCorrupt`): every record matches its digest, columns
-   and canonical encoding, and the record count matches the counter.
+   and canonical encoding, the record count matches the counter, and no
+   record has a prune tombstone of its own id digest. `Append` never
+   writes a pruned id again, so a record next to its tombstone was written
+   around retention: by a binary before #294, which re-created a pruned
+   record on re-delivery, or by hand. The error names that record's id,
+   and a tombstone of any kind counts, as `Append` refuses another kind
+   under a pruned id too. The ids are checked in batches of 256, one
+   indexed lookup per batch (Limits gives the cost).
 2. **Agreement** (`ErrMismatch`), for each `audit.Owner` passed (the
    approval store and the journal implement it): every durable decision
    has its record or a prune tombstone of the same id digest and kind, and
@@ -394,7 +413,7 @@ and only that tenant, may repeat the decision.
 
 | Re-delivery under | Retained run | Compacted run | Writes |
 | --- | --- | --- | --- |
-| The deciding tenant | `Duplicate`, the original actor, evidence and result (never the re-delivery's own) | `Duplicate` + `Erased`, key and state only | a missing record, under the deciding tenant |
+| The deciding tenant | `Duplicate`, the original actor, evidence and result (never the re-delivery's own) | `Duplicate` + `Erased`, key and state only | a missing record, under the deciding tenant; never one `Prune` removed (#294) |
 | Any other tenant, the system tenant `""` included | `ErrNotReconciliable`, an empty `Reconciliation` | not found, an empty `Reconciliation` | nothing |
 
 **Why a refusal, not a bare duplicate.** ADR 0006's idempotency rule is
@@ -432,8 +451,11 @@ never derived again, so ownership does not depend on audit retention: an
 audit record that `Prune` later removes, while its run is still kept, does
 not change who owns the decision, and a restart after the prune does not
 either. Re-delivery reads only the stored column. Re-delivering a
-reconciliation whose record was pruned writes that record again, under the
-stored tenant, as any re-delivery backfills a missing record.
+reconciliation whose record was pruned returns the same duplicate as before
+the prune and writes nothing: the prune tombstone retired the record's id
+(§4, #294). Until #294 such a re-delivery wrote the record again, with its
+original time, so the record existed again after retention had removed it,
+until the next `Prune` removed it again.
 
 A row from before #286 with no audit record (it predates audit too) thus
 belongs to the system tenant `""`, the tenant compaction files its
@@ -606,6 +628,26 @@ table):
   unstamped database is classified by shape. No existing table changes.
 - **Additive**: `store.ErrNewerSchema`, `store.NewerSchemaError`.
 
+Pruned records stay pruned (#294), classified separately:
+
+- **Behaviour change**: `Append` of a record whose id has a prune
+  tombstone writes nothing (a no-op, `inserted` false, for the same kind;
+  `ErrConflict` for another kind). A re-delivered reconciliation, a
+  retried approval and a compaction backfill of a pruned record therefore
+  answer as before and no longer write, mirror or count it again. The
+  tombstone is checked before `Validate`, so a pruned record accepted under
+  an older sensitivity rule does not turn that answer into
+  `ErrSensitive`.
+- **Behaviour change (stricter)**: a first approval or reconciliation
+  whose `Append` inserts nothing (its id already has a record or a
+  tombstone) is `ErrConflict`, with nothing applied, written or mirrored.
+- **Behaviour change (stricter)**: `Verify` returns `ErrCorrupt` for a
+  record that has a prune tombstone of its own id. A store in which a
+  binary before #294, `v0.1.0-alpha` included, re-created a pruned record
+  fails `Verify`, naming the record's id, until the next `Prune` removes
+  it (Limits).
+- No schema change.
+
 ## Evidence
 
 - `contract/audit/testdata/cases.json`: 15 predeclared cases (11 refusals)
@@ -691,6 +733,25 @@ table):
   `contract/audit/erasure_migration_test.go` (a process killed inside the
   migration leaves no stamp). Red on origin/main; mutations and the real
   pre-#286 and pre-#290 binaries are in the PR.
+- Pruned records stay pruned (#294), against real SQLite files:
+  `contract/audit/pruned_record_test.go` (the deciding tenant re-delivers
+  a reconciliation whose record was pruned, before and after a restart,
+  and gets the same duplicate with no record written, mirrored or counted;
+  compaction after the prune re-creates nothing; an approval retried after
+  its record was pruned writes nothing; another kind under a pruned id is
+  `ErrConflict`; a pruned record put back verbatim with its counter
+  adjusted is `ErrCorrupt`, with and without owners, and passes once its
+  tombstone is removed instead; one `Prune` removes a record re-created
+  the way a binary before #294 did it, and `Verify` passes; a record next
+  to a tombstone of another kind is `ErrCorrupt`; the record is found and
+  named in any batch of 256; a pruned reconciliation accepted under an
+  older sensitivity rule compacts, unowned, and re-delivers, owned, without
+  an error; a first approval or reconciliation under a planted tombstone
+  is `ErrConflict` and applies nothing, and commits once the tombstone is
+  gone). Two tests in `reconcile_tenant_test.go` that pinned the
+  re-created record were inverted. Red on origin/main or on the first
+  #294 head; mutations and a store written by the origin/main code are in
+  the PR.
 
 ## Limits
 
@@ -731,7 +792,27 @@ table):
   87–121 ms, `Compact` 27–29 vs 31–33 ms (about +12%). Worker and journal
   costs are within noise; compaction pays for the zeroing.
 - Prune tombstones (`audit_pruned_v1`) keep a pruned record's id digest
-  and kind forever, so Verify can tell pruned from missing.
+  and kind forever, so Verify can tell pruned from missing, and the id is
+  retired for good (#294).
+- A record a binary before #294 re-created after it was pruned (a
+  re-delivered reconciliation, a retried approval, or a compaction
+  backfill of a pruned record) sits next to its own tombstone, and
+  `Verify` now reports `ErrCorrupt` for it, naming its id. Nothing
+  repairs it automatically, and the repair is to run `Prune`: the older
+  binary re-created the record with its original time, so a cutoff that
+  pruned it once covers it again, and one `Prune` removes it, refreshes
+  its tombstone and decrements the counter. A `Hold` or a run still
+  active keeps it, as it keeps any record. Shown on a store written by
+  the origin/main code (re-delivery after a prune) and opened by the
+  #294 code: `Verify` named the record, one `Prune` removed it, and
+  `Verify` passed with the tombstone alone.
+- `Verify` checks every record's id against the tombstones, in batches of
+  256. Measured in review on 20,000 records, best of 7, under load
+  (macOS, 1-minute load average about 26): without tombstones 119 ms
+  without the check (origin/main), 427 ms with one lookup per record,
+  164 ms batched; with 20,000 other tombstones 147, 459 and 284 ms. The
+  cost is index page reads in the pure-Go SQLite driver, which batching
+  does not remove. It was not measured at `MaxRecords` scale.
 - No hash chain or external anchoring of audit records.
 - The live event stream (`observe/event`, `inspect/events*.go`) was not
   reshaped: it gains the new redaction through the shared `inspect`

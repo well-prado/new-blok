@@ -1,46 +1,69 @@
 {
-  "schemaVersion": "journal/v1",
+  "schemaVersion": "journal/v2",
   "cases": [
     {
       "name": "concurrent duplicate admission",
-      "callers": 32,
-      "accepted": 1,
-      "runIds": 1,
-      "conflictingReuse": "request_conflict",
-      "observableEffects": 0
+      "expect": {
+        "callers": 32,
+        "accepted": 1,
+        "runIds": 1,
+        "storedRuns": 1,
+        "conflictingReuse": "request_conflict",
+        "observableEffects": 0
+      }
     },
     {
       "name": "committed result replay",
-      "attempts": 2,
-      "providerOperationKeys": 1,
-      "observableEffectDispatches": 1,
-      "replayState": "committed"
+      "expect": {
+        "attempts": 2,
+        "providerOperationKeys": 1,
+        "committedAttempts": 1,
+        "replayState": "committed",
+        "replayResult": "{\"charged\":true}",
+        "redispatchAfterReopen": "not_dispatchable"
+      }
     },
     {
       "name": "uncertain external outcome",
-      "state": "uncertain",
-      "redispatch": "rejected",
-      "reconciliationRequired": true
+      "expect": {
+        "state": "uncertain",
+        "redispatch": "uncertain",
+        "completeRun": "uncertain",
+        "reconciledState": "committed",
+        "redispatchAfterReconcile": "not_dispatchable",
+        "completeRunAfterReconcile": "ok"
+      }
     },
     {
       "name": "new replay lineage",
-      "runIdentity": "fresh",
-      "lineage": "source_run_id",
-      "operationIdentity": "fresh"
+      "expect": {
+        "runIdentity": "fresh",
+        "lineage": "source_run_id",
+        "operationIdentity": "fresh",
+        "reusedReplayKey": "request_conflict"
+      }
     },
     {
       "name": "stale attempt result",
-      "stalePublish": "rejected",
-      "currentAttemptWins": true
+      "expect": {
+        "stalePublish": "stale_attempt",
+        "currentAttemptWins": true
+      }
     },
     {
       "name": "integrity failure",
-      "truncatedStore": "fails_closed"
+      "expect": {
+        "truncatedStore": "fails_closed"
+      }
     },
     {
       "name": "write failure",
-      "simulatedDiskFull": "fails_closed",
-      "acknowledged": false
+      "expect": {
+        "simulatedDiskFull": "fails_closed",
+        "acknowledged": false,
+        "storedRuns": 0,
+        "acceptedAfterRecovery": true
+      }
     }
   ],
   "crashBarriers": [
@@ -53,6 +76,7 @@
   "limits": [
     "External effects are not executed by this journal; effect providers must use the stable provider operation key.",
     "Uncertain outcomes require reconciliation and are never silently retried.",
+    "The write failure is simulated by a store that refuses before its transaction; TestRealDiskFullFailsClosedAndReopensIntact covers a real ENOSPC on Linux.",
     "Crash evidence covers one local SQLite filesystem and does not prove disk-loss survival or multi-host failover."
   ]
 }
