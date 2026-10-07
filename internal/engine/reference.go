@@ -92,9 +92,15 @@ func field(current reflect.Value, name string) (reflect.Value, error) {
 	return reflect.Value{}, kindError(current, name)
 }
 
-func nullError(name string) error { return fmt.Errorf("cannot read %q from null", name) }
+func nullError(name string) error { return absentError(fmt.Sprintf("cannot read %q from null", name)) }
 
-func missingError(name string) error { return fmt.Errorf("field %q is missing", name) }
+func missingError(name string) error { return absentError(fmt.Sprintf("field %q is missing", name)) }
+
+// absentError is a reference path that reaches no value: a missing field,
+// or a field read from null. A default instruction falls back on it.
+type absentError string
+
+func (e absentError) Error() string { return string(e) }
 
 func unencodableError(name string, err error) error {
 	return fmt.Errorf("cannot read %q: value has no JSON encoding: %w", name, err)

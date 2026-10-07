@@ -256,8 +256,20 @@ func runTry(ctx context.Context, id string, plan *TryPlan) (any, error) {
 	if err != nil && ctx.Err() == nil && plan.Catch != nil {
 		output, err = plan.Catch(ctx, err)
 	}
-	if ctx.Err() == nil {
-		if finallyOutput, finallyErr := runActions(ctx, plan.Finally); finallyErr != nil {
+	// Only the caller's cancellation of the run skips finally. When a
+	// construct around this one canceled it because a sibling failed
+	// (fail-fast), finally still runs, canceled only if the run is.
+	run, ok := ctx.Value(runContextKey{}).(context.Context)
+	if !ok {
+		run = ctx
+	}
+	if run.Err() == nil {
+		finallyCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+		stop := context.AfterFunc(run, cancel)
+		finallyOutput, finallyErr := runActions(finallyCtx, plan.Finally)
+		stop()
+		cancel()
+		if finallyErr != nil {
 			return nil, finallyErr
 		} else if finallyOutput != nil && err == nil {
 			output = finallyOutput
