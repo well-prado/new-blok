@@ -74,8 +74,14 @@ func NewJournal(ctx context.Context, database store.Database, cfg Config) (*Jour
 	// while it loses (#235, #291).
 	err := migration.Retry(ctx, func() error {
 		return database.WithTx(ctx, func(tx *sql.Tx) error {
-			return migration.Apply(ctx, tx, migration.Schema{Component: schemaComponent, Supported: schemaVersion, Infer: migration.Present("audit_records_v1")}, func(int) error {
-				return createTables(ctx, tx)
+			return migration.Apply(ctx, tx, migration.Schema{Component: schemaComponent, Supported: schemaVersion, Infer: migration.Present("audit_records_v1")}, func(from int) error {
+				if err := createTables(ctx, tx); err != nil {
+					return err
+				}
+				if from < 2 {
+					return openStarts(ctx, tx)
+				}
+				return nil
 			})
 		})
 	})
@@ -87,10 +93,11 @@ func NewJournal(ctx context.Context, database store.Database, cfg Config) (*Jour
 
 // schemaVersion is the highest audit schema version this binary
 // understands (#291). Version 1 is the shape #80 introduced, with
-// audit_pruned_v1; no audit migration has changed it since. NewJournal
-// refuses a store stamped with a newer one, and CheckSchema refuses it to
-// an owner reading the audit tables without a Journal.
-const schemaVersion = 1
+// audit_pruned_v1; version 2 adds the audit start marker (#284):
+// audit_start_v1 and audit_legacy_v1. NewJournal refuses a store stamped
+// with a newer one, and CheckSchema refuses it to an owner reading the
+// audit tables without a Journal.
+const schemaVersion = 2
 
 // schemaComponent names audit's row in the schema version table.
 const schemaComponent = "audit"
@@ -116,12 +123,210 @@ func createTables(ctx context.Context, tx *sql.Tx) error {
 		// so Verify can tell a pruned record from a missing one.
 		`CREATE TABLE IF NOT EXISTS audit_pruned_v1 (id_digest TEXT PRIMARY KEY, kind TEXT NOT NULL, pruned_at INTEGER NOT NULL)`,
 		`INSERT INTO audit_meta_v1 (name, value) SELECT 'records', COUNT(*) FROM audit_records_v1 WHERE true ON CONFLICT(name) DO NOTHING`,
+		// The audit start marker (#284), one row per owner kind. It is
+		// open (started = 0) from the migration that creates it until the
+		// owner's first Start, which lists the owner's decisions that have
+		// no record (legacy, recorded before audit existed) in
+		// audit_legacy_v1 as id digests and closes the marker with their
+		// count and digest. A started marker is never written again.
+		`CREATE TABLE IF NOT EXISTS audit_start_v1 (kind TEXT PRIMARY KEY, started INTEGER NOT NULL CHECK(started IN (0, 1)), legacy INTEGER NOT NULL DEFAULT 0, digest TEXT NOT NULL DEFAULT '')`,
+		`CREATE TABLE IF NOT EXISTS audit_legacy_v1 (kind TEXT NOT NULL, id_digest TEXT NOT NULL, PRIMARY KEY(kind, id_digest))`,
 	} {
 		if _, err := tx.ExecContext(ctx, statement); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// ownedKinds are the kinds whose decisions an Owner holds, and so the
+// kinds that get an audit start marker. Deployment decisions have no owner
+// table (ADR 0021 §5).
+var ownedKinds = []Kind{KindApproval, KindReconciliation}
+
+// openStarts opens the start marker of every owned kind. It runs once,
+// in the migration that brings the store to version 2: when audit is
+// first enabled on the database (from 0), or on a store written before
+// #284 (from 1). A store already at version 2 never reopens a marker, so a
+// marker table dropped or emptied later is not filled again from whatever
+// decisions exist then.
+func openStarts(ctx context.Context, tx *sql.Tx) error {
+	for _, kind := range ownedKinds {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO audit_start_v1 (kind, started) VALUES (?, 0) ON CONFLICT(kind) DO NOTHING`, string(kind)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Start closes owner's audit start marker the first time the owner is
+// composed with this journal; owners call it when they open. Each of the
+// owner's decisions that has neither a record nor a prune tombstone was
+// recorded before audit existed on this database: Start lists it as legacy
+// (the sha256 of its record id, as a tombstone keeps it) and records the
+// legacy count and the digest of the list in the marker, in one write
+// transaction, so no decision can commit between the listing and the
+// marker. Verify then accepts exactly those decisions without a record and
+// reports them as legacy.
+//
+// A marker is written once. Start does nothing for a marker that is
+// already started, and nothing for a kind without a marker, which only a
+// store whose marker rows were removed after version 2 has: Verify then
+// accepts no decision without its record.
+func (j *Journal) Start(ctx context.Context, owner Owner) error {
+	if j == nil || owner == nil {
+		return ErrRequired
+	}
+	kind := owner.AuditKind()
+	open := false
+	if err := j.database.WithTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		open, err = startOpen(ctx, tx, kind)
+		return err
+	}); err != nil || !open {
+		return err
+	}
+	return migration.Retry(ctx, func() error {
+		return j.database.WithTx(store.Writer(ctx), func(tx *sql.Tx) error {
+			// Reserve the writer, then read again: a concurrent opener may
+			// have closed the marker since.
+			if _, err := tx.ExecContext(ctx, `UPDATE audit_start_v1 SET kind = kind WHERE 0`); err != nil {
+				return err
+			}
+			if open, err := startOpen(ctx, tx, kind); err != nil || !open {
+				return err
+			}
+			var legacy []string
+			if err := owner.AuditedIDs(ctx, tx, func(id string) error {
+				covered, err := recordedOrPruned(ctx, tx, id, kind)
+				if err != nil || covered {
+					return err
+				}
+				legacy = append(legacy, Digest([]byte(id)))
+				return nil
+			}); err != nil {
+				return err
+			}
+			for _, idDigest := range legacy {
+				if _, err := tx.ExecContext(ctx, `INSERT INTO audit_legacy_v1 (kind, id_digest) VALUES (?, ?) ON CONFLICT DO NOTHING`, string(kind), idDigest); err != nil {
+					return err
+				}
+			}
+			count, digest, err := legacySet(ctx, tx, kind, nil)
+			if err != nil {
+				return err
+			}
+			_, err = tx.ExecContext(ctx, `UPDATE audit_start_v1 SET started = 1, legacy = ?, digest = ? WHERE kind = ? AND started = 0`, count, digest, string(kind))
+			return err
+		})
+	})
+}
+
+func startOpen(ctx context.Context, tx *sql.Tx, kind Kind) (bool, error) {
+	var started int
+	err := tx.QueryRowContext(ctx, `SELECT started FROM audit_start_v1 WHERE kind = ?`, string(kind)).Scan(&started)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil && started == 0, err
+}
+
+func recordedOrPruned(ctx context.Context, tx *sql.Tx, id string, kind Kind) (bool, error) {
+	var found int
+	if err := tx.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM audit_records_v1 WHERE id = ? AND kind = ?) + (SELECT COUNT(*) FROM audit_pruned_v1 WHERE id_digest = ? AND kind = ?)`, id, string(kind), Digest([]byte(id)), string(kind)).Scan(&found); err != nil {
+		return false, err
+	}
+	return found > 0, nil
+}
+
+// legacySet reads kind's legacy list in id-digest order and returns its
+// size and its digest: the sha256 of the kind and every id digest, one per
+// line. When into is not nil it also collects the id digests.
+func legacySet(ctx context.Context, tx *sql.Tx, kind Kind, into map[string]bool) (int, string, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT id_digest FROM audit_legacy_v1 WHERE kind = ? ORDER BY id_digest`, string(kind))
+	if err != nil {
+		return 0, "", err
+	}
+	defer rows.Close()
+	var listed bytes.Buffer
+	listed.WriteString(string(kind))
+	count := 0
+	for rows.Next() {
+		var idDigest string
+		if err := rows.Scan(&idDigest); err != nil {
+			return 0, "", err
+		}
+		listed.WriteString("\n" + idDigest)
+		count++
+		if into != nil {
+			into[idDigest] = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, "", err
+	}
+	return count, Digest(listed.Bytes()), nil
+}
+
+// Marker is what a started audit start marker recorded: how many of its
+// owner's decisions predated audit, and the digest of their list.
+type Marker struct {
+	Legacy int
+	Digest string
+}
+
+// verifyStarts checks every start marker against its legacy list
+// (ErrCorrupt when they disagree) and returns the started markers and
+// their lists. A legacy list without a started marker is ErrCorrupt too.
+func verifyStarts(ctx context.Context, tx *sql.Tx) (map[Kind]Marker, map[Kind]map[string]bool, error) {
+	markers := map[Kind]Marker{}
+	lists := map[Kind]map[string]bool{}
+	rows, err := tx.QueryContext(ctx, `SELECT kind, started, legacy, digest FROM audit_start_v1 ORDER BY kind`)
+	if err != nil {
+		return nil, nil, err
+	}
+	type row struct {
+		kind    Kind
+		started bool
+		marker  Marker
+	}
+	var all []row
+	for rows.Next() {
+		var r row
+		var kind string
+		if err := rows.Scan(&kind, &r.started, &r.marker.Legacy, &r.marker.Digest); err != nil {
+			rows.Close()
+			return nil, nil, err
+		}
+		r.kind = Kind(kind)
+		all = append(all, r)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, nil, err
+	}
+	for _, r := range all {
+		if !r.started {
+			continue
+		}
+		list := map[string]bool{}
+		count, digest, err := legacySet(ctx, tx, r.kind, list)
+		if err != nil {
+			return nil, nil, err
+		}
+		if count != r.marker.Legacy || digest != r.marker.Digest {
+			return nil, nil, ErrCorrupt
+		}
+		markers[r.kind] = r.marker
+		lists[r.kind] = list
+	}
+	var orphans int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM audit_legacy_v1 WHERE kind NOT IN (SELECT kind FROM audit_start_v1 WHERE started = 1)`).Scan(&orphans); err != nil {
+		return nil, nil, err
+	}
+	if orphans != 0 {
+		return nil, nil, ErrCorrupt
+	}
+	return markers, lists, nil
 }
 
 // Shares reports whether the journal writes to database. An owner that
@@ -400,23 +605,46 @@ type Owner interface {
 	AuditedIDs(ctx context.Context, tx *sql.Tx, fn func(id string) error) error
 }
 
-// Verify reads every record and checks it against its digest, its indexed
-// columns and the record count, and that no prune tombstone has its id
+// Report is what VerifyReport found.
+type Report struct {
+	// Records counts the records verified.
+	Records int
+	// Legacy counts, per owner kind passed, the decisions accepted without
+	// a record because the kind's start marker lists them as recorded
+	// before audit existed on the database (#284). A legacy decision whose
+	// record was written since (an idempotent retry or a re-delivery
+	// backfills it) is matched instead, and not counted.
+	Legacy map[Kind]int
+	// Markers holds each started start marker: the legacy count and list
+	// digest it recorded. They never change once written, so an operator
+	// can keep them outside the database and compare.
+	Markers map[Kind]Marker
+}
+
+// Verify is VerifyReport, returning only the number of records verified.
+func (j *Journal) Verify(ctx context.Context, owners ...Owner) (int, error) {
+	report, err := j.VerifyReport(ctx, owners...)
+	return report.Records, err
+}
+
+// VerifyReport reads every record and checks it against its digest, its
+// indexed columns and the record count, that no prune tombstone has its id
 // (ErrCorrupt: Append never writes a pruned id again, so a record next to
 // its own tombstone was written around retention, #294; the error names
-// the record's id, and Prune removes such a record again). It then
-// cross-checks each owner's durable decisions against the records
-// (ErrMismatch): a decision without its record or tombstone, or a record
+// the record's id, and Prune removes such a record again), and every start
+// marker against its legacy list (ErrCorrupt, #284). It then cross-checks
+// each owner's durable decisions against the records (ErrMismatch): a
+// decision without its record, tombstone or legacy listing, or a record
 // naming a decision the owner does not have. Run it after a restore with
-// every owner composed on the store.
-// Records of a kind no owner is passed for (deployment decisions have no
-// owner table) are integrity-checked only. It holds one read transaction
-// and, per owner, a set of its decision ids in memory.
-func (j *Journal) Verify(ctx context.Context, owners ...Owner) (int, error) {
+// every owner composed on the store. Records of a kind no owner is passed
+// for (deployment decisions have no owner table) are integrity-checked
+// only. It holds one read transaction and, per owner, a set of its
+// decision ids in memory.
+func (j *Journal) VerifyReport(ctx context.Context, owners ...Owner) (Report, error) {
 	if j == nil {
-		return 0, ErrRequired
+		return Report{}, ErrRequired
 	}
-	verified := 0
+	report := Report{Legacy: map[Kind]int{}}
 	err := j.database.WithTx(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, `SELECT seq, id, kind, tenant, run_id, record, digest FROM audit_records_v1 ORDER BY seq`)
 		if err != nil {
@@ -437,7 +665,7 @@ func (j *Journal) Verify(ctx context.Context, owners ...Owner) (int, error) {
 				}
 				batch = batch[:0]
 			}
-			verified++
+			report.Records++
 		}
 		if err := rows.Err(); err != nil {
 			return err
@@ -449,17 +677,27 @@ func (j *Journal) Verify(ctx context.Context, owners ...Owner) (int, error) {
 		if err := tx.QueryRowContext(ctx, `SELECT value FROM audit_meta_v1 WHERE name = 'records'`).Scan(&count); err != nil {
 			return err
 		}
-		if count != verified {
+		if count != report.Records {
 			return ErrCorrupt
 		}
+		markers, lists, err := verifyStarts(ctx, tx)
+		if err != nil {
+			return err
+		}
+		report.Markers = markers
 		for _, owner := range owners {
-			if err := crossCheck(ctx, tx, owner); err != nil {
+			legacy, err := crossCheck(ctx, tx, owner, lists[owner.AuditKind()])
+			if err != nil {
 				return err
 			}
+			report.Legacy[owner.AuditKind()] += legacy
 		}
 		return nil
 	})
-	return verified, err
+	if err != nil {
+		return Report{Records: report.Records}, err
+	}
+	return report, nil
 }
 
 // checkNotPruned is ErrCorrupt, naming the first record in ids (in the
@@ -497,38 +735,45 @@ func checkNotPruned(ctx context.Context, tx *sql.Tx, ids []string) error {
 	return nil
 }
 
-func crossCheck(ctx context.Context, tx *sql.Tx, owner Owner) error {
+// crossCheck matches owner's decisions and records. A decision with
+// neither a record nor a tombstone is accepted only when legacy, the
+// kind's start marker list, holds its id digest; it returns how many were.
+func crossCheck(ctx context.Context, tx *sql.Tx, owner Owner, legacy map[string]bool) (int, error) {
 	kind := owner.AuditKind()
 	decisions := map[string]bool{}
+	accepted := 0
 	err := owner.AuditedIDs(ctx, tx, func(id string) error {
 		decisions[id] = true
-		var found int
-		if err := tx.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM audit_records_v1 WHERE id = ? AND kind = ?) + (SELECT COUNT(*) FROM audit_pruned_v1 WHERE id_digest = ? AND kind = ?)`, id, string(kind), Digest([]byte(id)), string(kind)).Scan(&found); err != nil {
+		covered, err := recordedOrPruned(ctx, tx, id, kind)
+		switch {
+		case err != nil:
 			return err
+		case covered:
+			return nil
+		case legacy[Digest([]byte(id))]:
+			accepted++
+			return nil
 		}
-		if found == 0 {
-			return ErrMismatch
-		}
-		return nil
+		return ErrMismatch
 	})
 	if err != nil {
-		return err
+		return 0, err
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT id FROM audit_records_v1 WHERE kind = ?`, string(kind))
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
-			return err
+			return 0, err
 		}
 		if !decisions[id] {
-			return ErrMismatch
+			return 0, ErrMismatch
 		}
 	}
-	return rows.Err()
+	return accepted, rows.Err()
 }
 
 type scanner interface{ Scan(...any) error }

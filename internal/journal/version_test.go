@@ -207,13 +207,13 @@ func TestNewerAuditSchemaRefusesTheTenantRepair(t *testing.T) {
 	} {
 		t.Run(shape.name, func(t *testing.T) {
 			database := untenantedReconciliation(t)
-			execAll(t, database, append(shape.newer, `UPDATE blok_schema_versions SET version = 2 WHERE component = 'audit'`)...)
+			execAll(t, database, append(shape.newer, `UPDATE blok_schema_versions SET version = 3 WHERE component = 'audit'`)...)
 			for range 2 {
 				refused, err := New(ctx, database, Config{})
 				var newer *store.NewerSchemaError
 				tenants := reconciliationTenants(t, database)
-				if refused != nil || !errors.As(err, &newer) || *newer != (store.NewerSchemaError{Component: "audit", Version: 2, Supported: 1}) {
-					t.Fatalf("journal opened over an audit-2 store: journal=%v err=%v, reconciliation tenants now %q", refused != nil, err, tenants)
+				if refused != nil || !errors.As(err, &newer) || *newer != (store.NewerSchemaError{Component: "audit", Version: 3, Supported: 2}) {
+					t.Fatalf("journal opened over an audit-3 store: journal=%v err=%v, reconciliation tenants now %q", refused != nil, err, tenants)
 				}
 				if len(tenants) != 1 || tenants[0] != "<null>" {
 					t.Fatalf("a refused open changed who owns the reconciliation: tenants=%q", tenants)
@@ -221,7 +221,7 @@ func TestNewerAuditSchemaRefusesTheTenantRepair(t *testing.T) {
 			}
 			// What the refusal withheld: the binary that understands
 			// the stamp repairs the row from its record.
-			execAll(t, database, append(shape.restored, `UPDATE blok_schema_versions SET version = 1 WHERE component = 'audit'`)...)
+			execAll(t, database, append(shape.restored, `UPDATE blok_schema_versions SET version = 2 WHERE component = 'audit'`)...)
 			if _, err := New(ctx, database, Config{}); err != nil {
 				t.Fatal(err)
 			}
@@ -238,7 +238,7 @@ func TestNewerAuditSchemaRefusesTheTenantRepair(t *testing.T) {
 // A component is refused only for a schema it reads.
 func TestNewerAuditSchemaWithNothingToRepairStillOpens(t *testing.T) {
 	database := untenantedReconciliation(t)
-	execAll(t, database, `UPDATE journal_reconciliations SET tenant = 'tenant-a'`, `UPDATE blok_schema_versions SET version = 2 WHERE component = 'audit'`)
+	execAll(t, database, `UPDATE journal_reconciliations SET tenant = 'tenant-a'`, `UPDATE blok_schema_versions SET version = 3 WHERE component = 'audit'`)
 	if _, err := New(context.Background(), database, Config{}); err != nil {
 		t.Fatalf("a journal with nothing to repair was refused for audit's stamp: %v", err)
 	}
@@ -248,15 +248,15 @@ func TestNewerAuditSchemaWithNothingToRepairStillOpens(t *testing.T) {
 }
 
 // requireAuditRefusal opens a journal-only binary over database and wants
-// audit's refusal for an audit-2 stamp, with the reconciliation's row left
+// audit's refusal for an audit-3 stamp, with the reconciliation's row left
 // without a tenant.
 func requireAuditRefusal(t *testing.T, database store.Database) {
 	t.Helper()
 	refused, err := New(context.Background(), database, Config{})
 	var newer *store.NewerSchemaError
 	tenants := reconciliationTenants(t, database)
-	if refused != nil || !errors.As(err, &newer) || *newer != (store.NewerSchemaError{Component: "audit", Version: 2, Supported: 1}) {
-		t.Fatalf("want NewerSchemaError{audit 2, supported 1}, got journal=%v err=%v (reconciliation tenants now %q)", refused != nil, err, tenants)
+	if refused != nil || !errors.As(err, &newer) || *newer != (store.NewerSchemaError{Component: "audit", Version: 3, Supported: 2}) {
+		t.Fatalf("want NewerSchemaError{audit 3, supported 2}, got journal=%v err=%v (reconciliation tenants now %q)", refused != nil, err, tenants)
 	}
 	if len(tenants) != 1 || tenants[0] != "<null>" {
 		t.Fatalf("a refused open changed who owns the reconciliation: tenants=%q", tenants)
@@ -402,8 +402,8 @@ func pruneReconciliationRecord(t *testing.T, database store.Database) {
 // reads no audit row under a stamp it does not understand", made
 // observable. Every read of a record (audit.StoredTenant) or a tombstone
 // (audit.Pruned) is counted, including one whose result or error is
-// discarded. Under an audit-2 stamp each refused open counts zero reads of
-// either. With stamp 1 restored, the same open reads the record and
+// discarded. Under an audit-3 stamp each refused open counts zero reads of
+// either. With stamp 2 restored, the same open reads the record and
 // repairs the row to tenant-a, or, when the record was pruned, reads the
 // tombstone and leaves the row unowned: each wire is live where the repair
 // needs it.
@@ -422,18 +422,18 @@ func TestNewerAuditSchemaIsCheckedBeforeAnyAuditRowIsRead(t *testing.T) {
 				pruneReconciliationRecord(t, database)
 			}
 			wires := tripwireAuditReads(t, database)
-			execAll(t, database, `UPDATE blok_schema_versions SET version = 2 WHERE component = 'audit'`)
+			execAll(t, database, `UPDATE blok_schema_versions SET version = 3 WHERE component = 'audit'`)
 			records, tombstones := wires.reads()
 			for range 2 {
 				requireAuditRefusal(t, database)
 			}
 			if r, p := wires.reads(); r != records || p != tombstones {
-				t.Fatalf("refused opens under audit 2 read audit rows: %d record reads, %d tombstone reads, want 0 and 0", r-records, p-tombstones)
+				t.Fatalf("refused opens under audit 3 read audit rows: %d record reads, %d tombstone reads, want 0 and 0", r-records, p-tombstones)
 			}
 
-			execAll(t, database, `UPDATE blok_schema_versions SET version = 1 WHERE component = 'audit'`)
+			execAll(t, database, `UPDATE blok_schema_versions SET version = 2 WHERE component = 'audit'`)
 			if _, err := New(context.Background(), database, Config{}); err != nil {
-				t.Fatalf("audit-1 open over the tripwired tables: %v", err)
+				t.Fatalf("audit-2 open over the tripwired tables: %v", err)
 			}
 			if got := reconciliationTenants(t, database); len(got) != 1 || got[0] != shape.want {
 				t.Fatalf("repair under an understood stamp: tenants=%q, want [%s]", got, shape.want)
@@ -444,9 +444,9 @@ func TestNewerAuditSchemaIsCheckedBeforeAnyAuditRowIsRead(t *testing.T) {
 				live = p - tombstones
 			}
 			if live < 1 {
-				t.Fatalf("the tripwire is not live: the audit-1 repair counted %d record reads and %d tombstone reads", r-records, p-tombstones)
+				t.Fatalf("the tripwire is not live: the audit-2 repair counted %d record reads and %d tombstone reads", r-records, p-tombstones)
 			}
-			t.Logf("audit 2: 0 reads; audit 1: %d record reads, %d tombstone reads", r-records, p-tombstones)
+			t.Logf("audit 3: 0 reads; audit 2: %d record reads, %d tombstone reads", r-records, p-tombstones)
 		})
 	}
 }
@@ -470,7 +470,7 @@ func TestUnreadableAuditStampRefusesTheTenantRepair(t *testing.T) {
 			t.Fatalf("a refused open changed who owns the reconciliation: tenants=%q", tenants)
 		}
 	}
-	execAll(t, database, `UPDATE blok_schema_versions SET version = 1 WHERE component = 'audit'`)
+	execAll(t, database, `UPDATE blok_schema_versions SET version = 2 WHERE component = 'audit'`)
 	if _, err := New(context.Background(), database, Config{}); err != nil {
 		t.Fatal(err)
 	}
@@ -512,12 +512,12 @@ func TestUnrepairableRowsKeepAJournalOnlyOpenRefusedUnderANewerAudit(t *testing.
 			// An understood stamp opens it, and the repair leaves the row
 			// unowned, as #286 intends.
 			if _, err := New(ctx, database, Config{}); err != nil {
-				t.Fatalf("audit-1 open: %v", err)
+				t.Fatalf("audit-2 open: %v", err)
 			}
 			if got := reconciliationTenants(t, database); len(got) != 1 || got[0] != "<null>" {
 				t.Fatalf("an unrepairable row was given a tenant: %q", got)
 			}
-			execAll(t, database, `UPDATE blok_schema_versions SET version = 2 WHERE component = 'audit'`)
+			execAll(t, database, `UPDATE blok_schema_versions SET version = 3 WHERE component = 'audit'`)
 			for range 3 {
 				requireAuditRefusal(t, database)
 			}

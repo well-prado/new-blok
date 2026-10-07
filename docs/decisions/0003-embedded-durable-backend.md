@@ -180,7 +180,7 @@ release supports:
 | Component | Owner | Version | History |
 | --- | --- | --- | --- |
 | `journal` | `internal/journal` | 7 | 1 before #281; 2 with #281's erasure tables; 3 with #286's reconciliation tenant; 4 with #332's wait identity (ADR 0027); 5 with #334's scope attempt (below); 6 with #332's wakeup durability: fired waits and run leases (ADR 0027); 7 with #332's engine step input digest (ADR 0027) |
-| `audit` | `contract/audit` | 1 | the #80 tables, unchanged since |
+| `audit` | `contract/audit` | 2 | 1 with the #80 tables; 2 with #284's audit start marker (`audit_start_v1`, `audit_legacy_v1`; ADR 0021 §10) |
 | `worker` | `trigger/worker` | 2 | 1 before #290; 2 with #290's `worker_compacted` and `worker_meta` |
 | `approval` | `contract/approval` | 1 | `approval_decisions_v1` as #75 introduced it |
 | `cron` | `trigger/cron` | 1 | `cron_cursors` as introduced |
