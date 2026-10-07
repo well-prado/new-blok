@@ -106,9 +106,12 @@ when it would read Go source the watcher does not see:
   `node_modules`, …), that leaves the root or leads into a skipped
   directory or a nested module. Each path element is resolved by
   `layout.ClassifyLink`, which reads only inside the root and decides an
-  escape lexically, against the root resolved once at start (blok dev
-  started through a link to the project, or under macOS's `/var`, still
-  sees an absolute in-project target as inside). A link inside the
+  escape lexically, against the root resolved once at start and, as an
+  alias, the absolute path blok dev was started with (#347). Started
+  through a link to the project, or under macOS's `/var`, blok dev sees an
+  absolute in-project target as inside whether it is written against the
+  resolved path or the starting one; other spellings (a link to an
+  ancestor that is not on the starting path) are escapes. A link inside the
   root that leads back to a watched directory is harmless when every link
   of its chain is one the walk records: the build reads through each
   hop, so a chain through a link the walk does not record (a name

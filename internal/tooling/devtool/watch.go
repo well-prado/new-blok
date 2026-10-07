@@ -217,8 +217,9 @@ func (s snapshot) refresh(root, rel string) {
 // source (//go:embed patterns, cgo and assembly files) are not watched at
 // all (ADR 0026, Limits); nor is dependency code (the module cache,
 // vendor, local replace targets). root is the root's symlink-resolved
-// path, module go.mod's module path.
-func (s snapshot) buildReads(ctx context.Context, root, module, main string) ([]diagnostic.Diagnostic, error) {
+// path, aliases other absolute spellings of it (layout.ClassifyLink),
+// module go.mod's module path.
+func (s snapshot) buildReads(ctx context.Context, root, module, main string, aliases ...string) ([]diagnostic.Diagnostic, error) {
 	var found []diagnostic.Diagnostic
 	sources := map[string][]string{} // symlink-free directory -> its non-test Go files
 	for name, item := range s {
@@ -253,7 +254,7 @@ func (s snapshot) buildReads(ctx context.Context, root, module, main string) ([]
 		}
 		dir := queue[0]
 		queue = queue[1:]
-		resolved, problem := s.resolvePackage(fsRoot, root, dir)
+		resolved, problem := s.resolvePackage(fsRoot, root, dir, aliases)
 		if problem != nil {
 			report(*problem)
 			continue
@@ -391,7 +392,7 @@ func headerEnds(files *token.FileSet, parsed *ast.File, data []byte) bool {
 // the reason the build would read it from files the watcher does not see.
 // It returns "" and no problem for a directory that does not exist (or a
 // dangling link or a cycle): the build fails on its own.
-func (s snapshot) resolvePackage(fsRoot *os.Root, root, dir string) (string, *diagnostic.Diagnostic) {
+func (s snapshot) resolvePackage(fsRoot *os.Root, root, dir string, aliases []string) (string, *diagnostic.Diagnostic) {
 	if dir == "." {
 		return ".", nil
 	}
@@ -412,7 +413,7 @@ func (s snapshot) resolvePackage(fsRoot *os.Root, root, dir string) (string, *di
 			resolved = here
 			continue
 		}
-		code, target := layout.ClassifyLink(fsRoot, root, here)
+		code, target := layout.ClassifyLink(fsRoot, root, here, aliases...)
 		switch code {
 		case layout.CodeSymlinkEscape:
 			return "", linkProblem(here, "a symbolic link leading outside the project")
@@ -423,7 +424,7 @@ func (s snapshot) resolvePackage(fsRoot *os.Root, root, dir string) (string, *di
 		// Every link the chain goes through is read too: each must be one
 		// the walk records, so retargeting it rebuilds. A link whose name
 		// starts with a dot, or inside a skipped directory, is not.
-		for _, hop := range linkHops(fsRoot, root, here) {
+		for _, hop := range linkHops(fsRoot, root, here, aliases) {
 			if item, ok := s[hop]; !ok || item.mode&fs.ModeSymlink == 0 {
 				return "", linkProblem(here, "a symbolic link resolved through the link "+hop+", which blok dev does not watch")
 			}
@@ -455,7 +456,7 @@ const maxHops = 255
 // symlink-free project-relative paths, in order: rel itself first. It reads
 // only inside the root, as layout.ClassifyLink does, and is called only for
 // a link ClassifyLink resolved inside the root.
-func linkHops(fsRoot *os.Root, absRoot, rel string) []string {
+func linkHops(fsRoot *os.Root, absRoot, rel string, aliases []string) []string {
 	pending := strings.Split(rel, "/")
 	var resolved, hops []string
 	for len(pending) > 0 && len(hops) <= maxHops {
@@ -485,7 +486,7 @@ func linkHops(fsRoot *os.Root, absRoot, rel string) []string {
 			return hops
 		}
 		if filepath.IsAbs(target) || filepath.VolumeName(target) != "" {
-			inside, err := filepath.Rel(absRoot, filepath.Clean(target))
+			inside, err := layout.RootRelative(target, absRoot, aliases...)
 			if err != nil {
 				return hops
 			}

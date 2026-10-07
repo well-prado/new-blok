@@ -315,7 +315,9 @@ func TestScanRefusesLinkedDirectories(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	found, err := scan.buildReads(context.Background(), resolved, "example.com/x", "cmd/app")
+	// The links were written through root, which on macOS is under /var,
+	// an alias of the resolved /private/var (#347).
+	found, err := scan.buildReads(context.Background(), resolved, "example.com/x", "cmd/app", root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -547,6 +549,12 @@ trap 'exit 0' TERM
 sleep 300 &
 wait`)
 	options.Args = []string{"--flag", "it's quoted"}
+	// The resume command enters the symlink-resolved root, the directory
+	// blok dev builds and runs in (/private/var on macOS for /var).
+	resolvedRoot, err := filepath.EvalSymlinks(options.Root)
+	if err != nil {
+		t.Fatal(err)
+	}
 	session := startDev(t, options)
 	session.await(func(e DevEvent) bool { return e.Event == EventAppStarted && e.Build == 1 }, "build 1 started")
 	var buildDir string
@@ -563,7 +571,7 @@ wait`)
 			continue
 		}
 		refused := session.await(func(e DevEvent) bool { return e.Event == EventAppExited && e.Build == build }, fmt.Sprintf("build %d refusing", build))
-		want := "cd " + options.Root + " && " + filepath.Join(buildDir, "build-2", "fake") + ` --flag 'it'\''s quoted'`
+		want := "cd " + resolvedRoot + " && " + filepath.Join(buildDir, "build-2", "fake") + ` --flag 'it'\''s quoted'`
 		if refused.Status != "exit status 65" || len(refused.Diagnostics) != 1 || refused.Diagnostics[0].Code != "dev_durable_incompatible" || refused.Resume != want {
 			t.Fatalf("build %d: %+v\nwant resume %s\n%s", build, refused.DevEvent, want, session.dump())
 		}

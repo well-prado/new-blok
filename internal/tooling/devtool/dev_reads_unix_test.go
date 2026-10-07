@@ -190,6 +190,35 @@ func TestDevResolvesLinksAgainstTheResolvedRoot(t *testing.T) {
 	session.stop()
 }
 
+// TestDevResolvesLinksWrittenThroughTheStartingPath (#347): an absolute
+// link target written through the path blok dev was started with (a link
+// to the project, or macOS's /var for /private/var) is inside the project
+// too, as it is for the go command. One that leaves it lexically from that
+// path is still an escape, and a chain written through it is checked hop by
+// hop: internal/chain reaches internal/real through .cur, a link the walk
+// does not record, so it is refused.
+func TestDevResolvesLinksWrittenThroughTheStartingPath(t *testing.T) {
+	options, _, _ := heldApp(t, `exit 0`)
+	via := filepath.Join(t.TempDir(), "via")
+	if err := os.Symlink(options.Root, via); err != nil {
+		t.Fatal(err)
+	}
+	writeFiles(t, options.Root, map[string]string{"internal/real/r.go": "package real\n", "cmd/fake/main.go": mainImporting("internal/alias", "internal/out", "internal/chain")})
+	writeFiles(t, filepath.Dir(via), map[string]string{"elsewhere/e.go": "package elsewhere\n"})
+	linkAll(t, options.Root, map[string]string{
+		"internal/alias": filepath.Join(via, "internal", "real"),
+		"internal/out":   via + "/../elsewhere",
+		"internal/chain": filepath.Join(via, ".cur"),
+		".cur":           "internal/real",
+	})
+	options.Root = via
+	event, found, session := firstBuild(t, options)
+	if want := "[dev_symlink_unwatched internal/chain dev_symlink_unwatched internal/out]"; event != EventBuildFailed || fmt.Sprint(found) != want {
+		t.Fatalf("build 1 %s %v, want build-failed %s\n%s", event, found, want, session.dump())
+	}
+	session.stop()
+}
+
 // TestShellQuoteRoundTrips: /bin/sh reads every quoted word back as the
 // word itself, whatever it holds.
 func TestShellQuoteRoundTrips(t *testing.T) {

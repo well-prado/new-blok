@@ -222,6 +222,10 @@ type devLoop struct {
 	options DevOptions
 	ctx     context.Context
 	root    string
+	// started is the root as blok dev was started with it, absolute but not
+	// symlink-resolved: an absolute link target written through it is
+	// inside the project too (#347).
+	started string
 	// buildDir holds the executables; it is removed on exit, and by guard,
 	// the session's process guard, if blok dev is killed.
 	buildDir string
@@ -280,6 +284,7 @@ func (l *devLoop) emit(event DevEvent) {
 
 func (l *devLoop) run() (int, error) {
 	root, err := filepath.Abs(l.options.Root)
+	l.started = root
 	if err == nil {
 		root, err = filepath.EvalSymlinks(root)
 	}
@@ -549,8 +554,8 @@ func (l *devLoop) compile(number int) (binary string, regenerated []string, prob
 	}
 	// The build must not read files the watcher does not see, the
 	// regenerated bindings' imports included. l.root is symlink-resolved
-	// (run), as layout.ClassifyLink requires.
-	unwatched, err := l.scan.buildReads(l.ctx, l.root, module, main)
+	// (run), as layout.ClassifyLink requires; l.started is its alias.
+	unwatched, err := l.scan.buildReads(l.ctx, l.root, module, main, l.started)
 	if err != nil {
 		if l.ctx.Err() != nil {
 			return "", regenerated, nil, false

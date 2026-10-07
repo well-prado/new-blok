@@ -20,6 +20,25 @@ func TestCollisionsFoldLetterCase(t *testing.T) {
 	}
 }
 
+// TestRootRelativeAcceptsAnyAlias (#347): a target inside any spelling of
+// the root is inside it, relative to that spelling; outside all of them it
+// is relative to the root and starts with "..".
+func TestRootRelativeAcceptsAnyAlias(t *testing.T) {
+	base := t.TempDir()
+	root, first, second := filepath.Join(base, "real"), filepath.Join(base, "a"), filepath.Join(base, "b")
+	for target, want := range map[string]string{
+		filepath.Join(root, "x", "y"):   "x/y",
+		filepath.Join(second, "x"):      "x",
+		filepath.Join(first, "..", "b"): ".",
+		filepath.Join(first, "..", "c"): "../c",
+	} {
+		got, err := RootRelative(target, root, first, second)
+		if err != nil || filepath.ToSlash(got) != want {
+			t.Errorf("RootRelative(%s) = %q, %v; want %q", target, got, err, want)
+		}
+	}
+}
+
 // TestCaseCollisionOnDisk needs a case-sensitive file system, where both
 // spellings can exist; on a case-insensitive one they cannot be created,
 // which is the hazard the diagnostic prevents.
