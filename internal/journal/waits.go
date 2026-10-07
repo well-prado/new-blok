@@ -25,21 +25,31 @@ var (
 	ErrLateSignal   = errors.New("journal: signal arrived after wait was closed")
 )
 
+// WaitRequest schedules one wait. InvocationPath and IterationPath identify
+// the step that waits and its iteration, as they identify an effect
+// (OperationIdentity): a run holds at most one wait per step and iteration,
+// whatever its name, and may wait on the same name in successive iterations
+// or steps (#332). Name is what a signal addresses.
 type WaitRequest struct {
-	RunID  string
-	WaitID string
-	Name   string
-	DueAt  time.Time
+	RunID          string
+	WaitID         string
+	Name           string
+	InvocationPath string
+	IterationPath  string
+	DueAt          time.Time
 }
 
+// WaitRecord is a stored wait. A wait written before #332 has empty paths.
 type WaitRecord struct {
-	WaitID   string
-	RunID    string
-	Name     string
-	DueAt    time.Time
-	State    string
-	SignalID string
-	Payload  json.RawMessage
+	WaitID         string
+	RunID          string
+	Name           string
+	InvocationPath string
+	IterationPath  string
+	DueAt          time.Time
+	State          string
+	SignalID       string
+	Payload        json.RawMessage
 }
 
 type SignalResult struct {
@@ -49,13 +59,18 @@ type SignalResult struct {
 	Resumed   bool
 }
 
+// ScheduleWait stores a waiting wait and, in the same transaction, hands it
+// the oldest pending signal of its name. A wait whose ID, or whose step and
+// iteration, the run already used returns ErrWaitExists and writes nothing.
 func (j *Journal) ScheduleWait(ctx context.Context, request WaitRequest) (WaitRecord, error) {
-	if request.RunID == "" || request.WaitID == "" || request.Name == "" || request.DueAt.IsZero() {
-		return WaitRecord{}, errors.New("journal: run, wait ID, name and due time are required")
+	if request.RunID == "" || request.WaitID == "" || request.Name == "" || request.InvocationPath == "" || request.IterationPath == "" || request.DueAt.IsZero() {
+		return WaitRecord{}, errors.New("journal: run, wait ID, name, invocation and iteration path, and due time are required")
 	}
 	var record WaitRecord
 	err := j.withTx(ctx, "wait-schedule", func(tx *sql.Tx) error {
-		result, err := tx.ExecContext(ctx, `INSERT INTO journal_waits (wait_id, run_id, name, due_at, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(wait_id) DO NOTHING`, request.WaitID, request.RunID, request.Name, request.DueAt.UTC().UnixNano(), waitWaiting, j.now(), j.now())
+		// No conflict target: both the wait ID and the step identity are
+		// uniqueness constraints, and either one is a duplicate.
+		result, err := tx.ExecContext(ctx, `INSERT INTO journal_waits (wait_id, run_id, name, invocation_path, iteration_path, due_at, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`, request.WaitID, request.RunID, request.Name, request.InvocationPath, request.IterationPath, request.DueAt.UTC().UnixNano(), waitWaiting, j.now(), j.now())
 		if err != nil {
 			return err
 		}
@@ -66,7 +81,7 @@ func (j *Journal) ScheduleWait(ctx context.Context, request WaitRequest) (WaitRe
 		if changed == 0 {
 			return ErrWaitExists
 		}
-		record = WaitRecord{WaitID: request.WaitID, RunID: request.RunID, Name: request.Name, DueAt: request.DueAt.UTC(), State: waitWaiting}
+		record = WaitRecord{WaitID: request.WaitID, RunID: request.RunID, Name: request.Name, InvocationPath: request.InvocationPath, IterationPath: request.IterationPath, DueAt: request.DueAt.UTC(), State: waitWaiting}
 		var signalID string
 		var payload []byte
 		err = tx.QueryRowContext(ctx, `SELECT signal_id, payload_json FROM journal_signals WHERE run_id = ? AND name = ? AND state = ? ORDER BY created_at, signal_id LIMIT 1`, request.RunID, request.Name, signalPending).Scan(&signalID, &payload)
@@ -90,6 +105,12 @@ func (j *Journal) ScheduleWait(ctx context.Context, request WaitRequest) (WaitRe
 	return record, err
 }
 
+// Signal delivers a signal to the run's oldest open wait of its name. With
+// no open wait it is pending, for the next wait of that name to take, when
+// the run never waited on the name, and late when a wait of the name has
+// already closed: a name-addressed signal cannot tell a stale delivery for
+// the closed wait from an early one for a later wait, and is never handed
+// to a wait it may not have been meant for (#332).
 func (j *Journal) Signal(ctx context.Context, envelope signal.Envelope, authorized bool) (SignalResult, error) {
 	if err := envelope.Validate(); err != nil {
 		return SignalResult{}, err
@@ -108,19 +129,23 @@ func (j *Journal) Signal(ctx context.Context, envelope signal.Envelope, authoriz
 		if !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
-		var waitID, state string
-		err = tx.QueryRowContext(ctx, `SELECT wait_id, state FROM journal_waits WHERE run_id = ? AND name = ?`, envelope.RunID, envelope.Name).Scan(&waitID, &state)
+		var waitID string
+		err = tx.QueryRowContext(ctx, `SELECT wait_id FROM journal_waits WHERE run_id = ? AND name = ? AND state = ? ORDER BY created_at, wait_id LIMIT 1`, envelope.RunID, envelope.Name, waitWaiting).Scan(&waitID)
 		if errors.Is(err, sql.ErrNoRows) {
-			_, err = tx.ExecContext(ctx, `INSERT INTO journal_signals (run_id, signal_id, name, principal, payload_json, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, envelope.RunID, envelope.SignalID, envelope.Name, envelope.Principal, []byte(envelope.Payload), signalPending, j.now())
+			var closed bool
+			if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM journal_waits WHERE run_id = ? AND name = ?)`, envelope.RunID, envelope.Name).Scan(&closed); err != nil {
+				return err
+			}
+			state := signalPending
 			result = SignalResult{Accepted: true}
+			if closed {
+				state = signalLate
+				result = SignalResult{Late: true}
+			}
+			_, err = tx.ExecContext(ctx, `INSERT INTO journal_signals (run_id, signal_id, name, principal, payload_json, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, envelope.RunID, envelope.SignalID, envelope.Name, envelope.Principal, []byte(envelope.Payload), state, j.now())
 			return err
 		}
 		if err != nil {
-			return err
-		}
-		if state != waitWaiting {
-			_, err = tx.ExecContext(ctx, `INSERT INTO journal_signals (run_id, signal_id, name, principal, payload_json, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, envelope.RunID, envelope.SignalID, envelope.Name, envelope.Principal, []byte(envelope.Payload), signalLate, j.now())
-			result = SignalResult{Late: true}
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO journal_signals (run_id, signal_id, name, principal, payload_json, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, envelope.RunID, envelope.SignalID, envelope.Name, envelope.Principal, []byte(envelope.Payload), signalStored, j.now()); err != nil {
@@ -142,7 +167,7 @@ func (j *Journal) ClaimDueWaits(ctx context.Context, now time.Time, limit int) (
 	}
 	var records []WaitRecord
 	err := j.withTx(ctx, "wait-claim", func(tx *sql.Tx) error {
-		rows, err := tx.QueryContext(ctx, `SELECT wait_id, run_id, name, due_at, state, signal_id, payload_json FROM journal_waits WHERE state = ? AND due_at <= ? ORDER BY due_at, wait_id LIMIT ?`, waitWaiting, now.UTC().UnixNano(), limit)
+		rows, err := tx.QueryContext(ctx, `SELECT wait_id, run_id, name, COALESCE(invocation_path, ''), COALESCE(iteration_path, ''), due_at, state, signal_id, payload_json FROM journal_waits WHERE state = ? AND due_at <= ? ORDER BY due_at, wait_id LIMIT ?`, waitWaiting, now.UTC().UnixNano(), limit)
 		if err != nil {
 			return err
 		}
@@ -187,7 +212,7 @@ func (j *Journal) Wait(ctx context.Context, waitID string) (WaitRecord, error) {
 	var record WaitRecord
 	err := j.withRead(ctx, func(tx *sql.Tx) error {
 		var err error
-		record, err = scanWait(tx.QueryRowContext(ctx, `SELECT wait_id, run_id, name, due_at, state, signal_id, payload_json FROM journal_waits WHERE wait_id = ?`, waitID))
+		record, err = scanWait(tx.QueryRowContext(ctx, `SELECT wait_id, run_id, name, COALESCE(invocation_path, ''), COALESCE(iteration_path, ''), due_at, state, signal_id, payload_json FROM journal_waits WHERE wait_id = ?`, waitID))
 		return err
 	})
 	if errors.Is(err, sql.ErrNoRows) {
@@ -200,7 +225,7 @@ func scanWait(row interface{ Scan(...any) error }) (WaitRecord, error) {
 	var record WaitRecord
 	var dueAt int64
 	var payload []byte
-	if err := row.Scan(&record.WaitID, &record.RunID, &record.Name, &dueAt, &record.State, &record.SignalID, &payload); err != nil {
+	if err := row.Scan(&record.WaitID, &record.RunID, &record.Name, &record.InvocationPath, &record.IterationPath, &dueAt, &record.State, &record.SignalID, &payload); err != nil {
 		return WaitRecord{}, err
 	}
 	record.DueAt = time.Unix(0, dueAt).UTC()
