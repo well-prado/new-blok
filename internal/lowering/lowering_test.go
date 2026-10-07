@@ -130,9 +130,9 @@ func TestControlIsRejectedWithoutTheControlOption(t *testing.T) {
 	}
 	// A construct nested in an arm is checked before anything else, even
 	// with the option.
-	each := Instruction{Kind: "each", ID: "loop", Input: "$step.a", Arms: []Arm{{Name: "body", Output: "$step.a"}}}
-	if _, err := Lower("w", "1.0.0", []Instruction{call("a", "$input"), ifOf("route", []Instruction{each}, nil, "$step.a", "$step.a")}, "$join.route", Options{Control: true}); err == nil || err.Error() != `flow: instruction "loop" of kind "each" cannot be lowered` {
-		t.Fatalf("nested each: err=%v", err)
+	template := Instruction{Kind: "template", ID: "label", Data: map[string]any{"template": "x"}}
+	if _, err := Lower("w", "1.0.0", []Instruction{call("a", "$input"), ifOf("route", []Instruction{template}, nil, "$step.a", "$step.a")}, "$join.route", Options{Control: true}); err == nil || err.Error() != `flow: instruction "label" of kind "template" cannot be lowered` {
+		t.Fatalf("nested template: err=%v", err)
 	}
 }
 
@@ -156,5 +156,53 @@ func TestControlNestingIsBounded(t *testing.T) {
 	instructions, output = build(MaxNesting + 1)
 	if _, err := Lower("w", "1.0.0", instructions, output, Options{Control: true}); err == nil || err.Error() != `flow: if "c0": control flow nests deeper than 64 levels` {
 		t.Fatalf("past the bound: err=%v", err)
+	}
+}
+
+func eachOf(id, items string, body []Instruction, output string) Instruction {
+	return Instruction{Kind: "each", ID: id, Input: items, Data: map[string]any{"concurrency": 2}, Arms: []Arm{{Name: "body", Instructions: body, Output: output}}}
+}
+
+func parallelOf(id string, arms ...[]Instruction) Instruction {
+	instruction := Instruction{Kind: "parallel", ID: id}
+	for index, arm := range arms {
+		instruction.Arms = append(instruction.Arms, Arm{Name: fmt.Sprint(index), Instructions: arm})
+	}
+	return instruction
+}
+
+// An each's item is readable only in its body, a body's steps nowhere
+// outside it; a parallel's arm steps are readable after the parallel, never
+// in a sibling arm. A control operand may read the workflow input.
+func TestEachAndParallelScopes(t *testing.T) {
+	control := Options{Control: true}
+	lower := func(output string, instructions ...Instruction) error {
+		_, err := Lower("w", "1.0.0", instructions, output, control)
+		return err
+	}
+	cases := map[string]struct {
+		err  error
+		want string
+	}{
+		"item and input read in the body":    {lower("$join.loop", eachOf("loop", "$input.lines", []Instruction{call("line", "$item.loop.sku")}, "$step.line")), ""},
+		"outer item read in a nested body":   {lower("$join.outer", eachOf("outer", "$input", []Instruction{eachOf("inner", "$item.outer.lines", []Instruction{call("line", "$item.outer")}, "$step.line")}, "$join.inner")), ""},
+		"item read after its each":           {lower("$step.after", eachOf("loop", "$input", []Instruction{call("line", "$item.loop")}, "$step.line"), call("after", "$item.loop")), `flow: call "after": input "$item.loop" reads the item of each "loop", which is readable only inside that each's body`},
+		"body step read after its each":      {lower("$step.after", eachOf("loop", "$input", []Instruction{call("line", "$item.loop")}, "$step.line"), call("after", "$step.line")), `flow: call "after": input "$step.line" names a step inside arm "body" of each "loop", which is not visible here: read the construct's result instead`},
+		"each result read inside its body":   {lower("$join.loop", eachOf("loop", "$input", []Instruction{call("line", "$join.loop")}, "$step.line")), `flow: call "line": input "$join.loop" does not reference an earlier operation or construct`},
+		"parallel arms read after it":        {lower("$step.after", call("a", "$input"), parallelOf("fan", []Instruction{call("left", "$step.a")}, []Instruction{call("right", "$step.a")}), call("after", "$step.right")), ""},
+		"sibling arm read in a parallel":     {lower("$step.left", parallelOf("fan", []Instruction{call("left", "$input")}, []Instruction{call("right", "$step.left")})), `flow: call "right": input "$step.left" names a step inside arm "0" of parallel "fan", which is not visible here: read the construct's result instead`},
+		"parallel has no result":             {lower("$join.fan", parallelOf("fan", []Instruction{call("left", "$input")})), `flow: output: "$join.fan" does not reference an earlier operation or construct`},
+		"input field still not a call input": {lower("$step.a", call("a", "$input.sku")), `flow: call "a": input "$input.sku" cannot be lowered: it does not name a call result`},
+		"empty input field in an operand":    {lower("$join.loop", eachOf("loop", "$input..lines", []Instruction{call("line", "$item.loop")}, "$step.line")), `flow: each "loop": items "$input..lines" has an empty field`},
+	}
+	for name, tc := range cases {
+		if tc.want == "" && tc.err != nil || tc.want != "" && (tc.err == nil || tc.err.Error() != tc.want) {
+			t.Errorf("%s: err=%v; want %q", name, tc.err, tc.want)
+		}
+	}
+	bad := eachOf("loop", "$input", []Instruction{call("line", "$item.loop")}, "$step.line")
+	bad.Data["concurrency"] = 0
+	if err := lower("$join.loop", bad); err == nil || err.Error() != `flow: each "loop": concurrency 0 is not between 1 and 1024` {
+		t.Errorf("unbounded each: err=%v", err)
 	}
 }

@@ -31,6 +31,9 @@ type frame struct {
 	// the root; iteration is the iteration path, "root" outside each.
 	prefix    string
 	iteration string
+	// input is the workflow input, which control operands may read
+	// (contract.InputStep).
+	input any
 	// span is the trace span the frame's steps are children of: the run's
 	// at the root, the construct's inside an arm.
 	span observe.Span
@@ -47,10 +50,26 @@ func (f *frame) invocation(id string) string {
 
 // arm returns the frame that runs arm of the construct id in this frame.
 func (f *frame) arm(id string, arm contract.Arm) *frame {
-	return &frame{values: map[string]any{}, parent: f, prefix: f.invocation(id) + "/" + arm.Name, iteration: f.iteration, span: f.span}
+	return &frame{values: map[string]any{}, parent: f, prefix: f.invocation(id) + "/" + arm.Name, iteration: f.iteration, input: f.input, span: f.span}
+}
+
+// item returns the frame that runs the body of the each id in this frame
+// for its index-th item: the each's id reads the item there, and the
+// iteration path gains "<id>[<index>]".
+func (f *frame) item(id string, body contract.Arm, index int, item any) *frame {
+	inner := f.arm(id, body)
+	inner.values[id] = item
+	inner.iteration = fmt.Sprintf("%s[%d]", id, index)
+	if f.iteration != rootIteration {
+		inner.iteration = f.iteration + "/" + inner.iteration
+	}
+	return inner
 }
 
 func (f *frame) resolve(reference contract.Reference) (any, error) {
+	if reference.Step == contract.InputStep {
+		return resolveReference(map[string]any{contract.InputStep: f.input}, reference)
+	}
 	for current := f; current != nil; current = current.parent {
 		if _, ok := current.values[reference.Step]; ok {
 			return resolveReference(current.values, reference)
@@ -141,6 +160,8 @@ var controlShapes = map[string]shape{
 	"if":          {operands: 1, arms: []string{"then", "else"}},
 	"choose":      {operands: 1, arms: []string{"default"}},
 	"try-finally": {arms: []string{"try", "finally"}},
+	"each":        {operands: 1, arms: []string{"body"}},
+	"parallel":    {},
 }
 
 func (s shape) check(instruction contract.InternalInstruction) error {
@@ -165,7 +186,19 @@ func (s shape) check(instruction contract.InternalInstruction) error {
 	} else if control.Operator != "" {
 		return fmt.Errorf("%s has an operator", instruction.Kind)
 	}
+	if (instruction.Kind == "each") != (control.Concurrency != 0) || control.Concurrency < 0 || control.Concurrency > 1024 {
+		return fmt.Errorf("%s has concurrency %d; only an each has one, from 1 to 1024", instruction.Kind, control.Concurrency)
+	}
 	want := s.arms
+	if instruction.Kind == "parallel" {
+		if len(control.Arms) < 1 {
+			return fmt.Errorf("parallel needs at least one arm")
+		}
+		want = nil
+		for index := range control.Arms {
+			want = append(want, fmt.Sprintf("%d", index))
+		}
+	}
 	if instruction.Kind == "choose" {
 		if len(control.Arms) < 2 {
 			return fmt.Errorf("choose needs at least one case and a default")
@@ -187,8 +220,8 @@ func (s shape) check(instruction contract.InternalInstruction) error {
 		if (len(arm.Match) > 0) != (instruction.Kind == "choose" && arm.Name != "default") || len(arm.Match) > 0 && json.Unmarshal(arm.Match, &match) != nil {
 			return fmt.Errorf("arm %q has an invalid case value", arm.Name)
 		}
-		if (arm.Output == nil) != (arm.Name == "finally") {
-			return fmt.Errorf("arm %q: only a finally arm returns no result", arm.Name)
+		if (arm.Output == nil) != (arm.Name == "finally" || instruction.Kind == "parallel") {
+			return fmt.Errorf("arm %q: only finally and parallel arms return no result", arm.Name)
 		}
 		if arm.Output != nil {
 			if err := checkOperand(*arm.Output); err != nil {
@@ -210,9 +243,10 @@ func checkOperand(operand contract.Operand) error {
 }
 
 // runControl runs one checked control instruction in f. runArm runs one of
-// its arms in that arm's frame and returns the arm's result. Branches and
-// try-finally run through the engine's control path (control.go).
-func runControl(ctx context.Context, f *frame, instruction contract.InternalInstruction, runArm func(context.Context, contract.Arm) (any, error)) (any, error) {
+// its arms in the frame given and returns the arm's result. Branches,
+// try-finally, each and parallel run through the engine's control path
+// (control.go); an each runs at most maxItems items.
+func runControl(ctx context.Context, f *frame, instruction contract.InternalInstruction, maxItems int, runArm func(context.Context, *frame, contract.Arm) (any, error)) (any, error) {
 	control := instruction.Control
 	operands := make([]any, len(control.Operands))
 	for index, operand := range control.Operands {
@@ -230,7 +264,7 @@ func runControl(ctx context.Context, f *frame, instruction contract.InternalInst
 		operands[index] = value
 	}
 	action := func(arm contract.Arm) []Action {
-		return []Action{{ID: instruction.ID, Run: func(ctx context.Context) (any, error) { return runArm(ctx, arm) }}}
+		return []Action{{ID: instruction.ID, Run: func(ctx context.Context) (any, error) { return runArm(ctx, f.arm(instruction.ID, arm), arm) }}}
 	}
 	step := ControlStep{ID: instruction.ID, Kind: ControlAction}
 	switch instruction.Kind {
@@ -270,11 +304,69 @@ func runControl(ctx context.Context, f *frame, instruction contract.InternalInst
 		finally := control.Arms[1]
 		step.Kind = ControlTry
 		step.Try = &TryPlan{Try: action(control.Arms[0]), Finally: []Action{{ID: instruction.ID, Run: func(ctx context.Context) (any, error) {
-			_, err := runArm(ctx, finally)
+			_, err := runArm(ctx, f.arm(instruction.ID, finally), finally)
 			return nil, err
 		}}}}
+	case "each":
+		items, err := elements(operands[0])
+		if err != nil {
+			return nil, &Error{Code: "invalid_items", Class: "validation", Step: instruction.ID, Err: err}
+		}
+		if len(items) > maxItems {
+			return nil, &Error{Code: "step_budget_exceeded", Class: "admission", Step: instruction.ID, Err: fmt.Errorf("each has %d items; at most %d run", len(items), maxItems)}
+		}
+		body := control.Arms[0]
+		step.Kind = ControlEach
+		step.Each = &EachPlan{Items: items, Concurrency: control.Concurrency, Run: func(ctx context.Context, item any, index int) (any, error) {
+			return runArm(ctx, f.item(instruction.ID, body, index, item), body)
+		}}
+	case "parallel":
+		// Each arm runs in its own frame; once every arm has completed,
+		// their results join this frame, where later steps read them.
+		frames := make([]*frame, len(control.Arms))
+		step.Kind = ControlParallel
+		step.Parallel = &ParallelPlan{}
+		for index, arm := range control.Arms {
+			frames[index] = f.arm(instruction.ID, arm)
+			armFrame := frames[index]
+			step.Parallel.Actions = append(step.Parallel.Actions, Action{ID: instruction.ID, Run: func(ctx context.Context) (any, error) { return runArm(ctx, armFrame, arm) }})
+		}
+		if _, err := runControlStep(ctx, step, 0, maxNesting); err != nil {
+			return nil, err
+		}
+		for _, armFrame := range frames {
+			for id, value := range armFrame.values {
+				f.values[id] = value
+			}
+		}
+		return nil, nil
 	}
 	return runControlStep(ctx, step, 0, maxNesting)
+}
+
+// elements returns the items an each runs: a Go slice or array element by
+// element, anything else read as JSON, which must be an array.
+func elements(value any) ([]any, error) {
+	switch value.(type) {
+	case []byte, json.RawMessage, nil:
+	default:
+		if reflected := reflect.ValueOf(value); reflected.Kind() == reflect.Slice || reflected.Kind() == reflect.Array {
+			items := make([]any, reflected.Len())
+			for index := range items {
+				items[index] = reflected.Index(index).Interface()
+			}
+			return items, nil
+		}
+	}
+	normalized, err := normalize(value)
+	if err != nil {
+		return nil, err
+	}
+	items, ok := normalized.([]any)
+	if !ok {
+		return nil, fmt.Errorf("each items are %s, not an array", describe(normalized))
+	}
+	return items, nil
 }
 
 // isNull reports whether value's JSON form is null: nil, or a nil pointer,
