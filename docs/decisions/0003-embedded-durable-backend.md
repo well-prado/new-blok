@@ -28,12 +28,14 @@ reads and then writes fails at once with `SQLITE_BUSY` if another writer holds
 the write lock or has committed since its read began, because SQLite does not
 invoke the busy handler when it upgrades a transaction that has already read.
 A transaction that may write under contention therefore writes first. Today
-that holds for the worker's job claim, one `UPDATE … RETURNING` (#176), and
-cron's cursor, inserted before it is read (#169); the journal and provider
-paths that still read first are tracked in #179. Starting every transaction
-with `BEGIN IMMEDIATE` was rejected: `WithTx` is also the read path
-(`Get`, `Settled`, journal reads), so every read would wait behind the
-long write transaction a worker handler holds.
+that holds for the worker's job claim, one `UPDATE … RETURNING` (#176),
+cron's cursor, inserted before it is read (#169), and the order example's
+outbox dispatch, which claims an event with `UPDATE … RETURNING` and a lease,
+publishes it outside any transaction and then marks it sent (#331); the
+journal and provider paths that still read first are tracked in #179.
+Starting every transaction with `BEGIN IMMEDIATE` was rejected: `WithTx` is
+also the read path (`Get`, `Settled`, journal reads), so every read would
+wait behind the long write transaction a worker handler holds.
 
 Write-first removes the immediate failure, not the single writer. A worker's
 handler runs inside its claim's write transaction, so concurrent workers run
