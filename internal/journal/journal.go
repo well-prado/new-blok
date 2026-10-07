@@ -336,6 +336,7 @@ func (j *Journal) migrate(ctx context.Context, tx *sql.Tx, from int) error {
 			{"journal_runs", "lease_owner", `TEXT`},
 			{"journal_runs", "lease_until", `INTEGER`},
 			{"journal_runs", "leased_at", `INTEGER`},
+			{"journal_runs", "lease_token", `INTEGER`},
 		} {
 			if err := ensureColumn(ctx, tx, column.table, column.name, column.declaration); err != nil {
 				return err
@@ -413,7 +414,8 @@ var schemaStatements = []string{
 		error_class TEXT NOT NULL DEFAULT '',
 		lease_owner TEXT,
 		lease_until INTEGER,
-		leased_at INTEGER
+		leased_at INTEGER,
+		lease_token INTEGER
 	)`,
 	`CREATE TABLE IF NOT EXISTS journal_operations (
 		operation_key TEXT PRIMARY KEY,

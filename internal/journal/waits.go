@@ -50,8 +50,9 @@ type WaitRequest struct {
 }
 
 // WaitRecord is a stored wait. A wait written before #332 has empty paths.
-// LeaseOwner and LeaseUntil are the lease on the wait's run: the holder
-// executing it and when that lapses; both are empty when none has it.
+// LeaseOwner, LeaseUntil and LeaseToken are the lease on the wait's run:
+// the holder executing it, when that lapses, and the token naming that
+// acquisition, which renewing, releasing and acknowledging require.
 type WaitRecord struct {
 	WaitID         string
 	RunID          string
@@ -64,12 +65,13 @@ type WaitRecord struct {
 	Payload        json.RawMessage
 	LeaseOwner     string
 	LeaseUntil     time.Time
+	LeaseToken     int64
 }
 
 // waitColumns is what scanWait reads, from journal_waits w joined to its
 // run r (waitsWithRun).
 const (
-	waitColumns  = `w.wait_id, w.run_id, w.name, COALESCE(w.invocation_path, ''), COALESCE(w.iteration_path, ''), w.due_at, w.state, w.signal_id, w.payload_json, COALESCE(r.lease_owner, ''), COALESCE(r.lease_until, 0)`
+	waitColumns  = `w.wait_id, w.run_id, w.name, COALESCE(w.invocation_path, ''), COALESCE(w.iteration_path, ''), w.due_at, w.state, w.signal_id, w.payload_json, COALESCE(r.lease_owner, ''), COALESCE(r.lease_until, 0), COALESCE(r.lease_token, 0)`
 	waitsWithRun = ` FROM journal_waits w JOIN journal_runs r ON r.run_id = w.run_id`
 )
 
@@ -251,9 +253,11 @@ func (j *Journal) ClaimDueWaits(ctx context.Context, now time.Time, limit int) (
 				return err
 			}
 			if _, seen := leased[run]; !seen {
-				if leased[run], err = j.takeRunLease(ctx, tx, run, now); err != nil {
+				token, err := j.takeRunLease(ctx, tx, run, now)
+				if err != nil {
 					return err
 				}
+				leased[run] = token != 0
 			}
 			if leased[run] {
 				record, err := scanWait(tx.QueryRowContext(ctx, `SELECT `+waitColumns+waitsWithRun+` WHERE w.wait_id = ?`, waitID))
@@ -270,8 +274,10 @@ func (j *Journal) ClaimDueWaits(ctx context.Context, now time.Time, limit int) (
 
 // PendingResumptions takes the run lease of up to limit live runs that have
 // a fired wait and no live run lease, and returns those runs' fired waits:
-// the caller executes them. Runs leased least recently come first, so a
-// run whose resumption never finishes cannot starve the others. Run it on
+// the caller executes them. Runs are served in the order they last got
+// attention, the later of their last lease and (never leased) their first
+// wakeup, so neither a run whose resumption never finishes nor a stream of
+// newly woken runs can starve the others. Run it on
 // start, and periodically, to resume the runs whose wakeup a crash or a
 // lapsed lease interrupted.
 func (j *Journal) PendingResumptions(ctx context.Context, now time.Time, limit int) ([]WaitRecord, error) {
@@ -281,7 +287,7 @@ func (j *Journal) PendingResumptions(ctx context.Context, now time.Time, limit i
 	var records []WaitRecord
 	err := j.withTx(ctx, "wait-lease", func(tx *sql.Tx) error {
 		runs, err := queryStrings(ctx, tx, `SELECT w.run_id`+waitsWithRun+` WHERE w.state = ? AND r.state = ? AND (r.lease_until IS NULL OR r.lease_until <= ?)
-			GROUP BY w.run_id ORDER BY COALESCE(MAX(r.leased_at), 0), MIN(w.fired_at), w.run_id LIMIT ?`, waitFired, runAccepted, now.UTC().UnixNano(), limit)
+			GROUP BY w.run_id ORDER BY COALESCE(MAX(r.leased_at), MIN(w.fired_at)), w.run_id LIMIT ?`, waitFired, runAccepted, now.UTC().UnixNano(), limit)
 		if err != nil {
 			return err
 		}
@@ -311,49 +317,90 @@ func (j *Journal) PendingResumptions(ctx context.Context, now time.Time, limit i
 }
 
 // takeRunLease leases a live run to this holder until now plus the wakeup
-// lease, when no holder (this one included) has it under a live lease. A
+// lease, when no holder (this one included) has it under a live lease, and
+// returns the new lease token: every acquisition gets the next one, so an
+// execution under an older lease, even this holder's, is fenced out. A
 // holder that wants to keep a run it holds renews it instead.
-func (j *Journal) takeRunLease(ctx context.Context, tx *sql.Tx, runID string, now time.Time) (bool, error) {
-	result, err := tx.ExecContext(ctx, `UPDATE journal_runs SET lease_owner = ?, lease_until = ?, leased_at = ? WHERE run_id = ? AND state = ? AND (lease_until IS NULL OR lease_until <= ?)`, j.holder, now.Add(j.lease).UTC().UnixNano(), now.UTC().UnixNano(), runID, runAccepted, now.UTC().UnixNano())
-	if err != nil {
-		return false, err
+func (j *Journal) takeRunLease(ctx context.Context, tx *sql.Tx, runID string, now time.Time) (int64, error) {
+	var token int64
+	err := tx.QueryRowContext(ctx, `UPDATE journal_runs SET lease_owner = ?, lease_until = ?, leased_at = ?, lease_token = COALESCE(lease_token, 0) + 1 WHERE run_id = ? AND state = ? AND (lease_until IS NULL OR lease_until <= ?) RETURNING lease_token`, j.holder, now.Add(j.lease).UTC().UnixNano(), j.now(), runID, runAccepted, now.UTC().UnixNano()).Scan(&token)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
 	}
-	changed, err := result.RowsAffected()
-	return changed == 1, err
+	return token, err
 }
 
-// RenewRunLease extends this holder's lease on a run it is executing to now
-// plus the wakeup lease. A run another holder has taken over, or one with
-// no lease, is ErrLeaseLost.
-func (j *Journal) RenewRunLease(ctx context.Context, runID string, now time.Time) error {
-	return j.changeRunLease(ctx, "run-lease-renew", runID, `lease_until = ?`, now.Add(j.lease).UTC().UnixNano())
-}
-
-// ReleaseRunLease gives up this holder's lease on a run, so the next holder
-// may take it at once. A run with no lease is a no-op; one another holder
-// has is ErrLeaseLost.
-func (j *Journal) ReleaseRunLease(ctx context.Context, runID string) error {
-	return j.changeRunLease(ctx, "run-lease-release", runID, `lease_owner = NULL, lease_until = NULL`)
-}
-
-func (j *Journal) changeRunLease(ctx context.Context, name, runID, set string, args ...any) error {
-	return j.withTx(ctx, name, func(tx *sql.Tx) error {
-		var owner sql.NullString
-		if err := tx.QueryRowContext(ctx, `SELECT lease_owner FROM journal_runs WHERE run_id = ?`, runID).Scan(&owner); err != nil {
+// TakeRunLease leases a run to this holder when it starts executing it
+// without a wakeup (a run just admitted, for example), so its own waits
+// are not handed to another holder while it runs. It returns the lease
+// token that RenewRunLease, ReleaseRunLease and AcknowledgeWait require.
+// A run another holder (or this one) has under a live lease is
+// ErrLeaseLost; an ended one is ErrRunNotActive; an unknown one
+// ErrNotFound. Admission does not take it.
+func (j *Journal) TakeRunLease(ctx context.Context, runID string, now time.Time) (int64, error) {
+	var token int64
+	err := j.withTx(ctx, "run-lease-take", func(tx *sql.Tx) error {
+		var state string
+		if err := tx.QueryRowContext(ctx, `SELECT state FROM journal_runs WHERE run_id = ?`, runID).Scan(&state); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrNotFound
 			}
 			return err
 		}
-		if !owner.Valid && name == "run-lease-release" {
-			return nil
+		if state != runAccepted {
+			return ErrRunNotActive
 		}
-		if owner.String != j.holder {
-			return ErrLeaseLost
+		var err error
+		if token, err = j.takeRunLease(ctx, tx, runID, now); err == nil && token == 0 {
+			err = ErrLeaseLost
 		}
-		_, err := tx.ExecContext(ctx, `UPDATE journal_runs SET `+set+` WHERE run_id = ? AND lease_owner = ?`, append(args, runID, j.holder)...)
 		return err
 	})
+	return token, err
+}
+
+// RenewRunLease extends the lease token names to at least now plus the
+// wakeup lease; it never shortens it. A lease since taken again by any
+// holder, this one included, or released, is ErrLeaseLost.
+func (j *Journal) RenewRunLease(ctx context.Context, runID string, token int64, now time.Time) error {
+	return j.withTx(ctx, "run-lease-renew", func(tx *sql.Tx) error {
+		if err := j.checkRunLease(ctx, tx, runID, token, false); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `UPDATE journal_runs SET lease_until = MAX(lease_until, ?) WHERE run_id = ?`, now.Add(j.lease).UTC().UnixNano(), runID)
+		return err
+	})
+}
+
+// ReleaseRunLease gives up the lease token names, so the next holder may
+// take the run at once: a holder releases it when the run suspends or
+// ends. Releasing it again is a no-op; a lease since taken again is
+// ErrLeaseLost.
+func (j *Journal) ReleaseRunLease(ctx context.Context, runID string, token int64) error {
+	return j.withTx(ctx, "run-lease-release", func(tx *sql.Tx) error {
+		if err := j.checkRunLease(ctx, tx, runID, token, true); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `UPDATE journal_runs SET lease_owner = NULL, lease_until = NULL WHERE run_id = ?`, runID)
+		return err
+	})
+}
+
+// checkRunLease returns ErrLeaseLost unless token is the run's current
+// lease, held by this holder (or, when released counts, already released).
+func (j *Journal) checkRunLease(ctx context.Context, tx *sql.Tx, runID string, token int64, released bool) error {
+	var owner sql.NullString
+	var current int64
+	if err := tx.QueryRowContext(ctx, `SELECT lease_owner, COALESCE(lease_token, 0) FROM journal_runs WHERE run_id = ?`, runID).Scan(&owner, &current); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if token == 0 || token != current || owner.Valid && owner.String != j.holder || !owner.Valid && !released {
+		return ErrLeaseLost
+	}
+	return nil
 }
 
 func queryStrings(ctx context.Context, tx *sql.Tx, query string, args ...any) ([]string, error) {
@@ -376,18 +423,18 @@ func queryStrings(ctx context.Context, tx *sql.Tx, query string, args ...any) ([
 // AcknowledgeWait records that the engine committed the step a fired wait
 // resumed: the wakeup is consumed and the wait leaves PendingResumptions.
 // Acknowledging it again is a no-op; a wait that has not fired is
-// ErrWaitNotFired. It does not touch the run lease: the holder is still
-// executing the run, and renews or releases the lease itself. It does not
-// check the lease holder either: a holder whose lease was taken over can
-// still acknowledge (slice C acknowledges inside the resumed step's own
-// transaction, checked against the run lease).
-func (j *Journal) AcknowledgeWait(ctx context.Context, waitID string) error {
+// ErrWaitNotFired. token must be the run's current lease, held by this
+// holder: an execution whose lease was taken over, by another holder or by
+// this one again, gets ErrLeaseLost. It does not touch the run lease: the
+// holder is still executing the run, and renews or releases it itself.
+// (Slice C acknowledges inside the resumed step's own transaction.)
+func (j *Journal) AcknowledgeWait(ctx context.Context, waitID string, token int64) error {
 	if waitID == "" {
 		return errors.New("journal: wait ID is required")
 	}
 	return j.withTx(ctx, "wait-acknowledge", func(tx *sql.Tx) error {
-		var state string
-		if err := tx.QueryRowContext(ctx, `SELECT state FROM journal_waits WHERE wait_id = ?`, waitID).Scan(&state); err != nil {
+		var state, runID string
+		if err := tx.QueryRowContext(ctx, `SELECT state, run_id FROM journal_waits WHERE wait_id = ?`, waitID).Scan(&state, &runID); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrNotFound
 			}
@@ -397,6 +444,9 @@ func (j *Journal) AcknowledgeWait(ctx context.Context, waitID string) error {
 		case waitAcknowledged:
 			return nil
 		case waitFired:
+			if err := j.checkRunLease(ctx, tx, runID, token, false); err != nil {
+				return err
+			}
 			_, err := tx.ExecContext(ctx, `UPDATE journal_waits SET state = ?, updated_at = ? WHERE wait_id = ? AND state = ?`, waitAcknowledged, j.now(), waitID, waitFired)
 			return err
 		default:
@@ -442,7 +492,7 @@ func scanWait(row interface{ Scan(...any) error }) (WaitRecord, error) {
 	var record WaitRecord
 	var dueAt, leaseUntil int64
 	var payload []byte
-	if err := row.Scan(&record.WaitID, &record.RunID, &record.Name, &record.InvocationPath, &record.IterationPath, &dueAt, &record.State, &record.SignalID, &payload, &record.LeaseOwner, &leaseUntil); err != nil {
+	if err := row.Scan(&record.WaitID, &record.RunID, &record.Name, &record.InvocationPath, &record.IterationPath, &dueAt, &record.State, &record.SignalID, &payload, &record.LeaseOwner, &leaseUntil, &record.LeaseToken); err != nil {
 		return WaitRecord{}, err
 	}
 	record.DueAt = time.Unix(0, dueAt).UTC()

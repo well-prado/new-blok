@@ -80,7 +80,7 @@ func TestClaimedWakeupSurvivesReopen(t *testing.T) {
 			t.Fatalf("at +%v: listed=%v err=%v; want %v", step.at, waitIDs(listed), err, step.want)
 		}
 		for _, w := range listed {
-			if err := j.AcknowledgeWait(ctx, w.WaitID); err != nil {
+			if err := j.AcknowledgeWait(ctx, w.WaitID, w.LeaseToken); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -92,8 +92,9 @@ func TestClaimedWakeupSurvivesReopen(t *testing.T) {
 	}
 }
 
-// TestAcknowledgeWait: a fired wait is acknowledged once (again is a
-// no-op); a waiting or canceled one is ErrWaitNotFired; an unknown one is
+// TestAcknowledgeWait: a fired wait is acknowledged once, under its run's
+// current lease (again is a no-op); without that lease it is ErrLeaseLost;
+// a waiting or canceled one is ErrWaitNotFired; an unknown one is
 // ErrNotFound.
 func TestAcknowledgeWait(t *testing.T) {
 	r := newSignalRig(t, ticking(fixtureBase))
@@ -103,16 +104,23 @@ func TestAcknowledgeWait(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, id := range []string{"open", "canceled"} {
-		if err := r.journal.AcknowledgeWait(r.ctx, id); !errors.Is(err, ErrWaitNotFired) {
+		if err := r.journal.AcknowledgeWait(r.ctx, id, 0); !errors.Is(err, ErrWaitNotFired) {
 			t.Fatalf("%s: err=%v; want ErrWaitNotFired", id, err)
 		}
 	}
-	if err := r.journal.AcknowledgeWait(r.ctx, "missing"); !errors.Is(err, ErrNotFound) {
+	if err := r.journal.AcknowledgeWait(r.ctx, "missing", 0); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing: err=%v", err)
 	}
 	r.send("s1")
+	if err := r.journal.AcknowledgeWait(r.ctx, "open", 0); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("acknowledged without the run lease: err=%v", err)
+	}
+	token, err := r.journal.TakeRunLease(r.ctx, r.run, fixtureBase)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for range 2 {
-		if err := r.journal.AcknowledgeWait(r.ctx, "open"); err != nil {
+		if err := r.journal.AcknowledgeWait(r.ctx, "open", token); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -285,7 +293,8 @@ func TestRunLeaseOutlivesAcknowledgement(t *testing.T) {
 	}
 	claimed, err := a.ClaimDueWaits(ctx, at(0), 10)
 	expect("a claims w1", claimed, err, "w1@a")
-	if err := a.AcknowledgeWait(ctx, "w1"); err != nil {
+	token := claimed[0].LeaseToken
+	if err := a.AcknowledgeWait(ctx, "w1", token); err != nil {
 		t.Fatal(err)
 	}
 	claimed, err = b.ClaimDueWaits(ctx, at(time.Minute), 10)
@@ -295,20 +304,20 @@ func TestRunLeaseOutlivesAcknowledgement(t *testing.T) {
 	}
 	listed, err := b.PendingResumptions(ctx, at(time.Minute+time.Second), 10)
 	expect("b's listing while a still runs it", listed, err)
-	if err := a.RenewRunLease(ctx, run, at(4*time.Minute)); err != nil {
+	if err := a.RenewRunLease(ctx, run, token, at(4*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	listed, err = b.PendingResumptions(ctx, at(6*time.Minute), 10)
 	expect("b's listing after a renewed past its first lease", listed, err)
 	for _, change := range []func() error{
-		func() error { return b.RenewRunLease(ctx, run, at(6*time.Minute)) },
-		func() error { return b.ReleaseRunLease(ctx, run) },
+		func() error { return b.RenewRunLease(ctx, run, token, at(6*time.Minute)) },
+		func() error { return b.ReleaseRunLease(ctx, run, token) },
 	} {
 		if err := change(); !errors.Is(err, ErrLeaseLost) {
 			t.Fatalf("b changing a's lease: err=%v; want ErrLeaseLost", err)
 		}
 	}
-	if err := a.ReleaseRunLease(ctx, run); err != nil {
+	if err := a.ReleaseRunLease(ctx, run, token); err != nil {
 		t.Fatal(err)
 	}
 	listed, err = b.PendingResumptions(ctx, at(6*time.Minute), 10)
@@ -424,5 +433,157 @@ func TestReopenDoesNotWaitForAWriter(t *testing.T) {
 	}
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestLeaseTokenFencesStaleExecutions is Review R round 2's three probes:
+// every acquisition of a run lease gets a new token, and renewing,
+// releasing or acknowledging under an older one is ErrLeaseLost, even when
+// the same holder has taken the run again. On 3258f8c each was accepted.
+func TestLeaseTokenFencesStaleExecutions(t *testing.T) {
+	ctx := context.Background()
+	at := func(d time.Duration) time.Time { return fixtureBase.Add(d) }
+	t.Run("own sweep retakes a stalled execution's run", func(t *testing.T) {
+		database, a := newJournal(t, "stall.db", Config{Holder: "a"})
+		defer database.Close()
+		run := admitWaiting(t, a, "run", map[string]time.Time{"w1": fixtureBase})
+		claimed, err := a.ClaimDueWaits(ctx, at(0), 10)
+		if err != nil || len(claimed) != 1 {
+			t.Fatalf("claim=%v err=%v", waitIDs(claimed), err)
+		}
+		stale := claimed[0].LeaseToken
+		swept, err := a.PendingResumptions(ctx, at(31*time.Second), 10)
+		if err != nil || !reflect.DeepEqual(waitIDs(swept), []string{"w1@a"}) || swept[0].LeaseToken == stale {
+			t.Fatalf("sweep=%+v err=%v; want w1 under a new token", swept, err)
+		}
+		if err := a.RenewRunLease(ctx, run, stale, at(32*time.Second)); !errors.Is(err, ErrLeaseLost) {
+			t.Fatalf("the stalled execution renewed: err=%v", err)
+		}
+		if err := a.AcknowledgeWait(ctx, "w1", stale); !errors.Is(err, ErrLeaseLost) {
+			t.Fatalf("the stalled execution acknowledged: err=%v", err)
+		}
+		if err := a.AcknowledgeWait(ctx, "w1", swept[0].LeaseToken); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("retaken after another holder died", func(t *testing.T) {
+		a, b := twoHolders(t, Config{Holder: "a"}, Config{Holder: "b"})
+		run := admitWaiting(t, a, "run", map[string]time.Time{"w1": fixtureBase})
+		claimed, err := a.ClaimDueWaits(ctx, at(0), 10)
+		if err != nil || len(claimed) != 1 {
+			t.Fatalf("claim=%v err=%v", waitIDs(claimed), err)
+		}
+		if listed, err := b.PendingResumptions(ctx, at(31*time.Second), 10); err != nil || len(listed) != 1 {
+			t.Fatalf("b=%v err=%v", waitIDs(listed), err)
+		}
+		retaken, err := a.PendingResumptions(ctx, at(62*time.Second), 10)
+		if err != nil || len(retaken) != 1 {
+			t.Fatalf("a=%v err=%v", waitIDs(retaken), err)
+		}
+		if err := a.RenewRunLease(ctx, run, claimed[0].LeaseToken, at(63*time.Second)); !errors.Is(err, ErrLeaseLost) {
+			t.Fatalf("a's first execution renewed: err=%v", err)
+		}
+		if err := a.RenewRunLease(ctx, run, retaken[0].LeaseToken, at(63*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		// Renewal never shortens a lease.
+		if err := a.RenewRunLease(ctx, run, retaken[0].LeaseToken, at(0)); err != nil {
+			t.Fatal(err)
+		}
+		if w, err := a.Wait(ctx, "w1"); err != nil || !w.LeaseUntil.Equal(at(93*time.Second)) {
+			t.Fatalf("lease until %v err=%v; want %v", w.LeaseUntil, err, at(93*time.Second))
+		}
+	})
+	t.Run("two journals under one holder name", func(t *testing.T) {
+		first, second := twoHolders(t, Config{Holder: "same"}, Config{Holder: "same"})
+		run := admitWaiting(t, first, "run", nil)
+		token, err := first.TakeRunLease(ctx, run, at(0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := second.ReleaseRunLease(ctx, run, token+1); !errors.Is(err, ErrLeaseLost) {
+			t.Fatalf("the other journal released it: err=%v", err)
+		}
+		if _, err := second.TakeRunLease(ctx, run, at(time.Second)); !errors.Is(err, ErrLeaseLost) {
+			t.Fatalf("the other journal took it: err=%v", err)
+		}
+		for range 2 {
+			if err := first.ReleaseRunLease(ctx, run, token); err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+}
+
+// TestTakeRunLeaseHoldsARunThatNeverSuspended is Review R round 2's S2
+// probe: a run executing since admission takes its lease, so a timer it
+// schedules while it runs is not claimed by another holder; once released
+// it is. An ended run or a held one cannot be taken.
+func TestTakeRunLeaseHoldsARunThatNeverSuspended(t *testing.T) {
+	ctx := context.Background()
+	a, b := twoHolders(t, Config{Holder: "a"}, Config{Holder: "b"})
+	run := admitWaiting(t, a, "fresh", nil)
+	token, err := a.TakeRunLease(ctx, run, fixtureBase)
+	if err != nil || token == 0 {
+		t.Fatalf("take=%d err=%v", token, err)
+	}
+	if _, err := b.TakeRunLease(ctx, run, fixtureBase); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("b took a held run: err=%v", err)
+	}
+	if _, err := a.ScheduleWait(ctx, WaitRequest{RunID: run, WaitID: "t", Name: "t", InvocationPath: "t", IterationPath: "root", DueAt: fixtureBase}); err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := b.ClaimDueWaits(ctx, fixtureBase.Add(time.Second), 10); err != nil || len(claimed) != 0 {
+		t.Fatalf("b claimed %v from a run a is executing; err=%v", waitIDs(claimed), err)
+	}
+	if err := a.ReleaseRunLease(ctx, run, token); err != nil {
+		t.Fatal(err)
+	}
+	if listed, err := b.PendingResumptions(ctx, fixtureBase.Add(2*time.Second), 10); err != nil || !reflect.DeepEqual(waitIDs(listed), []string{"t@b"}) {
+		t.Fatalf("after release: %v err=%v; want [t@b]", waitIDs(listed), err)
+	}
+	ended := admitWaiting(t, a, "ended", nil)
+	if err := a.CompleteRun(ctx, ended, []byte(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.TakeRunLease(ctx, ended, fixtureBase); !errors.Is(err, ErrRunNotActive) {
+		t.Fatalf("took an ended run: err=%v", err)
+	}
+	if _, err := a.TakeRunLease(ctx, "run:missing", fixtureBase); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("took an unknown run: err=%v", err)
+	}
+}
+
+// TestNewWakeupsDoNotStarveALeasedRun: a run whose lease lapsed without
+// acknowledgement waits its turn behind runs that woke before it was last
+// leased, and ahead of runs that woke after. On 3258f8c never-leased runs
+// always ranked first.
+func TestNewWakeupsDoNotStarveALeasedRun(t *testing.T) {
+	ctx := context.Background()
+	database, j := newJournal(t, "starve.db", Config{Holder: "a", Clock: ticking(fixtureBase)})
+	defer database.Close()
+	signal1 := func(key string) {
+		run := admitWaiting(t, j, key, map[string]time.Time{key: fixtureBase.Add(time.Hour)})
+		if _, err := j.Signal(ctx, signal.Envelope{RunID: run, SignalID: key, Name: key, Principal: "operator", Payload: []byte(`{}`)}, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	signal1("stuck")
+	if listed, err := j.PendingResumptions(ctx, fixtureBase, 1); err != nil || len(listed) != 1 {
+		t.Fatalf("%v err=%v", waitIDs(listed), err)
+	}
+	for _, key := range []string{"new-1", "new-2", "new-3"} {
+		signal1(key)
+	}
+	var order []string
+	for period := 1; period <= 4; period++ {
+		listed, err := j.PendingResumptions(ctx, fixtureBase.Add(time.Duration(period)*31*time.Second), 1)
+		if err != nil || len(listed) != 1 {
+			t.Fatalf("period %d: %v err=%v", period, waitIDs(listed), err)
+		}
+		order = append(order, listed[0].WaitID)
+	}
+	if want := []string{"stuck", "new-1", "new-2", "new-3"}; !reflect.DeepEqual(order, want) {
+		t.Fatalf("listed %v; want %v", order, want)
 	}
 }
