@@ -48,3 +48,28 @@ Reason: #322 (~7,000 lines) cost one to three hours per review round because eve
 - **Full gate once.** Run the whole-repo validation block above (gofmt, diff --check, mod verify, vet including both Windows arches, both builds, `go test ./...`, `go test -race ./...`, plus any module suites touched) once, on the final head, before merge.
 - **No repeated flakiness batches by default.** Run `-count=N` repeats only for a test that is new, timing-sensitive, or has flaked before.
 - **New non-blocking findings in a later round become issues,** not another round. Blockers and should-fix items on the changed lines are still fixed in the PR.
+
+## Orchestrator practice (added 2026-10-07; follow it)
+- **Max 4 agents at once** (implementers + reviewers together). Agents never merge, never spawn sub-agents.
+- **Every merge = independent Review R approved + full gate on the tree that lands.** Round 1 reviews the whole PR;
+  later rounds review only the delta (`git show --remerge-diff <merge>` must be empty or justified, plus
+  `git diff <last-reviewed>..<new>`). The orchestrator may review a small delta itself only when it wrote none of that code;
+  if the orchestrator pushes a commit (e.g. a conflict fix), a separate agent reviews it.
+- **Gate on the tree that lands:** check out the PR head detached, `git merge origin/main` locally (no push), run
+  `.handoff/gate.sh <worktree> <logdir>` (gofmt, diff --check, mod verify, vet incl. GOOS=windows arm64+amd64, build
+  ±CGO, `go test ./...`, `go test -race ./...`). If main moves before the merge and the PRs don't overlap, re-run only
+  the packages where they meet and record that on the PR.
+- **A gate failure in an untouched package** must be proven unrelated before merging: show the PR doesn't touch it
+  (`git diff --stat origin/main...HEAD -- <pkg>`), and re-run it on the same tree and on `origin/main` at the same load.
+  Known flaky: #374 (trigger/worker timing). Record the evidence in the PR comment.
+- **Record the Review R summary and gate results as a PR comment before merging**, then
+  `bash .handoff/waiver-merge.sh <pr> <full-sha>` (must print PROTECTION IDENTICAL). `Fixes #N` doesn't fire for a PR
+  merged into a non-default branch — close those issues by hand with a link.
+- **Stacked PRs:** merge in stack order. When parent and child are both approved, merging the child INTO the parent
+  branch lets one gate and one main merge cover both.
+- **Schema/ADR numbers are scarce:** assign them centrally (STATE.md lists what's taken); two open PRs must never take
+  the same journal schema version — the second to merge renumbers.
+- **After merge:** move board items to Done, tick the matching E07 child-issue boxes WITH evidence links (never from
+  mocks/file presence), and file every non-blocking later-round finding as an issue (What/Why/How).
+- **Never** run fixture/RED work in the shared checkout; never `git checkout -- <file>` to revert a mutation (it wipes
+  other edits) — apply/revert mutations with exact string replacement or `go test -overlay`.
