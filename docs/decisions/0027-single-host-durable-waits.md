@@ -1,8 +1,9 @@
 # ADR 0027: Single-host durable waits
 
-- Status: in progress for E07-T09 (#332), delivered as stacked PRs. Slice A
-  (this revision) records wait identity. Slice B (crash-safe wakeups) and
-  slice C (the engine's `WaitJournal` on `internal/journal`) extend it
+- Status: in progress for E07-T09 (#332), delivered in slices. Slice A
+  (merged, #350) records wait identity and signal routing; slice B (this
+  revision) makes wakeups crash-safe; slice C (the engine's `WaitJournal`
+  on `internal/journal`) extends it
 - Date: 2026-10-07
 - Roadmap: E07-T09 ([#332](https://github.com/well-prado/new-blok/issues/332)),
   closing gaps in E07-T04 (#46); prerequisite of E07-T10 (#333, nested
@@ -103,6 +104,100 @@ signal by `(run_id, name)` alone and reads an arbitrary row once a name
 repeats, with its own pre-#332 late rule: the same convention limit #286
 accepted for pre-#291 binaries (ADR 0003, Limits).
 
+## Wakeup durability (slice B)
+
+**The defect (D1).** A timer claim (`ClaimDueWaits`) or a signal moved a
+wait straight to `resumed`. If the process died before the run was
+resumed, nothing could find that wakeup again: the wait was no longer due,
+the signal was no longer pending, and the run stayed `accepted` forever
+(the E07 audit's probe, reproduced on origin/main 83bd1bf in the slice B
+PR: after claim and reopen, `reclaimable=0`, wait `resumed`, run
+`accepted`). A coat check analogy: the attendant tore up the ticket when
+the owner's name was called, before anyone had handed the coat over.
+
+**States.** A wait is `waiting`, then `fired` (claimed by its timer, or
+given a signal, including a pending one at schedule time), then
+`acknowledged`; or `canceled`. Firing records `fired_at`. A fired wait is
+a wakeup the run has not consumed yet, and it stays fired until
+`AcknowledgeWait`, which the engine calls once it has committed the step
+the wait resumed (slice C wires that). Acknowledging again is a no-op
+under the current lease token, and `ErrLeaseLost` under any other; a wait
+that has not fired is `ErrWaitNotFired`.
+
+**Run leases** (Review R round 1 on #366, orchestrator decision: the
+lease is on the run, so slice C and #333 have one executor per run; rounds
+2 and 3: fenced by a journal-wide token per acquisition). Each `Journal` has a holder name
+(`Config.Holder`, which must be unique per process; random by default) and
+a lease length (`Config.WakeupLease`, 30 s by default). A run lease is
+`lease_owner`, `lease_until`, `leased_at` and `lease_token` on
+`journal_runs`. A run is held while `lease_until` is after the `now` a call
+is given, whoever holds it, the caller included: a holder that wants to
+keep a run renews it, never takes it again.
+
+Every acquisition (a claim, a resumption listing, `TakeRunLease`) draws the
+next value of one journal-wide sequence (the `lease_token` counter in
+`journal_meta`, which compaction never resets) and stores it as
+the run's `lease_token`, returned in `WaitRecord.LeaseToken` or by
+`TakeRunLease`. Renewing, releasing and acknowledging (an acknowledged
+retry included) require the run's current token, so an execution whose
+lease was taken over, by another holder or by the same holder again (its
+own sweep after a stall, or after another holder took the run and died),
+gets `ErrLeaseLost` and must stop, and a token from one run never passes on
+another. The token is a fencing counter, not a capability: it is not
+secret, and it orders acquisitions; it does not authenticate the caller.
+
+- `ClaimDueWaits(now, limit)` fires due waits of live (`accepted`) runs,
+  and takes the lease of each of their runs that is not held. It returns
+  the waits of the runs it leased: the caller executes those runs. A wait
+  of a held run still fires, but is not returned, even to the holder that
+  holds the run: it stays fired for that holder's execution, or for
+  `PendingResumptions` once the lease lapses or is released. A due wait of
+  an ended run does not fire.
+- A signal fires its wait and does not touch the lease: the signaller does
+  not execute runs.
+- `PendingResumptions(now, limit)` takes, in one write-first transaction,
+  the lease of up to `limit` live runs that have a fired wait and are not
+  held, and returns their fired waits. Runs are served in the order they
+  last got attention: the later of their last lease (`leased_at`, on the
+  journal's clock; none counts as earliest) and their first pending wakeup
+  (`fired_at`). A run whose resumption never finishes and a stream of newly
+  woken runs therefore take turns, neither starving the other, and a run
+  leased long ago that wakes again queues behind runs that woke before it.
+  Run it on start and periodically.
+- `TakeRunLease(runID, now)` leases a run its holder starts executing
+  without a wakeup, a run just admitted for example, so the waits it
+  schedules are not handed to another holder while it runs. Admission does
+  not take it (slice C's runner does). A held run is `ErrLeaseLost`; an
+  ended one `ErrRunNotActive`.
+- `AcknowledgeWait(waitID, token)` consumes a wakeup under the run's
+  current lease (`ErrLeaseLost` otherwise) and leaves the lease alone: the
+  holder is still executing the run.
+- `RenewRunLease(runID, token, now)` extends the lease to at least `now`
+  plus the lease length; it never shortens it. `ReleaseRunLease(runID,
+  token)` gives it up so the next holder may take the run at once; a
+  holder releases it when the run suspends at a wait or ends.
+
+The `now` given to these calls is the clock leases are measured on;
+callers pass the same clock to all of them.
+
+**Inspection.** A fired wait's step shows `running` (inspection/v1 has no
+"woken" status) until it is acknowledged, or its run has ended, when it
+shows `completed`.
+
+**Migration (schema 6).** `fired_at` is added to `journal_waits` and
+`lease_owner`, `lease_until`, `leased_at` and `lease_token` to
+`journal_runs`, gated on the version found. Every `resumed` wait becomes
+`fired` when its run is live, so origin/main's stranded wakeups are listed by `PendingResumptions`
+after the upgrade, or `acknowledged` when its run has ended. That remap is
+not gated on the version: like #286's tenant repair it runs on every open,
+because a binary from before #291 cannot see the stamp and can still
+write `resumed`; it only reads unless such a wait exists, so reopening a
+migrated journal never waits for the write lock. There is no unstamped
+shape for 6: every database with these columns was written after the
+stamp existed. A schema-5 binary refuses a schema-6 journal (#291).
+Version 5 is #334's scope attempt (PR #351), which merged first; this step
+was renumbered from 5 to 6.
+
 ## Compatibility
 
 | Change | Class | Migration |
@@ -114,8 +209,10 @@ accepted for pre-#291 binaries (ADR 0003, Limits).
 | `SignalWait` and `WaitTarget` address one wait | API, additive | None |
 | A duplicate step identity or wait ID returns `ErrWaitExists`, not a raw constraint error | behavioral | None |
 | Journal schema 3 → 4 | schema, one-way | On open, in the schema transaction, killed or not (see Evidence) |
+| Wait states `resumed` → `fired` / `acknowledged`; run leases; `ClaimDueWaits` fires only waits of live runs and returns only those of runs it leased; `PendingResumptions`, `TakeRunLease`, `AcknowledgeWait`, `RenewRunLease`, `ReleaseRunLease` (the last three take the lease token), `ErrWaitNotFired`, `ErrLeaseLost`, `Config.Holder`, `Config.WakeupLease`, `WaitRecord.LeaseOwner`/`LeaseUntil`/`LeaseToken` (the run's lease) (slice B) | API and behavioral; no caller outside `internal/journal` | Call `PendingResumptions` on start; `TakeRunLease` when starting a run without a wakeup; `AcknowledgeWait` after the resumed step commits; renew while executing, release when the run suspends or ends |
+| Journal schema 5 → 6 (slice B) | schema, one-way | On open; `resumed` waits remapped on every open |
 
-## Evidence (slice A)
+## Evidence
 
 In the #332 slice A PR, all RED on origin/main or under a named mutation
 of the change:
@@ -138,10 +235,44 @@ of the change:
   `TestInspectionShowsTheOpenWaitOfAName`,
   `TestTargetedSignalReachesOnlyItsWait`.
 
-## Limits (slice A)
+Slice B: `TestClaimedWakeupSurvivesReopen` (the audit's D1 probe),
+`TestAcknowledgeWait`, `TestPendingResumptionsLeasesEachRunOnce`,
+`TestLegacyResumedWaitsBecomeFiredOrAcknowledged` (including the aaf633c
+database's stranded claim and signal); after Review R round 1,
+`TestRunLeaseOutlivesAcknowledgement` (the reviewer's two probes, renewal,
+release), `TestAnyLiveLeaseHoldsTheRun`, `TestClaimSkipsEndedRuns`,
+`TestPendingResumptionsIsFair`, `TestReopenDoesNotWaitForAWriter`; after
+round 2, `TestLeaseTokenFencesStaleExecutions` (the reviewer's three
+probes), `TestTakeRunLeaseHoldsARunThatNeverSuspended`,
+`TestNewWakeupsDoNotStarveALeasedRun`; after round 3,
+`TestAcknowledgedRetryNeedsTheCurrentToken`, `TestLeaseTokensAreJournalWide`,
+`TestRewokenRunRanksByItsNewWakeup`.
 
-- A claimed or signalled wakeup is still not crash-safe (defect D1): a
-  wait flips to resumed with no lease. Slice B.
+## Limits
+
+- Nothing calls `PendingResumptions` or `AcknowledgeWait` yet: slice C's
+  single-host resumer does, and decides whether acknowledgement commits in
+  the same transaction as the resumed step.
+- A lease is time-based on the caller's clock: a holder that stalls past
+  its lease without renewing it can be overtaken, and the run executed
+  twice. The engine's step journal makes replay of committed steps
+  idempotent; fencing the stale holder's later writes is not part of this
+  slice.
+- `RenewRunLease` and `ReleaseRunLease` still succeed under the current
+  token after the run has ended. That is harmless (resumption listings and
+  claims only consider live runs); slice C's runner releases the lease when
+  a run ends.
+- The lease token fences the journal's lease calls, not the engine's
+  step writes: a stale execution learns it lost the run at its next renew
+  or acknowledgement. Slice C acknowledges inside the resumed step's own
+  transaction, so the step commits only under the current token.
+- Mixed versions: a binary from before this slice, still running during an
+  upgrade, may be executing a run whose wakeup it marked `resumed`; the
+  first open by this binary remaps that wait to `fired` and a holder may
+  then list and execute the same run: a double-resume window that lasts
+  until the old process stops. Upgrade by stopping old processes first.
+- `CompleteRun` does not yet refuse a run with an unacknowledged fired
+  wait.
 - `internal/journal` does not yet implement `engine.WaitJournal`, and the
   single-host runner does not resume from it. Slice C, which also chooses
   how the engine's `StepIdentity` and #333's iteration path map onto the

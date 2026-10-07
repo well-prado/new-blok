@@ -804,8 +804,8 @@ func TestVersion4JournalGainsScopeAttempts(t *testing.T) {
 
 	database, j = newJournalAtPath(t, path, Config{})
 	defer database.Close()
-	if got := oneRow(t, database, `SELECT version || '|' || upgraded_from FROM blok_schema_versions WHERE component = 'journal'`); got != "5|4" {
-		t.Fatalf("journal stamp=%s; want 5 upgraded from 4", got)
+	if got := oneRow(t, database, `SELECT version || '|' || upgraded_from FROM blok_schema_versions WHERE component = 'journal'`); got != "6|4" {
+		t.Fatalf("journal stamp=%s; want 6 (#332 after #334's 5) upgraded from 4", got)
 	}
 	if err := j.CompleteScope(ctx, run.RunID, "each/0", "", []byte(`{"v":"guessed"}`)); !errors.Is(err, ErrStaleAttempt) {
 		t.Errorf("completing a pre-#334 scope without an attempt: err=%v, want ErrStaleAttempt", err)

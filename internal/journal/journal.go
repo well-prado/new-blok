@@ -68,6 +68,14 @@ type Config struct {
 	// never removes a run completed less than this long ago, whatever cutoff
 	// it is given. Negative is refused.
 	MinRetention time.Duration
+	// Holder names this process for run leases (ADR 0027): a run whose
+	// wakeup it claims or lists for resumption is leased to it. It must be
+	// unique per process; empty draws a random one per Journal.
+	Holder string
+	// WakeupLease is how long a run stays leased to the holder executing
+	// it, unless renewed, before another may take it over. Zero means 30
+	// seconds; negative is refused.
+	WakeupLease time.Duration
 }
 
 // RetainedRun identifies a completed run Compact is about to delete.
@@ -82,6 +90,8 @@ type Journal struct {
 	audit    *audit.Journal
 	hold     func(RetainedRun) bool
 	minimum  time.Duration
+	holder   string
+	lease    time.Duration
 }
 
 type AdmissionRequest struct {
@@ -172,9 +182,22 @@ func New(ctx context.Context, database store.Database, config Config) (*Journal,
 	if config.MinRetention < 0 {
 		return nil, errors.New("journal: minimum retention must not be negative")
 	}
-	j := &Journal{database: database, clock: config.Clock, hooks: config.Hooks, audit: config.Audit, hold: config.Hold, minimum: config.MinRetention}
+	if config.WakeupLease < 0 {
+		return nil, errors.New("journal: wakeup lease must not be negative")
+	}
+	j := &Journal{database: database, clock: config.Clock, hooks: config.Hooks, audit: config.Audit, hold: config.Hold, minimum: config.MinRetention, holder: config.Holder, lease: config.WakeupLease}
 	if j.clock == nil {
 		j.clock = time.Now
+	}
+	if j.lease == 0 {
+		j.lease = 30 * time.Second
+	}
+	if j.holder == "" {
+		holder, err := randomID("holder")
+		if err != nil {
+			return nil, err
+		}
+		j.holder = holder
 	}
 	// Adding a column reads the schema first, so concurrent openers of a
 	// journal that needs one race; the idempotent migration is retried
@@ -197,18 +220,20 @@ func New(ctx context.Context, database store.Database, config Config) (*Journal,
 // with digests and erased_at), 3 with #286's reconciliation tenant, 4 with
 // #332's wait identity (journal_waits keyed by step and iteration instead
 // of by name), 5 with #334's scope attempt (journal_scopes.attempt_id,
-// which fences scope completion). New refuses a journal stamped with a
+// which fences scope completion), 6 with #332's wakeup durability (fired
+// waits, run leases). New refuses a journal stamped with a
 // newer one. Raise it with every change an older binary would misread,
 // together with the migration step that makes it. It is a variable only so
 // tests can stand in for an older binary.
-var schemaVersion = 5
+var schemaVersion = 6
 
 // inferSchemaVersion classifies a journal written before the stamp existed
 // by its shape: 0 when it has no tables yet, 4 when its waits carry an
 // iteration path (#332), 3 when its reconciliations carry a tenant (#286),
-// 2 when they carry erased_at (#281), else 1. There is no shape for 5:
-// every database with journal_scopes.attempt_id was written after the stamp
-// existed (#291), so it is stamped and never inferred.
+// 2 when they carry erased_at (#281), else 1. There is no shape for 5 or 6:
+// every database with journal_scopes.attempt_id or a run lease was
+// written after the stamp existed (#291), so it is stamped and never
+// inferred.
 func inferSchemaVersion(ctx context.Context, tx *sql.Tx) (int, error) {
 	if found, err := migration.TableExists(ctx, tx, "journal_runs"); err != nil || !found {
 		return 0, err
@@ -234,7 +259,8 @@ func inferSchemaVersion(ctx context.Context, tx *sql.Tx) (int, error) {
 // pre-#281 one recreates journal_audit, or a pre-#286 one inserts a
 // reconciliation without a tenant, in a journal already stamped current.
 // The next open repairs both. Steps from #332 on run only when the version
-// found is older than their own.
+// found is older than their own, except the "resumed" remap below, which
+// is shape-guarded and runs on every open for the same reason.
 func (j *Journal) migrate(ctx context.Context, tx *sql.Tx, from int) error {
 	for _, statement := range schemaStatements {
 		if _, err := tx.ExecContext(ctx, statement); err != nil {
@@ -303,7 +329,38 @@ func (j *Journal) migrate(ctx context.Context, tx *sql.Tx, from int) error {
 			return err
 		}
 	}
-	return nil
+	// Wakeup durability (#332): a fired time on waits, a lease on runs.
+	if from < 6 {
+		for _, column := range []struct{ table, name, declaration string }{
+			{"journal_waits", "fired_at", `INTEGER`},
+			{"journal_runs", "lease_owner", `TEXT`},
+			{"journal_runs", "lease_until", `INTEGER`},
+			{"journal_runs", "leased_at", `INTEGER`},
+			{"journal_runs", "lease_token", `INTEGER`},
+		} {
+			if err := ensureColumn(ctx, tx, column.table, column.name, column.declaration); err != nil {
+				return err
+			}
+		}
+	}
+	return remapResumedWaits(ctx, tx)
+}
+
+// remapResumedWaits maps the single "resumed" state waits had before
+// #332's slice B to fired, for a wait whose run is live, so a wakeup
+// claimed or signalled before a crash is listed by PendingResumptions; or
+// to acknowledged, for a run that has ended. It is not gated on the version
+// found: like the #286 tenant repair it runs on every open, because a
+// binary from before #291 cannot see the stamp and can still write
+// "resumed". It only reads unless such a wait exists, so reopening a
+// migrated journal never waits for the write lock.
+func remapResumedWaits(ctx context.Context, tx *sql.Tx) error {
+	var found bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM journal_waits WHERE state = ?)`, waitLegacyResumed).Scan(&found); err != nil || !found {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `UPDATE journal_waits SET state = CASE WHEN EXISTS (SELECT 1 FROM journal_runs r WHERE r.run_id = journal_waits.run_id AND r.state = ?) THEN ? ELSE ? END, fired_at = COALESCE(fired_at, updated_at) WHERE state = ?`, runAccepted, waitFired, waitAcknowledged, waitLegacyResumed)
+	return err
 }
 
 // migrateWaitIdentity rebuilds journal_waits keyed by step and iteration
@@ -354,7 +411,11 @@ var schemaStatements = []string{
 		completed_at INTEGER,
 		principal TEXT NOT NULL DEFAULT '',
 		error_code TEXT NOT NULL DEFAULT '',
-		error_class TEXT NOT NULL DEFAULT ''
+		error_class TEXT NOT NULL DEFAULT '',
+		lease_owner TEXT,
+		lease_until INTEGER,
+		leased_at INTEGER,
+		lease_token INTEGER
 	)`,
 	`CREATE TABLE IF NOT EXISTS journal_operations (
 		operation_key TEXT PRIMARY KEY,
@@ -488,6 +549,7 @@ func waitsTable(name string) string {
 		updated_at INTEGER NOT NULL,
 		invocation_path TEXT,
 		iteration_path TEXT,
+		fired_at INTEGER,
 		FOREIGN KEY (run_id) REFERENCES journal_runs(run_id),
 		UNIQUE (run_id, invocation_path, iteration_path),
 		CHECK ((invocation_path IS NULL) = (iteration_path IS NULL))

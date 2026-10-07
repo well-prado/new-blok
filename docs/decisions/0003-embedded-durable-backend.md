@@ -179,7 +179,7 @@ release supports:
 
 | Component | Owner | Version | History |
 | --- | --- | --- | --- |
-| `journal` | `internal/journal` | 5 | 1 before #281; 2 with #281's erasure tables; 3 with #286's reconciliation tenant; 4 with #332's wait identity (ADR 0027); 5 with #334's scope attempt (below) |
+| `journal` | `internal/journal` | 6 | 1 before #281; 2 with #281's erasure tables; 3 with #286's reconciliation tenant; 4 with #332's wait identity (ADR 0027); 5 with #334's scope attempt (below); 6 with #332's wakeup durability: fired waits and run leases (ADR 0027) |
 | `audit` | `contract/audit` | 1 | the #80 tables, unchanged since |
 | `worker` | `trigger/worker` | 2 | 1 before #290; 2 with #290's `worker_compacted` and `worker_meta` |
 | `approval` | `contract/approval` | 1 | `approval_decisions_v1` as #75 introduced it |

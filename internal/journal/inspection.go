@@ -147,7 +147,11 @@ func (j *Journal) ReadInspection(ctx context.Context, principal, runID, stepID s
 				if err := tx.QueryRowContext(ctx, query, args...).Scan(&waitState, &payload, &updated); err == nil {
 					step.StartedAt = time.Unix(0, updated).UTC()
 					step.Output = append([]byte(nil), payload...)
-					if waitState == waitResumed {
+					// A fired wait has woken its run, which has not yet
+					// committed the step it resumes: the step is still
+					// running (inspection/v1 has no "woken" status), until
+					// it is acknowledged or the run has ended.
+					if waitState == waitAcknowledged || waitState == waitFired && state != runAccepted {
 						step.Status = inspection.StatusCompleted
 						step.FinishedAt = step.StartedAt
 					} else if waitState == waitWaiting {

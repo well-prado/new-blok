@@ -41,7 +41,7 @@ func TestWaitAndSignalSurviveRestartAndDuplicateSignalsAreStable(t *testing.T) {
 		t.Fatalf("duplicate=%+v err=%v", duplicate, err)
 	}
 	record, err = journal.Wait(context.Background(), "wait-1")
-	if err != nil || record.State != waitResumed || record.SignalID != "signal-1" {
+	if err != nil || record.State != waitFired || record.SignalID != "signal-1" {
 		t.Fatalf("resumed=%+v err=%v", record, err)
 	}
 }
@@ -92,7 +92,7 @@ func TestSignalArrivingBeforeWaitIsConsumedAtomically(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if record.State != waitResumed || record.SignalID != envelope.SignalID || string(record.Payload) != string(envelope.Payload) {
+	if record.State != waitFired || record.SignalID != envelope.SignalID || string(record.Payload) != string(envelope.Payload) {
 		t.Fatalf("wait did not consume pre-wait signal: %+v", record)
 	}
 	duplicate, err := journal.Signal(context.Background(), envelope, true)
