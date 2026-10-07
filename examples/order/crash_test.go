@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -63,7 +64,12 @@ func TestOrderCrashMatrix(t *testing.T) {
 			if err := child.Process.Kill(); err != nil {
 				t.Fatal(err)
 			}
+			// Killing a child that already exited is not an error, so check
+			// that it died of the kill, still parked.
 			_ = child.Wait()
+			if status, ok := child.ProcessState.Sys().(syscall.WaitStatus); !ok || !status.Signaled() || status.Signal() != syscall.SIGKILL {
+				t.Fatalf("crash child was not killed at its crash point: %v", child.ProcessState)
+			}
 
 			run = openRun(t, path, log, crashRequest.RequestKey, "ok", offset)
 			defer run.close()
@@ -71,6 +77,8 @@ func TestOrderCrashMatrix(t *testing.T) {
 			// The producer's client never saw an acknowledgment and retries;
 			// for a later phase the retry is a duplicate delivery.
 			run.enqueue(crashRequest)
+			// This stage assumes less than the 30s default leases passed on
+			// the wall clock between the child's claim and this drain.
 			run.drain(1, false)
 			run.expect("recovered at the time of the crash", crash.AtCrashTime)
 			run.drain(3, true)

@@ -17,13 +17,13 @@
       "name": "validation failure",
       "deliveries": [{"requestKey": "invalid", "sku": "coffee", "quantity": 0}],
       "publisher": "ok",
-      "expect": {"accepted": 1, "errors": [], "jobs": 1, "jobState": "dead", "jobAttempt": 1, "orders": 0, "outbox": 0, "outboxState": "", "outboxAttempts": 0, "publishes": 0}
+      "expect": {"accepted": 1, "errors": [], "jobs": 1, "jobState": "dead", "jobAttempt": 1, "jobError": "order: sku and quantity are invalid", "orders": 0, "outbox": 0, "outboxState": "", "outboxAttempts": 0, "publishes": 0}
     },
     {
       "name": "unknown sku",
       "deliveries": [{"requestKey": "unknown", "sku": "tea", "quantity": 1}],
       "publisher": "ok",
-      "expect": {"accepted": 1, "errors": [], "jobs": 1, "jobState": "dead", "jobAttempt": 1, "orders": 0, "outbox": 0, "outboxState": "", "outboxAttempts": 0, "publishes": 0}
+      "expect": {"accepted": 1, "errors": [], "jobs": 1, "jobState": "dead", "jobAttempt": 1, "jobError": "order: sku and quantity are invalid", "orders": 0, "outbox": 0, "outboxState": "", "outboxAttempts": 0, "publishes": 0}
     },
     {
       "name": "provider timeout",
@@ -36,14 +36,14 @@
       "deliveries": [{"requestKey": "down", "sku": "coffee", "quantity": 1}],
       "publisher": "fail-always",
       "outboxMaxAttempts": 2,
-      "expect": {"accepted": 1, "errors": ["publish_failed", "publish_failed"], "jobs": 1, "jobState": "completed", "jobAttempt": 1, "orders": 1, "outbox": 1, "outboxState": "dead", "outboxAttempts": 2, "publishes": 2}
+      "expect": {"accepted": 1, "errors": ["publish_failed", "publish_failed"], "jobs": 1, "jobState": "completed", "jobAttempt": 1, "orders": 1, "outbox": 1, "outboxState": "dead", "outboxAttempts": 2, "outboxError": "publish_failed", "publishes": 2}
     },
     {
       "name": "outbox write keeps failing",
       "deliveries": [{"requestKey": "blocked", "sku": "coffee", "quantity": 1}],
       "publisher": "ok",
       "foreignEvent": true,
-      "expect": {"accepted": 1, "errors": [], "jobs": 1, "jobState": "dead", "jobAttempt": 3, "orders": 0, "outbox": 0, "outboxState": "", "outboxAttempts": 0, "publishes": 0}
+      "expect": {"accepted": 1, "errors": [], "jobs": 1, "jobState": "dead", "jobAttempt": 3, "jobError": "order store write failed", "orders": 0, "outbox": 0, "outboxState": "", "outboxAttempts": 0, "publishes": 0}
     }
   ],
   "crashes": [

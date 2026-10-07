@@ -6,9 +6,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -54,12 +56,21 @@ type observation struct {
 	Jobs           int      `json:"jobs"`
 	JobState       string   `json:"jobState"`
 	JobAttempt     int      `json:"jobAttempt"`
+	JobError       string   `json:"jobError"`
 	Orders         int      `json:"orders"`
 	Outbox         int      `json:"outbox"`
 	OutboxState    string   `json:"outboxState"`
 	OutboxAttempts int      `json:"outboxAttempts"`
+	OutboxError    string   `json:"outboxError"`
 	Publishes      int      `json:"publishes"`
 }
+
+// The scenarios and crash phases the fixture file must declare, exactly: a
+// case dropped from the file fails the tests instead of going unrun.
+var (
+	fixtureScenarios = []string{"duplicate delivery", "conflicting request reuse", "validation failure", "unknown sku", "provider timeout", "provider down", "outbox write keeps failing"}
+	fixtureCrashes   = []string{"producer-before-commit", "producer-after-commit", "handler-between-order-and-outbox", "dispatcher-after-publish"}
+)
 
 func loadOrderFixtures(t *testing.T) orderFixtures {
 	t.Helper()
@@ -73,8 +84,21 @@ func loadOrderFixtures(t *testing.T) orderFixtures {
 	if err := decoder.Decode(&fixtures); err != nil {
 		t.Fatalf("order fixtures: %v", err)
 	}
-	if fixtures.SchemaVersion != "worker-order/v2" || len(fixtures.Scenarios) == 0 || len(fixtures.Crashes) == 0 {
-		t.Fatalf("order fixtures: schema %q with %d scenarios and %d crashes, want worker-order/v2 with both", fixtures.SchemaVersion, len(fixtures.Scenarios), len(fixtures.Crashes))
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		t.Fatalf("order fixtures: content after the fixture object (%v)", err)
+	}
+	if fixtures.SchemaVersion != "worker-order/v2" {
+		t.Fatalf("order fixtures: schema %q, want worker-order/v2", fixtures.SchemaVersion)
+	}
+	var scenarios, crashes []string
+	for _, scenario := range fixtures.Scenarios {
+		scenarios = append(scenarios, scenario.Name)
+	}
+	for _, crash := range fixtures.Crashes {
+		crashes = append(crashes, crash.Phase)
+	}
+	if !slices.Equal(scenarios, fixtureScenarios) || !slices.Equal(crashes, fixtureCrashes) {
+		t.Fatalf("order fixtures: scenarios %q and crashes %q, want %q and %q", scenarios, crashes, fixtureScenarios, fixtureCrashes)
 	}
 	return fixtures
 }
@@ -214,10 +238,10 @@ func (r *orderRun) expect(stage string, want observation) {
 		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM order_outbox WHERE order_id = ?`, "order:"+r.key).Scan(&got.Outbox); err != nil {
 			return err
 		}
-		if err := tx.QueryRowContext(ctx, `SELECT state, attempt FROM worker_jobs WHERE request_key = ?`, r.key).Scan(&got.JobState, &got.JobAttempt); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		if err := tx.QueryRowContext(ctx, `SELECT state, attempt, error_text FROM worker_jobs WHERE request_key = ?`, r.key).Scan(&got.JobState, &got.JobAttempt, &got.JobError); err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
-		err := tx.QueryRowContext(ctx, `SELECT state, attempts FROM order_outbox WHERE event_id = ? AND order_id = ?`, "event:"+r.key, "order:"+r.key).Scan(&got.OutboxState, &got.OutboxAttempts)
+		err := tx.QueryRowContext(ctx, `SELECT state, attempts, error_text FROM order_outbox WHERE event_id = ? AND order_id = ?`, "event:"+r.key, "order:"+r.key).Scan(&got.OutboxState, &got.OutboxAttempts, &got.OutboxError)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
