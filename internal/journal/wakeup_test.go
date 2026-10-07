@@ -26,6 +26,24 @@ func wakeupRows(t *testing.T, j *Journal) []string {
 	return append(rows, waitRows(t, j.database, `SELECT signal_id || '|' || state FROM journal_signals ORDER BY rowid`)...)
 }
 
+// consumeWakeup acknowledges a fired wait under a fresh run lease, as an
+// engine run that resumed past it does, then releases the lease: a run
+// completes only once its wakeups are consumed (#332).
+func consumeWakeup(tb testing.TB, j *Journal, runID, waitID string) {
+	tb.Helper()
+	ctx := context.Background()
+	token, err := j.TakeRunLease(ctx, runID, time.Now())
+	if err == nil {
+		err = j.AcknowledgeWait(ctx, waitID, token)
+	}
+	if err == nil {
+		err = j.ReleaseRunLease(ctx, runID, token)
+	}
+	if err != nil {
+		tb.Fatal(err)
+	}
+}
+
 func waitIDs(records []WaitRecord) []string {
 	ids := []string{}
 	for _, record := range records {
@@ -224,6 +242,7 @@ func TestLegacyResumedWaitsBecomeFiredOrAcknowledged(t *testing.T) {
 	if _, err := r.journal.Signal(r.ctx, signal.Envelope{RunID: ended.RunID, SignalID: "s-ended", Name: "approval", Principal: "operator", Payload: []byte(`{}`)}, true); err != nil {
 		t.Fatal(err)
 	}
+	consumeWakeup(t, r.journal, ended.RunID, "ended")
 	if err := r.journal.CompleteRun(r.ctx, ended.RunID, []byte(`{}`)); err != nil {
 		t.Fatal(err)
 	}

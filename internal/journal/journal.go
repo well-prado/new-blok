@@ -807,40 +807,44 @@ func (j *Journal) CommitEffect(ctx context.Context, commit EffectCommit) error {
 		return errors.New("journal: valid operation, attempt and result are required")
 	}
 	return j.withTx(ctx, "effect-commit", func(tx *sql.Tx) error {
-		var state, current string
-		if err := tx.QueryRowContext(ctx, `SELECT state, current_attempt_id FROM journal_operations WHERE operation_key = ?`, commit.OperationKey).Scan(&state, &current); err != nil {
-			return err
-		}
-		if state == operationCommitted && current == commit.AttemptID {
-			return nil
-		}
-		if state == operationUncertain {
-			return ErrUncertain
-		}
-		result, err := tx.ExecContext(ctx, `UPDATE journal_attempts SET state = ?, result_json = ?, finished_at = ? WHERE attempt_id = ? AND operation_key = ? AND state = ? AND EXISTS (SELECT 1 FROM journal_operations WHERE operation_key = ? AND state = ? AND current_attempt_id = ?)`, attemptCommitted, []byte(commit.Result), j.now(), commit.AttemptID, commit.OperationKey, attemptDispatched, commit.OperationKey, operationDispatched, commit.AttemptID)
-		if err != nil {
-			return err
-		}
-		changed, err := result.RowsAffected()
-		if err != nil {
-			return err
-		}
-		if changed != 1 {
-			return ErrStaleAttempt
-		}
-		result, err = tx.ExecContext(ctx, `UPDATE journal_operations SET state = ?, result_json = ?, updated_at = ? WHERE operation_key = ? AND state = ? AND current_attempt_id = ?`, operationCommitted, []byte(commit.Result), j.now(), commit.OperationKey, operationDispatched, commit.AttemptID)
-		if err != nil {
-			return err
-		}
-		changed, err = result.RowsAffected()
-		if err != nil {
-			return err
-		}
-		if changed != 1 {
-			return ErrStaleAttempt
-		}
-		return nil
+		return j.commitEffect(ctx, tx, commit)
 	})
+}
+
+func (j *Journal) commitEffect(ctx context.Context, tx *sql.Tx, commit EffectCommit) error {
+	var state, current string
+	if err := tx.QueryRowContext(ctx, `SELECT state, current_attempt_id FROM journal_operations WHERE operation_key = ?`, commit.OperationKey).Scan(&state, &current); err != nil {
+		return err
+	}
+	if state == operationCommitted && current == commit.AttemptID {
+		return nil
+	}
+	if state == operationUncertain {
+		return ErrUncertain
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE journal_attempts SET state = ?, result_json = ?, finished_at = ? WHERE attempt_id = ? AND operation_key = ? AND state = ? AND EXISTS (SELECT 1 FROM journal_operations WHERE operation_key = ? AND state = ? AND current_attempt_id = ?)`, attemptCommitted, []byte(commit.Result), j.now(), commit.AttemptID, commit.OperationKey, attemptDispatched, commit.OperationKey, operationDispatched, commit.AttemptID)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return ErrStaleAttempt
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE journal_operations SET state = ?, result_json = ?, updated_at = ? WHERE operation_key = ? AND state = ? AND current_attempt_id = ?`, operationCommitted, []byte(commit.Result), j.now(), commit.OperationKey, operationDispatched, commit.AttemptID)
+	if err != nil {
+		return err
+	}
+	changed, err = result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return ErrStaleAttempt
+	}
+	return nil
 }
 
 func (j *Journal) MarkUncertain(ctx context.Context, operationKey, attemptID, evidence string) error {
@@ -882,29 +886,42 @@ func (j *Journal) CompleteRun(ctx context.Context, runID string, output json.Raw
 		return errors.New("journal: valid run and output are required")
 	}
 	return j.withTx(ctx, "run-complete", func(tx *sql.Tx) error {
-		if err := requireQuiescentRun(ctx, tx, runID); err != nil {
-			return err
-		}
-		result, err := tx.ExecContext(ctx, `UPDATE journal_runs SET state = ?, output_json = ?, completed_at = ? WHERE run_id = ? AND state = ?`, runCompleted, []byte(output), j.now(), runID, runAccepted)
-		if err != nil {
-			return err
-		}
-		changed, err := result.RowsAffected()
-		if err != nil {
-			return err
-		}
-		if changed != 1 {
-			var state string
-			if scanErr := tx.QueryRowContext(ctx, `SELECT state FROM journal_runs WHERE run_id = ?`, runID).Scan(&state); scanErr != nil {
-				return scanErr
-			}
-			if state == runCompleted {
-				return nil
-			}
-			return ErrStaleAttempt
-		}
-		return nil
+		return j.completeRun(ctx, tx, runID, output)
 	})
+}
+
+func (j *Journal) completeRun(ctx context.Context, tx *sql.Tx, runID string, output json.RawMessage) error {
+	if err := requireQuiescentRun(ctx, tx, runID); err != nil {
+		return err
+	}
+	// A fired wait not yet acknowledged is a wakeup the run has not
+	// consumed: completing the run would drop it (#332).
+	var fired bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM journal_waits WHERE run_id = ? AND state = ?)`, runID, waitFired).Scan(&fired); err != nil {
+		return err
+	}
+	if fired {
+		return ErrRunActiveWork
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE journal_runs SET state = ?, output_json = ?, completed_at = ? WHERE run_id = ? AND state = ?`, runCompleted, []byte(output), j.now(), runID, runAccepted)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		var state string
+		if scanErr := tx.QueryRowContext(ctx, `SELECT state FROM journal_runs WHERE run_id = ?`, runID).Scan(&state); scanErr != nil {
+			return scanErr
+		}
+		if state == runCompleted {
+			return nil
+		}
+		return ErrStaleAttempt
+	}
+	return nil
 }
 
 // FailRun records the canonical terminal workflow outcome. Attempt failures
@@ -915,45 +932,49 @@ func (j *Journal) FailRun(ctx context.Context, runID, errorCode, errorClass stri
 		return errors.New("journal: run and safe failure code/class are required")
 	}
 	return j.withTx(ctx, "run-fail", func(tx *sql.Tx) error {
-		var state string
-		if err := tx.QueryRowContext(ctx, `SELECT state FROM journal_runs WHERE run_id=?`, runID).Scan(&state); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return ErrNotFound
-			}
-			return err
-		}
-		if state == runFailed {
-			var oldCode, oldClass string
-			if err := tx.QueryRowContext(ctx, `SELECT error_code,error_class FROM journal_runs WHERE run_id=?`, runID).Scan(&oldCode, &oldClass); err != nil {
-				return err
-			}
-			if oldCode == errorCode && oldClass == errorClass {
-				return nil
-			}
-			return ErrStaleAttempt
-		}
-		if state == runUncertain {
-			return ErrUncertain
-		}
-		if state != runAccepted {
-			return ErrStaleAttempt
-		}
-		if err := requireQuiescentRun(ctx, tx, runID); err != nil {
-			return err
-		}
-		result, err := tx.ExecContext(ctx, `UPDATE journal_runs SET state=?,error_code=?,error_class=?,completed_at=? WHERE run_id=? AND state=?`, runFailed, errorCode, errorClass, j.now(), runID, runAccepted)
-		if err != nil {
-			return err
-		}
-		changed, err := result.RowsAffected()
-		if err != nil {
-			return err
-		}
-		if changed != 1 {
-			return ErrStaleAttempt
-		}
-		return nil
+		return j.failRun(ctx, tx, runID, errorCode, errorClass)
 	})
+}
+
+func (j *Journal) failRun(ctx context.Context, tx *sql.Tx, runID, errorCode, errorClass string) error {
+	var state string
+	if err := tx.QueryRowContext(ctx, `SELECT state FROM journal_runs WHERE run_id=?`, runID).Scan(&state); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if state == runFailed {
+		var oldCode, oldClass string
+		if err := tx.QueryRowContext(ctx, `SELECT error_code,error_class FROM journal_runs WHERE run_id=?`, runID).Scan(&oldCode, &oldClass); err != nil {
+			return err
+		}
+		if oldCode == errorCode && oldClass == errorClass {
+			return nil
+		}
+		return ErrStaleAttempt
+	}
+	if state == runUncertain {
+		return ErrUncertain
+	}
+	if state != runAccepted {
+		return ErrStaleAttempt
+	}
+	if err := requireQuiescentRun(ctx, tx, runID); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE journal_runs SET state=?,error_code=?,error_class=?,completed_at=? WHERE run_id=? AND state=?`, runFailed, errorCode, errorClass, j.now(), runID, runAccepted)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return ErrStaleAttempt
+	}
+	return nil
 }
 
 // MarkRunUncertain records a conservative terminal projection when the

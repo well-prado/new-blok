@@ -1,9 +1,10 @@
 # ADR 0027: Single-host durable waits
 
 - Status: in progress for E07-T09 (#332), delivered in slices. Slice A
-  (merged, #350) records wait identity and signal routing; slice B (this
-  revision) makes wakeups crash-safe; slice C (the engine's `WaitJournal`
-  on `internal/journal`) extends it
+  (merged, #350) records wait identity and signal routing; slice B (#366,
+  #378) makes wakeups crash-safe; slice C1 (this revision) makes
+  `internal/journal` the engine's step and wait journal; slice C2 (the
+  single-host resumer) completes it
 - Date: 2026-10-07
 - Roadmap: E07-T09 ([#332](https://github.com/well-prado/new-blok/issues/332)),
   closing gaps in E07-T04 (#46); prerequisite of E07-T10 (#333, nested
@@ -198,6 +199,55 @@ stamp existed. A schema-5 binary refuses a schema-6 journal (#291).
 Version 5 is #334's scope attempt (PR #351), which merged first; this step
 was renumbered from 5 to 6.
 
+## Engine journal (slice C1)
+
+`(*Journal).ForRun(runID, token)` returns a `RunJournal`, the engine's
+`StepJournal` and `WaitJournal` for one run executed under that lease
+token. A run's steps are identified as the journal identifies effects and
+waits: the invocation path is the engine's step ID, and the iteration path
+is `root` until #333 gives the engine iteration paths (ADR 0031 defines
+both; a top-level step's invocation path is its ID).
+
+- **Lease.** `VerifyRun` refuses a run that is not live, whose artifact or
+  input differs, or whose lease is no longer the token's
+  (`ErrLeaseLost`). Every commit checks the lease again in its own
+  transaction, so an execution whose lease was taken over cannot commit.
+  An effect's dispatch is checked by a read just before it is recorded.
+- **Calls.** A call with declared effects is recorded as dispatched
+  (`BeginEffect`, `StartAttempt`) before the node runs, and committed
+  (`CommitEffect`) after; one found dispatched on replay is marked
+  uncertain and the run fails as uncertain, never charging twice. A call
+  with no effects journals nothing before it runs (running it again is
+  safe) and its result is committed in one transaction.
+- **Waits.** `Await` looks the step's wait up by run, invocation path and
+  iteration path, and schedules it the first time. Its ID is derived from
+  the engine's operation key (which covers the wait's name and timeout) and
+  the iteration path, so every replay reads the same wait and a changed
+  plan at the same step is `ErrRequestConflict`. A wait without a timeout
+  is due at the end of time: only a signal fires it. Waiting suspends the
+  run; fired or acknowledged returns the stored outcome (the signal, or a
+  timeout when no signal fired it); canceled is `ErrWaitCanceled`.
+- **Acknowledgement.** A fired wait's outcome read by `Await` is
+  acknowledged in the transaction of the next commit: the next step's
+  result, or the run's end through `RunJournal.CompleteRun` or `FailRun`.
+  Never before: a crash between reading the outcome and that commit leaves
+  the wait fired, the run is listed again once its lease lapses, and the
+  replay reads the same outcome. `Journal.CompleteRun` refuses a run with
+  a fired, unacknowledged wait (`ErrRunActiveWork`); `Journal.FailRun` does
+  not, because a failure ends the run whatever woke it.
+
+The engine's `StepJournal` has no hook for a wait step's own commit, so a
+wakeup is consumed with the step after it rather than with the wait step;
+the effect is the same, since the wait step's output is the stored
+outcome and replays identically.
+
+`internal/cluster`'s `WaitIDFor(runID, stepID)` addresses a wait by run
+and step only. Once #333 runs a wait in a loop durably, every iteration
+would map to one cluster wait, and the second iteration would read the
+first one's outcome: it needs the iteration path (and the invocation path
+inside an arm) before durable loops reach the cluster runtime. ADR 0031
+(#333, in progress) has a durable runner refuse control flow until then.
+
 ## Compatibility
 
 | Change | Class | Migration |
@@ -210,6 +260,8 @@ was renumbered from 5 to 6.
 | A duplicate step identity or wait ID returns `ErrWaitExists`, not a raw constraint error | behavioral | None |
 | Journal schema 3 → 4 | schema, one-way | On open, in the schema transaction, killed or not (see Evidence) |
 | Wait states `resumed` → `fired` / `acknowledged`; run leases; `ClaimDueWaits` fires only waits of live runs and returns only those of runs it leased; `PendingResumptions`, `TakeRunLease`, `AcknowledgeWait`, `RenewRunLease`, `ReleaseRunLease` (the last three take the lease token), `ErrWaitNotFired`, `ErrLeaseLost`, `Config.Holder`, `Config.WakeupLease`, `WaitRecord.LeaseOwner`/`LeaseUntil`/`LeaseToken` (the run's lease) (slice B) | API and behavioral; no caller outside `internal/journal` | Call `PendingResumptions` on start; `TakeRunLease` when starting a run without a wakeup; `AcknowledgeWait` after the resumed step commits; renew while executing, release when the run suspends or ends |
+| `Journal.ForRun`, `RunJournal` (engine `StepJournal` and `WaitJournal`), `Journal.WaitAt`, `ErrWaitCanceled` (slice C1) | API, additive | None |
+| `Journal.CompleteRun` refuses a run with a fired, unacknowledged wait (slice C1) | behavioral | Acknowledge the wait (`AcknowledgeWait`, or a `RunJournal` commit) before completing |
 | Journal schema 5 → 6 (slice B) | schema, one-way | On open; `resumed` waits remapped on every open |
 
 ## Evidence
@@ -246,7 +298,13 @@ round 2, `TestLeaseTokenFencesStaleExecutions` (the reviewer's three
 probes), `TestTakeRunLeaseHoldsARunThatNeverSuspended`,
 `TestNewWakeupsDoNotStarveALeasedRun`; after round 3,
 `TestAcknowledgedRetryNeedsTheCurrentToken`, `TestLeaseTokensAreJournalWide`,
-`TestRewokenRunRanksByItsNewWakeup`.
+`TestRewokenRunRanksByItsNewWakeup`. Slice C1:
+`TestEngineSuspendsAndResumesThroughTheJournal`,
+`TestEngineWaitTimesOutThroughTheJournal`,
+`TestCompleteRunRefusesAnUnconsumedWakeup`,
+`TestEngineReplaysAfterACrashMidResumption`,
+`TestEngineEffectInterruptedByACrashIsUncertain` (the last two kill a real
+process).
 
 ## Limits
 
@@ -271,12 +329,13 @@ probes), `TestTakeRunLeaseHoldsARunThatNeverSuspended`,
   first open by this binary remaps that wait to `fired` and a holder may
   then list and execute the same run: a double-resume window that lasts
   until the old process stops. Upgrade by stopping old processes first.
-- `CompleteRun` does not yet refuse a run with an unacknowledged fired
-  wait.
-- `internal/journal` does not yet implement `engine.WaitJournal`, and the
-  single-host runner does not resume from it. Slice C, which also chooses
-  how the engine's `StepIdentity` and #333's iteration path map onto the
-  two paths recorded here.
+- No single-host runner resumes runs through `RunJournal` yet: slice C2
+  lists resumptions on start, executes them, renews and releases leases.
+- Every step is at the `root` iteration until #333 passes iteration paths
+  to the engine (ADR 0031, in progress, refuses durable control flow until
+  then).
+- Effect inputs over `MaxInspectionInputBytes` are refused at dispatch, as
+  `BeginEffect` refuses them.
 - Pending signals of a run that ends stay pending (never late
   retroactively) until the run is compacted with them.
 - A signal's duplicate check compares the signal ID only, not its

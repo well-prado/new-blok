@@ -42,6 +42,7 @@ func TestJournalInspectionReadsActualWaitUncertainAndChildLineage(t *testing.T) 
 	if _, err := j.Signal(ctx, signal.Envelope{RunID: waiting.RunID, SignalID: "approval-1", Name: "approval", Principal: "alice", Payload: []byte(`{"approved":true}`)}, true); err != nil {
 		t.Fatal(err)
 	}
+	consumeWakeup(t, j, waiting.RunID, "wait-real")
 	if err := j.CompleteRun(ctx, waiting.RunID, []byte(`{"approved":true}`)); err != nil {
 		t.Fatal(err)
 	}

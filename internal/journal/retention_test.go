@@ -321,6 +321,7 @@ func seedRecoveryRun(tb testing.TB, j *Journal, key, childRunID string) recovery
 	if result, err := j.Signal(ctx, signal.Envelope{RunID: runID, SignalID: "approve:" + key, Name: "approval", Payload: []byte(`{"approved":true}`), Principal: "ops"}, true); err != nil || !result.Resumed {
 		tb.Fatalf("signal=%+v err=%v", result, err)
 	}
+	consumeWakeup(tb, j, runID, "wait:"+key)
 	if result, err := j.Signal(ctx, signal.Envelope{RunID: runID, SignalID: "later:" + key, Name: "later", Payload: []byte(`{"early":true}`), Principal: "ops"}, true); err != nil || !result.Accepted {
 		tb.Fatalf("pending signal=%+v err=%v", result, err)
 	}
