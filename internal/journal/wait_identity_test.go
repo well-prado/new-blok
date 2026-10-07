@@ -101,11 +101,11 @@ func TestRunWaitsOnOneNameInSuccessiveIterationsAndSteps(t *testing.T) {
 		t.Fatalf("s4 after every wait closed=%+v; want pending", result)
 	}
 	wantWaits := []string{
-		"audit|approval|audit|root|resumed|s3",
-		"confirm|approval|confirm|root|resumed|s2",
-		"loop[0]|approval|approve|0|resumed|s0",
-		"loop[1]|approval|approve|1|resumed|s1",
-		"loop[2]|approval|approve|2|resumed|",
+		"audit|approval|audit|root|fired|s3",
+		"confirm|approval|confirm|root|fired|s2",
+		"loop[0]|approval|approve|0|fired|s0",
+		"loop[1]|approval|approve|1|fired|s1",
+		"loop[2]|approval|approve|2|fired|",
 	}
 	if got := waitRows(t, database, `SELECT wait_id || '|' || name || '|' || invocation_path || '|' || iteration_path || '|' || state || '|' || signal_id FROM journal_waits ORDER BY wait_id`); !reflect.DeepEqual(got, wantWaits) {
 		t.Fatalf("waits:\n got %q\nwant %q", got, wantWaits)
@@ -163,7 +163,7 @@ func TestDuplicateWaitIsErrWaitExists(t *testing.T) {
 	if record, err := j.ScheduleWait(ctx, other); err != nil || record.State != waitWaiting {
 		t.Fatalf("another run at the same step and iteration=%+v err=%v", record, err)
 	}
-	want := []string{"first|approve|root|resumed", "other-run|approve|root|waiting"}
+	want := []string{"first|approve|root|fired", "other-run|approve|root|waiting"}
 	if got := waitRows(t, database, `SELECT wait_id || '|' || invocation_path || '|' || iteration_path || '|' || state FROM journal_waits ORDER BY wait_id`); !reflect.DeepEqual(got, want) {
 		t.Fatalf("waits:\n got %q\nwant %q", got, want)
 	}
@@ -187,15 +187,15 @@ func TestOriginMainWaitsMigrateToStepIdentity(t *testing.T) {
 	}
 	database, j := newJournalAtPath(t, path, Config{Clock: ticking(fixtureBase.Add(48 * time.Hour))})
 	defer database.Close()
-	if got := oneRow(t, database, `SELECT version || '|' || upgraded_from FROM blok_schema_versions WHERE component = 'journal'`); got != "4|3" {
-		t.Fatalf("journal stamp=%s; want 4 upgraded from 3", got)
+	if got := oneRow(t, database, `SELECT version || '|' || upgraded_from FROM blok_schema_versions WHERE component = 'journal'`); got != "5|3" {
+		t.Fatalf("journal stamp=%s; want 5 upgraded from 3", got)
 	}
 	unique := waitRows(t, database, `SELECT (SELECT group_concat(name, ',') FROM pragma_index_info(l.name)) FROM pragma_index_list('journal_waits') l WHERE l."unique" = 1 AND l.origin = 'u'`)
 	if !reflect.DeepEqual(unique, []string{"run_id,invocation_path,iteration_path"}) {
 		t.Fatalf("journal_waits unique constraints=%q; want only (run_id, invocation_path, iteration_path)", unique)
 	}
-	if got := waitRows(t, database, legacyWaitsQuery+` WHERE invocation_path IS NULL AND iteration_path IS NULL ORDER BY wait_id`); !reflect.DeepEqual(got, legacy.waits) {
-		t.Fatalf("migrated waits:\n got %q\nwant %q", got, legacy.waits)
+	if got := waitRows(t, database, legacyWaitsQuery+` WHERE invocation_path IS NULL AND iteration_path IS NULL ORDER BY wait_id`); !reflect.DeepEqual(got, fired(legacy.waits)) {
+		t.Fatalf("migrated waits:\n got %q\nwant %q", got, fired(legacy.waits))
 	}
 	if got := waitRows(t, database, legacySignalsQuery); !reflect.DeepEqual(got, legacy.signals) {
 		t.Fatalf("migrated signals:\n got %q\nwant %q", got, legacy.signals)
@@ -226,7 +226,7 @@ func TestOriginMainWaitsMigrateToStepIdentity(t *testing.T) {
 		t.Fatalf("retry of the legacy delivered signal=%+v", result)
 	}
 	early, err := j.ScheduleWait(ctx, WaitRequest{RunID: runs["early"], WaitID: "early-approval", Name: "approval", InvocationPath: "approve", IterationPath: "root", DueAt: fixtureBase.Add(72 * time.Hour)})
-	if err != nil || early.State != waitResumed || early.SignalID != "early-1" {
+	if err != nil || early.State != waitFired || early.SignalID != "early-1" {
 		t.Fatalf("wait after the legacy pending signal=%+v err=%v", early, err)
 	}
 	if result := send("canceled", "after-cancel", `{}`); result != (SignalResult{Accepted: true}) {
@@ -241,13 +241,13 @@ func TestOriginMainWaitsMigrateToStepIdentity(t *testing.T) {
 	}
 	wantWaits := []string{
 		"canceled-approval|approval|||canceled|",
-		"claimed-timer|timer|||resumed|",
-		"due-timer|timer|||resumed|",
-		"early-approval|approval|approve|root|resumed|early-1",
-		"open-approval|approval|||resumed|after-1",
-		"open-approval-2|approval|approve|1|resumed|after-2",
+		"claimed-timer|timer|||fired|",
+		"due-timer|timer|||fired|",
+		"early-approval|approval|approve|root|fired|early-1",
+		"open-approval|approval|||fired|after-1",
+		"open-approval-2|approval|approve|1|fired|after-2",
 		"open-review|review|||waiting|",
-		"signaled-approval|approval|||resumed|signal-1",
+		"signaled-approval|approval|||fired|signal-1",
 	}
 	if got := waitRows(t, database, `SELECT wait_id || '|' || name || '|' || COALESCE(invocation_path, '') || '|' || COALESCE(iteration_path, '') || '|' || state || '|' || signal_id FROM journal_waits ORDER BY wait_id`); !reflect.DeepEqual(got, wantWaits) {
 		t.Fatalf("waits after use:\n got %q\nwant %q", got, wantWaits)
@@ -270,7 +270,7 @@ func TestOriginMainWaitsMigrateToStepIdentity(t *testing.T) {
 // inside the journal's schema transaction migrating the aaf633c database,
 // just before it commits and just after. Before, the database is exactly
 // origin/main's: the old shape, every row, stamp 3. After, it is migrated
-// and stamped 4 with every row. Either way the next open leaves it
+// and stamped 5 with every row (its claimed and signalled waits fired). Either way the next open leaves it
 // migrated with every row.
 func TestWaitIdentityMigrationSurvivesAKill(t *testing.T) {
 	if os.Getenv("NEWBLOK_332_MIGRATION_CHILD") == "1" {
@@ -307,13 +307,13 @@ func TestWaitIdentityMigrationSurvivesAKill(t *testing.T) {
 			if phase == "before" && !reflect.DeepEqual(killed, legacy) {
 				t.Fatalf("a migration killed before commit changed the database:\n got %+v\nwant %+v", killed, legacy)
 			}
-			if phase == "after" && (killed.stamp != "4|3" || strings.Contains(killed.schema, "UNIQUE (run_id, name)") || !reflect.DeepEqual(killed.waits, legacy.waits) || !reflect.DeepEqual(killed.signals, legacy.signals)) {
+			if phase == "after" && (killed.stamp != "5|3" || strings.Contains(killed.schema, "UNIQUE (run_id, name)") || !reflect.DeepEqual(killed.waits, fired(legacy.waits)) || !reflect.DeepEqual(killed.signals, legacy.signals)) {
 				t.Fatalf("a migration killed after commit:\n got %+v\nwant migrated with %+v", killed, legacy)
 			}
 			database, _ := newJournalAtPath(t, path, Config{})
 			database.Close()
 			reopened := legacyWaitDump(t, path)
-			if reopened.stamp != "4|3" || !strings.Contains(reopened.schema, "iteration_path") || !reflect.DeepEqual(reopened.waits, legacy.waits) || !reflect.DeepEqual(reopened.signals, legacy.signals) {
+			if reopened.stamp != "5|3" || !strings.Contains(reopened.schema, "iteration_path") || !reflect.DeepEqual(reopened.waits, fired(legacy.waits)) || !reflect.DeepEqual(reopened.signals, legacy.signals) {
 				t.Fatalf("reopened after the kill:\n got %+v\nwant migrated with %+v", reopened, legacy)
 			}
 		})
@@ -321,17 +321,17 @@ func TestWaitIdentityMigrationSurvivesAKill(t *testing.T) {
 }
 
 // TestUnstampedStepIdentityShapeIsClassified4: a journal with step-keyed
-// waits and no stamp is classified by that shape as version 4, not
-// migrated again.
+// waits, no wakeup lease and no stamp is classified by that shape as
+// version 4, not rebuilt again, then upgraded to 5.
 func TestUnstampedStepIdentityShapeIsClassified4(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "unstamped.db")
 	database, _ := newJournalAtPath(t, path, Config{})
-	execAll(t, database, `DELETE FROM blok_schema_versions WHERE component = 'journal'`)
+	execAll(t, database, `DELETE FROM blok_schema_versions WHERE component = 'journal'`, `ALTER TABLE journal_waits DROP COLUMN fired_at`, `ALTER TABLE journal_waits DROP COLUMN lease_owner`, `ALTER TABLE journal_waits DROP COLUMN lease_until`)
 	if _, err := New(context.Background(), database, Config{}); err != nil {
 		t.Fatal(err)
 	}
-	if got := oneRow(t, database, `SELECT version || '|' || upgraded_from FROM blok_schema_versions WHERE component = 'journal'`); got != "4|4" {
-		t.Fatalf("journal stamp=%s; want 4 classified from its shape", got)
+	if got := oneRow(t, database, `SELECT version || '|' || upgraded_from FROM blok_schema_versions WHERE component = 'journal'`); got != "5|4" {
+		t.Fatalf("journal stamp=%s; want 5 upgraded from 4, classified from its shape", got)
 	}
 	database.Close()
 }
@@ -429,4 +429,14 @@ func decompress(t *testing.T, compressed string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+// fired is legacy wait rows as the wakeup-lease migration leaves them: the
+// fixture's resumed waits all belong to live runs, so they are fired.
+func fired(rows []string) []string {
+	out := make([]string, len(rows))
+	for i, row := range rows {
+		out[i] = strings.Replace(row, "|"+waitLegacyResumed+"|", "|"+waitFired+"|", 1)
+	}
+	return out
 }

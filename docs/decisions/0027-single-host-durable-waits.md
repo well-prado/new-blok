@@ -1,8 +1,9 @@
 # ADR 0027: Single-host durable waits
 
-- Status: in progress for E07-T09 (#332), delivered as stacked PRs. Slice A
-  (this revision) records wait identity. Slice B (crash-safe wakeups) and
-  slice C (the engine's `WaitJournal` on `internal/journal`) extend it
+- Status: in progress for E07-T09 (#332), delivered in slices. Slice A
+  (merged, #350) records wait identity and signal routing; slice B (this
+  revision) makes wakeups crash-safe; slice C (the engine's `WaitJournal`
+  on `internal/journal`) extends it
 - Date: 2026-10-07
 - Roadmap: E07-T09 ([#332](https://github.com/well-prado/new-blok/issues/332)),
   closing gaps in E07-T04 (#46); prerequisite of E07-T10 (#333, nested
@@ -103,6 +104,59 @@ signal by `(run_id, name)` alone and reads an arbitrary row once a name
 repeats, with its own pre-#332 late rule: the same convention limit #286
 accepted for pre-#291 binaries (ADR 0003, Limits).
 
+## Wakeup durability (slice B)
+
+**The defect (D1).** A timer claim (`ClaimDueWaits`) or a signal moved a
+wait straight to `resumed`. If the process died before the run was
+resumed, nothing could find that wakeup again: the wait was no longer due,
+the signal was no longer pending, and the run stayed `accepted` forever
+(the E07 audit's probe, reproduced on origin/main 83bd1bf in the slice B
+PR: after claim and reopen, `reclaimable=0`, wait `resumed`, run
+`accepted`). A coat check analogy: the attendant tore up the ticket when
+the owner's name was called, before anyone had handed the coat over.
+
+**States.** A wait is `waiting`, then `fired` (claimed by its timer, or
+given a signal, including a pending one at schedule time), then
+`acknowledged`; or `canceled`. Firing records `fired_at`. A fired wait is
+a wakeup the run has not consumed yet, and it stays fired until
+`AcknowledgeWait`, which the engine calls once it has committed the step
+the wait resumed (slice C wires that). Acknowledging again is a no-op; a
+wait that has not fired is `ErrWaitNotFired`.
+
+**Leases.** Each `Journal` has a holder name (`Config.Holder`, random by
+default) and a wakeup lease (`Config.WakeupLease`, 30 s by default). A
+lease is `lease_owner` and `lease_until` on a fired wait.
+
+- `ClaimDueWaits(now, limit)` fires due waits and leases them to its
+  holder until `now` plus the lease, returning those it leased: the caller
+  resumes their runs. A due wait of a run another holder is resuming under
+  a live lease fires unleased and is not returned, so two holders never
+  resume one run at once.
+- A signal fires its wait unleased: the signaller does not resume runs.
+- `PendingResumptions(now, limit)` lists, in one write-first transaction,
+  the fired waits of up to `limit` live (`accepted`) runs none of whose
+  fired waits holds a lease past `now`, and leases all of each run's fired
+  waits to its holder. Run it on start and periodically: a wakeup whose
+  resumer died is listed again once its lease lapses, a signalled one at
+  once. The lease is per run, because a run is resumed as a whole: two
+  fired waits in parallel branches go to one holder together.
+
+The `now` given to a claim or a listing is the clock its leases are
+measured on; callers pass the same clock to both.
+
+**Migration (schema 5).** `fired_at`, `lease_owner` and `lease_until` are
+added to `journal_waits`, and every `resumed` wait becomes `fired` when its
+run is live, so origin/main's stranded wakeups are listed by
+`PendingResumptions` after the upgrade, or `acknowledged` when its run has
+ended. The remap runs on every open, like #286's tenant repair, because a
+binary from before #291 cannot see the stamp and can still write
+`resumed`. An unstamped journal with `lease_until` is classified 5. A
+schema-4 binary refuses a schema-5 journal (#291).
+
+Schema version coordination: this slice assumed version 5 on a main where
+#334's recovery fencing (PR #351) had not yet merged; whichever merges
+second renumbers to the next version.
+
 ## Compatibility
 
 | Change | Class | Migration |
@@ -114,8 +168,10 @@ accepted for pre-#291 binaries (ADR 0003, Limits).
 | `SignalWait` and `WaitTarget` address one wait | API, additive | None |
 | A duplicate step identity or wait ID returns `ErrWaitExists`, not a raw constraint error | behavioral | None |
 | Journal schema 3 → 4 | schema, one-way | On open, in the schema transaction, killed or not (see Evidence) |
+| Wait states `resumed` → `fired` / `acknowledged`; `ClaimDueWaits` leases what it returns and may return fewer than it fires; `PendingResumptions`, `AcknowledgeWait`, `ErrWaitNotFired`, `Config.Holder`, `Config.WakeupLease`, `WaitRecord.LeaseOwner`/`LeaseUntil` (slice B) | API and behavioral; no caller outside `internal/journal` | Call `PendingResumptions` on start; `AcknowledgeWait` after the resumed step commits |
+| Journal schema 4 → 5 (slice B) | schema, one-way | On open; `resumed` waits remapped on every open |
 
-## Evidence (slice A)
+## Evidence
 
 In the #332 slice A PR, all RED on origin/main or under a named mutation
 of the change:
@@ -138,10 +194,23 @@ of the change:
   `TestInspectionShowsTheOpenWaitOfAName`,
   `TestTargetedSignalReachesOnlyItsWait`.
 
-## Limits (slice A)
+Slice B: `TestClaimedWakeupSurvivesReopen` (the audit's D1 probe),
+`TestAcknowledgeWait`, `TestPendingResumptionsLeasesEachRunOnce`,
+`TestClaimLeavesARunAnotherHolderResumes`,
+`TestLegacyResumedWaitsBecomeFiredOrAcknowledged` (including the aaf633c
+database's stranded claim and signal).
 
-- A claimed or signalled wakeup is still not crash-safe (defect D1): a
-  wait flips to resumed with no lease. Slice B.
+## Limits
+
+- Nothing calls `PendingResumptions` or `AcknowledgeWait` yet: slice C's
+  single-host resumer does, and decides whether acknowledgement commits in
+  the same transaction as the resumed step.
+- A lease is time-based on the caller's clock: a holder that stalls past
+  its lease without dying can be overtaken, and the run resumed twice.
+  The engine's step journal makes replay of committed steps idempotent;
+  fencing the stale holder's later writes is not part of this slice.
+- `CompleteRun` does not yet refuse a run with an unacknowledged fired
+  wait.
 - `internal/journal` does not yet implement `engine.WaitJournal`, and the
   single-host runner does not resume from it. Slice C, which also chooses
   how the engine's `StepIdentity` and #333's iteration path map onto the

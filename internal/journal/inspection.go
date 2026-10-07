@@ -147,7 +147,7 @@ func (j *Journal) ReadInspection(ctx context.Context, principal, runID, stepID s
 				if err := tx.QueryRowContext(ctx, query, args...).Scan(&waitState, &payload, &updated); err == nil {
 					step.StartedAt = time.Unix(0, updated).UTC()
 					step.Output = append([]byte(nil), payload...)
-					if waitState == waitResumed {
+					if waitState == waitFired || waitState == waitAcknowledged {
 						step.Status = inspection.StatusCompleted
 						step.FinishedAt = step.StartedAt
 					} else if waitState == waitWaiting {
