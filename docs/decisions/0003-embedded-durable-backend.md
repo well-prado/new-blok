@@ -399,6 +399,66 @@ stores. `:memory:` is unchanged (`journal_mode=MEMORY`, no switch).
 | `Open` fails unless the file ends up in WAL (#320) | behavioral | None for files this backend creates. Before, the answer of `PRAGMA journal_mode=WAL` was ignored, so a file SQLite would not switch opened in its old mode; it is now refused with an error naming the mode it stayed in |
 | Pooled connections no longer request WAL when they connect; they rely on the mode persisted in the file (#320) | behavioral (internal) | None. `Open` switches the file before it returns a handle, and SQLite keeps WAL in the file across connections and restarts |
 
+## Crash-safe backup and restore (#343)
+
+A backup should be like a photo: restoring from it must not change it.
+Before #343, `Restore` opened the backup through `Open`, read-write, which
+switched the file to WAL (header bytes 18–19 went from 1 1 to 2 2) and
+made a read-only backup unrestorable; a restored copy that failed its
+check stayed at the destination and refused every retry with `already
+exists`; `Backup` ran `VACUUM INTO` straight to the destination, so a crash
+or a full disk left a partial file there that refused every retry the same
+way; and nothing synced a directory after a rename.
+
+`Backup` now runs `VACUUM INTO` to a temporary file (`.backup-<random>`)
+beside the destination, syncs it, renames it to the destination and syncs
+the directory. On failure it removes the temporary file; a crash can leave
+it (and its `-journal`) behind, but never at the destination. Like
+`Restore`, it refuses a destination that exists or has a `-wal`, `-shm` or
+`-journal` file beside it, at the start and just before the rename: SQLite
+would read a leftover one into the backup whenever it is opened. Refusing
+was chosen over removing it, since the leftover may belong to a database
+still in use; the operator removes it. A destination directory `Backup`
+creates has its parent synced.
+
+`Restore` checks the backup through a connection opened `mode=ro&immutable=1`,
+not through `Open`. Immutable means SQLite takes no lock and creates no
+`-wal`, `-shm` or `-journal` file, so the check works on a read-only file in
+a read-only directory whatever journal mode the header names; `mode=ro`
+alone cannot open a WAL-mode file there, since it must create the `-shm`.
+Immutable also means SQLite reads the database file alone, exactly the
+bytes `Restore` copies, ignoring any log beside it. `Restore` therefore
+refuses a source with a non-empty `-wal` or `-journal` file beside it
+rather than restore it without the changes those hold: folding them in
+would write to the backup. A file `Backup` wrote is in rollback mode and
+self-contained. The source must not be written while `Restore` runs.
+
+`Restore` refuses a destination that exists or has a `-wal`, `-shm` or
+`-journal` file beside it, at the start and again just before the rename.
+SQLite reads such a file as the database's own: before Review R of #343, a
+log an old database at the destination left behind was replayed into the
+restored copy (a 400-row backup restored with `nil` and held the old
+database's 7 rows, passing `integrity_check`). The leftover is refused, not
+removed, since it may belong to a database still in use. The check is not
+atomic with the rename: a file another process creates at the destination
+in that moment is replaced. A destination directory `Restore` creates has
+its parent synced. The copy is written to `.restore-*` beside the destination,
+synced, renamed to the destination, the directory synced, and the copy then
+opened through `Open` and checked again; if that fails, the destination
+and any `-wal`, `-shm` or `-journal` beside it are removed and the
+directory synced. So when `Restore` returns an error the destination does
+not exist; a crash before the rename leaves at most the temporary file, and
+a crash after it leaves the whole, synced copy of the checked backup.
+
+| Change | Class | Migration |
+| --- | --- | --- |
+| `Restore` never writes to its source and restores from a read-only file or directory (#343) | behavioral (bug fix) | None. A backup's bytes and checksum are unchanged by `Restore` |
+| `Restore` refuses a source with a non-empty `-wal` or `-journal` file beside it (#343) | behavioral (breaking for such sources) | Restore a file written by `Backup`, or checkpoint the source (open and close it with no other connection) first. Before, `Restore` folded the log into the source by writing to it, or, with another connection open, silently restored without the log's changes |
+| `Restore` removes the destination when the restored check fails (#343) | behavioral (bug fix) | None. A retry is no longer refused with `already exists` |
+| `Restore` refuses a destination with a `-wal`, `-shm` or `-journal` file beside it (#343) | behavioral (bug fix) | Remove the leftover if no database uses it. Before, a leftover log was replayed into the restored database |
+| `Restore` syncs the directory after the rename, and the parent of a directory it creates (#343) | durability (bug fix) | None. Not done on Windows (unsupported, #297). A crash can leave `.restore-*` files beside the destination; they never block a retry and may be deleted |
+| `Backup` writes to a temporary file, syncs it, renames it and syncs the directory; a failed or interrupted backup leaves nothing at the destination; it refuses a destination with a `-wal`, `-shm` or `-journal` beside it (#343) | behavioral (bug fix) | None. A crash can leave `.backup-*` files (and their `-journal`) beside the destination; they never block a retry and may be deleted. The rename replaces a file another process creates at the destination between `Backup`'s check and the rename; `VACUUM INTO` alone refused one |
+
 ## Recovery records are write-once (#334)
 
 A run's recovery records are its receipts: a scope's output, a child run's
@@ -406,25 +466,75 @@ answer, a join's count of returned branches, the checkpoint it resumes from.
 Before #334 a late or stale writer could change them: `CompleteScope`
 overwrote a committed output, `StartScope` restarted a canceled scope (which
 could then be completed), a checkpoint could name another artifact than the
-run's admitted one, and a run that had ended still took new scopes and
-checkpoints. (Joins and children are the second part of #334.)
+run's admitted one, a run that had ended still took new scopes and
+checkpoints, and `RecordJoin` and `RecordChild` upserted unconditionally: a
+completed 2-of-2 join went back to running 1 of 3, a completed child back
+to running, and a child record could name a run that did not exist.
 
-A scope has two terminal states, completed and canceled, and never leaves
-either. Each write now runs in the journal's writer transaction, reads what
-is stored, and either moves the record forward (a scope from running to one
-of its terminal states), repeats it byte for byte (an idempotent retry,
-which succeeds and writes nothing), or is refused with a typed error and
-changes nothing:
+A scope has two terminal states, completed and canceled; a join and a
+child have one, completed. No record leaves a terminal state. Each write
+now runs in the journal's writer transaction, reads what is stored, and
+either moves the record forward (a scope from running to one of its
+terminal states; a join by filling empty slots, completing when every
+slot is filled; a child from running to completed), brings nothing new (an
+idempotent retry, which succeeds and writes nothing), or is refused with a
+typed error and changes nothing.
 
-- `ErrRecordFinal`: the scope is final. `CompleteScope` on a completed
+**A join's results are positional slots.** `Results` holds exactly
+`Expected` slots in branch order, as the engine's parallel runner fills its
+results by branch position; a slot is JSON null (or empty) until its
+branch comes back, and `Completed` is the number of filled slots. No
+results at all means `Expected` empty slots. `Expected` is fixed when the
+join is created, and a filled slot never changes. A write merges into the
+stored slots inside the writer transaction: it fills the empty slots it
+carries, and its own empty slots leave the stored ones as they are. So
+branches that come back in any order, or from different journal handles,
+each fill their own slot without conflicting; two writers filling the same
+slot with different values do conflict, and the first one wins. The join
+is completed, and final, when every slot is filled. A record whose results
+are not `Expected` slots, whose `Completed` is not its number of filled
+slots, or whose `State` contradicts them is an invalid record and nothing
+is stored. Because null marks an empty slot, a branch whose own result is
+JSON null must be recorded wrapped (for example `{"value":null}`), or it
+reads as not yet back. Slots are compared in the compact JSON form
+`json.Marshal` stores them in (spacing dropped; `<`, `>` and `&`
+escaped), so a writer resending a slot it already knows, spelled
+differently, is not refused; nothing else is normalised, so reordered
+object keys or `1.0` for `1` are another value. A running child has no
+result: a running write with one is an invalid record, whether it would
+create the child record or update it.
+
+A join row the pre-#334 upsert left is never changed. One whose results
+are not one slot per branch, or whose completed count disagrees with its
+slots, cannot be read as slots: every write but an identical one is
+`ErrRecordConflict`. One in a state other than running or completed
+refuses a write that would fill a slot, and a write that brings nothing
+new succeeds and changes nothing, as for any join. One stored with no
+results (`results_json` null, from a nil `Results`) reads as its empty
+slots and can be filled. A child row in a state other than running or
+completed refuses completion.
+
+- `ErrRecordFinal`: the record is final. `CompleteScope` on a completed
   scope with another output, or from another attempt; `StartScope` on a
-  canceled scope. (`StartScope` on a completed scope is not an error: it
+  canceled scope; `RecordJoin` or `RecordChild` writing a completed record
+  differently. (`StartScope` on a completed scope is not an error: it
   returns `AlreadyCompleted`.)
+- `ErrRecordConflict`: the write contradicts what the record holds: a
+  join's expected count, a filled join slot given another value, a child's
+  run id, or a row the pre-#334 upsert left in a shape the write cannot
+  extend (above). Since branches filling different slots never conflict,
+  it means a slot was already filled with another value, by a
+  racing writer or a stale one; retrying the same write cannot succeed, so
+  the engine either serialises a join's fan-in or re-reads the join and
+  decides.
+- `ErrChildRunNotFound`: a new child record names a run the journal does
+  not hold. It is checked when the record is created, not on later writes,
+  so a child run compacted afterwards does not strand its parent's record.
 - `ErrStaleAttempt`: `CompleteScope` from an attempt that a later
   `StartScope` superseded, or with no attempt id.
 - `ErrNotFound`: `CompleteScope` on a canceled scope, as before #334; and
-  any write for an unknown run, where SQLite's foreign-key error used to
-  leak.
+  any write for an unknown run (a scope, checkpoint, join or child's parent
+  run), where SQLite's foreign-key error used to leak.
 - `ErrRunNotActive`: `StartScope` or `SaveCheckpoint` for a run that is
   not accepted (canceled, completed, failed or uncertain).
 - `ErrArtifactMismatch`: a checkpoint, or a `Recover`, naming another
@@ -465,6 +575,8 @@ caller holds, so only a fresh `StartScope` can complete it.
 | Completed and canceled scopes are final; scopes are fenced by attempt; checkpoints are bound to the admitted artifact and an accepted run; `StartScope` needs an accepted run; `Recover` checks the admitted artifact (#334) | behavioral (bug fix) | None for a caller that writes each record forward once. A write that used to overwrite, or a restart of a canceled scope, now returns one of the typed errors above. Nothing in the repository restarted a canceled scope |
 | Journal schema version 5 (#334) | behavioral (breaking for downgrades) | None for upgrades. A binary supporting journal 4 or older refuses a database this release opened, with `store.NewerSchemaError` (from #291 on; see Limits under § Schema versions); restore a backup taken before the upgrade, as for every raise above |
 | `ErrRecordFinal`, `ScopeAttempt` (#334) | additive | None |
+| Join results are positional slots (one per expected branch, filled once, merged per write); joins are final once every slot is filled; a child record keeps the child run it was created with, must name an existing run when created, and moves only from running to completed; `RecordJoin` and `RecordChild` refuse an unknown run with `ErrNotFound`; a join's `Completed` and `State` must agree with its slots, and a running child has no result (#334, part 2) | behavioral (bug fix) | None for a caller that records each join and child forward. A write that used to overwrite or regress one now returns one of the typed errors above; a child record naming a run the journal does not hold is refused; a join written with results that are not `Expected` slots is refused (the repository's callers already wrote one result per branch). Existing rows are read as before. No schema change, so no version raise: nothing on disk changes shape, and a version-5 binary reads every row this one writes |
+| `ErrRecordConflict`, `ErrChildRunNotFound` (#334, part 2) | additive | None |
 
 ## Alternatives considered
 
@@ -497,6 +609,23 @@ The same test truncates a closed database and requires opening or integrity
 checking to fail closed. `sqlite_test.go` creates a backup with
 `VACUUM INTO`, reopens it through the selected backend, runs an integrity check,
 and reads the committed row.
+
+`backup_test.go` (#343) restores a corrupt backup, which must be refused
+before anything is copied (mutation M49b, skipping the source check, fails
+it), and a copy damaged between the rename and the restored check, which
+must fail and leave no destination (M49b2, skipping that check, fails it),
+and refuses a destination with a leftover `-wal` (a real stale log), `-shm`
+or `-journal` beside it, at the start and when one appears during the copy.
+It requires the backup's SHA-256 and modification time to be unchanged by
+`Restore`, with the backup and its directory read-only and with a WAL-mode
+file, run as an unprivileged user when the tests run as root. It kills a
+real child process with SIGKILL before and after `Restore`'s rename, while
+`VACUUM INTO` is part way through writing a 48 MiB backup, and before
+`Backup`'s rename, and retries in the parent. On Linux with
+`BLOK_TEST_SMALL_FS`, as below, a backup and a restore that do not fit on a
+full tmpfs must fail, leave nothing at or beside the destination, and
+succeed once space is freed. No test can observe a missing fsync without
+cutting power; the PRs for #343 record an `strace` of the syncs instead.
 
 A killed process cannot tell a flushed commit from one still in the
 operating system's cache, so the crash test stays green with
