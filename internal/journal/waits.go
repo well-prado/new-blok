@@ -99,6 +99,15 @@ func (j *Journal) ScheduleWait(ctx context.Context, request WaitRequest) (WaitRe
 	}
 	var record WaitRecord
 	err := j.withTx(ctx, "wait-schedule", func(tx *sql.Tx) error {
+		var err error
+		record, err = j.scheduleWait(ctx, tx, request)
+		return err
+	})
+	return record, err
+}
+
+func (j *Journal) scheduleWait(ctx context.Context, tx *sql.Tx, request WaitRequest) (record WaitRecord, err error) {
+	err = func() error {
 		// No conflict target: both the wait ID and the step identity are
 		// uniqueness constraints, and either one is a duplicate.
 		result, err := tx.ExecContext(ctx, `INSERT INTO journal_waits (wait_id, run_id, name, invocation_path, iteration_path, due_at, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`, request.WaitID, request.RunID, request.Name, request.InvocationPath, request.IterationPath, request.DueAt.UTC().UnixNano(), waitWaiting, j.now(), j.now())
@@ -132,7 +141,7 @@ func (j *Journal) ScheduleWait(ctx context.Context, request WaitRequest) (WaitRe
 		record.SignalID = signalID
 		record.Payload = append([]byte(nil), payload...)
 		return nil
-	})
+	}()
 	return record, err
 }
 
@@ -499,6 +508,37 @@ func (j *Journal) Wait(ctx context.Context, waitID string) (WaitRecord, error) {
 		return WaitRecord{}, ErrNotFound
 	}
 	return record, err
+}
+
+// WaitAt returns the run's wait at a step and iteration, or ErrNotFound.
+func (j *Journal) WaitAt(ctx context.Context, runID, invocationPath, iterationPath string) (WaitRecord, error) {
+	var record WaitRecord
+	err := j.withRead(ctx, func(tx *sql.Tx) error {
+		var err error
+		record, err = scanWait(tx.QueryRowContext(ctx, `SELECT `+waitColumns+waitsWithRun+` WHERE w.run_id = ? AND w.invocation_path = ? AND w.iteration_path = ?`, runID, invocationPath, iterationPath))
+		return err
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		return WaitRecord{}, ErrNotFound
+	}
+	return record, err
+}
+
+// acknowledgeWaits consumes a run's fired waits in tx, under its current
+// lease token: the transaction that commits what the wakeups led to.
+func (j *Journal) acknowledgeWaits(ctx context.Context, tx *sql.Tx, runID string, token int64, waitIDs []string) error {
+	if len(waitIDs) == 0 {
+		return nil
+	}
+	if err := j.checkRunLease(ctx, tx, runID, token, false); err != nil {
+		return err
+	}
+	for _, waitID := range waitIDs {
+		if _, err := tx.ExecContext(ctx, `UPDATE journal_waits SET state = ?, updated_at = ? WHERE wait_id = ? AND run_id = ? AND state = ?`, waitAcknowledged, j.now(), waitID, runID, waitFired); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func scanWait(row interface{ Scan(...any) error }) (WaitRecord, error) {

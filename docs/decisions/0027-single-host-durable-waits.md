@@ -1,9 +1,10 @@
 # ADR 0027: Single-host durable waits
 
 - Status: in progress for E07-T09 (#332), delivered in slices. Slice A
-  (merged, #350) records wait identity and signal routing; slice B (this
-  revision) makes wakeups crash-safe; slice C (the engine's `WaitJournal`
-  on `internal/journal`) extends it
+  (merged, #350) records wait identity and signal routing; slice B (#366,
+  #378) makes wakeups crash-safe; slice C1 (this revision) makes
+  `internal/journal` the engine's step and wait journal; slice C2 (the
+  single-host resumer) completes it
 - Date: 2026-10-07
 - Roadmap: E07-T09 ([#332](https://github.com/well-prado/new-blok/issues/332)),
   closing gaps in E07-T04 (#46); prerequisite of E07-T10 (#333, nested
@@ -198,6 +199,95 @@ stamp existed. A schema-5 binary refuses a schema-6 journal (#291).
 Version 5 is #334's scope attempt (PR #351), which merged first; this step
 was renumbered from 5 to 6.
 
+## Engine journal (slice C1)
+
+`(*Journal).ForRun(runID, token)` returns a `RunJournal`, the engine's
+`StepJournal` and `WaitJournal` for one run executed under that lease
+token. A run's steps are identified as the journal identifies effects and
+waits: the invocation path is the engine's step ID, and the iteration path
+is `root` until #333 gives the engine iteration paths (ADR 0031 defines
+both; a top-level step's invocation path is its ID).
+
+- **Lease and input.** `VerifyRun` refuses a run that is not live, whose
+  artifact differs, or whose lease is no longer the token's
+  (`ErrLeaseLost`). A run's engine input (the engine's digest of the input
+  its runner hands it, a typed decode of the admitted JSON re-encoded) is
+  fixed once: at admission when the admitter knows it
+  (`AdmissionRequest.EngineInput`, the decoded value itself, which `Admit`
+  digests with the engine's own `engine.InputDigest`, so no caller
+  encoding can differ from the engine's; a value `json.Marshal` refuses is
+  refused at admission), otherwise by the run's first execution
+  (`journal_runs.engine_input_digest`, schema 7). A later execution with
+  another engine input is refused, and so is a repeat admission of the
+  request key naming another engine input than the one fixed (Review R
+  round 3 on #380: caller bytes with other whitespace, HTML escaping, key
+  order or `\u` escapes than `json.Marshal`'s fixed an identity no
+  execution could match). The admitted bytes are
+  never compared with a re-encoding: a run admitted with valid input always
+  runs, whether its typed decode reorders fields, keeps an integer beyond
+  float64's exact range, drops an unknown field or zero-fills an optional
+  one (Review R round 2 on #380 and round 1 on #384: each of those could
+  never run).
+- **Permanent conflicts.** `Permanent(err)` reports the errors no retry
+  can fix: `ErrRequestConflict` (another engine input, step input or wait
+  plan), `ErrWaitCanceled`, `ErrStepResultLimit`. A runner settles such a
+  run as failed with a diagnostic; a lost lease and storage faults are not
+  permanent. The engine still labels them `persistence`; the journal's
+  sentinel is what classifies them (#333 is reworking the engine's run
+  loop).
+- **Calls.** A call with declared effects is recorded as dispatched before
+  the node runs, in one transaction, and committed after; one found
+  dispatched on replay is marked uncertain and the run fails as uncertain,
+  never charging twice. A call with no effects journals nothing before it
+  runs (running it again is safe) and its result is committed in one
+  transaction. Every step's operation records the engine's digest of the
+  step's input (`journal_operations.input_digest`, schema 7): a replay
+  that resolves a different input at the same step (a later loop
+  iteration, or an upgrade that resolves inputs differently) is
+  `ErrRequestConflict`, never served the recorded result. Step results are
+  bounded by `MaxStepResultBytes` (1 MiB, as a run's output). The engine
+  already refuses a node result over 1 MiB as `invalid_output`, except for
+  a node whose output schema is an open object; there the journal refuses
+  it with `ErrStepResultLimit`, which the engine reports as
+  `journal_step_complete` (class `persistence`); it is permanent (above).
+- **Waits.** `Await` looks the step's wait up by run, invocation path and
+  iteration path, and schedules it the first time. Its ID is a digest of
+  an explicit encoding of the run, artifact, step, the engine's digest of
+  the wait plan (name and timeout) and the iteration path, owned by the
+  journal (`wait/v1`, pinned by a test vector; not of the engine's
+  identity struct, whose encoding could move with a field rename), so
+  every replay reads the same wait and a changed plan at the same step is
+  `ErrRequestConflict`. The engine's digest of the wait plan is of
+  `contract.WaitInstruction`'s JSON encoding: a new field without
+  `omitempty` would change every suspended run's wait ID, which a test
+  also pins. A wait without a timeout
+  is due at the end of time: only a signal fires it. Waiting suspends the
+  run; fired or acknowledged returns the stored outcome (the signal, or a
+  timeout when no signal fired it); canceled is `ErrWaitCanceled`.
+- **Acknowledgement.** A fired wait's outcome read by `Await` is
+  acknowledged in the transaction of the next durable progress: the next
+  step's result, the schedule of the next wait (a run waiting at b right
+  after a is woken for b only, not again for a), the run found still
+  waiting at a wait, or the run's end through `RunJournal.CompleteRun`,
+  `FailRun` or `MarkRunUncertain`. Never before: a crash between reading
+  the outcome and that progress leaves the wait fired, the run is listed
+  again once its lease lapses, and the replay reads the same outcome.
+  `Journal.CompleteRun` refuses a run with a fired, unacknowledged wait
+  (`ErrRunActiveWork`); `Journal.FailRun` does not, because a failure ends
+  the run whatever woke it.
+
+The engine's `StepJournal` has no hook for a wait step's own commit, so a
+wakeup is consumed with the step after it rather than with the wait step;
+the effect is the same, since the wait step's output is the stored
+outcome and replays identically.
+
+`internal/cluster`'s `WaitIDFor(runID, stepID)` addresses a wait by run
+and step only. Once #333 runs a wait in a loop durably, every iteration
+would map to one cluster wait, and the second iteration would read the
+first one's outcome: it needs the iteration path (and the invocation path
+inside an arm) before durable loops reach the cluster runtime. ADR 0031
+(#333, in progress) has a durable runner refuse control flow until then.
+
 ## Compatibility
 
 | Change | Class | Migration |
@@ -210,7 +300,11 @@ was renumbered from 5 to 6.
 | A duplicate step identity or wait ID returns `ErrWaitExists`, not a raw constraint error | behavioral | None |
 | Journal schema 3 → 4 | schema, one-way | On open, in the schema transaction, killed or not (see Evidence) |
 | Wait states `resumed` → `fired` / `acknowledged`; run leases; `ClaimDueWaits` fires only waits of live runs and returns only those of runs it leased; `PendingResumptions`, `TakeRunLease`, `AcknowledgeWait`, `RenewRunLease`, `ReleaseRunLease` (the last three take the lease token), `ErrWaitNotFired`, `ErrLeaseLost`, `Config.Holder`, `Config.WakeupLease`, `WaitRecord.LeaseOwner`/`LeaseUntil`/`LeaseToken` (the run's lease) (slice B) | API and behavioral; no caller outside `internal/journal` | Call `PendingResumptions` on start; `TakeRunLease` when starting a run without a wakeup; `AcknowledgeWait` after the resumed step commits; renew while executing, release when the run suspends or ends |
+| `Journal.ForRun`, `RunJournal` (engine `StepJournal` and `WaitJournal`), `Journal.WaitAt`, `ErrWaitCanceled` (slice C1) | API, additive | None |
+| `Journal.CompleteRun` refuses a run with a fired, unacknowledged wait (slice C1) | behavioral | Acknowledge the wait (`AcknowledgeWait`, or a `RunJournal` commit) before completing |
 | Journal schema 5 → 6 (slice B) | schema, one-way | On open; `resumed` waits remapped on every open |
+| Journal schema 6 → 7: `journal_operations.input_digest`, `journal_runs.engine_input_digest` (slice C1) | schema, one-way | On open, `from < 7`; operations recorded before it have no digest and are not compared; a run's engine input is fixed by its next execution |
+| `RunJournal.MarkRunUncertain`, `AdmissionRequest.EngineInput`, `Permanent`, `MaxStepResultBytes`, `ErrStepResultLimit` (slice C1) | API, additive | None |
 
 ## Evidence
 
@@ -246,7 +340,20 @@ round 2, `TestLeaseTokenFencesStaleExecutions` (the reviewer's three
 probes), `TestTakeRunLeaseHoldsARunThatNeverSuspended`,
 `TestNewWakeupsDoNotStarveALeasedRun`; after round 3,
 `TestAcknowledgedRetryNeedsTheCurrentToken`, `TestLeaseTokensAreJournalWide`,
-`TestRewokenRunRanksByItsNewWakeup`.
+`TestRewokenRunRanksByItsNewWakeup`. Slice C1:
+`TestEngineSuspendsAndResumesThroughTheJournal`,
+`TestEngineWaitTimesOutThroughTheJournal`,
+`TestCompleteRunRefusesAnUnconsumedWakeup`,
+`TestEngineReplaysAfterACrashMidResumption`,
+`TestEngineEffectInterruptedByACrashIsUncertain` (the last two kill a real
+process); after Review R round 1, `TestWaitAfterWaitIsNotWokenAgain`,
+`TestStaleExecutionWritesNothing`, `TestStepResultIsBoundToItsInput`,
+`TestRunJournalMarksARunUncertain`, `TestStepResultIsBounded`; after
+round 2, `TestEveryValidInputRuns`, `TestEngineInputIsFixedOnce`,
+`TestPermanentErrors`, `TestWritesAfterTheRunEndedAreRefused`,
+`TestWaitIDFormatIsPinned`, `TestOversizeStepResultIsRecognizable`; after
+round 3, `TestEngineInputFixedAtAdmissionRuns`,
+`TestEngineInputMustEncode`, `TestRepeatAdmissionComparesEngineInput`.
 
 ## Limits
 
@@ -262,21 +369,25 @@ probes), `TestTakeRunLeaseHoldsARunThatNeverSuspended`,
   token after the run has ended. That is harmless (resumption listings and
   claims only consider live runs); slice C's runner releases the lease when
   a run ends.
-- The lease token fences the journal's lease calls, not the engine's
-  step writes: a stale execution learns it lost the run at its next renew
-  or acknowledgement. Slice C acknowledges inside the resumed step's own
-  transaction, so the step commits only under the current token.
+- The lease token fences journal writes, not nodes: a stale execution's
+  next node still runs (a pure node journals nothing first) before its
+  write is refused and it stops. Effects are recorded under the lease
+  before they dispatch, so a stale execution never dispatches one.
+- The journal's own `Journal` methods (`ScheduleWait`, `MarkUncertain`,
+  `MarkRunUncertain`, …) take no lease; only `RunJournal`, the engine's
+  path, is fenced.
 - Mixed versions: a binary from before this slice, still running during an
   upgrade, may be executing a run whose wakeup it marked `resumed`; the
   first open by this binary remaps that wait to `fired` and a holder may
   then list and execute the same run: a double-resume window that lasts
   until the old process stops. Upgrade by stopping old processes first.
-- `CompleteRun` does not yet refuse a run with an unacknowledged fired
-  wait.
-- `internal/journal` does not yet implement `engine.WaitJournal`, and the
-  single-host runner does not resume from it. Slice C, which also chooses
-  how the engine's `StepIdentity` and #333's iteration path map onto the
-  two paths recorded here.
+- No single-host runner resumes runs through `RunJournal` yet: slice C2
+  lists resumptions on start, executes them, renews and releases leases.
+- Every step is at the `root` iteration until #333 passes iteration paths
+  to the engine (ADR 0031, in progress, refuses durable control flow until
+  then).
+- Effect inputs over `MaxInspectionInputBytes` are refused at dispatch, as
+  `BeginEffect` refuses them.
 - Pending signals of a run that ends stay pending (never late
   retroactively) until the run is compacted with them.
 - A signal's duplicate check compares the signal ID only, not its

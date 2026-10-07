@@ -27,10 +27,12 @@ func asBinary(t *testing.T, version int) {
 }
 
 // TestOlderBinaryRefusesAMigratedJournal: a journal this binary migrated
-// (schema 6) is refused by a binary that supports only schema 5 (after
-// #334, before #332's wakeup durability), 4 (after #332's wait identity,
+// (schema 7) is refused by a binary that supports only schema 6 (before
+// #332's step input digest), 5 (after #334, before #332's wakeup
+// durability), 4 (after #332's wait identity,
 // before #334), 3 (after #286, before #332), 2 (after #281, before #286)
-// or 1 (before #281), naming the journal and both versions. A schema-5
+// or 1 (before #281), naming the journal and both versions. A schema-6
+// binary would serve a step's result to a different input, a schema-5
 // binary would strand fired wakeups and ignore run leases, a pre-#334
 // binary would ignore the scope attempt fence and overwrite a completed
 // scope, a pre-#332 binary would read waits by name alone, a pre-#286 one would insert reconciliations without a
@@ -69,13 +71,13 @@ func TestOlderBinaryRefusesAMigratedJournal(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, older := range []int{5, 4, 3, 2, 1} {
+	for _, older := range []int{6, 5, 4, 3, 2, 1} {
 		func() {
 			asBinary(t, older)
 			refused, err := New(ctx, database, Config{Audit: log})
 			var newer *store.NewerSchemaError
-			if refused != nil || !errors.As(err, &newer) || *newer != (store.NewerSchemaError{Component: "journal", Version: 6, Supported: older}) {
-				t.Fatalf("a journal-%d binary opened a journal-6 database: journal=%v err=%v", older, refused, err)
+			if refused != nil || !errors.As(err, &newer) || *newer != (store.NewerSchemaError{Component: "journal", Version: 7, Supported: older}) {
+				t.Fatalf("a journal-%d binary opened a journal-7 database: journal=%v err=%v", older, refused, err)
 			}
 		}()
 	}
@@ -89,7 +91,7 @@ func TestOlderBinaryRefusesAMigratedJournal(t *testing.T) {
 		t.Fatalf("untenanted reconciliations=%d legacy table=%d err=%v", untenanted, legacy, err)
 	}
 
-	for _, version := range []int{6, 7} {
+	for _, version := range []int{7, 8} {
 		asBinary(t, version)
 		reopened, err := New(ctx, database, Config{Audit: log})
 		if err != nil {

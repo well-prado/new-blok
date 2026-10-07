@@ -89,6 +89,17 @@ func (r *rig) contentRun(label string, reconciled bool) contentRun {
 	if _, err := r.journal.Signal(ctx, signal.Envelope{RunID: run.RunID, SignalID: "signal-" + label, Name: "approved", Payload: quoted("SIGNAL"), Principal: "alice"}, true); err != nil {
 		r.t.Fatal(err)
 	}
+	// The resumed run consumes its wakeup before it completes (#332).
+	token, err := r.journal.TakeRunLease(ctx, run.RunID, r.clock)
+	if err == nil {
+		err = r.journal.AcknowledgeWait(ctx, "wait-"+label, token)
+	}
+	if err == nil {
+		err = r.journal.ReleaseRunLease(ctx, run.RunID, token)
+	}
+	if err != nil {
+		r.t.Fatal(err)
+	}
 	// The child record must name a run the journal holds (#334). The child
 	// carries no marker and stays accepted, so compaction leaves it alone.
 	child, err := r.journal.Admit(ctx, journal.AdmissionRequest{RequestKey: "child-of-" + label, Workflow: "orders", ArtifactDigest: digest("artifact"), Input: []byte(`{}`)})

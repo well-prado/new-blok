@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/well-prado/new-blok/contract/audit"
+	"github.com/well-prado/new-blok/internal/engine"
 	"github.com/well-prado/new-blok/internal/migration"
 	"github.com/well-prado/new-blok/store"
 )
@@ -100,6 +101,13 @@ type AdmissionRequest struct {
 	Workflow       string
 	ArtifactDigest string
 	Input          json.RawMessage
+	// EngineInput, when set, is the value the run's runner will hand the
+	// engine (a typed decode of Input): its engine-input identity, fixed at
+	// admission. Admit digests it exactly as the engine does
+	// (engine.InputDigest), so pass the value, not an encoding of it; a
+	// value json.Marshal refuses is refused. Without it, the first
+	// execution's engine input fixes the identity (VerifyRun).
+	EngineInput any
 }
 
 type Admission struct {
@@ -221,11 +229,12 @@ func New(ctx context.Context, database store.Database, config Config) (*Journal,
 // #332's wait identity (journal_waits keyed by step and iteration instead
 // of by name), 5 with #334's scope attempt (journal_scopes.attempt_id,
 // which fences scope completion), 6 with #332's wakeup durability (fired
-// waits, run leases). New refuses a journal stamped with a
+// waits, run leases), 7 with #332's input digests (an engine step's result
+// bound to its input, a run to its engine input). New refuses a journal stamped with a
 // newer one. Raise it with every change an older binary would misread,
 // together with the migration step that makes it. It is a variable only so
 // tests can stand in for an older binary.
-var schemaVersion = 6
+var schemaVersion = 7
 
 // inferSchemaVersion classifies a journal written before the stamp existed
 // by its shape: 0 when it has no tables yet, 4 when its waits carry an
@@ -343,6 +352,17 @@ func (j *Journal) migrate(ctx context.Context, tx *sql.Tx, from int) error {
 			}
 		}
 	}
+	// An engine step's result records the digest of its input (#332), so a
+	// replay that resolves a different input is refused, not served it.
+	// A run's engine input is fixed once, at admission or first execution.
+	if from < 7 {
+		if err := ensureColumn(ctx, tx, "journal_operations", "input_digest", `TEXT`); err != nil {
+			return err
+		}
+		if err := ensureColumn(ctx, tx, "journal_runs", "engine_input_digest", `TEXT`); err != nil {
+			return err
+		}
+	}
 	return remapResumedWaits(ctx, tx)
 }
 
@@ -415,7 +435,8 @@ var schemaStatements = []string{
 		lease_owner TEXT,
 		lease_until INTEGER,
 		leased_at INTEGER,
-		lease_token INTEGER
+		lease_token INTEGER,
+		engine_input_digest TEXT
 	)`,
 	`CREATE TABLE IF NOT EXISTS journal_operations (
 		operation_key TEXT PRIMARY KEY,
@@ -430,6 +451,7 @@ var schemaStatements = []string{
 		input_json BLOB,
 		created_at INTEGER NOT NULL,
 		updated_at INTEGER NOT NULL,
+		input_digest TEXT,
 		FOREIGN KEY (run_id) REFERENCES journal_runs(run_id)
 	)`,
 	`CREATE TABLE IF NOT EXISTS journal_attempts (
@@ -585,6 +607,14 @@ func (j *Journal) Admit(ctx context.Context, request AdmissionRequest) (Admissio
 		return Admission{}, err
 	}
 	digest := digestBytes(request.Input)
+	var engineInput any
+	if request.EngineInput != nil {
+		bound, err := engine.InputDigest(request.EngineInput)
+		if err != nil {
+			return Admission{}, fmt.Errorf("journal: admit: the engine input cannot be encoded: %w", err)
+		}
+		engineInput = bound
+	}
 	runID, err := randomID("run")
 	if err != nil {
 		return Admission{}, err
@@ -592,9 +622,9 @@ func (j *Journal) Admit(ctx context.Context, request AdmissionRequest) (Admissio
 	admission := Admission{RunID: runID, RequestKey: request.RequestKey}
 	err = j.withTx(ctx, "admission", func(tx *sql.Tx) error {
 		result, err := tx.ExecContext(ctx, `INSERT INTO journal_runs
-			(run_id, request_key, workflow, artifact_digest, input_json, input_digest, state, created_at, principal)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(request_key) DO NOTHING`,
-			runID, request.RequestKey, request.Workflow, request.ArtifactDigest, []byte(request.Input), digest, runAccepted, j.now(), request.Principal)
+			(run_id, request_key, workflow, artifact_digest, input_json, input_digest, state, created_at, principal, engine_input_digest)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(request_key) DO NOTHING`,
+			runID, request.RequestKey, request.Workflow, request.ArtifactDigest, []byte(request.Input), digest, runAccepted, j.now(), request.Principal, engineInput)
 		if err != nil {
 			return err
 		}
@@ -610,6 +640,15 @@ func (j *Journal) Admit(ctx context.Context, request AdmissionRequest) (Admissio
 			}
 			if existing.Principal != request.Principal || existing.Workflow != request.Workflow || existing.ArtifactDigest != request.ArtifactDigest || existing.InputDigest != digest {
 				return ErrRequestConflict
+			}
+			if engineInput != nil {
+				var bound sql.NullString
+				if err := tx.QueryRowContext(ctx, `SELECT engine_input_digest FROM journal_runs WHERE run_id = ?`, existing.RunID).Scan(&bound); err != nil {
+					return err
+				}
+				if bound.Valid && bound.String != engineInput {
+					return ErrRequestConflict
+				}
 			}
 			admission.RunID = existing.RunID
 			admission.Accepted = false
@@ -677,6 +716,18 @@ func (j *Journal) BeginEffect(ctx context.Context, intent EffectIntent) (Operati
 	key := intent.Identity.Key()
 	var operation Operation
 	err := j.withTx(ctx, "effect-intent", func(tx *sql.Tx) error {
+		var err error
+		operation, err = j.beginEffect(ctx, tx, intent, key)
+		return err
+	})
+	if err != nil {
+		return Operation{}, fmt.Errorf("journal: effect intent: %w", err)
+	}
+	return operation, nil
+}
+
+func (j *Journal) beginEffect(ctx context.Context, tx *sql.Tx, intent EffectIntent, key string) (operation Operation, err error) {
+	err = func() error {
 		var runState string
 		if err := tx.QueryRowContext(ctx, `SELECT state FROM journal_runs WHERE run_id=?`, intent.Identity.RunID).Scan(&runState); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
@@ -714,11 +765,8 @@ func (j *Journal) BeginEffect(ctx context.Context, intent EffectIntent) (Operati
 			}
 		}
 		return err
-	})
-	if err != nil {
-		return Operation{}, fmt.Errorf("journal: effect intent: %w", err)
-	}
-	return operation, nil
+	}()
+	return operation, err
 }
 
 func (j *Journal) StartAttempt(ctx context.Context, operationKey string) (Attempt, error) {
@@ -727,6 +775,18 @@ func (j *Journal) StartAttempt(ctx context.Context, operationKey string) (Attemp
 	}
 	var attempt Attempt
 	err := j.withTx(ctx, "attempt-start", func(tx *sql.Tx) error {
+		var err error
+		attempt, err = j.startAttempt(ctx, tx, operationKey)
+		return err
+	})
+	if err != nil {
+		return Attempt{}, fmt.Errorf("journal: start attempt: %w", err)
+	}
+	return attempt, nil
+}
+
+func (j *Journal) startAttempt(ctx context.Context, tx *sql.Tx, operationKey string) (attempt Attempt, err error) {
+	err = func() error {
 		operation, err := scanOperation(tx.QueryRowContext(ctx, `SELECT operation_key, run_id, artifact_digest, invocation_path, iteration_path, provider_operation_key, state, current_attempt_id, input_json, result_json FROM journal_operations WHERE operation_key = ?`, operationKey))
 		if err != nil {
 			return err
@@ -760,11 +820,8 @@ func (j *Journal) StartAttempt(ctx context.Context, operationKey string) (Attemp
 		}
 		attempt = Attempt{ID: attemptID, OperationKey: operationKey, AttemptNumber: next, ProviderOperationKey: operation.ProviderOperationKey, State: attemptDispatched, Input: append([]byte(nil), operation.Input...)}
 		return nil
-	})
-	if err != nil {
-		return Attempt{}, fmt.Errorf("journal: start attempt: %w", err)
-	}
-	return attempt, nil
+	}()
+	return attempt, err
 }
 
 func (j *Journal) FailAttempt(ctx context.Context, operationKey, attemptID string, retryable bool, message string) error {
@@ -807,40 +864,44 @@ func (j *Journal) CommitEffect(ctx context.Context, commit EffectCommit) error {
 		return errors.New("journal: valid operation, attempt and result are required")
 	}
 	return j.withTx(ctx, "effect-commit", func(tx *sql.Tx) error {
-		var state, current string
-		if err := tx.QueryRowContext(ctx, `SELECT state, current_attempt_id FROM journal_operations WHERE operation_key = ?`, commit.OperationKey).Scan(&state, &current); err != nil {
-			return err
-		}
-		if state == operationCommitted && current == commit.AttemptID {
-			return nil
-		}
-		if state == operationUncertain {
-			return ErrUncertain
-		}
-		result, err := tx.ExecContext(ctx, `UPDATE journal_attempts SET state = ?, result_json = ?, finished_at = ? WHERE attempt_id = ? AND operation_key = ? AND state = ? AND EXISTS (SELECT 1 FROM journal_operations WHERE operation_key = ? AND state = ? AND current_attempt_id = ?)`, attemptCommitted, []byte(commit.Result), j.now(), commit.AttemptID, commit.OperationKey, attemptDispatched, commit.OperationKey, operationDispatched, commit.AttemptID)
-		if err != nil {
-			return err
-		}
-		changed, err := result.RowsAffected()
-		if err != nil {
-			return err
-		}
-		if changed != 1 {
-			return ErrStaleAttempt
-		}
-		result, err = tx.ExecContext(ctx, `UPDATE journal_operations SET state = ?, result_json = ?, updated_at = ? WHERE operation_key = ? AND state = ? AND current_attempt_id = ?`, operationCommitted, []byte(commit.Result), j.now(), commit.OperationKey, operationDispatched, commit.AttemptID)
-		if err != nil {
-			return err
-		}
-		changed, err = result.RowsAffected()
-		if err != nil {
-			return err
-		}
-		if changed != 1 {
-			return ErrStaleAttempt
-		}
-		return nil
+		return j.commitEffect(ctx, tx, commit)
 	})
+}
+
+func (j *Journal) commitEffect(ctx context.Context, tx *sql.Tx, commit EffectCommit) error {
+	var state, current string
+	if err := tx.QueryRowContext(ctx, `SELECT state, current_attempt_id FROM journal_operations WHERE operation_key = ?`, commit.OperationKey).Scan(&state, &current); err != nil {
+		return err
+	}
+	if state == operationCommitted && current == commit.AttemptID {
+		return nil
+	}
+	if state == operationUncertain {
+		return ErrUncertain
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE journal_attempts SET state = ?, result_json = ?, finished_at = ? WHERE attempt_id = ? AND operation_key = ? AND state = ? AND EXISTS (SELECT 1 FROM journal_operations WHERE operation_key = ? AND state = ? AND current_attempt_id = ?)`, attemptCommitted, []byte(commit.Result), j.now(), commit.AttemptID, commit.OperationKey, attemptDispatched, commit.OperationKey, operationDispatched, commit.AttemptID)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return ErrStaleAttempt
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE journal_operations SET state = ?, result_json = ?, updated_at = ? WHERE operation_key = ? AND state = ? AND current_attempt_id = ?`, operationCommitted, []byte(commit.Result), j.now(), commit.OperationKey, operationDispatched, commit.AttemptID)
+	if err != nil {
+		return err
+	}
+	changed, err = result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return ErrStaleAttempt
+	}
+	return nil
 }
 
 func (j *Journal) MarkUncertain(ctx context.Context, operationKey, attemptID, evidence string) error {
@@ -848,6 +909,12 @@ func (j *Journal) MarkUncertain(ctx context.Context, operationKey, attemptID, ev
 		return errors.New("journal: operation and attempt keys are required")
 	}
 	return j.withTx(ctx, "effect-uncertain", func(tx *sql.Tx) error {
+		return j.markUncertain(ctx, tx, operationKey, attemptID, evidence)
+	})
+}
+
+func (j *Journal) markUncertain(ctx context.Context, tx *sql.Tx, operationKey, attemptID, evidence string) error {
+	return func() error {
 		result, err := tx.ExecContext(ctx, `UPDATE journal_attempts SET state = ?, error_text = ?, finished_at = ? WHERE attempt_id = ? AND operation_key = ? AND state = ?`, attemptUncertain, evidence, j.now(), attemptID, operationKey, attemptDispatched)
 		if err != nil {
 			return err
@@ -871,7 +938,7 @@ func (j *Journal) MarkUncertain(ctx context.Context, operationKey, attemptID, ev
 			return ErrStaleAttempt
 		}
 		return nil
-	})
+	}()
 }
 
 func (j *Journal) CompleteRun(ctx context.Context, runID string, output json.RawMessage) error {
@@ -882,29 +949,42 @@ func (j *Journal) CompleteRun(ctx context.Context, runID string, output json.Raw
 		return errors.New("journal: valid run and output are required")
 	}
 	return j.withTx(ctx, "run-complete", func(tx *sql.Tx) error {
-		if err := requireQuiescentRun(ctx, tx, runID); err != nil {
-			return err
-		}
-		result, err := tx.ExecContext(ctx, `UPDATE journal_runs SET state = ?, output_json = ?, completed_at = ? WHERE run_id = ? AND state = ?`, runCompleted, []byte(output), j.now(), runID, runAccepted)
-		if err != nil {
-			return err
-		}
-		changed, err := result.RowsAffected()
-		if err != nil {
-			return err
-		}
-		if changed != 1 {
-			var state string
-			if scanErr := tx.QueryRowContext(ctx, `SELECT state FROM journal_runs WHERE run_id = ?`, runID).Scan(&state); scanErr != nil {
-				return scanErr
-			}
-			if state == runCompleted {
-				return nil
-			}
-			return ErrStaleAttempt
-		}
-		return nil
+		return j.completeRun(ctx, tx, runID, output)
 	})
+}
+
+func (j *Journal) completeRun(ctx context.Context, tx *sql.Tx, runID string, output json.RawMessage) error {
+	if err := requireQuiescentRun(ctx, tx, runID); err != nil {
+		return err
+	}
+	// A fired wait not yet acknowledged is a wakeup the run has not
+	// consumed: completing the run would drop it (#332).
+	var fired bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM journal_waits WHERE run_id = ? AND state = ?)`, runID, waitFired).Scan(&fired); err != nil {
+		return err
+	}
+	if fired {
+		return ErrRunActiveWork
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE journal_runs SET state = ?, output_json = ?, completed_at = ? WHERE run_id = ? AND state = ?`, runCompleted, []byte(output), j.now(), runID, runAccepted)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		var state string
+		if scanErr := tx.QueryRowContext(ctx, `SELECT state FROM journal_runs WHERE run_id = ?`, runID).Scan(&state); scanErr != nil {
+			return scanErr
+		}
+		if state == runCompleted {
+			return nil
+		}
+		return ErrStaleAttempt
+	}
+	return nil
 }
 
 // FailRun records the canonical terminal workflow outcome. Attempt failures
@@ -915,45 +995,49 @@ func (j *Journal) FailRun(ctx context.Context, runID, errorCode, errorClass stri
 		return errors.New("journal: run and safe failure code/class are required")
 	}
 	return j.withTx(ctx, "run-fail", func(tx *sql.Tx) error {
-		var state string
-		if err := tx.QueryRowContext(ctx, `SELECT state FROM journal_runs WHERE run_id=?`, runID).Scan(&state); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return ErrNotFound
-			}
-			return err
-		}
-		if state == runFailed {
-			var oldCode, oldClass string
-			if err := tx.QueryRowContext(ctx, `SELECT error_code,error_class FROM journal_runs WHERE run_id=?`, runID).Scan(&oldCode, &oldClass); err != nil {
-				return err
-			}
-			if oldCode == errorCode && oldClass == errorClass {
-				return nil
-			}
-			return ErrStaleAttempt
-		}
-		if state == runUncertain {
-			return ErrUncertain
-		}
-		if state != runAccepted {
-			return ErrStaleAttempt
-		}
-		if err := requireQuiescentRun(ctx, tx, runID); err != nil {
-			return err
-		}
-		result, err := tx.ExecContext(ctx, `UPDATE journal_runs SET state=?,error_code=?,error_class=?,completed_at=? WHERE run_id=? AND state=?`, runFailed, errorCode, errorClass, j.now(), runID, runAccepted)
-		if err != nil {
-			return err
-		}
-		changed, err := result.RowsAffected()
-		if err != nil {
-			return err
-		}
-		if changed != 1 {
-			return ErrStaleAttempt
-		}
-		return nil
+		return j.failRun(ctx, tx, runID, errorCode, errorClass)
 	})
+}
+
+func (j *Journal) failRun(ctx context.Context, tx *sql.Tx, runID, errorCode, errorClass string) error {
+	var state string
+	if err := tx.QueryRowContext(ctx, `SELECT state FROM journal_runs WHERE run_id=?`, runID).Scan(&state); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if state == runFailed {
+		var oldCode, oldClass string
+		if err := tx.QueryRowContext(ctx, `SELECT error_code,error_class FROM journal_runs WHERE run_id=?`, runID).Scan(&oldCode, &oldClass); err != nil {
+			return err
+		}
+		if oldCode == errorCode && oldClass == errorClass {
+			return nil
+		}
+		return ErrStaleAttempt
+	}
+	if state == runUncertain {
+		return ErrUncertain
+	}
+	if state != runAccepted {
+		return ErrStaleAttempt
+	}
+	if err := requireQuiescentRun(ctx, tx, runID); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE journal_runs SET state=?,error_code=?,error_class=?,completed_at=? WHERE run_id=? AND state=?`, runFailed, errorCode, errorClass, j.now(), runID, runAccepted)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return ErrStaleAttempt
+	}
+	return nil
 }
 
 // MarkRunUncertain records a conservative terminal projection when the
@@ -964,6 +1048,12 @@ func (j *Journal) MarkRunUncertain(ctx context.Context, runID, errorCode, errorC
 		return errors.New("journal: run and safe uncertainty code/class are required")
 	}
 	return j.withTx(ctx, "run-uncertain", func(tx *sql.Tx) error {
+		return j.markRunUncertain(ctx, tx, runID, errorCode, errorClass)
+	})
+}
+
+func (j *Journal) markRunUncertain(ctx context.Context, tx *sql.Tx, runID, errorCode, errorClass string) error {
+	return func() error {
 		result, err := tx.ExecContext(ctx, `UPDATE journal_runs SET state=?,error_code=?,error_class=?,completed_at=? WHERE run_id=? AND state=?`, runUncertain, errorCode, errorClass, j.now(), runID, runAccepted)
 		if err != nil {
 			return err
@@ -986,7 +1076,7 @@ func (j *Journal) MarkRunUncertain(ctx context.Context, runID, errorCode, errorC
 			return nil
 		}
 		return ErrStaleAttempt
-	})
+	}()
 }
 
 func requireQuiescentRun(ctx context.Context, tx *sql.Tx, runID string) error {
