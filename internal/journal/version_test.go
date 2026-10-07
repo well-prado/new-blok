@@ -27,12 +27,13 @@ func asBinary(t *testing.T, version int) {
 }
 
 // TestOlderBinaryRefusesAMigratedJournal: a journal this binary migrated
-// (schema 3) is refused by a binary that supports only schema 2 (after
-// #281, before #286) or 1 (before #281), naming the journal and both
-// versions. A pre-#286 binary would insert reconciliations without a
+// (schema 4) is refused by a binary that supports only schema 3 (after
+// #286, before #332), 2 (after #281, before #286) or 1 (before #281),
+// naming the journal and both versions. A pre-#332 binary would read waits
+// by name alone, a pre-#286 one would insert reconciliations without a
 // tenant (#286's interleaving) and a pre-#281 one would recreate the
-// legacy tombstone table; refused at open, neither writes anything. The
-// same and a newer binary open it.
+// legacy tombstone table; refused at open, none writes anything. The same
+// and a newer binary open it.
 func TestOlderBinaryRefusesAMigratedJournal(t *testing.T) {
 	ctx := context.Background()
 	database, err := (sqlite.Backend{}).Open(ctx, filepath.Join(t.TempDir(), "journal.db"))
@@ -65,13 +66,13 @@ func TestOlderBinaryRefusesAMigratedJournal(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, older := range []int{2, 1} {
+	for _, older := range []int{3, 2, 1} {
 		func() {
 			asBinary(t, older)
 			refused, err := New(ctx, database, Config{Audit: log})
 			var newer *store.NewerSchemaError
-			if refused != nil || !errors.As(err, &newer) || *newer != (store.NewerSchemaError{Component: "journal", Version: 3, Supported: older}) {
-				t.Fatalf("a journal-%d binary opened a journal-3 database: journal=%v err=%v", older, refused, err)
+			if refused != nil || !errors.As(err, &newer) || *newer != (store.NewerSchemaError{Component: "journal", Version: 4, Supported: older}) {
+				t.Fatalf("a journal-%d binary opened a journal-4 database: journal=%v err=%v", older, refused, err)
 			}
 		}()
 	}
@@ -85,7 +86,7 @@ func TestOlderBinaryRefusesAMigratedJournal(t *testing.T) {
 		t.Fatalf("untenanted reconciliations=%d legacy table=%d err=%v", untenanted, legacy, err)
 	}
 
-	for _, version := range []int{3, 4} {
+	for _, version := range []int{4, 5} {
 		asBinary(t, version)
 		reopened, err := New(ctx, database, Config{Audit: log})
 		if err != nil {
