@@ -353,10 +353,21 @@ func (j *Journal) RecordChild(ctx context.Context, record ChildRecord) error {
 // identical retry, succeeds and changes nothing. State is derived from the
 // slots; a caller State that disagrees, results of another length than
 // Expected, or a Completed that is not the number of filled slots is an
-// invalid record. The run must exist (ErrNotFound). A row the pre-#334
-// upsert left in another shape (a state other than running or completed,
-// or results that are not one slot per branch) is refused with
-// ErrRecordConflict unless the write is identical to it.
+// invalid record. The run must exist (ErrNotFound).
+//
+// Slots are compared in their compact JSON form, the form json.Marshal
+// stores (spacing dropped; <, > and & escaped), so resending a slot spelled
+// differently is the same slot. Nothing else is normalised: reordered
+// object keys or 1.0 for 1 are another value.
+//
+// A row the pre-#334 upsert left in another shape is never changed. One
+// whose results are not one slot per branch, or whose completed count
+// disagrees with its slots, cannot be read as slots: every write but an
+// identical one is ErrRecordConflict. One in a state other than running or
+// completed refuses a write that would fill a slot (ErrRecordConflict), and
+// a write that brings nothing new succeeds and changes nothing, as for any
+// join. A row stored with no results (results_json null) is read as its
+// empty slots.
 func (j *Journal) RecordJoin(ctx context.Context, record JoinRecord) error {
 	if record.RunID == "" || record.Path == "" || record.Expected < 1 {
 		return errors.New("journal: invalid join record")
@@ -404,8 +415,14 @@ func (j *Journal) RecordJoin(ctx context.Context, record JoinRecord) error {
 		if expected != record.Expected {
 			return final
 		}
-		var current []json.RawMessage
-		if json.Unmarshal(results, &current) != nil || len(current) != expected || filledSlots(current) != completed {
+		var raw []json.RawMessage
+		if json.Unmarshal(results, &raw) != nil {
+			return ErrRecordConflict
+		}
+		// Normalised like a write: a row the pre-#334 upsert stored with nil
+		// results ('null') reads as its empty slots.
+		current, err := joinSlots(raw, expected)
+		if err != nil || filledSlots(current) != completed {
 			return ErrRecordConflict
 		}
 		merged := make([]json.RawMessage, expected)
@@ -459,7 +476,13 @@ func joinSlots(results []json.RawMessage, expected int) ([]json.RawMessage, erro
 		if !json.Valid(trimmed) {
 			return nil, errors.New("journal: invalid join record: a result is not valid JSON")
 		}
-		slots[i] = append(json.RawMessage(nil), trimmed...)
+		// The compact form is what json.Marshal stores, so it is also what
+		// a slot is compared in.
+		compact, err := json.Marshal(json.RawMessage(trimmed))
+		if err != nil {
+			return nil, err
+		}
+		slots[i] = compact
 	}
 	return slots, nil
 }

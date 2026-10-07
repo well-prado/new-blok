@@ -394,6 +394,38 @@ func TestConcurrentJoinFillsFromTwoHandles(t *testing.T) {
 	}
 }
 
+// A slot is compared in its compact JSON form, the form it is stored in
+// (#370 review): repeating a slot written with spaces, or with characters
+// json.Marshal escapes (<, >, &), is the same slot, so a writer that resends
+// the slots it already knows while filling a new one is not refused.
+func TestJoinSlotsCompareInCompactForm(t *testing.T) {
+	ctx := context.Background()
+	j, runID := fencingRun(t, "join-compact")
+	for _, first := range []string{`{"a": 1}`, `"<b>"`, `"x&y"`, " [1, 2] "} {
+		path := "parallel/" + first
+		if err := j.RecordJoin(ctx, JoinRecord{RunID: runID, Path: path, Expected: 2, Completed: 1, Results: slots(first, ``)}); err != nil {
+			t.Fatalf("seeding %s: %v", first, err)
+		}
+		if err := j.RecordJoin(ctx, JoinRecord{RunID: runID, Path: path, Expected: 2, Completed: 2, Results: slots(first, `2`)}); err != nil {
+			t.Errorf("resending %s while filling the next slot: %v", first, err)
+		}
+		if err := j.RecordJoin(ctx, JoinRecord{RunID: runID, Path: path, Expected: 2, Completed: 2, Results: slots(first, `2`)}); err != nil {
+			t.Errorf("retrying the completing write with %s: %v", first, err)
+		}
+		if join, _ := storedSlots(t, j, runID, path); join.Completed != 2 || join.State != joinCompleted {
+			t.Errorf("join with %s = %+v", first, join)
+		}
+	}
+	// The compact form still tells different values apart: key order and
+	// number spelling are not normalised.
+	if err := j.RecordJoin(ctx, JoinRecord{RunID: runID, Path: "parallel/order", Expected: 2, Completed: 1, Results: slots(`{"a":1,"b":2}`, ``)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.RecordJoin(ctx, JoinRecord{RunID: runID, Path: "parallel/order", Expected: 2, Completed: 2, Results: slots(`{"b":2,"a":1}`, `2`)}); !errors.Is(err, ErrRecordConflict) {
+		t.Errorf("reordered keys: err=%v, want ErrRecordConflict", err)
+	}
+}
+
 // Rows the pre-#334 upsert wrote can hold what the writes no longer
 // produce: a join or child in a state other than running or completed, or
 // a join whose results are not one slot per branch. They are refused, not
@@ -419,6 +451,8 @@ func TestLegacyJoinAndChildRowsAreNotOverwritten(t *testing.T) {
 	execAll(t, database,
 		`INSERT INTO journal_joins (run_id, path, expected, completed, results_json, state) VALUES ('`+run.RunID+`', 'failed', 2, 1, '["1",null]', 'failed')`,
 		`INSERT INTO journal_joins (run_id, path, expected, completed, results_json, state) VALUES ('`+run.RunID+`', 'packed', 3, 1, '[1]', 'running')`,
+		`INSERT INTO journal_joins (run_id, path, expected, completed, results_json, state) VALUES ('`+run.RunID+`', 'miscounted', 2, 2, '[1,null]', 'running')`,
+		`INSERT INTO journal_joins (run_id, path, expected, completed, results_json, state) VALUES ('`+run.RunID+`', 'nil-results', 2, 0, 'null', 'running')`,
 		`INSERT INTO journal_children (run_id, path, child_run_id, state, result_json) VALUES ('`+run.RunID+`', 'child', '`+child.RunID+`', 'failed', NULL)`)
 	if err := j.RecordJoin(ctx, JoinRecord{RunID: run.RunID, Path: "failed", Expected: 2, Completed: 2, Results: slots(`"1"`, `"2"`)}); !errors.Is(err, ErrRecordConflict) {
 		t.Errorf("completing a legacy failed join: err=%v, want ErrRecordConflict", err)
@@ -429,12 +463,31 @@ func TestLegacyJoinAndChildRowsAreNotOverwritten(t *testing.T) {
 	if err := j.RecordChild(ctx, ChildRecord{RunID: run.RunID, Path: "child", ChildRunID: child.RunID, State: childCompleted, Result: []byte(`{"ok":true}`)}); !errors.Is(err, ErrRecordConflict) {
 		t.Errorf("completing a legacy failed child: err=%v, want ErrRecordConflict", err)
 	}
+	if err := j.RecordJoin(ctx, JoinRecord{RunID: run.RunID, Path: "miscounted", Expected: 2, Completed: 2, Results: slots(`1`, `2`)}); !errors.Is(err, ErrRecordConflict) {
+		t.Errorf("filling a legacy join whose count disagrees with its slots: err=%v, want ErrRecordConflict", err)
+	}
+	// A write that brings nothing new changes nothing on a row that reads
+	// as slots, whatever its state; a row that does not read as slots
+	// refuses it.
+	if err := j.RecordJoin(ctx, JoinRecord{RunID: run.RunID, Path: "failed", Expected: 2}); err != nil {
+		t.Errorf("an empty write to a legacy failed join: %v", err)
+	}
+	for _, path := range []string{"packed", "miscounted"} {
+		if err := j.RecordJoin(ctx, JoinRecord{RunID: run.RunID, Path: path, Expected: map[string]int{"packed": 3, "miscounted": 2}[path]}); !errors.Is(err, ErrRecordConflict) {
+			t.Errorf("an empty write to the legacy %s join: err=%v, want ErrRecordConflict", path, err)
+		}
+	}
+	// A join the pre-#334 upsert stored with nil results (results_json
+	// 'null') is read as its empty slots, so it can still be filled.
+	if err := j.RecordJoin(ctx, JoinRecord{RunID: run.RunID, Path: "nil-results", Expected: 2, Completed: 1, Results: slots(``, `"b"`)}); err != nil {
+		t.Errorf("filling a legacy join stored with nil results: %v", err)
+	}
 	got := recovered(t, j, run.RunID)
 	states := map[string]string{}
 	for _, join := range got.Joins {
 		states[join.Path] = fmt.Sprintf("%s %d/%d %s", join.State, join.Completed, join.Expected, join.Results)
 	}
-	if states["failed"] != `failed 1/2 ["1" null]` || states["packed"] != `running 1/3 [1]` || len(got.Children) != 1 || got.Children[0].State != "failed" || len(got.Children[0].Result) != 0 {
+	if states["failed"] != `failed 1/2 ["1" null]` || states["packed"] != `running 1/3 [1]` || states["miscounted"] != `running 2/2 [1 null]` || states["nil-results"] != `running 1/2 [null "b"]` || len(got.Children) != 1 || got.Children[0].State != "failed" || len(got.Children[0].Result) != 0 {
 		t.Fatalf("legacy rows changed: joins=%v children=%+v", states, got.Children)
 	}
 }

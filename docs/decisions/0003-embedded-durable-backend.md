@@ -436,9 +436,23 @@ are not `Expected` slots, whose `Completed` is not its number of filled
 slots, or whose `State` contradicts them is an invalid record and nothing
 is stored. Because null marks an empty slot, a branch whose own result is
 JSON null must be recorded wrapped (for example `{"value":null}`), or it
-reads as not yet back. A running child has no result: a running write with
-one is an invalid record, whether it would create the child record or
-update it.
+reads as not yet back. Slots are compared in the compact JSON form
+`json.Marshal` stores them in (spacing dropped; `<`, `>` and `&`
+escaped), so a writer resending a slot it already knows, spelled
+differently, is not refused; nothing else is normalised, so reordered
+object keys or `1.0` for `1` are another value. A running child has no
+result: a running write with one is an invalid record, whether it would
+create the child record or update it.
+
+A join row the pre-#334 upsert left is never changed. One whose results
+are not one slot per branch, or whose completed count disagrees with its
+slots, cannot be read as slots: every write but an identical one is
+`ErrRecordConflict`. One in a state other than running or completed
+refuses a write that would fill a slot, and a write that brings nothing
+new succeeds and changes nothing, as for any join. One stored with no
+results (`results_json` null, from a nil `Results`) reads as its empty
+slots and can be filled. A child row in a state other than running or
+completed refuses completion.
 
 - `ErrRecordFinal`: the record is final. `CompleteScope` on a completed
   scope with another output, or from another attempt; `StartScope` on a
@@ -448,9 +462,8 @@ update it.
 - `ErrRecordConflict`: the write contradicts what the record holds: a
   join's expected count, a filled join slot given another value, a child's
   run id, or a row the pre-#334 upsert left in a shape the write cannot
-  extend (a state other than running or completed, or join results that are
-  not one slot per branch). Since branches filling different slots never
-  conflict, it means a slot was already filled with another value, by a
+  extend (above). Since branches filling different slots never conflict,
+  it means a slot was already filled with another value, by a
   racing writer or a stale one; retrying the same write cannot succeed, so
   the engine either serialises a join's fan-in or re-reads the join and
   decides.
