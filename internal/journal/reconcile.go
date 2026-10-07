@@ -165,7 +165,9 @@ func (j *Journal) reconcileOnce(ctx context.Context, operationKey, actor, eviden
 				// A re-delivered reconciliation succeeds as a duplicate.
 				// When its record is missing (the original predates audit)
 				// it writes it, under the decision's own tenant; an
-				// existing record is never rewritten.
+				// existing record is never rewritten, and one Prune
+				// removed is not written again (Append leaves a pruned id
+				// alone, #294).
 				recorded, err := j.audit.Recorded(ctx, tx, "reconcile:"+existing.OperationKey)
 				if err != nil || recorded {
 					return err

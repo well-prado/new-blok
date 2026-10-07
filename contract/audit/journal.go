@@ -132,7 +132,9 @@ func (j *Journal) Shares(database store.Database) bool {
 // Append writes r inside tx, the transaction of the decision it records:
 // both commit or neither does. A record without a time is stamped. The
 // same record appended again is a no-op (inserted is false); a different
-// record under the same id is ErrConflict. Every store failure is
+// record under the same id is ErrConflict. A record whose id Prune retired
+// is not written again: of the same kind it is a no-op (inserted is false),
+// of another kind ErrConflict (#294). Every store failure is
 // ErrUnavailable, and the caller must return it so its transaction rolls
 // back. Owners pass the record to Notify after commit only when inserted, so
 // a retried decision is not mirrored twice.
@@ -165,6 +167,21 @@ func (j *Journal) Append(ctx context.Context, tx *sql.Tx, r Record) (record Reco
 	switch {
 	case err == nil:
 		if !bytes.Equal(existing, encoded) {
+			return Record{}, false, ErrConflict
+		}
+		return r, false, nil
+	case !errors.Is(err, sql.ErrNoRows):
+		return Record{}, false, unavailableErr(err)
+	}
+	// An id Prune retired is never written again (#294): its tombstone says
+	// the record existed and retention removed it. A retried or re-delivered
+	// decision, or a compaction backfill, of the same kind is a no-op, as for
+	// an existing record; another kind under that id is a different record.
+	var prunedKind string
+	err = tx.QueryRowContext(ctx, `SELECT kind FROM audit_pruned_v1 WHERE id_digest = ?`, Digest([]byte(r.ID))).Scan(&prunedKind)
+	switch {
+	case err == nil:
+		if prunedKind != string(r.Kind) {
 			return Record{}, false, ErrConflict
 		}
 		return r, false, nil
@@ -377,10 +394,13 @@ type Owner interface {
 }
 
 // Verify reads every record and checks it against its digest, its indexed
-// columns and the record count (ErrCorrupt), then cross-checks each owner's
-// durable decisions against the records (ErrMismatch): a decision without
-// its record or tombstone, or a record naming a decision the owner does not
-// have. Run it after a restore with every owner composed on the store.
+// columns and the record count, and that no prune tombstone has its id
+// (ErrCorrupt: Append never writes a pruned id again, so a record next to
+// its own tombstone was written around retention, #294). It then
+// cross-checks each owner's durable decisions against the records
+// (ErrMismatch): a decision without its record or tombstone, or a record
+// naming a decision the owner does not have. Run it after a restore with
+// every owner composed on the store.
 // Records of a kind no owner is passed for (deployment decisions have no
 // owner table) are integrity-checked only. It holds one read transaction
 // and, per owner, a set of its decision ids in memory.
@@ -396,8 +416,16 @@ func (j *Journal) Verify(ctx context.Context, owners ...Owner) (int, error) {
 		}
 		defer rows.Close()
 		for rows.Next() {
-			if _, _, err := scanVerified(rows); err != nil {
+			_, record, err := scanVerified(rows)
+			if err != nil {
 				return err
+			}
+			var pruned int
+			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM audit_pruned_v1 WHERE id_digest = ?`, Digest([]byte(record.ID))).Scan(&pruned); err != nil {
+				return err
+			}
+			if pruned != 0 {
+				return ErrCorrupt
 			}
 			verified++
 		}

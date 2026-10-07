@@ -334,13 +334,16 @@ func TestPruningTheRecordDoesNotChangeWhoOwnsTheReconciliation(t *testing.T) {
 		control, controlErr := r.redeliverAs(ctx, settled.Key)
 		requireIndistinguishable(t, got, err, control, controlErr)
 	}
-	// The owner's re-delivery wrote the pruned record again (re-delivery
-	// backfills any missing record, as before #286); it is under the
-	// deciding tenant, never the system tenant's.
-	if r.records("tenant-a") != 1 || r.records("") != 0 || r.records("tenant-b") != 0 {
-		t.Fatalf("records after prune a=%d system=%d b=%d", r.records("tenant-a"), r.records(""), r.records("tenant-b"))
+	// The owner's re-delivery is answered, but it does not write the pruned
+	// record again (#294): its prune tombstone says retention removed it,
+	// and only a record that never existed is backfilled. Until #294 this
+	// test pinned the opposite, one record under the deciding tenant next
+	// to its own tombstone, which outlived retention with every
+	// re-delivery and which Verify now reports as ErrCorrupt.
+	if r.records("tenant-a") != 0 || r.records("") != 0 || r.records("tenant-b") != 0 {
+		t.Fatalf("records after prune a=%d system=%d b=%d, want none", r.records("tenant-a"), r.records(""), r.records("tenant-b"))
 	}
-	r.reopen().mustVerify(1)
+	r.reopen().mustVerify(0)
 }
 
 // TestRowWithoutATenantIsOwnedByNobodyUntilTheNextOpen: a binary built
@@ -461,10 +464,12 @@ func TestPreColumnReconciliationsAreAnsweredOnlyToTheirRecordedTenant(t *testing
 		t.Fatalf("prune=%+v err=%v", report, err)
 	}
 	answers("records pruned")
-	if r.records("tenant-a") != 1 || r.records("") != 1 || r.records("tenant-b") != 0 {
-		t.Fatalf("records after prune a=%d system=%d b=%d", r.records("tenant-a"), r.records(""), r.records("tenant-b"))
+	// The owners' re-deliveries do not write the pruned records again
+	// (#294); until #294 they did, one under each deciding tenant.
+	if r.records("tenant-a") != 0 || r.records("") != 0 || r.records("tenant-b") != 0 {
+		t.Fatalf("records after prune a=%d system=%d b=%d, want none", r.records("tenant-a"), r.records(""), r.records("tenant-b"))
 	}
-	r.mustVerify(2)
+	r.mustVerify(0)
 }
 
 // TestTamperedRecordDoesNotLendItsTenant: the tenant is taken from the
