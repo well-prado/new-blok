@@ -346,13 +346,14 @@ func scheduleRetentionWait(tb testing.TB, j *Journal, runID, waitID, name string
 }
 
 // seedCompletedScope is the only StartScope/CompleteScope pair in these
-// tests: scope completion gains attempt fencing in #351.
+// tests; completion is fenced by the attempt StartScope returns.
 func seedCompletedScope(tb testing.TB, j *Journal, runID, path string) {
 	tb.Helper()
-	if _, err := j.StartScope(context.Background(), ScopeRecord{RunID: runID, Path: path, Kind: "each", Input: []byte(`{"items":2}`)}); err != nil {
+	attempt, err := j.StartScope(context.Background(), ScopeRecord{RunID: runID, Path: path, Kind: "each", Input: []byte(`{"items":2}`)})
+	if err != nil {
 		tb.Fatal(err)
 	}
-	if err := j.CompleteScope(context.Background(), runID, path, []byte(`{"done":true}`)); err != nil {
+	if err := j.CompleteScope(context.Background(), runID, path, attempt.AttemptID, []byte(`{"done":true}`)); err != nil {
 		tb.Fatal(err)
 	}
 }

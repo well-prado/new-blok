@@ -768,6 +768,10 @@ func waitForJournalMarkerWithin(t *testing.T, path string, timeout time.Duration
 		}
 		select {
 		case <-exited:
+			// It may have written the marker since the check above.
+			if _, err := os.Stat(path); err == nil {
+				return
+			}
 			t.Fatalf("journal child exited before reaching barrier: %s", path)
 		case <-time.After(10 * time.Millisecond):
 		}
