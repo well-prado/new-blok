@@ -57,6 +57,16 @@ var (
 	_ engine.WaitJournal = (*RunJournal)(nil)
 )
 
+// Permanent reports an error no retry of the run can fix: a conflict with
+// what the run already recorded (ErrRequestConflict: another engine input,
+// step input or wait plan), a canceled wait the run reached
+// (ErrWaitCanceled), a step result over the bound (ErrStepResultLimit). A
+// runner settles such a run as failed. A lost lease (another holder runs
+// it) and storage faults are not permanent.
+func Permanent(err error) bool {
+	return errors.Is(err, ErrRequestConflict) || errors.Is(err, ErrWaitCanceled) || errors.Is(err, ErrStepResultLimit)
+}
+
 // uncertainStep marks an effect whose outcome is unknown; the engine fails
 // the run as uncertain instead of invoking the effect again.
 type uncertainStep struct{ err error }
@@ -76,22 +86,43 @@ func (r *RunJournal) VerifyRun(ctx context.Context, runID, artifact, inputDigest
 	if run.State != runAccepted {
 		return ErrRunNotActive
 	}
-	// The engine digests its input re-encoded; compare the same encoding.
-	var input any
-	if err := json.Unmarshal(run.Input, &input); err != nil {
-		return err
-	}
-	canonical, err := json.Marshal(input)
-	if err != nil {
-		return err
-	}
-	if run.ArtifactDigest != artifact || digestBytes(canonical) != inputDigest {
+	if run.ArtifactDigest != artifact {
 		return ErrRequestConflict
 	}
+	// The run's engine input was fixed at admission or by its first
+	// execution: the runner decodes the admitted input the same way every
+	// time, so a later execution hands the engine the same encoding, and a
+	// different one is a different input (a changed decoder, a wrong run).
+	// Read first: only the first execution of a run admitted without an
+	// engine input writes.
+	var bound sql.NullString
 	if err := r.journal.withRead(ctx, func(tx *sql.Tx) error {
-		return r.journal.checkRunLease(ctx, tx, runID, r.token, false)
+		if err := r.journal.checkRunLease(ctx, tx, runID, r.token, false); err != nil {
+			return err
+		}
+		return tx.QueryRowContext(ctx, `SELECT engine_input_digest FROM journal_runs WHERE run_id = ?`, runID).Scan(&bound)
 	}); err != nil {
 		return err
+	}
+	if bound.Valid && bound.String != inputDigest {
+		return ErrRequestConflict
+	}
+	if !bound.Valid {
+		if err := r.journal.withTx(ctx, "run-verify", func(tx *sql.Tx) error {
+			if err := r.fence(ctx, tx, true); err != nil {
+				return err
+			}
+			result, err := tx.ExecContext(ctx, `UPDATE journal_runs SET engine_input_digest = ? WHERE run_id = ? AND (engine_input_digest IS NULL OR engine_input_digest = ?)`, inputDigest, runID, inputDigest)
+			if err != nil {
+				return err
+			}
+			if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+				return errors.Join(ErrRequestConflict, err)
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
 	}
 	r.mu.Lock()
 	r.artifact = artifact

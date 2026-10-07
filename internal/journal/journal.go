@@ -100,6 +100,11 @@ type AdmissionRequest struct {
 	Workflow       string
 	ArtifactDigest string
 	Input          json.RawMessage
+	// EngineInput, when set, is the input as the run's runner will hand it
+	// to the engine, encoded with json.Marshal (a typed decode of Input,
+	// re-encoded): the run's engine-input identity, fixed at admission.
+	// Without it, the first execution's engine input fixes it (VerifyRun).
+	EngineInput json.RawMessage
 }
 
 type Admission struct {
@@ -221,8 +226,8 @@ func New(ctx context.Context, database store.Database, config Config) (*Journal,
 // #332's wait identity (journal_waits keyed by step and iteration instead
 // of by name), 5 with #334's scope attempt (journal_scopes.attempt_id,
 // which fences scope completion), 6 with #332's wakeup durability (fired
-// waits, run leases), 7 with #332's step input digest (an engine step's
-// result is bound to its input). New refuses a journal stamped with a
+// waits, run leases), 7 with #332's input digests (an engine step's result
+// bound to its input, a run to its engine input). New refuses a journal stamped with a
 // newer one. Raise it with every change an older binary would misread,
 // together with the migration step that makes it. It is a variable only so
 // tests can stand in for an older binary.
@@ -346,8 +351,12 @@ func (j *Journal) migrate(ctx context.Context, tx *sql.Tx, from int) error {
 	}
 	// An engine step's result records the digest of its input (#332), so a
 	// replay that resolves a different input is refused, not served it.
+	// A run's engine input is fixed once, at admission or first execution.
 	if from < 7 {
 		if err := ensureColumn(ctx, tx, "journal_operations", "input_digest", `TEXT`); err != nil {
+			return err
+		}
+		if err := ensureColumn(ctx, tx, "journal_runs", "engine_input_digest", `TEXT`); err != nil {
 			return err
 		}
 	}
@@ -423,7 +432,8 @@ var schemaStatements = []string{
 		lease_owner TEXT,
 		lease_until INTEGER,
 		leased_at INTEGER,
-		lease_token INTEGER
+		lease_token INTEGER,
+		engine_input_digest TEXT
 	)`,
 	`CREATE TABLE IF NOT EXISTS journal_operations (
 		operation_key TEXT PRIMARY KEY,
@@ -594,6 +604,10 @@ func (j *Journal) Admit(ctx context.Context, request AdmissionRequest) (Admissio
 		return Admission{}, err
 	}
 	digest := digestBytes(request.Input)
+	var engineInput any
+	if request.EngineInput != nil {
+		engineInput = digestBytes(request.EngineInput)
+	}
 	runID, err := randomID("run")
 	if err != nil {
 		return Admission{}, err
@@ -601,9 +615,9 @@ func (j *Journal) Admit(ctx context.Context, request AdmissionRequest) (Admissio
 	admission := Admission{RunID: runID, RequestKey: request.RequestKey}
 	err = j.withTx(ctx, "admission", func(tx *sql.Tx) error {
 		result, err := tx.ExecContext(ctx, `INSERT INTO journal_runs
-			(run_id, request_key, workflow, artifact_digest, input_json, input_digest, state, created_at, principal)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(request_key) DO NOTHING`,
-			runID, request.RequestKey, request.Workflow, request.ArtifactDigest, []byte(request.Input), digest, runAccepted, j.now(), request.Principal)
+			(run_id, request_key, workflow, artifact_digest, input_json, input_digest, state, created_at, principal, engine_input_digest)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(request_key) DO NOTHING`,
+			runID, request.RequestKey, request.Workflow, request.ArtifactDigest, []byte(request.Input), digest, runAccepted, j.now(), request.Principal, engineInput)
 		if err != nil {
 			return err
 		}
@@ -1151,6 +1165,9 @@ func (j *Journal) now() int64 { return j.clock().UTC().UnixNano() }
 func validateAdmission(request AdmissionRequest) error {
 	if request.RequestKey == "" || request.Workflow == "" || request.ArtifactDigest == "" || !json.Valid(request.Input) {
 		return errors.New("journal: request key, workflow, artifact digest and valid JSON input are required")
+	}
+	if request.EngineInput != nil && !json.Valid(request.EngineInput) {
+		return errors.New("journal: the engine input must be valid JSON")
 	}
 	return nil
 }
