@@ -237,6 +237,7 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 	if err := checkProgram(program, e.maxSteps); err != nil {
 		return Result{}, err
 	}
+	controls := controlIDs(program.Instructions, nil)
 	if journal != nil && program.Format == contract.ControlFormat {
 		// Durable control flow journals scopes, joins and children (#333,
 		// later slices); until then a durable runner refuses it.
@@ -430,12 +431,6 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 				}
 				external = len(definition.Descriptor().Effects) > 0
 				callInput, err := resolveCallInput(f, instruction, input)
-				if err == nil && program.Format == contract.ControlFormat {
-					// A control program's values may be JSON literals or
-					// typed nils: hand the node its own input type. Call-only
-					// programs keep passing the referenced value as is.
-					callInput, err = definition.ConvertInput(callInput)
-				}
 				if err != nil {
 					step.Error = &Error{Code: "invalid_input_reference", Class: "validation", Step: instruction.ID, Err: err}
 					step.FinishedAt = time.Now().UTC()
@@ -527,7 +522,17 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 					// see this step attempt as their parent.
 					invokeCtx = observe.WithTrace(invokeCtx, stepSpan.TraceContext)
 				}
-				output, err := definition.Invoke(invokeCtx, callInput)
+				invokeInput := callInput
+				if program.Format == contract.ControlFormat && len(instruction.References) > 0 && controls[instruction.References[0].Step] {
+					// A value a control construct produced (a JSON literal,
+					// an each's results, a *T it handed on) reaches the node
+					// as its input type when it reads exactly as one; the
+					// schema above checked the value as resolved. Every
+					// other input is passed as is, as in a call-only
+					// program (ADR 0028).
+					invokeInput = definition.ConvertInput(callInput)
+				}
+				output, err := definition.Invoke(invokeCtx, invokeInput)
 				step.Executed = true
 				if err != nil {
 					if journal != nil {
