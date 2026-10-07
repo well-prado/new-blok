@@ -64,7 +64,7 @@ type component struct {
 // schema version this binary supports, opened as an application composes
 // it. Approval needs audit on the same database, so it opens audit first.
 var components = []component{
-	{"journal", 5, func(ctx context.Context, db store.Database) error {
+	{"journal", 6, func(ctx context.Context, db store.Database) error {
 		_, err := journal.New(ctx, db, journal.Config{})
 		return err
 	}},

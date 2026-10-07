@@ -28,12 +28,14 @@ reads and then writes fails at once with `SQLITE_BUSY` if another writer holds
 the write lock or has committed since its read began, because SQLite does not
 invoke the busy handler when it upgrades a transaction that has already read.
 A transaction that may write under contention therefore writes first. Today
-that holds for the worker's job claim, one `UPDATE … RETURNING` (#176), and
-cron's cursor, inserted before it is read (#169); the journal and provider
-paths that still read first are tracked in #179. Starting every transaction
-with `BEGIN IMMEDIATE` was rejected: `WithTx` is also the read path
-(`Get`, `Settled`, journal reads), so every read would wait behind the
-long write transaction a worker handler holds.
+that holds for the worker's job claim, one `UPDATE … RETURNING` (#176),
+cron's cursor, inserted before it is read (#169), and the order example's
+outbox dispatch, which claims an event with `UPDATE … RETURNING` and a lease,
+publishes it outside any transaction and then marks it sent (#331); the
+journal and provider paths that still read first are tracked in #179.
+Starting every transaction with `BEGIN IMMEDIATE` was rejected: `WithTx` is
+also the read path (`Get`, `Settled`, journal reads), so every read would
+wait behind the long write transaction a worker handler holds.
 
 Write-first removes the immediate failure, not the single writer. A worker's
 handler runs inside its claim's write transaction, so concurrent workers run
@@ -177,7 +179,7 @@ release supports:
 
 | Component | Owner | Version | History |
 | --- | --- | --- | --- |
-| `journal` | `internal/journal` | 5 | 1 before #281; 2 with #281's erasure tables; 3 with #286's reconciliation tenant; 4 with #332's wait identity (ADR 0027); 5 with #332's wakeup leases (ADR 0027) |
+| `journal` | `internal/journal` | 6 | 1 before #281; 2 with #281's erasure tables; 3 with #286's reconciliation tenant; 4 with #332's wait identity (ADR 0027); 5 with #334's scope attempt (below); 6 with #332's wakeup durability: fired waits and run leases (ADR 0027) |
 | `audit` | `contract/audit` | 1 | the #80 tables, unchanged since |
 | `worker` | `trigger/worker` | 2 | 1 before #290; 2 with #290's `worker_compacted` and `worker_meta` |
 | `approval` | `contract/approval` | 1 | `approval_decisions_v1` as #75 introduced it |
@@ -396,6 +398,73 @@ stores. `:memory:` is unchanged (`journal_mode=MEMORY`, no switch).
 | `Open` retries the WAL switch while it fails busy, bounded by `BusyTimeout`, and then fails with `store.ErrBusy` (#320) | behavioral (bug fix) | None. Concurrent first opens of one new file now succeed. A first open that still cannot switch, because another connection holds the file for the whole busy timeout, fails `store.ErrBusy` after that timeout instead of an immediate non-`ErrBusy` `database is locked` error. A cancelled `ctx` ends the wait at once with `ctx.Err()` joined to the busy error. Errors other than busy, such as an unwritable path, still return at once |
 | `Open` fails unless the file ends up in WAL (#320) | behavioral | None for files this backend creates. Before, the answer of `PRAGMA journal_mode=WAL` was ignored, so a file SQLite would not switch opened in its old mode; it is now refused with an error naming the mode it stayed in |
 | Pooled connections no longer request WAL when they connect; they rely on the mode persisted in the file (#320) | behavioral (internal) | None. `Open` switches the file before it returns a handle, and SQLite keeps WAL in the file across connections and restarts |
+
+## Recovery records are write-once (#334)
+
+A run's recovery records are its receipts: a scope's output, a child run's
+answer, a join's count of returned branches, the checkpoint it resumes from.
+Before #334 a late or stale writer could change them: `CompleteScope`
+overwrote a committed output, `StartScope` restarted a canceled scope (which
+could then be completed), a checkpoint could name another artifact than the
+run's admitted one, and a run that had ended still took new scopes and
+checkpoints. (Joins and children are the second part of #334.)
+
+A scope has two terminal states, completed and canceled, and never leaves
+either. Each write now runs in the journal's writer transaction, reads what
+is stored, and either moves the record forward (a scope from running to one
+of its terminal states), repeats it byte for byte (an idempotent retry,
+which succeeds and writes nothing), or is refused with a typed error and
+changes nothing:
+
+- `ErrRecordFinal`: the scope is final. `CompleteScope` on a completed
+  scope with another output, or from another attempt; `StartScope` on a
+  canceled scope. (`StartScope` on a completed scope is not an error: it
+  returns `AlreadyCompleted`.)
+- `ErrStaleAttempt`: `CompleteScope` from an attempt that a later
+  `StartScope` superseded, or with no attempt id.
+- `ErrNotFound`: `CompleteScope` on a canceled scope, as before #334; and
+  any write for an unknown run, where SQLite's foreign-key error used to
+  leak.
+- `ErrRunNotActive`: `StartScope` or `SaveCheckpoint` for a run that is
+  not accepted (canceled, completed, failed or uncertain).
+- `ErrArtifactMismatch`: a checkpoint, or a `Recover`, naming another
+  artifact than the run was admitted under.
+
+For a caller of `CompleteScope`, `ErrStaleAttempt`, `ErrRecordFinal` and
+`ErrNotFound` all mean it lost the scope: a superseded attempt sees
+`ErrStaleAttempt` while the scope runs, `ErrRecordFinal` once the current
+attempt has completed it, and `ErrNotFound` once it was canceled.
+
+A run whose checkpoint was written before #334 under another artifact than
+it was admitted under fails closed: `Recover` refuses it under either
+artifact, and `SaveCheckpoint` cannot replace the row. Resolving it is an
+operator decision, not something the journal guesses.
+
+The scope attempt is a new `journal_scopes.attempt_id` column, and it
+raises the journal to version 5 (§ Schema versions). An older binary that
+opened such a database would ignore the column, so it would honour neither
+the fence nor the finality: the #334 review ran the aaf633c binary on one,
+and it restarted a fenced scope without touching `attempt_id` and
+overwrote a completed output this binary had refused. A rollback would
+silently void the guarantees above; with the raise, a version-4 or older
+binary from #291 on refuses the database at open instead
+(`store.NewerSchemaError`; older binaries have no stamp check, see Limits
+under § Schema versions).
+The migration adds the column when the version found is older than 5; it
+uses `ensureColumn`, so a database a pre-release build of #334 already gave
+the column under an older stamp migrates too. Version 5 has no shape for
+`inferSchemaVersion`: every database with the column was written after the
+stamp existed (#291), so it is stamped and never classified by shape. A
+scope a version-4 binary left running has the empty attempt id, which no
+caller holds, so only a fresh `StartScope` can complete it.
+
+| Change | Class | Migration |
+| --- | --- | --- |
+| `journal_scopes.attempt_id TEXT NOT NULL DEFAULT ''` (#334) | schema, additive | Added when the version found is older than 5; existing rows get `''`, which no attempt matches until the next `StartScope` |
+| `StartScope` returns `ScopeAttempt{AttemptID, AlreadyCompleted}` instead of a bool; `CompleteScope` takes the attempt id (#334) | breaking (internal API) | Callers keep the attempt id `StartScope` returned and pass it to `CompleteScope`. Outside `internal/journal` only `contract/audit`'s tests call them |
+| Completed and canceled scopes are final; scopes are fenced by attempt; checkpoints are bound to the admitted artifact and an accepted run; `StartScope` needs an accepted run; `Recover` checks the admitted artifact (#334) | behavioral (bug fix) | None for a caller that writes each record forward once. A write that used to overwrite, or a restart of a canceled scope, now returns one of the typed errors above. Nothing in the repository restarted a canceled scope |
+| Journal schema version 5 (#334) | behavioral (breaking for downgrades) | None for upgrades. A binary supporting journal 4 or older refuses a database this release opened, with `store.NewerSchemaError` (from #291 on; see Limits under § Schema versions); restore a backup taken before the upgrade, as for every raise above |
+| `ErrRecordFinal`, `ScopeAttempt` (#334) | additive | None |
 
 ## Alternatives considered
 

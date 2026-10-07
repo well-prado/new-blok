@@ -144,18 +144,16 @@ lease is `lease_owner` and `lease_until` on a fired wait.
 The `now` given to a claim or a listing is the clock its leases are
 measured on; callers pass the same clock to both.
 
-**Migration (schema 5).** `fired_at`, `lease_owner` and `lease_until` are
+**Migration (schema 6).** `fired_at`, `lease_owner` and `lease_until` are
 added to `journal_waits`, and every `resumed` wait becomes `fired` when its
 run is live, so origin/main's stranded wakeups are listed by
 `PendingResumptions` after the upgrade, or `acknowledged` when its run has
 ended. The remap runs on every open, like #286's tenant repair, because a
 binary from before #291 cannot see the stamp and can still write
-`resumed`. An unstamped journal with `lease_until` is classified 5. A
-schema-4 binary refuses a schema-5 journal (#291).
-
-Schema version coordination: this slice assumed version 5 on a main where
-#334's recovery fencing (PR #351) had not yet merged; whichever merges
-second renumbers to the next version.
+`resumed`. There is no unstamped shape for 6: every database with these
+columns was written after the stamp existed. A schema-5 binary refuses a
+schema-6 journal (#291). Version 5 is #334's scope attempt (PR #351),
+which merged first; this step was renumbered from 5 to 6.
 
 ## Compatibility
 
@@ -169,7 +167,7 @@ second renumbers to the next version.
 | A duplicate step identity or wait ID returns `ErrWaitExists`, not a raw constraint error | behavioral | None |
 | Journal schema 3 → 4 | schema, one-way | On open, in the schema transaction, killed or not (see Evidence) |
 | Wait states `resumed` → `fired` / `acknowledged`; `ClaimDueWaits` leases what it returns and may return fewer than it fires; `PendingResumptions`, `AcknowledgeWait`, `ErrWaitNotFired`, `Config.Holder`, `Config.WakeupLease`, `WaitRecord.LeaseOwner`/`LeaseUntil` (slice B) | API and behavioral; no caller outside `internal/journal` | Call `PendingResumptions` on start; `AcknowledgeWait` after the resumed step commits |
-| Journal schema 4 → 5 (slice B) | schema, one-way | On open; `resumed` waits remapped on every open |
+| Journal schema 5 → 6 (slice B) | schema, one-way | On open; `resumed` waits remapped on every open |
 
 ## Evidence
 
