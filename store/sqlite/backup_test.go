@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -334,7 +335,8 @@ func TestRestoreRefusesASourceWithALiveLog(t *testing.T) {
 	requireAbsentFile(t, destination)
 }
 
-// Child processes for TestProcessKillDuringRestore.
+// Child processes for TestProcessKillDuringRestore and
+// TestProcessKillDuringBackup.
 const (
 	crashChildEnv  = "NEWBLOK_SQLITE_CRASH_POINT"
 	crashSourceEnv = "NEWBLOK_SQLITE_CRASH_SOURCE"
@@ -383,6 +385,97 @@ func TestProcessKillDuringRestore(t *testing.T) {
 	}
 }
 
+// TestProcessKillDuringBackup (#343, D9d) kills a real child process with
+// SIGKILL while VACUUM INTO is part way through writing the backup, and
+// once it has written and synced it but not renamed it. Either way nothing
+// may exist at the destination, and a retry must succeed.
+func TestProcessKillDuringBackup(t *testing.T) {
+	if phase := os.Getenv(crashChildEnv); phase != "" {
+		runCrashPointChild(phase)
+		return
+	}
+	t.Run("mid VACUUM INTO", func(t *testing.T) {
+		// A large database keeps VACUUM INTO writing long enough for the
+		// parent to see its output grow and kill the child mid-copy.
+		const rows, pad, attempts = 768, 64 << 10, 5
+		source := filepath.Join(t.TempDir(), "journal.db")
+		if database, err := seedDatabaseAt(source, rows, pad); err != nil {
+			t.Fatal(err)
+		} else if err := database.Close(); err != nil {
+			t.Fatal(err)
+		}
+		for attempt := 1; ; attempt++ {
+			parent := t.TempDir()
+			destination := filepath.Join(parent, "backup.db")
+			command, marker := startCrashPointChild(t, "TestProcessKillDuringBackup", "vacuum", source, destination)
+			waitForMarker(t, marker)
+			waitForGrowingFile(t, parent, 10*time.Second)
+			killErr := command.Process.Kill()
+			_ = command.Wait()
+			if command.ProcessState != nil && command.ProcessState.Exited() {
+				// The child ran Backup to the end before the kill.
+				if attempt == attempts {
+					t.Fatalf("Backup finished before the kill in %d attempts", attempt)
+				}
+				t.Logf("attempt %d: Backup finished before the kill; trying again", attempt)
+				continue
+			}
+			if killErr != nil {
+				t.Fatal(killErr)
+			}
+			requireAbsentFile(t, destination)
+			// VACUUM INTO keeps a rollback journal beside its output.
+			left := entries(t, parent)
+			if len(left) == 0 || len(left) > 2 || !strings.HasPrefix(left[0], ".backup-") || (len(left) == 2 && left[1] != left[0]+"-journal") {
+				t.Fatalf("the killed Backup left %v; want one .backup-* temporary file and its journal", left)
+			}
+			partial, err := os.Stat(filepath.Join(parent, left[0]))
+			if err != nil {
+				t.Fatal(err)
+			}
+			database, err := (Backend{}).Open(context.Background(), source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = database.Backup(context.Background(), destination)
+			_ = database.Close()
+			if err != nil {
+				t.Fatalf("retry after the kill: %v", err)
+			}
+			whole, err := os.Stat(destination)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if partial.Size() >= whole.Size() {
+				// VACUUM INTO had finished; the kill landed in the sync or
+				// the rename, which "before rename" covers.
+				if attempt == attempts {
+					t.Fatalf("VACUUM INTO finished before the kill in %d attempts", attempt)
+				}
+				t.Logf("attempt %d: VACUUM INTO finished before the kill; trying again", attempt)
+				continue
+			}
+			t.Logf("killed after VACUUM INTO wrote %d of %d KiB; the retry wrote the whole backup", partial.Size()>>10, whole.Size()>>10)
+			requireEntries(t, destination, rows, pad)
+			return
+		}
+	})
+	t.Run("before rename", func(t *testing.T) {
+		const rows, pad = 400, 200
+		ctx := context.Background()
+		source := filepath.Join(t.TempDir(), "journal.db")
+		database := seedDatabase(t, source, rows, pad)
+		parent := t.TempDir()
+		destination := filepath.Join(parent, "backup.db")
+		killAtCrashPoint(t, "TestProcessKillDuringBackup", "backup-before-rename", source, destination)
+		requireAbsentFile(t, destination)
+		if err := database.Backup(ctx, destination); err != nil {
+			t.Fatalf("retry after the kill: %v (left %v)", err, entries(t, parent))
+		}
+		requireEntries(t, destination, rows, pad)
+	})
+}
+
 // killAtCrashPoint runs test's child at phase's crash point and kills it
 // there with SIGKILL.
 func killAtCrashPoint(t *testing.T, test, phase, source, destination string) {
@@ -411,7 +504,7 @@ func startCrashPointChild(t *testing.T, test, phase, source, destination string)
 	return command, marker
 }
 
-// runCrashPointChild runs one Restore, writes the marker at the
+// runCrashPointChild runs one Backup or Restore, writes the marker at the
 // phase's crash point and waits there for the parent to kill it.
 func runCrashPointChild(phase string) {
 	ctx := context.Background()
@@ -425,6 +518,19 @@ func runCrashPointChild(phase string) {
 	}
 	var err error
 	switch phase {
+	case "vacuum", "backup-before-rename":
+		database, openErr := (Backend{}).Open(ctx, source)
+		if openErr != nil {
+			panic(openErr)
+		}
+		if phase == "vacuum" {
+			if err := os.WriteFile(marker, []byte(phase), 0o600); err != nil {
+				panic(err)
+			}
+		} else {
+			backupWritten = park
+		}
+		err = database.Backup(ctx, destination)
 	case "restore-before-rename":
 		restoreCopied = park
 		err = (Backend{}).Restore(ctx, source, destination)
@@ -438,4 +544,137 @@ func runCrashPointChild(phase string) {
 		panic(err)
 	}
 	panic("the child passed its crash point")
+}
+
+// waitForGrowingFile waits for a database file in directory, not a journal,
+// to hold data.
+func waitForGrowingFile(t *testing.T, directory string, limit time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(limit)
+	for time.Now().Before(deadline) {
+		listed, err := os.ReadDir(directory)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range listed {
+			if strings.HasSuffix(entry.Name(), "-journal") {
+				continue
+			}
+			if info, err := entry.Info(); err == nil && info.Mode().IsRegular() && info.Size() > 0 {
+				return
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("nothing was written in %s within %v", directory, limit)
+}
+
+// smallFilesystemEnv names a directory on a small, size-limited filesystem
+// TestBackupAndRestoreOnAFullDisk may fill, as in internal/journal's
+// TestRealDiskFullFailsClosedAndReopensIntact (#337). Unset, the test skips;
+// it runs in Docker on Linux:
+//
+//	docker run --rm --tmpfs /mnt/small:size=4m -e BLOK_TEST_SMALL_FS=/mnt/small \
+//	  -v "$PWD":/src:ro -w /src golang:1.27.1 \
+//	  go test -count=1 -run TestBackupAndRestoreOnAFullDisk ./store/sqlite
+const smallFilesystemEnv = "BLOK_TEST_SMALL_FS"
+
+const (
+	// fullDiskRoom is the space a ballast file leaves free.
+	fullDiskRoom = 256 << 10
+	// fullDiskLimit bounds the ballast before the test decides the
+	// directory is not on a small filesystem.
+	fullDiskLimit = 64 << 20
+)
+
+// TestBackupAndRestoreOnAFullDisk (#343): Backup and Restore whose output
+// does not fit on a real full filesystem fail, leave nothing at the
+// destination or beside it, and succeed once space is freed.
+func TestBackupAndRestoreOnAFullDisk(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("needs a size-limited Linux filesystem (tmpfs) in %s; GOOS is %s", smallFilesystemEnv, runtime.GOOS)
+	}
+	small := os.Getenv(smallFilesystemEnv)
+	if small == "" {
+		t.Skipf("%s is unset; set it to a directory on a small tmpfs (e.g. docker run --tmpfs /mnt/small:size=4m)", smallFilesystemEnv)
+	}
+	// About 1 MiB: more than the room left, less than the filesystem.
+	const rows, pad = 400, 2 << 10
+	ctx := context.Background()
+	database := seedDatabase(t, filepath.Join(t.TempDir(), "journal.db"), rows, pad)
+	backup := filepath.Join(t.TempDir(), "backup.db")
+	if err := database.Backup(ctx, backup); err != nil {
+		t.Fatal(err)
+	}
+	for _, operation := range []string{"backup", "restore"} {
+		t.Run(operation, func(t *testing.T) {
+			directory, err := os.MkdirTemp(small, operation+"-*")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.RemoveAll(directory) })
+			ballast := filepath.Join(directory, "ballast")
+			if err := fillSmallFilesystem(ballast); err != nil {
+				t.Fatal(err)
+			}
+			info, err := os.Stat(ballast)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.Size() < 4*fullDiskRoom {
+				t.Fatalf("%s had %d KiB free; the test needs at least %d KiB (e.g. a 4m tmpfs)", smallFilesystemEnv, info.Size()>>10, 4*fullDiskRoom>>10)
+			}
+			if err := os.Truncate(ballast, info.Size()-fullDiskRoom); err != nil {
+				t.Fatal(err)
+			}
+			output := filepath.Join(directory, "out", operation+".db")
+			run := func() error {
+				if operation == "backup" {
+					return database.Backup(ctx, output)
+				}
+				return (Backend{}).Restore(ctx, backup, output)
+			}
+			err = run()
+			if err == nil {
+				t.Fatalf("%s of %d KiB fit in %d KiB of free space", operation, rows*pad>>10, fullDiskRoom>>10)
+			}
+			t.Logf("%s on a full disk: %v", operation, err)
+			if !errors.Is(err, syscall.ENOSPC) && !strings.Contains(err.Error(), "disk is full") {
+				t.Fatalf("the failure is not a full disk: %v", err)
+			}
+			requireAbsentFile(t, output)
+			if left := entries(t, filepath.Dir(output)); len(left) != 0 {
+				t.Fatalf("the failed %s left %v beside its destination", operation, left)
+			}
+			if err := os.Remove(ballast); err != nil {
+				t.Fatal(err)
+			}
+			if err := run(); err != nil {
+				t.Fatalf("retry after freeing space: %v", err)
+			}
+			requireEntries(t, output, rows, pad)
+		})
+	}
+}
+
+// fillSmallFilesystem writes path until its filesystem has no space left,
+// and fails unless that happens, with ENOSPC, within fullDiskLimit.
+func fillSmallFilesystem(path string) error {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	chunk := make([]byte, 64<<10)
+	for written := 0; written < fullDiskLimit; {
+		n, err := file.Write(chunk)
+		written += n
+		if errors.Is(err, syscall.ENOSPC) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("fill %s: %w", path, err)
+		}
+	}
+	return fmt.Errorf("%s is not on a small filesystem: %d MiB written without ENOSPC", path, fullDiskLimit>>20)
 }
