@@ -1,10 +1,9 @@
 # ADR 0027: Single-host durable waits
 
-- Status: in progress for E07-T09 (#332), delivered in slices. Slice A
-  (merged, #350) records wait identity and signal routing; slice B (#366,
-  #378) makes wakeups crash-safe; slice C1 (#380) makes
-  `internal/journal` the engine's step and wait journal; slice C2 (this
-  revision, with its benchmarks to follow) adds the single-host resumer
+- Status: implemented for E07-T09 (#332), delivered in slices: A (#350)
+  wait identity and signal routing; B (#366, #378) crash-safe wakeups and
+  run leases; C1 (#380) the journal as the engine's step and wait journal;
+  C2 (#384, and this revision's measured evidence) the single-host resumer
 - Date: 2026-10-07
 - Roadmap: E07-T09 ([#332](https://github.com/well-prado/new-blok/issues/332)),
   closing gaps in E07-T04 (#46); prerequisite of E07-T10 (#333, nested
@@ -291,7 +290,7 @@ not gain a scheduler).
 - **Suspended runs hold nothing.** An execution returns at a wait and its
   goroutine ends; the run is a waiting row and a released lease
   (`TestSuspendedRunsHoldNoGoroutine`: 500 suspended runs, no goroutine
-  growth; slice C2's benchmarks measure 10,000).
+  growth; the benchmarks below measure 10,000).
 - **Interrupted runs.** `Journal.InterruptedRuns` leases live runs that
   were leased before, hold no live lease and have neither an open nor a
   fired wait: their execution stopped without suspending or ending (the
@@ -305,6 +304,28 @@ not gain a scheduler).
   not the admitted JSON's; `RunJournal.WithInput` lets `VerifyRun` accept
   it when it is the same JSON value as the admitted input (C1 compared the
   sorted-key encoding only, so a two-field typed input could not run).
+
+## Measured footprint and wakeup bursts (slice C2)
+
+`benchmarks/waits` runs the real journal, engine and resumer on a SQLite file:
+N runs admitted, started to suspension at one wait, then all signalled back
+to back and resumed to completion. The committed report
+(`waits-go1.27.1-darwin-arm64.json`, raw per-run latencies included) holds
+three repetitions of 10,000 runs on a shared Apple M4 developer host:
+
+- **Goroutines.** 3 before, 3 with all 10,000 suspended, 3 after the burst,
+  in every repetition. A suspended run holds no goroutine.
+- **Memory.** Resident memory rose about 7 MiB with the first 10,000
+  suspended runs, SQLite's page cache included; heap in use rose under 1 MiB.
+- **Burst.** All 10,000 runs completed 4.8–5.0 s after the first signal
+  (2,000–2,083 runs/s), with p50 1.5 ms, p99 4.9–5.9 ms and a maximum of
+  40–48 ms from a run's signal commit to its completion. The burst was bound
+  by one goroutine committing the signals: the resumer kept pace with them.
+- **Scan cost.** Looking for interrupted runs on every sweep, inside a write
+  transaction over every live run, cut the same burst to about 464 runs/s
+  (p50 8.9 ms). It now reads first and runs once per third of a lease (#384).
+
+These are local samples, not a capacity or fleet claim.
 
 ## Compatibility
 
@@ -367,7 +388,15 @@ probes), `TestTakeRunLeaseHoldsARunThatNeverSuspended`,
 `TestEngineEffectInterruptedByACrashIsUncertain` (the last two kill a real
 process); after Review R round 1, `TestWaitAfterWaitIsNotWokenAgain`,
 `TestStaleExecutionWritesNothing`, `TestStepResultIsBoundToItsInput`,
-`TestRunJournalMarksARunUncertain`, `TestStepResultIsBounded`.
+`TestRunJournalMarksARunUncertain`, `TestStepResultIsBounded`. Slice C2:
+`internal/resumer` (`TestResumerSuspendsAndResumesRuns`,
+`TestSuspendedRunsHoldNoGoroutine`, `TestTimerWakesARun`,
+`TestInterruptedRunIsTakenAgain`, `TestCloseDrainsThenCancelsAndReleases`),
+`TestTypedInputIsVerifiedAsTheSameJSONValue`, the fixtures in
+`testdata/waits/fixtures.json` (`TestWaitFixtures`, nine cases, five of
+them negative) and `benchmarks/waits`
+(`TestSuspendedRunsCostStorageNotGoroutines`, always run at 1,000 runs, and
+the gated `TestWaitFootprintAndBurstSamples`).
 
 ## Limits
 
