@@ -418,7 +418,18 @@ bytes `Restore` copies, ignoring any log beside it. `Restore` therefore
 refuses a source with a non-empty `-wal` or `-journal` file beside it
 rather than restore it without the changes those hold: folding them in
 would write to the backup. A file `Backup` wrote is in rollback mode and
-self-contained. The copy is written to `.restore-*` beside the destination,
+self-contained. The source must not be written while `Restore` runs.
+
+`Restore` refuses a destination that exists or has a `-wal`, `-shm` or
+`-journal` file beside it, at the start and again just before the rename.
+SQLite reads such a file as the database's own: before Review R of #343, a
+log an old database at the destination left behind was replayed into the
+restored copy (a 400-row backup restored with `nil` and held the old
+database's 7 rows, passing `integrity_check`). The leftover is refused, not
+removed, since it may belong to a database still in use. The check is not
+atomic with the rename: a file another process creates at the destination
+in that moment is replaced. A destination directory `Restore` creates has
+its parent synced. The copy is written to `.restore-*` beside the destination,
 synced, renamed to the destination, the directory synced, and the copy then
 opened through `Open` and checked again; if that fails, the destination
 and any `-wal`, `-shm` or `-journal` beside it are removed and the
@@ -431,7 +442,8 @@ a crash after it leaves the whole, synced copy of the checked backup.
 | `Restore` never writes to its source and restores from a read-only file or directory (#343) | behavioral (bug fix) | None. A backup's bytes and checksum are unchanged by `Restore` |
 | `Restore` refuses a source with a non-empty `-wal` or `-journal` file beside it (#343) | behavioral (breaking for such sources) | Restore a file written by `Backup`, or checkpoint the source (open and close it with no other connection) first. Before, `Restore` folded the log into the source by writing to it, or, with another connection open, silently restored without the log's changes |
 | `Restore` removes the destination when the restored check fails (#343) | behavioral (bug fix) | None. A retry is no longer refused with `already exists` |
-| `Restore` syncs the directory after the rename (#343) | durability (bug fix) | None. Not on Windows, which cannot sync a directory and is not supported (#297). A crash can leave `.restore-*` files beside the destination; they never block a retry and may be deleted |
+| `Restore` refuses a destination with a `-wal`, `-shm` or `-journal` file beside it (#343) | behavioral (bug fix) | Remove the leftover if no database uses it. Before, a leftover log was replayed into the restored database |
+| `Restore` syncs the directory after the rename, and the parent of a directory it creates (#343) | durability (bug fix) | None. Not done on Windows (unsupported, #297). A crash can leave `.restore-*` files beside the destination; they never block a retry and may be deleted |
 
 ## Recovery records are write-once (#334)
 
@@ -535,7 +547,9 @@ and reads the committed row.
 `backup_test.go` (#343) restores a corrupt backup, which must be refused
 before anything is copied (mutation M49b, skipping the source check, fails
 it), and a copy damaged between the rename and the restored check, which
-must fail and leave no destination (M49b2, skipping that check, fails it).
+must fail and leave no destination (M49b2, skipping that check, fails it),
+and refuses a destination with a leftover `-wal` (a real stale log), `-shm`
+or `-journal` beside it, at the start and when one appears during the copy.
 It requires the backup's SHA-256 and modification time to be unchanged by
 `Restore`, with the backup and its directory read-only and with a WAL-mode
 file, run as an unprivileged user when the tests run as root. It kills a

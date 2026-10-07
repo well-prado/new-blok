@@ -459,7 +459,10 @@ var (
 )
 
 // Restore copies an integrity-checked SQLite backup into a new destination.
-// The destination is never overwritten. The backup is only read: it is
+// It refuses a destination that exists or has a -wal, -shm or -journal file
+// beside it, checking again just before it installs the copy; a file another
+// process creates there in that moment is replaced (see install). The source
+// must not be written while Restore runs. The backup is only read: it is
 // checked through a read-only, immutable connection and copied through a
 // read-only file, so its bytes are unchanged and it may be read-only, on a
 // read-only directory (#343). The copy is written to a temporary file beside
@@ -486,7 +489,7 @@ func (Backend) Restore(ctx context.Context, source, destination string) error {
 		return fmt.Errorf("sqlite: source integrity: %w", err)
 	}
 	directory := filepath.Dir(destination)
-	if err := os.MkdirAll(directory, 0o755); err != nil {
+	if err := createDirectory(directory); err != nil {
 		return fmt.Errorf("sqlite: create destination parent: %w", err)
 	}
 	temporary, err := os.CreateTemp(directory, ".restore-*")
@@ -592,21 +595,31 @@ func checkRestored(ctx context.Context, destination string) error {
 	return nil
 }
 
-// requireAbsent fails unless nothing exists at path.
+// requireAbsent fails unless nothing exists at path, nor a -wal, -shm or
+// -journal file beside it. SQLite reads such a file as the database's own:
+// a log an old database at path left behind would be replayed into the new
+// one (#343). A leftover is refused, not removed: it may belong to a
+// database still in use.
 func requireAbsent(path, what string) error {
-	if _, err := os.Lstat(path); err == nil {
-		return fmt.Errorf("sqlite: %s already exists: %s", what, path)
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("sqlite: inspect %s: %w", what, err)
+	for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+		if _, err := os.Lstat(path + suffix); err == nil {
+			if suffix == "" {
+				return fmt.Errorf("sqlite: %s already exists: %s", what, path)
+			}
+			return fmt.Errorf("sqlite: %s already exists beside the %s: %s; SQLite would read it into the new database, so remove it if no database uses it", suffix, what, path+suffix)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("sqlite: inspect %s: %w", what, err)
+		}
 	}
 	return nil
 }
 
 // install renames a synced temporary file to destination, which must not
-// exist, and syncs the directory so the rename survives a power loss. If the
-// directory cannot be synced, the installed file is removed again.
-// Destination is checked just before the rename; a file created there in
-// between by another process would be replaced.
+// exist nor have a -wal, -shm or -journal file beside it, and syncs the
+// directory so the rename survives a power loss. If the directory cannot be
+// synced, the installed file is removed again. Destination is checked just
+// before the rename; a file created there in between by another process
+// would be replaced.
 func install(temporary, destination, what string) error {
 	if err := requireAbsent(destination, what+" destination"); err != nil {
 		return err
@@ -642,9 +655,34 @@ func removeFiles(path string) error {
 	return errors.Join(failures...)
 }
 
+// createDirectory creates directory and any missing parents, and syncs the
+// parent of each directory it created, so a file installed in it survives a
+// power loss with the directories that hold it.
+func createDirectory(directory string) error {
+	var created []string
+	for path := directory; ; path = filepath.Dir(path) {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		created = append(created, path)
+		if filepath.Dir(path) == path {
+			break
+		}
+	}
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		return err
+	}
+	for _, path := range created {
+		if err := syncDirectory(filepath.Dir(path)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // syncDirectory flushes a directory's entries, so a file renamed into or
-// removed from it stays so after a power loss. Windows cannot open a
-// directory for flushing; it is not a supported platform (#297).
+// removed from it stays so after a power loss. Not done on Windows
+// (unsupported, #297).
 func syncDirectory(path string) error {
 	if goruntime.GOOS == "windows" {
 		return nil
