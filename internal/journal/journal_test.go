@@ -753,12 +753,24 @@ func journalMarkerAndWait() {
 
 func waitForJournalMarker(t *testing.T, path string) {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
+	waitForJournalMarkerWithin(t, path, 10*time.Second, nil)
+}
+
+// waitForJournalMarkerWithin waits up to timeout for a child to write its
+// barrier marker, and fails at once when exited (if not nil) closes first:
+// a child that exits never reaches its barrier.
+func waitForJournalMarkerWithin(t *testing.T, path string, timeout time.Duration, exited <-chan struct{}) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(path); err == nil {
 			return
 		}
-		time.Sleep(10 * time.Millisecond)
+		select {
+		case <-exited:
+			t.Fatalf("journal child exited before reaching barrier: %s", path)
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 	t.Fatalf("journal child did not reach barrier: %s", path)
 }

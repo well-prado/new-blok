@@ -3,13 +3,16 @@ package journal
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -43,6 +46,10 @@ func TestCompactionRetainsAuditAndActiveRuns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The leaf is the completed child of both runs, the active one
+	// included: today it is compacted like any completed run, and its
+	// result stays in the active parent's journal_children row. Slice B
+	// (#289) revisits child results.
 	if report.RemovedRuns != 2 || report.Tombstones != 2 {
 		t.Fatalf("report=%+v, want the completed run and its child leaf removed", report)
 	}
@@ -155,8 +162,9 @@ func TestRetentionBackupFixture(t *testing.T) {
 	observed.ActiveRunRetained = reflect.DeepEqual(snapshotRun(t, restoredJournal, active), activeBefore)
 	// auditRecordRetained: the run's audit records and its digest-only
 	// tombstone both survive compaction, backup and restore.
-	observed.AuditRecordRetained = tombstoneMatches(t, restoredJournal, "completed", completed.runID) &&
-		reflect.DeepEqual(snapshotRun(t, restoredJournal, completed)["audit_records_v1"], completedBefore["audit_records_v1"])
+	restoredCompleted := snapshotRun(t, restoredJournal, completed)
+	observed.AuditRecordRetained = tombstoneProblem(completedBefore["journal_runs"], restoredCompleted["journal_compacted"]) == "" &&
+		len(completedBefore["audit_records_v1"]) > 0 && reflect.DeepEqual(restoredCompleted["audit_records_v1"], completedBefore["audit_records_v1"])
 	if err := restored.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -180,6 +188,34 @@ func TestRetentionBackupFixture(t *testing.T) {
 	}
 }
 
+// TestRetentionTableDeclarationsCoverEveryTable proves the schema guard the
+// tests above rely on can fail: a new table the tests do not know about,
+// keyed by anything, stops every snapshot until it is declared.
+func TestRetentionTableDeclarationsCoverEveryTable(t *testing.T) {
+	ctx := context.Background()
+	database, j := openRetentionJournal(t, filepath.Join(t.TempDir(), "journal.db"), Hooks{})
+	defer database.Close()
+	if err := j.withRead(ctx, func(tx *sql.Tx) error {
+		_, err := runKeyedTables(ctx, tx)
+		return err
+	}); err != nil {
+		t.Fatalf("today's schema: %v", err)
+	}
+	if err := database.WithTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `CREATE TABLE journal_scope_items (scope_rowid INTEGER NOT NULL, item_json BLOB)`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err := j.withRead(ctx, func(tx *sql.Tx) error {
+		_, err := runKeyedTables(ctx, tx)
+		return err
+	})
+	if err == nil || !strings.Contains(err.Error(), "table journal_scope_items is declared neither") {
+		t.Fatalf("undeclared table without run_id: err=%v", err)
+	}
+}
+
 // recoveryRun names a run seeded by seedRecoveryRun and the operation
 // whose attempts it owns.
 type recoveryRun struct {
@@ -187,8 +223,8 @@ type recoveryRun struct {
 }
 
 // runRows is every row a run has in each table that holds run rows, keyed
-// by table, each row rendered in column order and sorted.
-type runRows map[string][]string
+// by table, sorted.
+type runRows map[string][]row
 
 const retentionArtifact = "sha256:retention"
 
@@ -339,11 +375,11 @@ func snapshotRun(tb testing.TB, j *Journal, run recoveryRun) runRows {
 			if table == "journal_attempts" {
 				query, argument = `SELECT * FROM journal_attempts WHERE operation_key = ?`, run.operationKey
 			}
-			rendered, err := renderRows(ctx, tx, query, argument)
+			read, err := readRows(ctx, tx, query, argument)
 			if err != nil {
 				return fmt.Errorf("%s: %w", table, err)
 			}
-			rows[table] = rendered
+			rows[table] = read
 		}
 		return nil
 	})
@@ -353,9 +389,23 @@ func snapshotRun(tb testing.TB, j *Journal, run recoveryRun) runRows {
 	return rows
 }
 
-// runKeyedTables lists every table with a run_id column, plus
-// journal_attempts, which is keyed by operation, and fails when one has no
-// declared compaction fate.
+// notRunOwnedTables are the tables that hold no row of any one run. Every
+// table in the store must be either here or in compactionFates.
+var notRunOwnedTables = map[string]bool{
+	"audit_meta_v1":        true,
+	"audit_pruned_v1":      true,
+	"blok_schema_versions": true,
+	"journal_artifacts":    true,
+	"journal_meta":         true,
+	"sqlite_sequence":      true,
+}
+
+// runKeyedTables returns the tables holding run rows. It fails unless every
+// table in the store is declared, either with a compaction fate or as not
+// run-owned, so a new table keyed in any way cannot escape these checks. A
+// table with a fate must be readable by run (a run_id column, or
+// journal_attempts by operation key), and one declared not run-owned must
+// have no run_id column.
 func runKeyedTables(ctx context.Context, tx *sql.Tx) ([]string, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name`)
 	if err != nil {
@@ -373,24 +423,30 @@ func runKeyedTables(ctx context.Context, tx *sql.Tx) ([]string, error) {
 	if err := rows.Close(); err != nil {
 		return nil, err
 	}
-	tables := []string{"journal_attempts"}
+	var tables []string
+	present := map[string]bool{}
 	for _, name := range all {
-		owned, err := hasColumn(ctx, tx, name, "run_id")
+		present[name] = true
+		_, fated := compactionFates[name]
+		keyed, err := hasColumn(ctx, tx, name, "run_id")
 		if err != nil {
 			return nil, err
 		}
-		if owned {
+		switch {
+		case fated && !keyed && name != "journal_attempts":
+			return nil, fmt.Errorf("table %s has a compaction fate but no run_id column to read it by", name)
+		case fated:
 			tables = append(tables, name)
+		case notRunOwnedTables[name] && keyed:
+			return nil, fmt.Errorf("table %s is declared not run-owned but has a run_id column", name)
+		case !notRunOwnedTables[name]:
+			return nil, fmt.Errorf("table %s is declared neither with a compaction fate nor as not run-owned", name)
 		}
 	}
-	sort.Strings(tables)
-	for _, table := range tables {
-		if _, ok := compactionFates[table]; !ok {
-			return nil, fmt.Errorf("table %s holds run rows but has no compaction fate in this test", table)
+	for _, table := range append(sortedTables(), sortedKeys(notRunOwnedTables)...) {
+		if !present[table] {
+			return nil, fmt.Errorf("declared table %s does not exist", table)
 		}
-	}
-	if len(tables) != len(compactionFates) {
-		return nil, fmt.Errorf("tables holding run rows %v, compaction fates declared for %d", tables, len(compactionFates))
 	}
 	for _, table := range runOwnedTables {
 		if compactionFates[table] != fateErased {
@@ -400,37 +456,82 @@ func runKeyedTables(ctx context.Context, tx *sql.Tx) ([]string, error) {
 	return tables, nil
 }
 
-func renderRows(ctx context.Context, tx *sql.Tx, query string, arguments ...any) ([]string, error) {
-	rows, err := tx.QueryContext(ctx, query, arguments...)
+// field is one column of a stored row; a []byte value is kept as a string.
+type field struct {
+	column string
+	value  any
+}
+
+// row is a stored row, its fields in column order.
+type row []field
+
+func (r row) String() string {
+	parts := make([]string, len(r))
+	for i, f := range r {
+		parts[i] = fmt.Sprintf("%s=%#v", f.column, f.value)
+	}
+	return strings.Join(parts, " ")
+}
+
+func (r row) value(column string) any {
+	for _, f := range r {
+		if f.column == column {
+			return f.value
+		}
+	}
+	return nil
+}
+
+// without returns the row without the named columns.
+func (r row) without(columns ...string) row {
+	var kept row
+	for _, f := range r {
+		if !slices.Contains(columns, f.column) {
+			kept = append(kept, f)
+		}
+	}
+	return kept
+}
+
+func rendered(rows []row) []string {
+	out := make([]string, len(rows))
+	for i, r := range rows {
+		out[i] = r.String()
+	}
+	return out
+}
+
+func readRows(ctx context.Context, tx *sql.Tx, query string, arguments ...any) ([]row, error) {
+	result, err := tx.QueryContext(ctx, query, arguments...)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	columns, err := rows.Columns()
+	defer result.Close()
+	columns, err := result.Columns()
 	if err != nil {
 		return nil, err
 	}
-	var rendered []string
-	for rows.Next() {
+	var rows []row
+	for result.Next() {
 		values := make([]any, len(columns))
 		pointers := make([]any, len(columns))
 		for i := range values {
 			pointers[i] = &values[i]
 		}
-		if err := rows.Scan(pointers...); err != nil {
+		if err := result.Scan(pointers...); err != nil {
 			return nil, err
 		}
-		fields := make([]string, len(columns))
+		r := make(row, len(columns))
 		for i, value := range values {
 			if data, ok := value.([]byte); ok {
 				value = string(data)
 			}
-			fields[i] = fmt.Sprintf("%s=%#v", columns[i], value)
+			r[i] = field{column: columns[i], value: value}
 		}
-		rendered = append(rendered, strings.Join(fields, " "))
+		rows = append(rows, r)
 	}
-	sort.Strings(rendered)
-	return rendered, rows.Err()
+	sort.Slice(rows, func(a, b int) bool { return rows[a].String() < rows[b].String() })
+	return rows, result.Err()
 }
 
 // requireEveryTable fails unless the seeded run has a row in every table
@@ -454,7 +555,7 @@ func assertWhole(tb testing.TB, j *Journal, run recoveryRun, before runRows) {
 	var changed []string
 	for _, table := range sortedTables() {
 		if !reflect.DeepEqual(after[table], before[table]) {
-			changed = append(changed, fmt.Sprintf("%s: %d rows -> %d rows\n  before %q\n  after  %q", table, len(before[table]), len(after[table]), before[table], after[table]))
+			changed = append(changed, fmt.Sprintf("%s: %d rows -> %d rows\n  before %q\n  after  %q", table, len(before[table]), len(after[table]), rendered(before[table]), rendered(after[table])))
 		}
 	}
 	if len(changed) > 0 {
@@ -462,13 +563,15 @@ func assertWhole(tb testing.TB, j *Journal, run recoveryRun, before runRows) {
 	}
 }
 
-func sortedTables() []string {
-	tables := make([]string, 0, len(compactionFates))
-	for table := range compactionFates {
-		tables = append(tables, table)
+func sortedTables() []string { return sortedKeys(compactionFates) }
+
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
 	}
-	sort.Strings(tables)
-	return tables
+	sort.Strings(keys)
+	return keys
 }
 
 // assertCompacted fails unless the run is compacted exactly per ADR 0021.
@@ -479,10 +582,16 @@ func assertCompacted(tb testing.TB, j *Journal, run recoveryRun, before runRows)
 	}
 }
 
-// compactedRows describes how the run's rows differ from a compacted run's,
-// or returns "": no row left in an erased table, its reconciliations kept
-// with actor, evidence and result erased, one tombstone, and its audit
-// records untouched.
+// erasedReconciliationColumns are the reconciliation columns compaction
+// erases (ADR 0021 §7.2); every other column must keep its value.
+var erasedReconciliationColumns = []string{"actor", "evidence", "result_json", "erased_at"}
+
+// compactedRows describes how the run's rows differ from a compacted run's
+// (ADR 0021 §7), or returns "": no row left in an erased table; each
+// reconciliation kept with every column but actor, evidence and result
+// unchanged, those three erased and erased_at set; one tombstone carrying
+// exactly the run's digests and timestamps; and its audit records
+// untouched.
 func compactedRows(tb testing.TB, j *Journal, run recoveryRun, before runRows) string {
 	tb.Helper()
 	after := snapshotRun(tb, j, run)
@@ -490,50 +599,76 @@ func compactedRows(tb testing.TB, j *Journal, run recoveryRun, before runRows) s
 		switch fate := compactionFates[table]; fate {
 		case fateErased:
 			if len(after[table]) != 0 {
-				return fmt.Sprintf("compacted run %s keeps %s rows %q", run.runID, table, after[table])
+				return fmt.Sprintf("compacted run %s keeps %s rows %q", run.runID, table, rendered(after[table]))
 			}
 		case fateTombstone:
-			if len(after[table]) != 1 {
-				return fmt.Sprintf("compacted run %s has %d tombstones", run.runID, len(after[table]))
+			if problem := tombstoneProblem(before["journal_runs"], after[table]); problem != "" {
+				return fmt.Sprintf("compacted run %s: %s", run.runID, problem)
 			}
 		case fateKept:
 			if !reflect.DeepEqual(after[table], before[table]) {
-				return fmt.Sprintf("compaction changed %s of run %s:\nbefore %q\nafter  %q", table, run.runID, before[table], after[table])
+				return fmt.Sprintf("compaction changed %s of run %s:\nbefore %q\nafter  %q", table, run.runID, rendered(before[table]), rendered(after[table]))
 			}
 		case fateScrubbed:
-			if len(after[table]) != len(before[table]) {
-				return fmt.Sprintf("compacted run %s has %d reconciliations, had %d", run.runID, len(after[table]), len(before[table]))
+			if problem := scrubProblem(before[table], after[table]); problem != "" {
+				return fmt.Sprintf("compacted run %s: %s", run.runID, problem)
 			}
 		}
-	}
-	var unerased int
-	err := j.withRead(context.Background(), func(tx *sql.Tx) error {
-		return tx.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM journal_reconciliations WHERE run_id = ? AND (actor != '' OR evidence IS NOT NULL OR result_json IS NOT NULL OR erased_at IS NULL)`, run.runID).Scan(&unerased)
-	})
-	if err != nil {
-		tb.Fatal(err)
-	}
-	if unerased != 0 {
-		return fmt.Sprintf("compacted run %s keeps %d reconciliations with content", run.runID, unerased)
 	}
 	return ""
 }
 
-// tombstoneMatches reports whether the run's tombstone carries the digest
-// of its request key and no plain content.
-func tombstoneMatches(tb testing.TB, j *Journal, requestKey, runID string) bool {
-	tb.Helper()
-	var request, state string
-	err := j.withRead(context.Background(), func(tx *sql.Tx) error {
-		return tx.QueryRowContext(context.Background(), `SELECT request_digest, state FROM journal_compacted WHERE run_id = ?`, runID).Scan(&request, &state)
-	})
-	if errors.Is(err, sql.ErrNoRows) {
-		return false
+// scrubProblem compares a run's reconciliations before and after
+// compaction, or returns "".
+func scrubProblem(before, after []row) string {
+	if len(after) != len(before) {
+		return fmt.Sprintf("%d reconciliations, had %d", len(after), len(before))
 	}
-	if err != nil {
-		tb.Fatal(err)
+	for i := range after {
+		if kept, was := after[i].without(erasedReconciliationColumns...), before[i].without(erasedReconciliationColumns...); !reflect.DeepEqual(kept, was) {
+			return fmt.Sprintf("reconciliation changed beyond its erased content:\nbefore %s\nafter  %s", was, kept)
+		}
+		if after[i].value("actor") != "" || after[i].value("evidence") != nil || after[i].value("result_json") != nil || after[i].value("erased_at") == nil {
+			return fmt.Sprintf("reconciliation keeps content: %s", after[i])
+		}
 	}
-	return request == digestBytes([]byte(requestKey)) && state == runCompleted
+	return ""
+}
+
+// tombstoneProblem checks the one tombstone left for a run against its row
+// before compaction (ADR 0021 §7.4), or returns "". Each digest is computed
+// here, not by the journal's own helpers.
+func tombstoneProblem(runRows, tombstones []row) string {
+	if len(runRows) != 1 || len(tombstones) != 1 {
+		return fmt.Sprintf("%d run rows before compaction and %d tombstones after, want 1 and 1", len(runRows), len(tombstones))
+	}
+	run, tombstone := runRows[0], tombstones[0]
+	sum := func(value any) string {
+		data, _ := value.(string)
+		if data == "" {
+			return ""
+		}
+		digest := sha256.Sum256([]byte(data))
+		return "sha256:" + hex.EncodeToString(digest[:])
+	}
+	want := row{
+		{"run_id", run.value("run_id")},
+		{"request_digest", sum(run.value("request_key"))},
+		{"artifact_digest", run.value("artifact_digest")},
+		{"input_digest", run.value("input_digest")},
+		{"output_digest", sum(run.value("output_json"))},
+		{"state", run.value("state")},
+		{"completed_at", run.value("completed_at")},
+	}
+	if got := tombstone.without("compacted_at"); !reflect.DeepEqual(got, want) {
+		return fmt.Sprintf("tombstone\n  got  %s\n  want %s", got, want)
+	}
+	compactedAt, ok := tombstone.value("compacted_at").(int64)
+	completedAt, _ := run.value("completed_at").(int64)
+	if !ok || compactedAt < completedAt {
+		return fmt.Sprintf("tombstone compacted_at %v before the run completed at %d", tombstone.value("compacted_at"), completedAt)
+	}
+	return ""
 }
 
 // integrityCheck returns the first row of PRAGMA integrity_check.

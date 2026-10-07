@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"syscall"
 	"testing"
 	"time"
 
@@ -63,17 +65,25 @@ func TestCompactionSurvivesAKillAtEitherCommitBarrier(t *testing.T) {
 			if err := command.Start(); err != nil {
 				t.Fatal(err)
 			}
-			t.Cleanup(func() { _ = command.Process.Kill() })
+			exited := make(chan struct{})
+			go func() {
+				_ = command.Wait()
+				close(exited)
+			}()
+			t.Cleanup(func() {
+				_ = command.Process.Kill()
+				<-exited
+			})
 			started := time.Now()
-			waitForCompactionBarrier(t, markerPath)
+			// The child parks at its barrier until killed, so the generous
+			// deadline only slows a loaded machine down.
+			waitForJournalMarkerWithin(t, markerPath, time.Minute, exited)
 			t.Logf("child reached the %s-commit barrier after %v", phase, time.Since(started).Round(time.Millisecond))
 			if err := command.Process.Kill(); err != nil {
 				t.Fatal(err)
 			}
-			_ = command.Wait()
-			if command.ProcessState.Success() {
-				t.Fatal("compaction child exited on its own; it was not killed at the barrier")
-			}
+			<-exited
+			requireKilled(t, command.ProcessState)
 
 			database, j = reopenAfterKill(t, databasePath)
 			defer database.Close()
@@ -150,19 +160,21 @@ func runCompactionChild(t *testing.T) {
 	}
 }
 
-// waitForCompactionBarrier waits for the child to park at its barrier. Its
-// deadline is generous because the child parks until killed, so a loaded
-// machine only slows the test down.
-func waitForCompactionBarrier(t *testing.T, path string) {
+// requireKilled fails unless the child died of the parent's kill, not on
+// its own. Off Windows that is SIGKILL; Windows has no signals, so there it
+// only checks the child did not exit successfully.
+func requireKilled(t *testing.T, state *os.ProcessState) {
 	t.Helper()
-	deadline := time.Now().Add(time.Minute)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(path); err == nil {
-			return
+	if runtime.GOOS == "windows" {
+		if state.Success() {
+			t.Fatal("compaction child exited on its own; it was not killed at the barrier")
 		}
-		time.Sleep(10 * time.Millisecond)
+		return
 	}
-	t.Fatalf("compaction child did not reach its barrier: %s", path)
+	status, ok := state.Sys().(syscall.WaitStatus)
+	if !ok || !status.Signaled() || status.Signal() != syscall.SIGKILL {
+		t.Fatalf("compaction child ended with %v, not SIGKILL at the barrier", state)
+	}
 }
 
 // reopenAfterKill opens the killed child's store, checks its integrity and
