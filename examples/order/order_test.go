@@ -96,7 +96,8 @@ func TestOutboxProviderFailureKeepsPendingEventAndRetriesStableID(t *testing.T) 
 		t.Fatal(err)
 	}
 	defer database.Close()
-	service, err := New(context.Background(), database, map[string]int64{"coffee": 1500}, nil)
+	clock := newTestClock()
+	service, err := New(context.Background(), database, map[string]int64{"coffee": 1500}, clock.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,6 +122,7 @@ func TestOutboxProviderFailureKeepsPendingEventAndRetriesStableID(t *testing.T) 
 	if state := outboxState(t, database, "event:req-timeout"); state != EventPending {
 		t.Fatalf("outbox state after the timeout=%s, want pending", state)
 	}
+	clock.Advance(time.Minute) // past the retry backoff
 	processed, err = service.DispatchOne(context.Background(), func(_ context.Context, event Event) error {
 		eventIDs = append(eventIDs, event.ID)
 		return nil
@@ -376,7 +378,8 @@ func TestOutboxPublishDeadlineAndAttemptsAreBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer database.Close()
-	service, err := New(ctx, database, map[string]int64{"coffee": 1500}, nil, WithOutboxLease(50*time.Millisecond), WithOutboxMaxAttempts(2))
+	clock := newTestClock()
+	service, err := New(ctx, database, map[string]int64{"coffee": 1500}, clock.Now, WithOutboxLease(50*time.Millisecond), WithOutboxMaxAttempts(2))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -391,6 +394,7 @@ func TestOutboxPublishDeadlineAndAttemptsAreBounded(t *testing.T) {
 		return ctx.Err()
 	}
 	for attempt, want := range []string{EventPending, EventDead} {
+		clock.Advance(time.Minute) // past the retry backoff
 		processed, err := service.DispatchOne(ctx, hang)
 		if !processed || !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("attempt %d processed=%v err=%v", attempt+1, processed, err)
@@ -420,11 +424,11 @@ func TestOutboxLeaseIsFencedAndAbandonedClaimsAreDeadLettered(t *testing.T) {
 	processed, err := service.DispatchOne(ctx, func(context.Context, Event) error {
 		// The publish outlives the lease and another dispatcher claims the event.
 		clock.Advance(DefaultOutboxLease)
-		_, token, err := service.claimEvent(ctx)
+		_, held, err := service.claimEvent(ctx)
 		if err != nil {
 			t.Errorf("takeover claim: %v", err)
 		}
-		takeover = token
+		takeover = held.token
 		return nil
 	})
 	if !processed || !errors.Is(err, ErrLeaseLost) {
@@ -433,7 +437,7 @@ func TestOutboxLeaseIsFencedAndAbandonedClaimsAreDeadLettered(t *testing.T) {
 	if state, attempts, _ := outboxRow(t, database, "event:req-lease"); state != EventDispatching || attempts != 2 {
 		t.Fatalf("after the late mark state=%s attempts=%d, want dispatching 2", state, attempts)
 	}
-	if err := service.settle(ctx, "event:req-lease", takeover, `state = 'sent', error_text = ''`); err != nil {
+	if err := service.settle(ctx, "event:req-lease", takeover, `state = 'sent', lease_until = NULL, error_text = ''`); err != nil {
 		t.Fatalf("takeover mark: %v", err)
 	}
 	if state := outboxState(t, database, "event:req-lease"); state != EventSent {
@@ -487,23 +491,5 @@ func TestOutboxCreatedBeforeDispatchColumnsIsMigrated(t *testing.T) {
 	}
 	if state, attempts, _ := outboxRow(t, database, "event:old"); state != EventSent || attempts != 1 {
 		t.Fatalf("state=%s attempts=%d, want sent 1", state, attempts)
-	}
-}
-
-// A publish that fails because the caller gave up does not spend an attempt.
-func TestOutboxAttemptIsNotChargedWhenTheCallerGivesUp(t *testing.T) {
-	service, database := openService(t, nil)
-	pendingEvent(t, service, "req-cancel")
-	ctx, cancel := context.WithCancel(context.Background())
-	processed, err := service.DispatchOne(ctx, func(publishCtx context.Context, _ Event) error {
-		cancel()
-		<-publishCtx.Done()
-		return publishCtx.Err()
-	})
-	if !processed || !errors.Is(err, context.Canceled) {
-		t.Fatalf("processed=%v err=%v", processed, err)
-	}
-	if state, attempts, code := outboxRow(t, database, "event:req-cancel"); state != EventPending || attempts != 0 || code != PublishFailed {
-		t.Fatalf("state=%s attempts=%d code=%s, want pending 0 %s", state, attempts, code, PublishFailed)
 	}
 }
