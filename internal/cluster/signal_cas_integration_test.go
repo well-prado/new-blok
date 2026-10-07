@@ -70,7 +70,7 @@ func TestSignalRetriesAWaitRunCASConflict(t *testing.T) {
 	if _, err := runtime.processOne(ctx, owner); !errors.Is(err, ErrNoWork) {
 		t.Fatalf("initial process error=%v, want suspended work yield", err)
 	}
-	waitID := WaitIDFor(admission.RunID, "approval")
+	waitID := WaitIDFor(admission.RunID, "approval", "")
 	wait, err := runtime.GetWait(ctx, tenant, waitID)
 	if err != nil || wait.State != "waiting" {
 		t.Fatalf("persisted wait=%+v err=%v", wait, err)
@@ -146,7 +146,7 @@ func TestSignalRetriesAWaitRunCASConflict(t *testing.T) {
 		if _, err := runtime.processOne(ctx, owner); !errors.Is(err, ErrNoWork) {
 			t.Fatalf("%d-conflict retry run process error=%v, want suspended work yield", conflictCount, err)
 		}
-		retryWaitID := WaitIDFor(admission.RunID, "approval")
+		retryWaitID := WaitIDFor(admission.RunID, "approval", "")
 		barrier.eventID = waitTransition("signal", tenant+"\x00"+retryWaitID+"\x00cas-signal")
 		barrier.before = func() error {
 			data, revision, readErr := directStore.ReadState(ctx, partition, admission.RunID)
@@ -200,7 +200,7 @@ func TestSignalRetriesAWaitRunCASConflict(t *testing.T) {
 		if _, err := runtime.processOne(ctx, owner); !errors.Is(err, ErrNoWork) {
 			t.Fatalf("%s collision run process error=%v, want suspended work yield", collision.name, err)
 		}
-		collisionWaitID := WaitIDFor(admission.RunID, "approval")
+		collisionWaitID := WaitIDFor(admission.RunID, "approval", "")
 		barrier.eventID = waitTransition("signal", tenant+"\x00"+collisionWaitID+"\x00cas-signal")
 		barrier.before = func() error {
 			waitData, waitRevision, readErr := directStore.ReadState(ctx, partition, waitStateID(tenant, collisionWaitID))

@@ -59,7 +59,7 @@ func (j *runStepJournal) Load(ctx context.Context, identity engine.StepIdentity)
 	if err := json.Unmarshal(data, &persisted); err != nil {
 		return nil, false, fmt.Errorf("cluster: decode step checkpoint: %w", err)
 	}
-	if persisted.Identity != identity {
+	if !persisted.Identity.SameExecution(identity) {
 		return nil, false, ErrRequestConflict
 	}
 	switch persisted.State {
@@ -96,13 +96,13 @@ func (j *runStepJournal) Begin(ctx context.Context, identity engine.StepIdentity
 	if err != nil {
 		return engine.StepAttempt{}, err
 	}
-	record := stepRecord{Identity: identity, State: "dispatched", AttemptNumber: 1, Effects: append([]string(nil), effects...)}
+	record := stepRecord{Identity: identity.Canonical(), State: "dispatched", AttemptNumber: 1, Effects: append([]string(nil), effects...)}
 	if revision != 0 {
 		var old stepRecord
 		if err := json.Unmarshal(current, &old); err != nil {
 			return engine.StepAttempt{}, err
 		}
-		if old.Identity != identity {
+		if !old.Identity.SameExecution(identity) {
 			return engine.StepAttempt{}, ErrRequestConflict
 		}
 		if old.State == "committed" {
@@ -137,7 +137,7 @@ func (j *runStepJournal) Await(ctx context.Context, identity engine.WaitIdentity
 	if !sameStepIdentity(identity.Step, j.record, identity.Step.StepID) || identity.Name == "" || identity.TimeoutMillis < 0 {
 		return engine.WaitResult{}, false, ErrRequestConflict
 	}
-	waitID := WaitIDFor(j.record.RunID, identity.Step.StepID)
+	waitID := WaitIDFor(j.record.RunID, identity.Step.StepID, identity.Step.IterationPath)
 	var dueAt time.Time
 	if identity.TimeoutMillis > 0 {
 		dueAt = time.Now().UTC().Add(time.Duration(identity.TimeoutMillis) * time.Millisecond)
@@ -183,7 +183,7 @@ func (j *runStepJournal) transition(ctx context.Context, attempt engine.StepAtte
 	if err := json.Unmarshal(data, &current); err != nil {
 		return err
 	}
-	if current.Identity != attempt.Identity {
+	if !current.Identity.SameExecution(attempt.Identity) {
 		return ErrRequestConflict
 	}
 	if current.CurrentAttempt != attempt.AttemptID {
@@ -210,8 +210,11 @@ func (j *runStepJournal) transition(ctx context.Context, attempt engine.StepAtte
 	return nil
 }
 
+// sameStepIdentity also requires the identity's operation key to be the
+// one its fields (iteration included) derive: the key addresses the step
+// and wait records, so a key from another iteration must not reach them.
 func sameStepIdentity(identity engine.StepIdentity, run RunRecord, step string) bool {
-	return identity.RunID == run.RunID && identity.ArtifactDigest == run.ArtifactDigest && identity.StepID == step && identity.InputDigest != "" && identity.OperationKey != ""
+	return identity.RunID == run.RunID && identity.ArtifactDigest == run.ArtifactDigest && identity.StepID == step && identity.InputDigest != "" && identity.OperationKey == engine.OperationKey(identity)
 }
 
 func stepStateID(operationKey string) string {

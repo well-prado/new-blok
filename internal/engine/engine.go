@@ -114,12 +114,22 @@ type WaitResult struct {
 // StepIdentity binds a checkpoint to the exact run artifact and resolved
 // input. OperationKey is stable across retries; each Begin returns a distinct
 // AttemptID so a stale result cannot overwrite a later attempt.
+//
+// Its JSON form is stored (internal/cluster persists it in every step
+// record), and OperationKey is a digest of an explicit encoding of it
+// (identity.go), so neither moves when a Go field is renamed or added.
+// The tags spell the names json.Marshal used before they existed (#382):
+// never change one. A field added later must be omitempty and its zero
+// value must mean what every record written before it meant.
 type StepIdentity struct {
-	RunID          string
-	ArtifactDigest string
-	StepID         string
-	InputDigest    string
-	OperationKey   string
+	RunID          string `json:"RunID"`
+	ArtifactDigest string `json:"ArtifactDigest"`
+	StepID         string `json:"StepID"`
+	InputDigest    string `json:"InputDigest"`
+	OperationKey   string `json:"OperationKey"`
+	// IterationPath is the loop iteration the step runs in (ADR 0028);
+	// empty, or RootIteration, outside every loop.
+	IterationPath string `json:"IterationPath,omitempty"`
 }
 
 type StepAttempt struct {
@@ -380,7 +390,7 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 				appendStep(step)
 				return result, step.Error
 			}
-			identity := stepIdentity(runID, program.Digest, instruction.ID, plan)
+			identity := NewStepIdentity(runID, program.Digest, instruction.ID, RootIteration, plan)
 			waitResult, ready, waitErr := waitJournal.Await(ctx, WaitIdentity{Step: identity, Name: instruction.Wait.Name, TimeoutMillis: instruction.Wait.TimeoutMillis})
 			if waitErr != nil {
 				step.Error = journalFailure("journal_wait", instruction.ID, waitErr, nil)
@@ -439,7 +449,7 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 					appendStep(step)
 					return result, step.Error
 				}
-				identity = stepIdentity(runID, program.Digest, instruction.ID, persistedInput)
+				identity = NewStepIdentity(runID, program.Digest, instruction.ID, RootIteration, persistedInput)
 				persistedOutput, completed, loadErr := journal.Load(ctx, identity)
 				if loadErr != nil {
 					step.Error = journalFailure("journal_step_load", instruction.ID, loadErr, definition.Descriptor().Effects)
@@ -765,15 +775,6 @@ func validateRawSchema(raw, data []byte) error {
 		return err
 	}
 	return parsed.ValidateValue(data)
-}
-
-func stepIdentity(runID, artifactDigest, stepID string, input []byte) StepIdentity {
-	inputHash := sha256.Sum256(input)
-	identity := StepIdentity{RunID: runID, ArtifactDigest: artifactDigest, StepID: stepID, InputDigest: "sha256:" + hex.EncodeToString(inputHash[:])}
-	encoded, _ := json.Marshal(identity)
-	operationHash := sha256.Sum256(encoded)
-	identity.OperationKey = "op:" + hex.EncodeToString(operationHash[:])
-	return identity
 }
 
 func journalContext(ctx context.Context) (context.Context, context.CancelFunc) {

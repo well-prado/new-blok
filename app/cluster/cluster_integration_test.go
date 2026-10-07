@@ -308,7 +308,7 @@ func TestDistributedLateSignalDuringOutageIsRetryable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitID := cluster.WaitIDFor(admission.RunID, "approval")
+	waitID := cluster.WaitIDFor(admission.RunID, "approval", "")
 	for ctx.Err() == nil {
 		if wait, err := runtime.GetWait(ctx, tenant, waitID); err == nil && wait.State == "timed_out" {
 			break

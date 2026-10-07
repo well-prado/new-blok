@@ -16,10 +16,11 @@ import (
 	"github.com/well-prado/new-blok/internal/engine"
 )
 
-// rootIteration is the iteration path of a step outside every loop. Until
-// #333 gives the engine iteration paths, every step of a run is at the
-// root, and a step's invocation path is its instruction ID (ADR 0031).
-const rootIteration = "root"
+// rootIteration is the iteration path of a step outside every loop. A
+// step's iteration path is the engine's (engine.StepIdentity.Iteration);
+// until #333 gives the engine iteration paths every step of a run is at
+// the root, and a step's invocation path is its instruction ID (ADR 0028).
+const rootIteration = engine.RootIteration
 
 // neverDue is the due time of a wait without a timeout: no timer claim
 // ever fires it; only a signal does.
@@ -141,7 +142,7 @@ func (r *RunJournal) operation(identity engine.StepIdentity) (OperationIdentity,
 	if identity.RunID != r.runID || artifact == "" || identity.ArtifactDigest != artifact || identity.StepID == "" || identity.OperationKey == "" {
 		return OperationIdentity{}, ErrRequestConflict
 	}
-	return OperationIdentity{RunID: r.runID, ArtifactDigest: artifact, InvocationPath: identity.StepID, IterationPath: rootIteration}, nil
+	return OperationIdentity{RunID: r.runID, ArtifactDigest: artifact, InvocationPath: identity.StepID, IterationPath: identity.Iteration()}, nil
 }
 
 // fence checks, inside a write transaction, that this execution still
