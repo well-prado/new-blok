@@ -67,6 +67,7 @@ type Resumer struct {
 	wake   chan struct{}
 
 	mu        sync.Mutex
+	scanned   time.Time // the last interrupted-run scan
 	running   map[string]context.CancelFunc
 	closing   bool
 	executing sync.WaitGroup
@@ -136,6 +137,18 @@ func (r *Resumer) Sweep(ctx context.Context) {
 	}
 	if due, err := r.config.Journal.ClaimDueWaits(ctx, now, r.config.Batch); err == nil {
 		r.startLeased(ctx, leasesOf(due))
+	}
+	// A run is interrupted only once its lease lapses, so looking a third
+	// of a lease apart finds every one within a lease and a third; it scans
+	// live runs, which mostly wait, so it is not done every sweep.
+	r.mu.Lock()
+	due := r.scanned.IsZero() || now.Sub(r.scanned) >= r.config.Lease/3 || now.Before(r.scanned)
+	if due {
+		r.scanned = now
+	}
+	r.mu.Unlock()
+	if !due {
+		return
 	}
 	if interrupted, err := r.config.Journal.InterruptedRuns(ctx, now, r.config.Batch); err == nil {
 		r.startLeased(ctx, interrupted)
