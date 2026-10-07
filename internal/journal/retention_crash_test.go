@@ -63,7 +63,10 @@ func TestCompactionSurvivesAKillAtEitherCommitBarrier(t *testing.T) {
 			if err := command.Start(); err != nil {
 				t.Fatal(err)
 			}
-			waitForJournalMarker(t, markerPath)
+			t.Cleanup(func() { _ = command.Process.Kill() })
+			started := time.Now()
+			waitForCompactionBarrier(t, markerPath)
+			t.Logf("child reached the %s-commit barrier after %v", phase, time.Since(started).Round(time.Millisecond))
 			if err := command.Process.Kill(); err != nil {
 				t.Fatal(err)
 			}
@@ -130,9 +133,14 @@ func runCompactionChild(t *testing.T) {
 	phase := os.Getenv("NEWBLOK_JOURNAL_PHASE")
 	park := func(side string) func(string) {
 		return func(name string) {
-			if name == "compact" && phase == side {
-				journalMarkerAndWait()
+			if name != "compact" || phase != side {
+				return
 			}
+			if err := os.WriteFile(os.Getenv("NEWBLOK_JOURNAL_MARKER"), []byte(side), 0o600); err != nil {
+				panic(err)
+			}
+			// Park until the parent kills this process.
+			time.Sleep(time.Hour)
 		}
 	}
 	database, j := openRetentionJournal(t, os.Getenv("NEWBLOK_JOURNAL_PATH"), Hooks{BeforeCommit: park("before"), AfterCommit: park("after")})
@@ -140,6 +148,21 @@ func runCompactionChild(t *testing.T) {
 	if _, err := j.Compact(context.Background(), time.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// waitForCompactionBarrier waits for the child to park at its barrier. Its
+// deadline is generous because the child parks until killed, so a loaded
+// machine only slows the test down.
+func waitForCompactionBarrier(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Minute)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("compaction child did not reach its barrier: %s", path)
 }
 
 // reopenAfterKill opens the killed child's store, checks its integrity and
