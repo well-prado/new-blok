@@ -63,8 +63,10 @@ func TestUnauthorizedLateAndCancelSignalOutcomes(t *testing.T) {
 	if err := journal.CancelWait(context.Background(), "wait-2"); err != nil {
 		t.Fatal(err)
 	}
+	// A signal for the canceled wait is late (#332: one addressed by name
+	// alone would be held for the run's next wait of the name).
 	envelope.SignalID = "late"
-	result, err := journal.Signal(context.Background(), envelope, true)
+	result, err := journal.SignalWait(context.Background(), envelope, WaitTarget{WaitID: "wait-2"}, true)
 	if err != nil || !result.Late {
 		t.Fatalf("late=%+v err=%v", result, err)
 	}

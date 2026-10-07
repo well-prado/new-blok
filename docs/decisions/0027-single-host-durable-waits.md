@@ -40,22 +40,50 @@ iteration the run has already waited at (open or closed), returns
 `ErrWaitExists` and writes nothing. The insert has no conflict target, so
 both constraints resolve the same way; no raw SQLite error escapes.
 
-**Signal routing.** A signal is delivered to the run's oldest open wait of
-its name (by creation time, then wait ID), so two open waits of one name,
-for example in parallel branches, take signals in the order they started
-waiting. With no open wait of its name, a signal is:
+**Signal routing** (decided by the user on 2026-10-07 after Review R
+round 1: "FIFO + targeted"). A signal is addressed either by name or to
+one wait.
 
-- pending, when the run has never waited on that name: the next wait of the
-  name takes it when it is scheduled, as before #332;
-- late, when a wait of that name has closed. A signal addressed only by
-  name cannot tell a stale delivery for the closed wait (a retried approval
-  under a new signal ID) from an early one for a wait not yet scheduled;
-  handing it to the next wait could approve something the sender never
-  saw, while a late result is visible to the sender, who can send again.
+- *By name* (`Signal`): a queue. The signal goes to the run's oldest open
+  wait of its name. With none open it is pending, whatever waits of the
+  name have closed before, and each later wait of the name takes the
+  pending signal that arrived first. A loop that waits on "approval" in
+  every iteration therefore receives every approval sent before, between
+  or during its iterations, one per iteration, in the order they were
+  sent. A backlog is not skipped: if two signals arrived before the first
+  wait and a third between the first and second waits, the second wait
+  takes the second signal and the third wait takes the third.
+- *To one wait* (`SignalWait` with a `WaitTarget`: the wait ID, the step
+  and iteration paths, or both, which must name the same wait): only that
+  wait, never another. It is delivered when that wait is open and late
+  when it has closed. When the run has no such wait of the signal's name
+  (not scheduled yet, another name, or an ID and paths of different
+  waits) it is refused with `ErrNotFound` and nothing is stored, as
+  `internal/cluster`'s `DeliverSignal` refuses a signal for an unknown wait
+  ID (`ErrWaitNotFound`): the sender retries once the wait exists, and the
+  same signal ID is then delivered.
+- *Late* otherwise means the run has ended: completed, failed, canceled or
+  uncertain. `accepted` is the journal's only live run state, and no
+  transition leads back to it. A signal to an ended run is recorded late,
+  whether addressed by name or to a wait. A signal to a run the journal
+  does not hold is `ErrNotFound` and stores nothing.
+- A retry with a signal ID the run already has is a duplicate, reported
+  with the first send's outcome, under any concurrency (one transaction
+  per signal, writer-first, as before).
+
+"Oldest" and "arrived first" are insertion order (SQLite's `rowid`), not
+creation timestamps: the clock is injectable and may tie or step back, and
+ties must not fall to ID text order ("loop[10]" before "loop[9]"). The
+earlier rule of slice A's first revision, late when any wait of the name
+had closed, contradicted the queue: a signal sent between two iterations
+was lost while an older pending one was delivered (the reviewer's probe,
+now a test). A sender that means one specific wait addresses it instead.
 
 **Inspection.** Inspection still shows a run's waits as one step per name
-(`wait:<name>`), now its latest wait, instead of an arbitrary one. Per-
-iteration inspection of waits belongs with #333's iteration paths.
+(`wait:<name>`): its latest open wait, or its latest wait when none is
+open, instead of an arbitrary one, so a suspended run does not show its
+only wait step completed. Per-iteration inspection of waits belongs with
+#333's iteration paths.
 
 **Schema version 4.** The journal's schema version rises from 3 to 4
 (ADR 0003's table). A journal found at 3 or older is migrated in its schema
@@ -69,7 +97,11 @@ serves signal routing, which the old unique index served. A shape with
 `journal_waits.iteration_path` and no stamp is classified 4. Binaries at
 version 3 refuse a version-4 journal at open (#291); binaries from before
 #291 cannot see the stamp, and can still insert a wait with NULL paths,
-which the new table accepts as a legacy wait.
+which the new table accepts as a legacy wait. Such a binary, for example an
+old process still running during a rolling upgrade, also still routes a
+signal by `(run_id, name)` alone and reads an arbitrary row once a name
+repeats, with its own pre-#332 late rule: the same convention limit #286
+accepted for pre-#291 binaries (ADR 0003, Limits).
 
 ## Compatibility
 
@@ -77,7 +109,9 @@ which the new table accepts as a legacy wait.
 | --- | --- | --- |
 | `WaitRequest` requires `InvocationPath` and `IterationPath` | API, breaking for `internal/journal` callers (no caller outside tests) | Pass the waiting step's paths |
 | `WaitRecord` carries `InvocationPath`, `IterationPath` (empty for a legacy wait) | API, additive | None |
-| A run may wait on one name more than once; a signal goes to the oldest open wait of its name | behavioral | None |
+| A run may wait on one name more than once; a signal by name goes to the oldest open wait of its name, else waits in a first-in, first-out queue for the next | behavioral | None |
+| A signal by name is late only when the run has ended (before: whenever a wait of its name had closed); a signal to an unknown run is `ErrNotFound` (before: stored pending) | behavioral | None |
+| `SignalWait` and `WaitTarget` address one wait | API, additive | None |
 | A duplicate step identity or wait ID returns `ErrWaitExists`, not a raw constraint error | behavioral | None |
 | Journal schema 3 → 4 | schema, one-way | On open, in the schema transaction, killed or not (see Evidence) |
 
@@ -96,6 +130,13 @@ of the change:
 - `TestWaitIdentityMigrationSurvivesAKill`: a process killed (SIGKILL) in
   the schema transaction just before and just after its commit.
 - `TestUnstampedStepIdentityShapeIsClassified4`.
+- Review R round 1: `TestSignalsByNameQueueFirstInFirstOut` (the
+  reviewer's probe), `TestLoopOfThreeIterationsReceivesEverySignal`,
+  `TestSignalAfterTheRunEndsIsLate`,
+  `TestConcurrentDuplicateSignalsDeliverOnce`,
+  `TestSignalOrderIsInsertionOrderNotIDOrder`,
+  `TestInspectionShowsTheOpenWaitOfAName`,
+  `TestTargetedSignalReachesOnlyItsWait`.
 
 ## Limits (slice A)
 
@@ -105,6 +146,8 @@ of the change:
   single-host runner does not resume from it. Slice C, which also chooses
   how the engine's `StepIdentity` and #333's iteration path map onto the
   two paths recorded here.
-- A signal arriving between one wait of a name closing and the next
-  opening is late (see Signal routing). A signal addressed to a specific
-  wait, rather than a name, is not part of this record.
+- Pending signals of a run that ends stay pending (never late
+  retroactively) until the run is compacted with them.
+- A signal's duplicate check compares the signal ID only, not its
+  principal or payload (unlike `internal/cluster`, which refuses a
+  different payload under the same ID as a conflict).

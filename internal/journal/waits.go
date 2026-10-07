@@ -60,7 +60,7 @@ type SignalResult struct {
 }
 
 // ScheduleWait stores a waiting wait and, in the same transaction, hands it
-// the oldest pending signal of its name. A wait whose ID, or whose step and
+// the pending signal of its name that arrived first. A wait whose ID, or whose step and
 // iteration, the run already used returns ErrWaitExists and writes nothing.
 func (j *Journal) ScheduleWait(ctx context.Context, request WaitRequest) (WaitRecord, error) {
 	if request.RunID == "" || request.WaitID == "" || request.Name == "" || request.InvocationPath == "" || request.IterationPath == "" || request.DueAt.IsZero() {
@@ -84,7 +84,7 @@ func (j *Journal) ScheduleWait(ctx context.Context, request WaitRequest) (WaitRe
 		record = WaitRecord{WaitID: request.WaitID, RunID: request.RunID, Name: request.Name, InvocationPath: request.InvocationPath, IterationPath: request.IterationPath, DueAt: request.DueAt.UTC(), State: waitWaiting}
 		var signalID string
 		var payload []byte
-		err = tx.QueryRowContext(ctx, `SELECT signal_id, payload_json FROM journal_signals WHERE run_id = ? AND name = ? AND state = ? ORDER BY created_at, signal_id LIMIT 1`, request.RunID, request.Name, signalPending).Scan(&signalID, &payload)
+		err = tx.QueryRowContext(ctx, `SELECT signal_id, payload_json FROM journal_signals WHERE run_id = ? AND name = ? AND state = ? ORDER BY rowid LIMIT 1`, request.RunID, request.Name, signalPending).Scan(&signalID, &payload)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
@@ -105,19 +105,41 @@ func (j *Journal) ScheduleWait(ctx context.Context, request WaitRequest) (WaitRe
 	return record, err
 }
 
-// Signal delivers a signal to the run's oldest open wait of its name. With
-// no open wait it is pending, for the next wait of that name to take, when
-// the run never waited on the name, and late when a wait of the name has
-// already closed: a name-addressed signal cannot tell a stale delivery for
-// the closed wait from an early one for a later wait, and is never handed
-// to a wait it may not have been meant for (#332).
+// WaitTarget addresses one wait of a run, by wait ID, by the step and
+// iteration that wait at it, or by both (which must name the same wait).
+// The zero target addresses the signal's name instead.
+type WaitTarget struct {
+	WaitID         string
+	InvocationPath string
+	IterationPath  string
+}
+
+// Signal delivers a signal addressed by name. It goes to the run's oldest
+// open wait of its name; with none open it is pending, and the next waits
+// of the name take pending signals in the order they arrived (#332). It is
+// late only when the run has ended. A retry with the same signal ID is a
+// duplicate. A run the journal does not hold is ErrNotFound.
 func (j *Journal) Signal(ctx context.Context, envelope signal.Envelope, authorized bool) (SignalResult, error) {
+	return j.SignalWait(ctx, envelope, WaitTarget{}, authorized)
+}
+
+// SignalWait delivers a signal to one wait only: the wait target names, of
+// the signal's name. It is never handed to another wait. An open wait
+// takes it; a closed one, or an ended run, makes it late. A wait the run
+// does not have yet is refused with ErrNotFound and nothing is stored, as
+// internal/cluster refuses a signal for an unknown wait: the sender
+// retries once the wait exists. The zero target is Signal.
+func (j *Journal) SignalWait(ctx context.Context, envelope signal.Envelope, target WaitTarget, authorized bool) (SignalResult, error) {
 	if err := envelope.Validate(); err != nil {
 		return SignalResult{}, err
+	}
+	if (target.InvocationPath == "") != (target.IterationPath == "") {
+		return SignalResult{}, errors.New("journal: a wait target needs both its invocation and iteration path, or neither")
 	}
 	if !authorized {
 		return SignalResult{}, ErrUnauthorized
 	}
+	targeted := target != WaitTarget{}
 	var result SignalResult
 	err := j.withTx(ctx, "signal", func(tx *sql.Tx) error {
 		var existing string
@@ -129,26 +151,47 @@ func (j *Journal) Signal(ctx context.Context, envelope signal.Envelope, authoriz
 		if !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
-		var waitID string
-		err = tx.QueryRowContext(ctx, `SELECT wait_id FROM journal_waits WHERE run_id = ? AND name = ? AND state = ? ORDER BY created_at, wait_id LIMIT 1`, envelope.RunID, envelope.Name, waitWaiting).Scan(&waitID)
-		if errors.Is(err, sql.ErrNoRows) {
-			var closed bool
-			if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM journal_waits WHERE run_id = ? AND name = ?)`, envelope.RunID, envelope.Name).Scan(&closed); err != nil {
-				return err
-			}
-			state := signalPending
-			result = SignalResult{Accepted: true}
-			if closed {
-				state = signalLate
-				result = SignalResult{Late: true}
-			}
-			_, err = tx.ExecContext(ctx, `INSERT INTO journal_signals (run_id, signal_id, name, principal, payload_json, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, envelope.RunID, envelope.SignalID, envelope.Name, envelope.Principal, []byte(envelope.Payload), state, j.now())
+		store := func(state string) error {
+			_, err := tx.ExecContext(ctx, `INSERT INTO journal_signals (run_id, signal_id, name, principal, payload_json, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, envelope.RunID, envelope.SignalID, envelope.Name, envelope.Principal, []byte(envelope.Payload), state, j.now())
 			return err
+		}
+		// Accepted is the journal's only live run state: completed, failed,
+		// canceled and uncertain runs never return to it.
+		var runState string
+		if err := tx.QueryRowContext(ctx, `SELECT state FROM journal_runs WHERE run_id = ?`, envelope.RunID).Scan(&runState); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if runState != runAccepted {
+			result = SignalResult{Late: true}
+			return store(signalLate)
+		}
+		var waitID, waitState string
+		if targeted {
+			err = tx.QueryRowContext(ctx, `SELECT wait_id, state FROM journal_waits WHERE run_id = ? AND name = ? AND (? = '' OR wait_id = ?) AND (? = '' OR (invocation_path = ? AND iteration_path = ?))`, envelope.RunID, envelope.Name, target.WaitID, target.WaitID, target.InvocationPath, target.InvocationPath, target.IterationPath).Scan(&waitID, &waitState)
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+		} else {
+			// Insertion order, not created_at: the clock is injectable and
+			// may tie or step back.
+			waitState = waitWaiting
+			err = tx.QueryRowContext(ctx, `SELECT wait_id FROM journal_waits WHERE run_id = ? AND name = ? AND state = ? ORDER BY rowid LIMIT 1`, envelope.RunID, envelope.Name, waitWaiting).Scan(&waitID)
+			if errors.Is(err, sql.ErrNoRows) {
+				result = SignalResult{Accepted: true}
+				return store(signalPending)
+			}
 		}
 		if err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO journal_signals (run_id, signal_id, name, principal, payload_json, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, envelope.RunID, envelope.SignalID, envelope.Name, envelope.Principal, []byte(envelope.Payload), signalStored, j.now()); err != nil {
+		if waitState != waitWaiting {
+			result = SignalResult{Late: true}
+			return store(signalLate)
+		}
+		if err := store(signalStored); err != nil {
 			return err
 		}
 		_, err = tx.ExecContext(ctx, `UPDATE journal_waits SET state = ?, signal_id = ?, payload_json = ?, updated_at = ? WHERE wait_id = ? AND state = ?`, waitResumed, envelope.SignalID, []byte(envelope.Payload), j.now(), waitID, waitWaiting)

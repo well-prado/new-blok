@@ -41,9 +41,9 @@ func ticking(start time.Time) func() time.Time {
 // waits on "approval" in two iterations of one step, then in two other
 // steps at once, then on a timer in a third iteration. Every wait is
 // stored, every signal goes to the open wait of its name (the oldest when
-// two are open), and none is classified late while a wait of its name is
-// open. On origin/main the second wait fails with a raw UNIQUE error and
-// its signal is late.
+// two are open), and none is classified late while the run is live. On
+// origin/main the second wait fails with a raw UNIQUE error and its signal
+// is late.
 func TestRunWaitsOnOneNameInSuccessiveIterationsAndSteps(t *testing.T) {
 	ctx := context.Background()
 	database, j := newJournal(t, "identity.db", Config{Clock: ticking(fixtureBase)})
@@ -96,9 +96,9 @@ func TestRunWaitsOnOneNameInSuccessiveIterationsAndSteps(t *testing.T) {
 	if err != nil || len(claimed) != 1 || claimed[0].WaitID != "loop[2]" || claimed[0].IterationPath != "2" {
 		t.Fatalf("claimed=%+v err=%v", claimed, err)
 	}
-	// Every wait of the name has closed, so a new signal is late.
-	if result := send("s4"); result != (SignalResult{Late: true}) {
-		t.Fatalf("s4 after every wait closed=%+v; want late", result)
+	// Every wait of the name has closed, so a new signal waits for the next.
+	if result := send("s4"); result != (SignalResult{Accepted: true}) {
+		t.Fatalf("s4 after every wait closed=%+v; want pending", result)
 	}
 	wantWaits := []string{
 		"audit|approval|audit|root|resumed|s3",
@@ -110,7 +110,7 @@ func TestRunWaitsOnOneNameInSuccessiveIterationsAndSteps(t *testing.T) {
 	if got := waitRows(t, database, `SELECT wait_id || '|' || name || '|' || invocation_path || '|' || iteration_path || '|' || state || '|' || signal_id FROM journal_waits ORDER BY wait_id`); !reflect.DeepEqual(got, wantWaits) {
 		t.Fatalf("waits:\n got %q\nwant %q", got, wantWaits)
 	}
-	wantSignals := []string{"s0|stored", "s1|stored", "s2|stored", "s3|stored", "s4|late"}
+	wantSignals := []string{"s0|stored", "s1|stored", "s2|stored", "s3|stored", "s4|pending"}
 	if got := waitRows(t, database, `SELECT signal_id || '|' || state FROM journal_signals ORDER BY signal_id`); !reflect.DeepEqual(got, wantSignals) {
 		t.Fatalf("signals:\n got %q\nwant %q", got, wantSignals)
 	}
@@ -175,8 +175,8 @@ func TestDuplicateWaitIsErrWaitExists(t *testing.T) {
 // had (with no step identity), signals are untouched, and each legacy wait
 // still behaves as it did: an open one takes its signal, a resumed one
 // answers its signal's retry as a duplicate, a pending signal goes to the
-// next wait of its name, a canceled one makes a new signal late, and a due
-// timer is claimed. The run that waited on "approval" can then wait on it
+// next wait of its name, a canceled one makes a signal addressed to it
+// late, and a due timer is claimed. The run that waited on "approval" can then wait on it
 // again. Reopening changes nothing.
 func TestOriginMainWaitsMigrateToStepIdentity(t *testing.T) {
 	ctx := context.Background()
@@ -229,8 +229,11 @@ func TestOriginMainWaitsMigrateToStepIdentity(t *testing.T) {
 	if err != nil || early.State != waitResumed || early.SignalID != "early-1" {
 		t.Fatalf("wait after the legacy pending signal=%+v err=%v", early, err)
 	}
-	if result := send("canceled", "late-2", `{}`); result != (SignalResult{Late: true}) {
-		t.Fatalf("signal after the legacy canceled wait=%+v", result)
+	if result := send("canceled", "after-cancel", `{}`); result != (SignalResult{Accepted: true}) {
+		t.Fatalf("signal by name after the legacy canceled wait=%+v; want pending for the run's next wait", result)
+	}
+	if result, err := j.SignalWait(ctx, signal.Envelope{RunID: runs["canceled"], SignalID: "late-2", Name: "approval", Principal: "operator", Payload: []byte(`{}`)}, WaitTarget{WaitID: "canceled-approval"}, true); err != nil || result != (SignalResult{Late: true}) {
+		t.Fatalf("signal to the legacy canceled wait=%+v err=%v; want late", result, err)
 	}
 	claimed, err := j.ClaimDueWaits(ctx, fixtureBase.Add(time.Hour), 10)
 	if err != nil || len(claimed) != 1 || claimed[0].WaitID != "due-timer" || claimed[0].InvocationPath != "" {
@@ -249,7 +252,7 @@ func TestOriginMainWaitsMigrateToStepIdentity(t *testing.T) {
 	if got := waitRows(t, database, `SELECT wait_id || '|' || name || '|' || COALESCE(invocation_path, '') || '|' || COALESCE(iteration_path, '') || '|' || state || '|' || signal_id FROM journal_waits ORDER BY wait_id`); !reflect.DeepEqual(got, wantWaits) {
 		t.Fatalf("waits after use:\n got %q\nwant %q", got, wantWaits)
 	}
-	wantSignals := []string{"after-1|stored", "after-2|stored", "early-1|stored", "late-1|late", "late-2|late", "signal-1|stored"}
+	wantSignals := []string{"after-1|stored", "after-2|stored", "after-cancel|pending", "early-1|stored", "late-1|late", "late-2|late", "signal-1|stored"}
 	if got := waitRows(t, database, `SELECT signal_id || '|' || state FROM journal_signals ORDER BY signal_id`); !reflect.DeepEqual(got, wantSignals) {
 		t.Fatalf("signals after use:\n got %q\nwant %q", got, wantSignals)
 	}

@@ -138,8 +138,8 @@ func (j *Journal) ReadInspection(ctx context.Context, principal, runID, stepID s
 					payloadProjection = `CASE WHEN payload_json IS NULL THEN NULL WHEN length(payload_json)<=? THEN payload_json ELSE CAST('{"$truncated":true}' AS BLOB) END`
 				}
 				// A run may wait on one name more than once (#332); the
-				// step shows its latest wait.
-				query := fmt.Sprintf(`SELECT state,%s,created_at FROM journal_waits WHERE run_id=? AND name=? ORDER BY created_at DESC, wait_id DESC LIMIT 1`, payloadProjection)
+				// step shows its latest open wait, else its latest wait.
+				query := fmt.Sprintf(`SELECT state,%s,created_at FROM journal_waits WHERE run_id=? AND name=? ORDER BY state='waiting' DESC, rowid DESC LIMIT 1`, payloadProjection)
 				args := []any{runID, item.name[5:]}
 				if fields[inspection.FieldOutput] {
 					args = []any{maxPayload, runID, item.name[5:]}

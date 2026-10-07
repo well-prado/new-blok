@@ -13,7 +13,11 @@
 //	gzip -9 -n -c /tmp/legacy.db > testdata/restore/wait-identity-332/legacy-main-aaf633c.db.gz
 //
 // The committed database decompresses to 155,648 bytes with sha256
-// 7e8d68aec4e3d8b193f86f4d0e9f442d181a4966494aa1249f48eb991518fdaa.
+// 7e8d68aec4e3d8b193f86f4d0e9f442d181a4966494aa1249f48eb991518fdaa. The
+// hash pins the committed bytes only: running generate.go again writes a
+// database with the same rows but a different hash, because aaf633c's
+// Admit draws each run ID from crypto/rand and nothing outside that commit
+// can fix it. The test finds each run by its request key, never by ID.
 //
 // Each run is admitted under its request key and holds the waits and
 // signals named below, every one in a state origin/main can reach:
