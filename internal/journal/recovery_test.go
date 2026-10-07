@@ -360,3 +360,50 @@ func TestSupersededScopeAttemptIsFenced(t *testing.T) {
 		t.Fatalf("recovered=%+v err=%v", recovery, err)
 	}
 }
+
+// A journal a version-4 binary (after #332, before #334) wrote has no scope
+// attempts. Opening it raises it to version 5 and adds the column, and a
+// scope that binary left running has the empty attempt, which no caller
+// holds: completing it without an attempt is ErrStaleAttempt, and only a
+// fresh StartScope can complete it.
+func TestVersion4JournalGainsScopeAttempts(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "journal-4.db")
+	database, j := newJournalAtPath(t, path, Config{})
+	if err := j.RegisterArtifact(ctx, ArtifactRecord{Digest: "sha256:admitted", Version: "1.0.0", ManifestJSON: []byte(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	run, err := j.Admit(ctx, AdmissionRequest{RequestKey: "journal-4", Workflow: "nested", ArtifactDigest: "sha256:admitted", Input: []byte(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := j.SaveCheckpoint(ctx, Checkpoint{RunID: run.RunID, ArtifactDigest: "sha256:admitted", CheckpointDigest: "sha256:codec", State: []byte(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	// Make it the database a version-4 binary leaves: no attempt column, a
+	// running scope, stamp 4.
+	execAll(t, database,
+		`ALTER TABLE journal_scopes DROP COLUMN attempt_id`,
+		`INSERT INTO journal_scopes (run_id, path, kind, parent_path, state, updated_at) VALUES ('`+run.RunID+`', 'each/0', 'each', '', 'running', 0)`,
+		`UPDATE blok_schema_versions SET version = 4, upgraded_from = 3 WHERE component = 'journal'`)
+	database.Close()
+
+	database, j = newJournalAtPath(t, path, Config{})
+	defer database.Close()
+	if got := oneRow(t, database, `SELECT version || '|' || upgraded_from FROM blok_schema_versions WHERE component = 'journal'`); got != "5|4" {
+		t.Fatalf("journal stamp=%s; want 5 upgraded from 4", got)
+	}
+	if err := j.CompleteScope(ctx, run.RunID, "each/0", "", []byte(`{"v":"guessed"}`)); !errors.Is(err, ErrStaleAttempt) {
+		t.Errorf("completing a pre-#334 scope without an attempt: err=%v, want ErrStaleAttempt", err)
+	}
+	if scopes := recovered(t, j, run.RunID).Scopes; len(scopes) != 1 || scopes[0].State != checkpointRunning || len(scopes[0].Output) != 0 {
+		t.Fatalf("pre-#334 scope changed: %+v", scopes)
+	}
+	started, err := j.StartScope(ctx, ScopeRecord{RunID: run.RunID, Path: "each/0", Kind: "each"})
+	if err != nil || started.AttemptID == "" {
+		t.Fatalf("start=%+v err=%v", started, err)
+	}
+	if err := j.CompleteScope(ctx, run.RunID, "each/0", started.AttemptID, []byte(`{"v":"current"}`)); err != nil {
+		t.Fatal(err)
+	}
+}

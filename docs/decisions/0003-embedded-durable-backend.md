@@ -177,7 +177,7 @@ release supports:
 
 | Component | Owner | Version | History |
 | --- | --- | --- | --- |
-| `journal` | `internal/journal` | 4 | 1 before #281; 2 with #281's erasure tables; 3 with #286's reconciliation tenant; 4 with #332's wait identity (ADR 0027) |
+| `journal` | `internal/journal` | 5 | 1 before #281; 2 with #281's erasure tables; 3 with #286's reconciliation tenant; 4 with #332's wait identity (ADR 0027); 5 with #334's scope attempt (below) |
 | `audit` | `contract/audit` | 1 | the #80 tables, unchanged since |
 | `worker` | `trigger/worker` | 2 | 1 before #290; 2 with #290's `worker_compacted` and `worker_meta` |
 | `approval` | `contract/approval` | 1 | `approval_decisions_v1` as #75 introduced it |
@@ -438,21 +438,28 @@ it was admitted under fails closed: `Recover` refuses it under either
 artifact, and `SaveCheckpoint` cannot replace the row. Resolving it is an
 operator decision, not something the journal guesses.
 
-The scope attempt is a new `journal_scopes.attempt_id` column. An older
-binary opens a database that has it and ignores it, so it neither honours
-the fence nor the finality: the #334 review ran the aaf633c binary, which restarted a
-fenced scope without touching `attempt_id` and overwrote a completed output
-this binary had refused. A rollback would silently void the guarantees
-above, so the column must be version-gated (§ Schema versions). The raise
-(journal 5, the column step gated on the version found) lands together with
-#350's version-aware migration; until then the column is added by a
-shape-guarded step on every open.
+The scope attempt is a new `journal_scopes.attempt_id` column, and it
+raises the journal to version 5 (§ Schema versions). An older binary that
+opened such a database would ignore the column, so it would honour neither
+the fence nor the finality: the #334 review ran the aaf633c binary on one,
+and it restarted a fenced scope without touching `attempt_id` and
+overwrote a completed output this binary had refused. A rollback would
+silently void the guarantees above; with the raise, a version-4 or older
+binary refuses the database at open instead (`store.NewerSchemaError`).
+The migration adds the column when the version found is older than 5; it
+uses `ensureColumn`, so a database a pre-release build of #334 already gave
+the column under an older stamp migrates too. Version 5 has no shape for
+`inferSchemaVersion`: every database with the column was written after the
+stamp existed (#291), so it is stamped and never classified by shape. A
+scope a version-4 binary left running has the empty attempt id, which no
+caller holds, so only a fresh `StartScope` can complete it.
 
 | Change | Class | Migration |
 | --- | --- | --- |
-| `journal_scopes.attempt_id TEXT NOT NULL DEFAULT ''` (#334) | schema, additive | Added on open; existing rows get `''`, which no attempt matches until the next `StartScope`. Version raise pending #350 (above) |
+| `journal_scopes.attempt_id TEXT NOT NULL DEFAULT ''` (#334) | schema, additive | Added when the version found is older than 5; existing rows get `''`, which no attempt matches until the next `StartScope` |
 | `StartScope` returns `ScopeAttempt{AttemptID, AlreadyCompleted}` instead of a bool; `CompleteScope` takes the attempt id (#334) | breaking (internal API) | Callers keep the attempt id `StartScope` returned and pass it to `CompleteScope`. Outside `internal/journal` only `contract/audit`'s tests call them |
 | Completed and canceled scopes are final; scopes are fenced by attempt; checkpoints are bound to the admitted artifact and an accepted run; `StartScope` needs an accepted run; `Recover` checks the admitted artifact (#334) | behavioral (bug fix) | None for a caller that writes each record forward once. A write that used to overwrite, or a restart of a canceled scope, now returns one of the typed errors above. Nothing in the repository restarted a canceled scope |
+| Journal schema version 5 (#334) | behavioral (breaking for downgrades) | None for upgrades. A binary supporting journal 4 or older refuses a database this release opened, with `store.NewerSchemaError`; restore a backup taken before the upgrade, as for every raise above |
 | `ErrRecordFinal`, `ScopeAttempt` (#334) | additive | None |
 
 ## Alternatives considered

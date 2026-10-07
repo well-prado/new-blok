@@ -196,16 +196,19 @@ func New(ctx context.Context, database store.Database, config Config) (*Journal,
 // (journal_compacted, journal_meta, and journal_reconciliations rebuilt
 // with digests and erased_at), 3 with #286's reconciliation tenant, 4 with
 // #332's wait identity (journal_waits keyed by step and iteration instead
-// of by name). New refuses a journal stamped with a newer one. Raise it
+// of by name), 5 with #334's scope attempt (journal_scopes.attempt_id,
+// which fences scope completion). New refuses a journal stamped with a newer one. Raise it
 // with every change an older binary would misread, together with the
 // migration step that makes it. It is a variable only so tests can stand in for an older
 // binary.
-var schemaVersion = 4
+var schemaVersion = 5
 
 // inferSchemaVersion classifies a journal written before the stamp existed
 // by its shape: 0 when it has no tables yet, 4 when its waits carry an
 // iteration path (#332), 3 when its reconciliations carry a tenant (#286),
-// 2 when they carry erased_at (#281), else 1.
+// 2 when they carry erased_at (#281), else 1. There is no shape for 5:
+// every database with journal_scopes.attempt_id was written after the stamp
+// existed (#291), so it is stamped and never inferred.
 func inferSchemaVersion(ctx context.Context, tx *sql.Tx) (int, error) {
 	if found, err := migration.TableExists(ctx, tx, "journal_runs"); err != nil || !found {
 		return 0, err
@@ -269,7 +272,6 @@ func (j *Journal) migrate(ctx context.Context, tx *sql.Tx, from int) error {
 		{"journal_operations", "input_json", `BLOB`},
 		{"journal_attempts", "input_json", `BLOB`},
 		{"journal_scopes", "input_json", `BLOB`},
-		{"journal_scopes", "attempt_id", `TEXT NOT NULL DEFAULT ''`},
 	} {
 		if err := ensureColumn(ctx, tx, column.table, column.name, column.declaration); err != nil {
 			return err
@@ -288,7 +290,18 @@ func (j *Journal) migrate(ctx context.Context, tx *sql.Tx, from int) error {
 		return err
 	}
 	if from < 4 {
-		return migrateWaitIdentity(ctx, tx)
+		if err := migrateWaitIdentity(ctx, tx); err != nil {
+			return err
+		}
+	}
+	// A scope attempt fences scope completion (#334). Version 5 marks it, so
+	// a binary that would ignore the fence refuses the database instead.
+	// ensureColumn keeps the step idempotent: a database a pre-release
+	// build of #334 opened already has the column under an older stamp.
+	if from < 5 {
+		if err := ensureColumn(ctx, tx, "journal_scopes", "attempt_id", `TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
 	}
 	return nil
 }

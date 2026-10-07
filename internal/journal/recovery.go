@@ -23,11 +23,11 @@ const (
 var ErrArtifactMismatch = errors.New("journal: checkpoint artifact does not match")
 
 // Refusals of the recovery records (#334). A recovery record is a run's
-// receipt: once written it does not change, except to move forward to its
-// one terminal value. Each refusal below leaves the stored record exactly as
-// it was.
+// receipt: once written it does not change, except to move forward to one
+// of its two terminal states (completed or canceled). Each refusal below
+// leaves the stored record exactly as it was.
 var (
-	// ErrRecordFinal: the record has reached its terminal value and the
+	// ErrRecordFinal: the record has reached a terminal state and the
 	// write would change it: a completed scope given another output or by
 	// another attempt, or a canceled scope started again. Repeating the
 	// write that completed a scope, byte for byte and from the attempt that
