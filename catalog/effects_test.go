@@ -424,7 +424,9 @@ func TestOrderOutboxLostEmailResponseRecoversWithStableProviderKey(t *testing.T)
 		_, err := email.Invoke(ctx, provider.EmailInput{Key: event.ID, To: "synthetic@example.invalid", Subject: "order", Text: string(event.Payload)})
 		return err
 	}
-	service, err := order.New(ctx, db, map[string]int64{"coffee": 1500}, nil)
+	now := time.Unix(1_700_000_000, 0)
+	clock := func() time.Time { return now }
+	service, err := order.New(ctx, db, map[string]int64{"coffee": 1500}, clock)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -445,7 +447,8 @@ func TestOrderOutboxLostEmailResponseRecoversWithStableProviderKey(t *testing.T)
 	}
 	db = openDB(t, path)
 	defer db.Close()
-	service, err = order.New(ctx, db, map[string]int64{"coffee": 1500}, nil)
+	now = now.Add(time.Minute) // the restarted dispatcher runs after the retry backoff
+	service, err = order.New(ctx, db, map[string]int64{"coffee": 1500}, clock)
 	if err != nil {
 		t.Fatal(err)
 	}
