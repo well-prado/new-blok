@@ -1,6 +1,7 @@
 package lowering
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -109,5 +110,51 @@ func TestChildReferencesFollowTheCallRules(t *testing.T) {
 		if _, err := Lower("w", "1.0.0", []Instruction{call("a", "$input"), child}, tc.output, options); err == nil || err.Error() != tc.want {
 			t.Errorf("output %s: err=%v; want %q", tc.output, err, tc.want)
 		}
+	}
+}
+
+func ifOf(id string, then, otherwise []Instruction, thenOutput, elseOutput string) Instruction {
+	return Instruction{Kind: "if", ID: id, Input: "$literal", Literal: []byte("true"), Arms: []Arm{
+		{Name: "then", Instructions: then, Output: thenOutput}, {Name: "else", Instructions: otherwise, Output: elseOutput},
+	}}
+}
+
+// Without Options.Control (the agent catalog) a control construct is
+// rejected by kind wherever it is, as before #333.
+func TestControlIsRejectedWithoutTheControlOption(t *testing.T) {
+	nested := ifOf("outer", []Instruction{call("a", "$input"), ifOf("inner", nil, nil, "$step.a", "$step.a")}, nil, "$join.inner", "$literal")
+	for _, options := range []Options{{}, {Literals: true, Children: true}} {
+		if _, err := Lower("w", "1.0.0", []Instruction{nested}, "$join.outer", options); err == nil || err.Error() != `flow: instruction "outer" of kind "if" cannot be lowered` {
+			t.Fatalf("options %+v: err=%v", options, err)
+		}
+	}
+	// A construct nested in an arm is checked before anything else, even
+	// with the option.
+	each := Instruction{Kind: "each", ID: "loop", Input: "$step.a", Arms: []Arm{{Name: "body", Output: "$step.a"}}}
+	if _, err := Lower("w", "1.0.0", []Instruction{call("a", "$input"), ifOf("route", []Instruction{each}, nil, "$step.a", "$step.a")}, "$join.route", Options{Control: true}); err == nil || err.Error() != `flow: instruction "loop" of kind "each" cannot be lowered` {
+		t.Fatalf("nested each: err=%v", err)
+	}
+}
+
+func TestControlNestingIsBounded(t *testing.T) {
+	// build nests levels ifs, each in the then arm of the one before; every
+	// arm reads "a", which the workflow computes first.
+	build := func(levels int) ([]Instruction, string) {
+		var block []Instruction
+		output := "$step.a"
+		for level := 0; level < levels; level++ {
+			id := fmt.Sprintf("c%d", level)
+			block = []Instruction{ifOf(id, block, nil, output, "$step.a")}
+			output = "$join." + id
+		}
+		return append([]Instruction{call("a", "$input")}, block...), output
+	}
+	instructions, output := build(MaxNesting)
+	if _, err := Lower("w", "1.0.0", instructions, output, Options{Control: true}); err != nil {
+		t.Fatalf("at the bound: %v", err)
+	}
+	instructions, output = build(MaxNesting + 1)
+	if _, err := Lower("w", "1.0.0", instructions, output, Options{Control: true}); err == nil || err.Error() != `flow: if "c0": control flow nests deeper than 64 levels` {
+		t.Fatalf("past the bound: err=%v", err)
 	}
 }

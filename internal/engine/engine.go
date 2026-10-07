@@ -57,14 +57,19 @@ type Result struct {
 }
 
 type StepResult struct {
-	ID         string
-	Executed   bool
-	Input      any
-	Attempt    int
-	Output     any
-	Error      error
-	StartedAt  time.Time
-	FinishedAt time.Time
+	ID string
+	// InvocationPath and IterationPath identify this execution of the step
+	// (ADR 0031): its id at the root or "<construct path>/<arm>/<id>"
+	// inside an arm, and "root" outside every each.
+	InvocationPath string
+	IterationPath  string
+	Executed       bool
+	Input          any
+	Attempt        int
+	Output         any
+	Error          error
+	StartedAt      time.Time
+	FinishedAt     time.Time
 }
 
 type Engine struct {
@@ -226,6 +231,14 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 	if len(program.Instructions) > e.maxSteps {
 		return Result{}, &Error{Code: "step_budget_exceeded", Class: "admission"}
 	}
+	if err := checkProgram(program, e.maxSteps); err != nil {
+		return Result{}, err
+	}
+	if journal != nil && program.Format == contract.ControlFormat {
+		// Durable control flow journals scopes, joins and children (#333,
+		// later slices); until then a durable runner refuses it.
+		return Result{}, &Error{Code: "durable_control_unsupported", Class: "configuration", Err: fmt.Errorf("control instructions run only in memory until #333 journals them")}
+	}
 	if journal != nil {
 		encodedInput, err := json.Marshal(input)
 		if err != nil {
@@ -338,261 +351,305 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 		event.At = step.FinishedAt
 		emit(event)
 	}
-	for _, instruction := range program.Instructions {
-		if err := ctx.Err(); err != nil {
-			return result, &Error{Code: "canceled", Class: "cancellation", Step: instruction.ID, Err: err}
+	// runBlock runs one block of instructions in its frame: the program at
+	// the root, or one arm of a control instruction (ADR 0031).
+	var runBlock func(context.Context, *frame, []contract.InternalInstruction) error
+	// runArm runs one arm in its frame and returns the arm's result.
+	runArm := func(ctx context.Context, f *frame, owner string, arm contract.Arm) (any, error) {
+		if err := runBlock(ctx, f, arm.Instructions); err != nil {
+			return nil, err
 		}
-		step := StepResult{ID: instruction.ID}
-		external = false
-		if tracing {
-			stepSpan = runSpan.Child()
+		if arm.Output == nil {
+			return nil, nil
 		}
-		switch instruction.Kind {
-		case "wait":
-			if journal == nil || instruction.Wait == nil {
-				step.Error = &Error{Code: "wait_requires_durable_runner", Class: "configuration", Step: instruction.ID}
-				step.FinishedAt = time.Now().UTC()
-				appendStep(step)
-				return result, step.Error
+		output, err := f.operand(*arm.Output)
+		if err != nil {
+			return nil, &Error{Code: "invalid_output_reference", Class: "validation", Step: owner, Err: fmt.Errorf("arm %s: %w", arm.Name, err)}
+		}
+		return output, nil
+	}
+	runBlock = func(ctx context.Context, f *frame, instructions []contract.InternalInstruction) error {
+		for _, instruction := range instructions {
+			if err := ctx.Err(); err != nil {
+				return &Error{Code: "canceled", Class: "cancellation", Step: instruction.ID, Err: err}
 			}
-			waitJournal, ok := journal.(WaitJournal)
-			if !ok {
-				step.Error = &Error{Code: "wait_journal_unavailable", Class: "configuration", Step: instruction.ID}
-				step.FinishedAt = time.Now().UTC()
-				appendStep(step)
-				return result, step.Error
-			}
-			plan, err := json.Marshal(instruction.Wait)
-			if err != nil {
-				step.Error = &Error{Code: "wait_identity_encode", Class: "persistence", Step: instruction.ID, Err: err}
-				step.FinishedAt = time.Now().UTC()
-				appendStep(step)
-				return result, step.Error
-			}
-			identity := stepIdentity(runID, program.Digest, instruction.ID, plan)
-			waitResult, ready, waitErr := waitJournal.Await(ctx, WaitIdentity{Step: identity, Name: instruction.Wait.Name, TimeoutMillis: instruction.Wait.TimeoutMillis})
-			if waitErr != nil {
-				step.Error = journalFailure("journal_wait", instruction.ID, waitErr, nil)
-				step.FinishedAt = time.Now().UTC()
-				appendStep(step)
-				return result, step.Error
-			}
-			if !ready {
-				step.Error = &Error{Code: "run_suspended", Class: "waiting", Step: instruction.ID, Suspended: true}
-				step.FinishedAt = time.Now().UTC()
-				appendStep(step)
-				return result, step.Error
-			}
-			state[instruction.ID] = waitResult
-			step.Output = waitResult
-		case "call":
-			var stepAttempt StepAttempt
-			definition, ok := e.nodes[instruction.Node]
-			if !ok {
-				step.Error = &Error{Code: "unknown_node", Class: "configuration", Step: instruction.ID}
-				step.FinishedAt = time.Now().UTC()
-				appendStep(step)
-				return result, step.Error
-			}
-			external = len(definition.Descriptor().Effects) > 0
-			callInput, err := resolveCallInput(state, instruction, input)
-			if err != nil {
-				step.Error = &Error{Code: "invalid_input_reference", Class: "validation", Step: instruction.ID, Err: err}
-				step.FinishedAt = time.Now().UTC()
-				appendStep(step)
-				return result, step.Error
-			}
-			step.Input = callInput
-			step.Attempt = 1
-			step.StartedAt = time.Now().UTC()
-			if observing {
-				processing := inspection.Event{Kind: inspection.StepProcessing, StepID: step.ID, Attempt: step.Attempt, AttemptID: invocation.AttemptID, Trace: stepSpan, External: external}
-				if payloads {
-					processing.Input = marshalObservation(step.Input)
-				}
-				emit(processing)
-			}
-			if err := validateSchema(definition.Descriptor().InputSchema, callInput); err != nil {
-				step.Error = &Error{Code: "invalid_input", Class: "validation", Step: instruction.ID, Err: err}
-				step.FinishedAt = time.Now().UTC()
-				appendStep(step)
-				return result, step.Error
-			}
-			var persistedInput json.RawMessage
-			var identity StepIdentity
-			if journal != nil {
-				persistedInput, err = json.Marshal(callInput)
-				if err != nil {
-					step.Error = &Error{Code: "journal_input_encode", Class: "persistence", Step: instruction.ID, Err: err}
-					step.FinishedAt = time.Now().UTC()
-					appendStep(step)
-					return result, step.Error
-				}
-				identity = stepIdentity(runID, program.Digest, instruction.ID, persistedInput)
-				persistedOutput, completed, loadErr := journal.Load(ctx, identity)
-				if loadErr != nil {
-					step.Error = journalFailure("journal_step_load", instruction.ID, loadErr, definition.Descriptor().Effects)
-					step.FinishedAt = time.Now().UTC()
-					appendStep(step)
-					return result, step.Error
-				}
-				if completed {
-					if schemaErr := validateRawSchema(definition.Descriptor().OutputSchema, persistedOutput); schemaErr != nil {
-						step.Error = &Error{Code: "journal_output_invalid", Class: "persistence", Step: instruction.ID, Err: schemaErr}
-						step.FinishedAt = time.Now().UTC()
-						appendStep(step)
-						return result, step.Error
-					}
-					output, decodeErr := definition.DecodeOutput(persistedOutput)
-					if decodeErr == nil {
-						decodeErr = validateSchema(definition.Descriptor().OutputSchema, output)
-					}
-					if decodeErr != nil {
-						step.Error = &Error{Code: "journal_output_invalid", Class: "persistence", Step: instruction.ID, Err: decodeErr}
-						step.FinishedAt = time.Now().UTC()
-						appendStep(step)
-						return result, step.Error
-					}
-					committed, cloneErr := value.Clone(output)
-					if cloneErr != nil {
-						step.Error = &Error{Code: "output_ownership", Class: "validation", Step: instruction.ID, Err: cloneErr}
-						step.FinishedAt = time.Now().UTC()
-						appendStep(step)
-						return result, step.Error
-					}
-					state[instruction.ID] = committed
-					step.Output = committed
-					step.FinishedAt = time.Now().UTC()
-					appendStep(step)
-					if len(definition.Descriptor().Effects) > 0 {
-						effected = instruction.ID
-					}
-					continue
-				}
-				attempt, beginErr := journal.Begin(ctx, identity, persistedInput, definition.Descriptor().Effects)
-				if beginErr != nil {
-					step.Error = journalFailure("journal_step_begin", instruction.ID, beginErr, definition.Descriptor().Effects)
-					step.FinishedAt = time.Now().UTC()
-					appendStep(step)
-					return result, step.Error
-				}
-				stepAttempt = attempt
-			}
-			invokeCtx := ctx
-			if observing {
-				invokeCtx = node.WithLogger(ctx, slog.New(&inspectionLogHandler{emit: emit, step: instruction.ID, trace: stepSpan}))
-			}
+			step := StepResult{ID: instruction.ID, InvocationPath: f.invocation(instruction.ID), IterationPath: f.iteration}
+			external = false
 			if tracing {
-				// The node, a worker it calls and any child run it starts
-				// see this step attempt as their parent.
-				invokeCtx = observe.WithTrace(invokeCtx, stepSpan.TraceContext)
+				stepSpan = runSpan.Child()
 			}
-			output, err := definition.Invoke(invokeCtx, callInput)
-			step.Executed = true
-			if err != nil {
-				if journal != nil {
-					hookCtx, cancel := journalContext(ctx)
-					journalErr := journal.Fail(hookCtx, stepAttempt, definition.Descriptor().Effects, err)
-					cancel()
-					if journalErr != nil {
-						err = fmt.Errorf("%w (effect reconciliation unconfirmed: %v)", err, journalErr)
-					}
+			switch instruction.Kind {
+			case "wait":
+				if journal == nil || instruction.Wait == nil {
+					step.Error = &Error{Code: "wait_requires_durable_runner", Class: "configuration", Step: instruction.ID}
+					step.FinishedAt = time.Now().UTC()
+					appendStep(step)
+					return step.Error
 				}
-				step.Error = classifyJournaledFailure("node_error", instruction.ID, err, definition.Descriptor().Effects, effected, journal != nil)
-				step.FinishedAt = time.Now().UTC()
-				appendStep(step)
-				return result, step.Error
-			}
-			if err := validateSchema(definition.Descriptor().OutputSchema, output); err != nil {
-				if journal != nil {
-					hookCtx, cancel := journalContext(ctx)
-					journalErr := journal.Fail(hookCtx, stepAttempt, definition.Descriptor().Effects, err)
-					cancel()
-					if journalErr != nil {
-						err = fmt.Errorf("%w (effect reconciliation unconfirmed: %v)", err, journalErr)
-					}
+				waitJournal, ok := journal.(WaitJournal)
+				if !ok {
+					step.Error = &Error{Code: "wait_journal_unavailable", Class: "configuration", Step: instruction.ID}
+					step.FinishedAt = time.Now().UTC()
+					appendStep(step)
+					return step.Error
 				}
-				step.Error = classifyJournaledFailure("invalid_output", instruction.ID, err, definition.Descriptor().Effects, effected, journal != nil)
-				step.FinishedAt = time.Now().UTC()
-				appendStep(step)
-				return result, step.Error
-			}
-			committed, err := value.Clone(output)
-			if err != nil {
-				if journal != nil {
-					hookCtx, cancel := journalContext(ctx)
-					journalErr := journal.Fail(hookCtx, stepAttempt, definition.Descriptor().Effects, err)
-					cancel()
-					if journalErr != nil {
-						err = fmt.Errorf("%w (effect reconciliation unconfirmed: %v)", err, journalErr)
-					}
+				plan, err := json.Marshal(instruction.Wait)
+				if err != nil {
+					step.Error = &Error{Code: "wait_identity_encode", Class: "persistence", Step: instruction.ID, Err: err}
+					step.FinishedAt = time.Now().UTC()
+					appendStep(step)
+					return step.Error
 				}
-				step.Error = classifyJournaledFailure("output_ownership", instruction.ID, err, definition.Descriptor().Effects, effected, journal != nil)
-				step.FinishedAt = time.Now().UTC()
-				appendStep(step)
-				return result, step.Error
-			}
-			if journal != nil {
-				persistedOutput, encodeErr := json.Marshal(committed)
-				if encodeErr != nil {
-					hookCtx, cancel := journalContext(ctx)
-					journalErr := journal.Fail(hookCtx, stepAttempt, definition.Descriptor().Effects, encodeErr)
-					cancel()
-					if journalErr != nil {
-						encodeErr = fmt.Errorf("%w (effect reconciliation unconfirmed: %v)", encodeErr, journalErr)
+				identity := stepIdentity(runID, program.Digest, instruction.ID, plan)
+				waitResult, ready, waitErr := waitJournal.Await(ctx, WaitIdentity{Step: identity, Name: instruction.Wait.Name, TimeoutMillis: instruction.Wait.TimeoutMillis})
+				if waitErr != nil {
+					step.Error = journalFailure("journal_wait", instruction.ID, waitErr, nil)
+					step.FinishedAt = time.Now().UTC()
+					appendStep(step)
+					return step.Error
+				}
+				if !ready {
+					step.Error = &Error{Code: "run_suspended", Class: "waiting", Step: instruction.ID, Suspended: true}
+					step.FinishedAt = time.Now().UTC()
+					appendStep(step)
+					return step.Error
+				}
+				f.values[instruction.ID] = waitResult
+				step.Output = waitResult
+			case "call":
+				var stepAttempt StepAttempt
+				definition, ok := e.nodes[instruction.Node]
+				if !ok {
+					step.Error = &Error{Code: "unknown_node", Class: "configuration", Step: instruction.ID}
+					step.FinishedAt = time.Now().UTC()
+					appendStep(step)
+					return step.Error
+				}
+				external = len(definition.Descriptor().Effects) > 0
+				callInput, err := resolveCallInput(f, instruction, input)
+				if err != nil {
+					step.Error = &Error{Code: "invalid_input_reference", Class: "validation", Step: instruction.ID, Err: err}
+					step.FinishedAt = time.Now().UTC()
+					appendStep(step)
+					return step.Error
+				}
+				step.Input = callInput
+				step.Attempt = 1
+				step.StartedAt = time.Now().UTC()
+				if observing {
+					processing := inspection.Event{Kind: inspection.StepProcessing, StepID: step.ID, Attempt: step.Attempt, AttemptID: invocation.AttemptID, Trace: stepSpan, External: external}
+					if payloads {
+						processing.Input = marshalObservation(step.Input)
 					}
-				} else {
-					hookCtx, cancel := journalContext(ctx)
-					encodeErr = journal.Complete(hookCtx, stepAttempt, persistedOutput)
-					cancel()
+					emit(processing)
+				}
+				if err := validateSchema(definition.Descriptor().InputSchema, callInput); err != nil {
+					step.Error = &Error{Code: "invalid_input", Class: "validation", Step: instruction.ID, Err: err}
+					step.FinishedAt = time.Now().UTC()
+					appendStep(step)
+					return step.Error
+				}
+				var persistedInput json.RawMessage
+				var identity StepIdentity
+				if journal != nil {
+					persistedInput, err = json.Marshal(callInput)
+					if err != nil {
+						step.Error = &Error{Code: "journal_input_encode", Class: "persistence", Step: instruction.ID, Err: err}
+						step.FinishedAt = time.Now().UTC()
+						appendStep(step)
+						return step.Error
+					}
+					identity = stepIdentity(runID, program.Digest, instruction.ID, persistedInput)
+					persistedOutput, completed, loadErr := journal.Load(ctx, identity)
+					if loadErr != nil {
+						step.Error = journalFailure("journal_step_load", instruction.ID, loadErr, definition.Descriptor().Effects)
+						step.FinishedAt = time.Now().UTC()
+						appendStep(step)
+						return step.Error
+					}
+					if completed {
+						if schemaErr := validateRawSchema(definition.Descriptor().OutputSchema, persistedOutput); schemaErr != nil {
+							step.Error = &Error{Code: "journal_output_invalid", Class: "persistence", Step: instruction.ID, Err: schemaErr}
+							step.FinishedAt = time.Now().UTC()
+							appendStep(step)
+							return step.Error
+						}
+						output, decodeErr := definition.DecodeOutput(persistedOutput)
+						if decodeErr == nil {
+							decodeErr = validateSchema(definition.Descriptor().OutputSchema, output)
+						}
+						if decodeErr != nil {
+							step.Error = &Error{Code: "journal_output_invalid", Class: "persistence", Step: instruction.ID, Err: decodeErr}
+							step.FinishedAt = time.Now().UTC()
+							appendStep(step)
+							return step.Error
+						}
+						committed, cloneErr := value.Clone(output)
+						if cloneErr != nil {
+							step.Error = &Error{Code: "output_ownership", Class: "validation", Step: instruction.ID, Err: cloneErr}
+							step.FinishedAt = time.Now().UTC()
+							appendStep(step)
+							return step.Error
+						}
+						f.values[instruction.ID] = committed
+						step.Output = committed
+						step.FinishedAt = time.Now().UTC()
+						appendStep(step)
+						if len(definition.Descriptor().Effects) > 0 {
+							effected = instruction.ID
+						}
+						continue
+					}
+					attempt, beginErr := journal.Begin(ctx, identity, persistedInput, definition.Descriptor().Effects)
+					if beginErr != nil {
+						step.Error = journalFailure("journal_step_begin", instruction.ID, beginErr, definition.Descriptor().Effects)
+						step.FinishedAt = time.Now().UTC()
+						appendStep(step)
+						return step.Error
+					}
+					stepAttempt = attempt
+				}
+				invokeCtx := ctx
+				if observing {
+					invokeCtx = node.WithLogger(ctx, slog.New(&inspectionLogHandler{emit: emit, step: instruction.ID, trace: stepSpan}))
+				}
+				if tracing {
+					// The node, a worker it calls and any child run it starts
+					// see this step attempt as their parent.
+					invokeCtx = observe.WithTrace(invokeCtx, stepSpan.TraceContext)
+				}
+				output, err := definition.Invoke(invokeCtx, callInput)
+				step.Executed = true
+				if err != nil {
+					if journal != nil {
+						hookCtx, cancel := journalContext(ctx)
+						journalErr := journal.Fail(hookCtx, stepAttempt, definition.Descriptor().Effects, err)
+						cancel()
+						if journalErr != nil {
+							err = fmt.Errorf("%w (effect reconciliation unconfirmed: %v)", err, journalErr)
+						}
+					}
+					step.Error = classifyJournaledFailure("node_error", instruction.ID, err, definition.Descriptor().Effects, effected, journal != nil)
+					step.FinishedAt = time.Now().UTC()
+					appendStep(step)
+					return step.Error
+				}
+				if err := validateSchema(definition.Descriptor().OutputSchema, output); err != nil {
+					if journal != nil {
+						hookCtx, cancel := journalContext(ctx)
+						journalErr := journal.Fail(hookCtx, stepAttempt, definition.Descriptor().Effects, err)
+						cancel()
+						if journalErr != nil {
+							err = fmt.Errorf("%w (effect reconciliation unconfirmed: %v)", err, journalErr)
+						}
+					}
+					step.Error = classifyJournaledFailure("invalid_output", instruction.ID, err, definition.Descriptor().Effects, effected, journal != nil)
+					step.FinishedAt = time.Now().UTC()
+					appendStep(step)
+					return step.Error
+				}
+				committed, err := value.Clone(output)
+				if err != nil {
+					if journal != nil {
+						hookCtx, cancel := journalContext(ctx)
+						journalErr := journal.Fail(hookCtx, stepAttempt, definition.Descriptor().Effects, err)
+						cancel()
+						if journalErr != nil {
+							err = fmt.Errorf("%w (effect reconciliation unconfirmed: %v)", err, journalErr)
+						}
+					}
+					step.Error = classifyJournaledFailure("output_ownership", instruction.ID, err, definition.Descriptor().Effects, effected, journal != nil)
+					step.FinishedAt = time.Now().UTC()
+					appendStep(step)
+					return step.Error
+				}
+				if journal != nil {
+					persistedOutput, encodeErr := json.Marshal(committed)
 					if encodeErr != nil {
-						hookCtx, cancel = journalContext(ctx)
+						hookCtx, cancel := journalContext(ctx)
 						journalErr := journal.Fail(hookCtx, stepAttempt, definition.Descriptor().Effects, encodeErr)
 						cancel()
 						if journalErr != nil {
 							encodeErr = fmt.Errorf("%w (effect reconciliation unconfirmed: %v)", encodeErr, journalErr)
 						}
+					} else {
+						hookCtx, cancel := journalContext(ctx)
+						encodeErr = journal.Complete(hookCtx, stepAttempt, persistedOutput)
+						cancel()
+						if encodeErr != nil {
+							hookCtx, cancel = journalContext(ctx)
+							journalErr := journal.Fail(hookCtx, stepAttempt, definition.Descriptor().Effects, encodeErr)
+							cancel()
+							if journalErr != nil {
+								encodeErr = fmt.Errorf("%w (effect reconciliation unconfirmed: %v)", encodeErr, journalErr)
+							}
+						}
+					}
+					if encodeErr != nil {
+						if len(definition.Descriptor().Effects) > 0 {
+							step.Error = classifyJournaledFailure("journal_step_complete", instruction.ID, encodeErr, definition.Descriptor().Effects, effected, true)
+						} else {
+							step.Error = &Error{Code: "journal_step_complete", Class: "persistence", Step: instruction.ID, Err: encodeErr}
+						}
+						step.FinishedAt = time.Now().UTC()
+						appendStep(step)
+						return step.Error
 					}
 				}
-				if encodeErr != nil {
-					if len(definition.Descriptor().Effects) > 0 {
-						step.Error = classifyJournaledFailure("journal_step_complete", instruction.ID, encodeErr, definition.Descriptor().Effects, effected, true)
-					} else {
-						step.Error = &Error{Code: "journal_step_complete", Class: "persistence", Step: instruction.ID, Err: encodeErr}
-					}
+				f.values[instruction.ID] = committed
+				step.Output = committed
+				if len(definition.Descriptor().Effects) > 0 {
+					effected = instruction.ID
+				}
+			case "output":
+				step.StartedAt = time.Now().UTC()
+				step.Attempt = 1
+				if observing {
+					emit(inspection.Event{Kind: inspection.StepProcessing, StepID: step.ID, Attempt: step.Attempt, AttemptID: invocation.AttemptID, Trace: stepSpan})
+				}
+				output, err := resolveOutput(f, instruction.References)
+				if err != nil {
+					step.Error = &Error{Code: "invalid_output_reference", Class: "validation", Step: instruction.ID, Err: err}
 					step.FinishedAt = time.Now().UTC()
 					appendStep(step)
-					return result, step.Error
+					return step.Error
 				}
-			}
-			state[instruction.ID] = committed
-			step.Output = committed
-			if len(definition.Descriptor().Effects) > 0 {
-				effected = instruction.ID
-			}
-		case "output":
-			step.StartedAt = time.Now().UTC()
-			step.Attempt = 1
-			if observing {
-				emit(inspection.Event{Kind: inspection.StepProcessing, StepID: step.ID, Attempt: step.Attempt, AttemptID: invocation.AttemptID, Trace: stepSpan})
-			}
-			output, err := resolveOutput(state, instruction.References)
-			if err != nil {
-				step.Error = &Error{Code: "invalid_output_reference", Class: "validation", Step: instruction.ID, Err: err}
+				result.Output = output
+				step.Output = output
+			case "compare", "default", "if", "choose", "try-finally":
+				step.StartedAt = time.Now().UTC()
+				step.Attempt = 1
+				if observing {
+					emit(inspection.Event{Kind: inspection.StepProcessing, StepID: step.ID, Attempt: step.Attempt, AttemptID: invocation.AttemptID, Trace: stepSpan})
+				}
+				own := stepSpan
+				output, err := runControl(ctx, f, instruction, func(ctx context.Context, arm contract.Arm) (any, error) {
+					return runArm(ctx, f.arm(instruction.ID, arm), instruction.ID, arm)
+				})
+				// The arms' steps reported themselves; the construct's own
+				// event keeps its span and is not an external call.
+				stepSpan, external = own, false
+				if err != nil {
+					step.Error = err
+					step.FinishedAt = time.Now().UTC()
+					appendStep(step)
+					return step.Error
+				}
+				f.values[instruction.ID] = output
+				step.Output = output
+			default:
+				step.Error = &Error{Code: "unsupported_instruction", Class: "configuration", Step: instruction.ID}
 				step.FinishedAt = time.Now().UTC()
 				appendStep(step)
-				return result, step.Error
+				return step.Error
 			}
-			result.Output = output
-			step.Output = output
-		default:
-			step.Error = &Error{Code: "unsupported_instruction", Class: "configuration", Step: instruction.ID}
 			step.FinishedAt = time.Now().UTC()
 			appendStep(step)
-			return result, step.Error
 		}
-		step.FinishedAt = time.Now().UTC()
-		appendStep(step)
+		return nil
+	}
+	if err := runBlock(ctx, &frame{values: state, iteration: rootIteration}, program.Instructions); err != nil {
+		return result, err
 	}
 	return result, nil
 }
@@ -696,18 +753,18 @@ func (e effectCommitted) Is(target error) bool {
 
 func (e effectCommitted) As(target any) bool { return errors.As(e.err, target) }
 
-func resolveCallInput(state map[string]any, instruction contract.InternalInstruction, input any) (any, error) {
+func resolveCallInput(f *frame, instruction contract.InternalInstruction, input any) (any, error) {
 	if len(instruction.References) == 0 {
 		return input, nil
 	}
-	return resolveReference(state, instruction.References[0])
+	return f.resolve(instruction.References[0])
 }
 
-func resolveOutput(state map[string]any, references []contract.Reference) (any, error) {
+func resolveOutput(f *frame, references []contract.Reference) (any, error) {
 	if len(references) == 0 {
 		return nil, fmt.Errorf("output requires a reference")
 	}
-	return resolveReference(state, references[0])
+	return f.resolve(references[0])
 }
 
 func resolveReference(state map[string]any, reference contract.Reference) (any, error) {

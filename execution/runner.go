@@ -54,7 +54,13 @@ type Result struct {
 	Steps  []StepResult
 }
 type StepResult struct {
-	ID                    string
+	ID string
+	// InvocationPath and IterationPath identify this execution of the step
+	// inside nested control flow (ADR 0031): the step id at the top level,
+	// "<construct path>/<arm>/<id>" inside an arm; "root" outside every
+	// loop.
+	InvocationPath        string
+	IterationPath         string
 	Executed              bool
 	Input                 any
 	Attempt               int
@@ -121,7 +127,7 @@ func (r *Runner) Run(ctx context.Context, program contract.InternalProgram, inpu
 	}
 	out := Result{Output: result.Output, State: result.State, Steps: make([]StepResult, len(result.Steps))}
 	for i, s := range result.Steps {
-		out.Steps[i] = StepResult{ID: s.ID, Executed: s.Executed, Input: s.Input, Attempt: s.Attempt, Output: s.Output, Error: s.Error, StartedAt: s.StartedAt, FinishedAt: s.FinishedAt}
+		out.Steps[i] = StepResult{ID: s.ID, InvocationPath: s.InvocationPath, IterationPath: s.IterationPath, Executed: s.Executed, Input: s.Input, Attempt: s.Attempt, Output: s.Output, Error: s.Error, StartedAt: s.StartedAt, FinishedAt: s.FinishedAt}
 	}
 	return out, err
 }

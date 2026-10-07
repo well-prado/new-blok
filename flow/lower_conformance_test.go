@@ -366,10 +366,12 @@ type constructCase struct {
 	recorded func(flow.Instruction) bool
 }
 
-// Control constructs have no form in the engine program yet, so Lower must
-// reject each one rather than lowering only its arm calls. Each construct's
-// own input references are still recorded structurally in Program.
-func TestLowerRejectsEveryControlConstruct(t *testing.T) {
+// Compare, Default, If, Choose and TryFinally lower to control instructions
+// (#333, ADR 0031; control_run_test.go runs them). Each, Parallel, Child and
+// Template have no form in the engine program yet, so Lower must reject each
+// one rather than lowering only its arm calls. Every construct's own input
+// references are recorded structurally in Program.
+func TestLowerRejectsEveryControlConstructWithoutAProgramForm(t *testing.T) {
 	n := newConformanceNodes(t)
 	arm := func(id string, in flow.Ref[object]) func(*flow.ArmBuilder) flow.Ref[object] {
 		return func(a *flow.ArmBuilder) flow.Ref[object] { return flow.ArmCall(a, id, n.reserve, in) }
@@ -427,10 +429,10 @@ func TestLowerRejectsEveryControlConstruct(t *testing.T) {
 	})
 	defaultDef := flow.MustDefine(conformanceSpec, func(b *flow.Builder, in flow.Ref[object]) flow.Ref[object] {
 		reserved := flow.Call(b, "reserve", n.reserve, in)
-		return flow.Default(b, "construct", flow.Select[object, object](reserved, "body"), in)
+		return flow.Default(b, "construct", flow.Select[object, object](reserved, "body"), reserved)
 	})
 	add("default", defaultDef.Program(), defaultDef.Lower, func(i flow.Instruction) bool {
-		return i.Data["value"] == "$step.reserve.body" && i.Data["fallback"] == "$input"
+		return i.Data["value"] == "$step.reserve.body" && i.Data["fallback"] == "$step.reserve"
 	})
 	templateDef := flow.MustDefine(conformanceSpec, func(b *flow.Builder, in flow.Ref[object]) flow.Ref[string] {
 		reserved := flow.Call(b, "reserve", n.reserve, in)
@@ -455,6 +457,13 @@ func TestLowerRejectsEveryControlConstruct(t *testing.T) {
 				t.Fatalf("construct recorded as %+v", construct)
 			}
 			program, err := tc.lower()
+			switch tc.kind {
+			case "if", "choose", "try-finally", "compare", "default":
+				if err != nil || program.Format != contract.ControlFormat {
+					t.Fatalf("Lower err=%v format=%d; want the construct lowered", err, program.Format)
+				}
+				return
+			}
 			want := `flow: instruction "construct" of kind "` + tc.kind + `" cannot be lowered`
 			if err == nil || err.Error() != want {
 				t.Fatalf("Lower err=%v program=%+v; want %q", err, program.Instructions, want)
