@@ -208,15 +208,27 @@ waits: the invocation path is the engine's step ID, and the iteration path
 is `root` until #333 gives the engine iteration paths (ADR 0031 defines
 both; a top-level step's invocation path is its ID).
 
-- **Lease.** `VerifyRun` refuses a run that is not live, whose artifact or
-  input differs, or whose lease is no longer the token's
-  (`ErrLeaseLost`). Every write a `RunJournal` makes runs in a transaction
-  that first checks the lease (and, except for the run's end, that the run
-  is live): recording a dispatch, marking one uncertain on replay or after
-  a node failure, committing a step, scheduling or acknowledging a wait,
-  and ending the run. A stale execution therefore changes nothing; only
-  its next node runs before it learns, since a pure node journals nothing
-  before it runs (Review R round 1 on #380).
+- **Lease and input.** `VerifyRun` refuses a run that is not live, whose
+  artifact differs, or whose lease is no longer the token's
+  (`ErrLeaseLost`). A run's engine input (the engine's digest of the input
+  its runner hands it, a typed decode of the admitted JSON re-encoded) is
+  fixed once: at admission when the admitter knows it
+  (`AdmissionRequest.EngineInput`, as `internal/cluster` stores
+  `json.Marshal` of the decoded input), otherwise by the run's first
+  execution (`journal_runs.engine_input_digest`, schema 7). A later
+  execution with another engine input is refused. The admitted bytes are
+  never compared with a re-encoding: a run admitted with valid input always
+  runs, whether its typed decode reorders fields, keeps an integer beyond
+  float64's exact range, drops an unknown field or zero-fills an optional
+  one (Review R round 2 on #380 and round 1 on #384: each of those could
+  never run).
+- **Permanent conflicts.** `Permanent(err)` reports the errors no retry
+  can fix: `ErrRequestConflict` (another engine input, step input or wait
+  plan), `ErrWaitCanceled`, `ErrStepResultLimit`. A runner settles such a
+  run as failed with a diagnostic; a lost lease and storage faults are not
+  permanent. The engine still labels them `persistence`; the journal's
+  sentinel is what classifies them (#333 is reworking the engine's run
+  loop).
 - **Calls.** A call with declared effects is recorded as dispatched before
   the node runs, in one transaction, and committed after; one found
   dispatched on replay is marked uncertain and the run fails as uncertain,
@@ -227,14 +239,22 @@ both; a top-level step's invocation path is its ID).
   that resolves a different input at the same step (a later loop
   iteration, or an upgrade that resolves inputs differently) is
   `ErrRequestConflict`, never served the recorded result. Step results are
-  bounded by `MaxStepResultBytes` (1 MiB, as a run's output).
+  bounded by `MaxStepResultBytes` (1 MiB, as a run's output). The engine
+  already refuses a node result over 1 MiB as `invalid_output`, except for
+  a node whose output schema is an open object; there the journal refuses
+  it with `ErrStepResultLimit`, which the engine reports as
+  `journal_step_complete` (class `persistence`); it is permanent (above).
 - **Waits.** `Await` looks the step's wait up by run, invocation path and
   iteration path, and schedules it the first time. Its ID is a digest of
   an explicit encoding of the run, artifact, step, the engine's digest of
   the wait plan (name and timeout) and the iteration path, owned by the
-  journal (not of the engine's identity struct, whose encoding could move
-  with a field rename), so every replay reads the same wait and a changed
-  plan at the same step is `ErrRequestConflict`. A wait without a timeout
+  journal (`wait/v1`, pinned by a test vector; not of the engine's
+  identity struct, whose encoding could move with a field rename), so
+  every replay reads the same wait and a changed plan at the same step is
+  `ErrRequestConflict`. The engine's digest of the wait plan is of
+  `contract.WaitInstruction`'s JSON encoding: a new field without
+  `omitempty` would change every suspended run's wait ID, which a test
+  also pins. A wait without a timeout
   is due at the end of time: only a signal fires it. Waiting suspends the
   run; fired or acknowledged returns the stored outcome (the signal, or a
   timeout when no signal fired it); canceled is `ErrWaitCanceled`.
@@ -321,9 +341,9 @@ not gain a scheduler).
 | `Journal.ForRun`, `RunJournal` (engine `StepJournal` and `WaitJournal`), `Journal.WaitAt`, `ErrWaitCanceled` (slice C1) | API, additive | None |
 | `Journal.CompleteRun` refuses a run with a fired, unacknowledged wait (slice C1) | behavioral | Acknowledge the wait (`AcknowledgeWait`, or a `RunJournal` commit) before completing |
 | Journal schema 5 → 6 (slice B) | schema, one-way | On open; `resumed` waits remapped on every open |
-| Journal schema 6 → 7: `journal_operations.input_digest` (slice C1) | schema, one-way | On open, `from < 7`; operations recorded before it have no digest and are not compared |
-| `RunJournal.MarkRunUncertain`, `MaxStepResultBytes`, `ErrStepResultLimit` (slice C1) | API, additive | None |
-| `internal/resumer`; `Journal.InterruptedRuns`, `RunLease`; `RunJournal.WithInput` (slice C2) | API, additive | None |
+| Journal schema 6 → 7: `journal_operations.input_digest`, `journal_runs.engine_input_digest` (slice C1) | schema, one-way | On open, `from < 7`; operations recorded before it have no digest and are not compared; a run's engine input is fixed by its next execution |
+| `RunJournal.MarkRunUncertain`, `AdmissionRequest.EngineInput`, `Permanent`, `MaxStepResultBytes`, `ErrStepResultLimit` (slice C1) | API, additive | None |
+| `internal/resumer`; `Journal.InterruptedRuns`, `RunLease` (slice C2) | API, additive | None |
 
 ## Evidence
 
@@ -367,7 +387,10 @@ probes), `TestTakeRunLeaseHoldsARunThatNeverSuspended`,
 `TestEngineEffectInterruptedByACrashIsUncertain` (the last two kill a real
 process); after Review R round 1, `TestWaitAfterWaitIsNotWokenAgain`,
 `TestStaleExecutionWritesNothing`, `TestStepResultIsBoundToItsInput`,
-`TestRunJournalMarksARunUncertain`, `TestStepResultIsBounded`.
+`TestRunJournalMarksARunUncertain`, `TestStepResultIsBounded`; after
+round 2, `TestEveryValidInputRuns`, `TestEngineInputIsFixedOnce`,
+`TestPermanentErrors`, `TestWritesAfterTheRunEndedAreRefused`,
+`TestWaitIDFormatIsPinned`, `TestOversizeStepResultIsRecognizable`.
 
 ## Limits
 
