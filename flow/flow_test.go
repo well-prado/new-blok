@@ -62,11 +62,11 @@ func TestLowerProducesEngineProgramWithoutExecutingNode(t *testing.T) {
 
 func TestLowerRejectsConstructWithoutAProgramForm(t *testing.T) {
 	definition := MustDefine(Spec{Name: "shop/quote", Version: "1.0.0"}, func(builder *Builder, input Ref[quoteInput]) Ref[quoteOutput] {
-		Parallel(builder, "fan", func(arm *ArmBuilder) { ArmCall(arm, "left", testQuoteNode(t), input) })
+		Template(builder, "label", "quote {}", Lit("x"))
 		return Call(builder, "quote", testQuoteNode(t), input)
 	})
-	if _, err := definition.Lower(); err == nil || err.Error() != `flow: instruction "fan" of kind "parallel" cannot be lowered` {
-		t.Fatalf("Lower err=%v; want parallel rejected until #333 lowers it", err)
+	if _, err := definition.Lower(); err == nil || err.Error() != `flow: instruction "label" of kind "template" cannot be lowered` {
+		t.Fatalf("Lower err=%v; want template rejected: it has no substitution semantics", err)
 	}
 }
 

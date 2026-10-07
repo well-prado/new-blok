@@ -501,7 +501,8 @@ func TestCatalogRejectsWhatFlowLowerRejectsForTheSameReason(t *testing.T) {
 					})
 				}))
 			},
-			want: `flow: instruction "construct" of kind "each" cannot be lowered`,
+			want:       `flow: instruction "construct" of kind "each" cannot be lowered`,
+			flowLowers: true,
 		},
 		{
 			name: "parallel",
@@ -512,7 +513,8 @@ func TestCatalogRejectsWhatFlowLowerRejectsForTheSameReason(t *testing.T) {
 					return reserved
 				}))
 			},
-			want: `flow: instruction "construct" of kind "parallel" cannot be lowered`,
+			want:       `flow: instruction "construct" of kind "parallel" cannot be lowered`,
+			flowLowers: true,
 		},
 		{
 			name: "try-finally",

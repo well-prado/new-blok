@@ -145,7 +145,8 @@ type InternalProgram struct {
 }
 
 // ControlFormat is the InternalProgram.Format of a program holding control
-// instructions: compare, default, if, choose and try-finally (ADR 0028).
+// instructions: compare, default, if, choose, try-finally, each and
+// parallel (ADR 0028).
 const ControlFormat = 2
 
 type InternalInstruction struct {
@@ -164,17 +165,25 @@ type InternalInstruction struct {
 
 // Control is the body of a control instruction (ADR 0028). Operands are
 // positional: compare reads left and right, default value and fallback, if
-// and choose their condition. Arms hold the nested instructions: if has
-// "then" and "else", choose one "case-<n>" arm per case (in case order)
-// and "default", try-finally "try" and "finally".
+// and choose their condition, each its items. Arms hold the nested
+// instructions: if has "then" and "else", choose one "case-<n>" arm per
+// case (in case order) and "default", try-finally "try" and "finally",
+// each "body", parallel "0" to "<n-1>". Concurrency bounds an each's
+// iterations in flight.
 type Control struct {
-	Operator string    `json:"operator,omitempty"`
-	Operands []Operand `json:"operands,omitempty"`
-	Arms     []Arm     `json:"arms,omitempty"`
+	Operator    string    `json:"operator,omitempty"`
+	Operands    []Operand `json:"operands,omitempty"`
+	Arms        []Arm     `json:"arms,omitempty"`
+	Concurrency int       `json:"concurrency,omitempty"`
 }
 
+// InputStep is the step a control operand's reference names to read the
+// workflow input. It is outside the id grammar, so no step can take it.
+const InputStep = "$input"
+
 // Operand is a value a control instruction reads: a reference to a value
-// in scope, or a JSON literal. Exactly one is set.
+// in scope (InputStep for the workflow input), or a JSON literal. Exactly
+// one is set.
 type Operand struct {
 	Reference *Reference      `json:"reference,omitempty"`
 	Literal   json.RawMessage `json:"literal,omitempty"`

@@ -102,11 +102,14 @@ func (d Definition[I, O]) Program() Program { return cloneProgram(d.program) }
 // earlier in this program — has no program form, so Lower rejects it instead
 // of letting the engine fall back to the workflow input (#244).
 //
-// Compare, Default, If, Choose and TryFinally lower to control instructions
-// whose arms nest their own instructions (ADR 0028, #333); a program holding
-// one has Format contract.ControlFormat. An arm's steps are visible only
-// inside that arm: later instructions read the construct's result. Each,
-// Parallel, Template and Child are still rejected.
+// Compare, Default, If, Choose, TryFinally, Each and Parallel lower to
+// control instructions whose arms nest their own instructions (ADR 0028,
+// #333); a program holding one has Format contract.ControlFormat. An arm's
+// steps are visible only inside that arm: later instructions read the
+// construct's result, except a Parallel's, whose arms' steps are readable
+// once every arm has completed. A control operand may read the workflow
+// input ("$input[.<field>…]"); a call input still may not. Template and
+// Child are still rejected.
 //
 // The rules live in internal/lowering, which the agent catalog lowers
 // composed workflows through as well, so the two cannot drift (#249). Lower
@@ -340,12 +343,14 @@ func Each[I, O any](builder *Builder, id string, input Ref[[]I], concurrency int
 	if body == nil {
 		violate("flow: each body is required")
 	}
+	// The item is named by its each, so a body nested in another each can
+	// still read the outer item: "$item.<each id>[.<field>…]".
 	recorded := builder.arm("body", func(arm *ArmBuilder) string {
-		return body(arm, Ref[I]{expression: expression{Kind: "iteration", Source: "$item"}}).expression.Source
+		return body(arm, Ref[I]{expression: expression{Kind: "iteration", Source: "$item." + id}}).expression.Source
 	})
 	builder.reserveID(id)
 	output := "$join." + id
-	builder.record(Instruction{Kind: "each", ID: id, Input: input.expression.Source, Output: output, Data: map[string]any{"concurrency": concurrency, "preserveOrder": true, "body": recorded.Output}, Arms: []Arm{recorded}})
+	builder.record(Instruction{Kind: "each", ID: id, Input: input.expression.Source, Literal: literalOf(input.expression), Output: output, Data: map[string]any{"concurrency": concurrency, "preserveOrder": true, "body": recorded.Output}, Arms: []Arm{recorded}})
 	return Ref[[]O]{expression: expression{Kind: "join", Source: output}}
 }
 
@@ -367,8 +372,10 @@ func Parallel(builder *Builder, id string, arms ...func(*ArmBuilder)) {
 // TryFinally runs tryArm, then finallyArm whether tryArm succeeded or failed,
 // and returns tryArm's result. A failing finallyArm fails the construct with
 // its own error; otherwise a failing tryArm fails it after finallyArm ran.
-// finallyArm does not run when the run is canceled (cancellation is
-// cooperative), nor, once runs are durable, after a suspension.
+// finallyArm also runs when an enclosing Each or Parallel canceled tryArm
+// because a sibling failed. It does not run when the caller cancels the run
+// (cancellation is cooperative), nor, once runs are durable, after a
+// suspension.
 func TryFinally[T any](builder *Builder, id string, tryArm func(*ArmBuilder) Ref[T], finallyArm func(*ArmBuilder)) Ref[T] {
 	if tryArm == nil || finallyArm == nil {
 		violate("flow: try and finally arms are required")

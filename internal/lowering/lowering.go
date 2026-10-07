@@ -29,10 +29,16 @@ const (
 	// (compare, default) and a construct's join (if, choose, try-finally).
 	opPrefix   = "$op."
 	joinPrefix = "$join."
+	// itemPrefix reads the current item of the each it names, only inside
+	// that each's body: "$item.<each id>[.<field>…]".
+	itemPrefix = "$item."
 )
 
 // MaxNesting bounds how deeply control constructs nest (ADR 0028).
 const MaxNesting = 64
+
+// MaxConcurrency bounds an each's iterations in flight, as flow.Each does.
+const MaxConcurrency = 1024
 
 // operators are the comparisons a compare instruction lowers with.
 var operators = map[string]bool{"eq": true, "ne": true, "gt": true, "gte": true, "lt": true, "lte": true}
@@ -81,8 +87,8 @@ type Options struct {
 	// Children lowers a "child" instruction as a call of the child workflow
 	// key in Node, referenced by later instructions as "$child.<id>".
 	Children bool
-	// Control lowers compare, default, if, choose and try-finally into
-	// control instructions (ADR 0028). flow.Definition.Lower sets it; the
+	// Control lowers compare, default, if, choose, try-finally, each and
+	// parallel into control instructions (ADR 0028). flow.Definition.Lower sets it; the
 	// agent catalog does not, so a composed workflow with control flow
 	// stays not agent-safe.
 	Control bool
@@ -140,7 +146,7 @@ func checkKinds(instructions []Instruction, options Options) error {
 	for _, instruction := range instructions {
 		supported := instruction.Kind == "call" || options.Children && instruction.Kind == "child"
 		switch instruction.Kind {
-		case "compare", "default", "if", "choose", "try-finally":
+		case "compare", "default", "if", "choose", "try-finally", "each", "parallel":
 			supported = options.Control
 		}
 		if !supported {
@@ -217,13 +223,20 @@ func (l *lowerer) block(instructions []Instruction, current *scope, depth int) (
 			}
 			next = contract.InternalInstruction{Index: index, ID: instruction.ID, Kind: instruction.Kind, Control: control}
 			prefix = joinPrefix
-			if instruction.Kind == "compare" || instruction.Kind == "default" {
+			switch instruction.Kind {
+			case "compare", "default":
 				prefix = opPrefix
+			case "parallel":
+				// A parallel has no result of its own; its arms' steps
+				// were made visible instead (control).
+				prefix = ""
 			}
 		}
 		lowered = append(lowered, next)
 		l.seen[instruction.ID] = true
-		current.earlier[instruction.ID] = prefix
+		if prefix != "" {
+			current.earlier[instruction.ID] = prefix
+		}
 	}
 	return lowered, nil
 }
@@ -263,6 +276,17 @@ func (l *lowerer) control(instruction Instruction, current *scope, depth int) (*
 			return fail(fmt.Errorf("condition %w", err))
 		}
 		control.Operands = append(control.Operands, condition)
+	case "each":
+		items, err := l.operand(instruction.Input, instruction.Literal, current)
+		if err != nil {
+			return fail(fmt.Errorf("items %w", err))
+		}
+		control.Operands = append(control.Operands, items)
+		concurrency, ok := wholeNumber(instruction.Data["concurrency"])
+		if !ok || concurrency < 1 || concurrency > MaxConcurrency {
+			return fail(fmt.Errorf("concurrency %v is not between 1 and %d", instruction.Data["concurrency"], MaxConcurrency))
+		}
+		control.Concurrency = concurrency
 	}
 	for _, key := range keys {
 		value, err := operand(key)
@@ -274,29 +298,64 @@ func (l *lowerer) control(instruction Instruction, current *scope, depth int) (*
 	if err := checkArms(instruction); err != nil {
 		return fail(err)
 	}
+	var parallel []*scope
 	for _, arm := range instruction.Arms {
 		inner := &scope{earlier: map[string]string{}, parent: current}
+		if instruction.Kind == "each" {
+			inner.earlier[instruction.ID] = itemPrefix
+		}
 		instructions, err := l.block(arm.Instructions, inner, depth+1)
 		if err != nil {
 			return nil, err
 		}
 		for id := range inner.earlier {
-			l.located[id] = fmt.Sprintf("arm %q of %s %q", arm.Name, instruction.Kind, instruction.ID)
+			if id != instruction.ID {
+				l.located[id] = fmt.Sprintf("arm %q of %s %q", arm.Name, instruction.Kind, instruction.ID)
+			}
+		}
+		if instruction.Kind == "parallel" {
+			parallel = append(parallel, inner)
 		}
 		lowered := contract.Arm{Name: arm.Name, Instructions: instructions}
 		if instruction.Kind == "choose" && arm.Name != "default" {
 			lowered.Match, _ = json.Marshal(arm.Case)
 		}
 		if arm.Output != "" {
-			output, err := l.reference(arm.Output, inner)
+			output, err := l.operand(arm.Output, nil, inner)
 			if err != nil {
 				return fail(fmt.Errorf("arm %q output %w", arm.Name, err))
 			}
-			lowered.Output = &contract.Operand{Reference: &output}
+			lowered.Output = &output
 		}
 		control.Arms = append(control.Arms, lowered)
 	}
+	// Every arm of a parallel has completed when it does, so its arms'
+	// steps are readable after it (never in a sibling arm, which runs
+	// concurrently): they join the enclosing scope once all are lowered.
+	for _, inner := range parallel {
+		for id, prefix := range inner.earlier {
+			current.earlier[id] = prefix
+			delete(l.located, id)
+		}
+	}
 	return control, nil
+}
+
+// wholeNumber reads a recorded count: an int as flow records it, or the
+// float64 or json.Number a decoded recording holds, if it is whole.
+func wholeNumber(value any) (int, bool) {
+	switch typed := value.(type) {
+	case int:
+		return typed, true
+	case int64:
+		return int(typed), int64(int(typed)) == typed
+	case float64:
+		return int(typed), float64(int(typed)) == typed
+	case json.Number:
+		parsed, err := typed.Int64()
+		return int(parsed), err == nil && int64(int(parsed)) == parsed
+	}
+	return 0, false
 }
 
 // checkArms checks a construct has the arms its kind lowers with, named
@@ -313,28 +372,47 @@ func checkArms(instruction Instruction) error {
 			want = append(want, "case-"+strconv.Itoa(index))
 		}
 		want = append(want, "default")
+	case "each":
+		want = []string{"body"}
+	case "parallel":
+		for index := range instruction.Arms {
+			want = append(want, strconv.Itoa(index))
+		}
 	}
-	if len(instruction.Arms) != len(want) || instruction.Kind == "choose" && len(want) < 2 {
+	if len(instruction.Arms) != len(want) || instruction.Kind == "choose" && len(want) < 2 || instruction.Kind == "parallel" && len(want) < 1 {
 		return fmt.Errorf("has %d arms; %s lowers with %s", len(instruction.Arms), instruction.Kind, strings.Join(want, ", "))
 	}
 	for index, arm := range instruction.Arms {
 		if arm.Name != want[index] {
 			return fmt.Errorf("arm %d is named %q; want %q", index, arm.Name, want[index])
 		}
-		if (arm.Output == "") != (arm.Name == "finally") {
-			return fmt.Errorf("arm %q: only a finally arm returns no result", arm.Name)
+		if (arm.Output == "") != (arm.Name == "finally" || instruction.Kind == "parallel") {
+			return fmt.Errorf("arm %q: only finally and parallel arms return no result", arm.Name)
 		}
 	}
 	return nil
 }
 
-// operand lowers a control operand: a recorded literal or a reference.
+// operand lowers a control operand: a recorded literal, the workflow input
+// or a field of it, or a reference.
 func (l *lowerer) operand(source string, literal []byte, current *scope) (contract.Operand, error) {
 	if source == literalSource {
 		if len(literal) == 0 || !json.Valid(literal) {
 			return contract.Operand{}, fmt.Errorf("literal has no recorded value")
 		}
 		return contract.Operand{Literal: append(json.RawMessage(nil), literal...)}, nil
+	}
+	if source == inputSource || strings.HasPrefix(source, inputSource+".") {
+		reference := contract.Reference{Step: contract.InputStep}
+		if source != inputSource {
+			reference.Path = strings.Split(strings.TrimPrefix(source, inputSource+"."), ".")
+		}
+		for _, part := range reference.Path {
+			if part == "" {
+				return contract.Operand{}, fmt.Errorf("%q has an empty field", source)
+			}
+		}
+		return contract.Operand{Reference: &reference}, nil
 	}
 	reference, err := l.reference(source, current)
 	if err != nil {
@@ -407,6 +485,8 @@ func lowerReference(source string, current *scope, options Options) (contract.Re
 		prefix = opPrefix
 	case strings.HasPrefix(source, joinPrefix) && options.Control:
 		prefix = joinPrefix
+	case strings.HasPrefix(source, itemPrefix) && options.Control:
+		prefix = itemPrefix
 	default:
 		return contract.Reference{}, fmt.Errorf("%q cannot be lowered: it does not name a call result", source)
 	}
@@ -417,6 +497,9 @@ func lowerReference(source string, current *scope, options Options) (contract.Re
 		}
 	}
 	if current.prefix(parts[0]) != prefix {
+		if prefix == itemPrefix {
+			return contract.Reference{}, fmt.Errorf("%q reads the item of each %q, which is readable only inside that each's body", source, parts[0])
+		}
 		if prefix == opPrefix || prefix == joinPrefix {
 			return contract.Reference{Step: parts[0]}, fmt.Errorf("%q does not reference an earlier operation or construct", source)
 		}

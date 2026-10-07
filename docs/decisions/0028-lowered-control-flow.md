@@ -1,9 +1,10 @@
 # ADR 0028: Lowered control flow and its execution paths
 
 - Status: in progress for E07-T10 (#333), delivered as stacked PRs. Slice 1a
-  (this revision) lowers and runs compare, default, if, choose and
-  try-finally in memory. Slice 1b adds each and parallel; slices 2+ make
-  every construct durable on a single host.
+  lowers and runs compare, default, if, choose and try-finally in memory;
+  slice 1b (this revision) adds each and parallel, and lets control operands
+  read the workflow input. Slices 2+ make every construct durable on a
+  single host.
 - Date: 2026-10-07
 - Roadmap: E07-T10 ([#333](https://github.com/well-prado/new-blok/issues/333)),
   closing gaps in E07-T05 (#47) and E07-T07 (#49)
@@ -115,19 +116,37 @@ compiler produces" applies to calls only.
 - `flow.Definition.Lower` sets `Control`; the agent catalog does not, so a
   composed workflow with control flow stays not agent-safe, rejected with
   the message it always had.
-- Kinds lowered: compare, default, if, choose, try-finally. Each, parallel,
-  child (in flow) and template are rejected by kind, wherever nested,
+- Kinds lowered: compare, default, if, choose, try-finally, each, parallel.
+  Child (in flow) and template are rejected by kind, wherever nested,
   before anything else is checked.
-- References: `$step.<id>`, `$op.<id>` (compare, default) and `$join.<id>`
-  (if, choose, try-finally), each with optional `.<field>` segments, lower
-  to `contract.Reference`. `$input` fields and literal call inputs stay
-  rejected as before; literals are accepted only as control operands.
+- References: `$step.<id>`, `$op.<id>` (compare, default), `$join.<id>`
+  (if, choose, try-finally, each) and, inside an each's body,
+  `$item.<each id>` (the current item; flow records an each's item under
+  its id, so a nested body still reads the outer item), each with optional
+  `.<field>` segments, lower to `contract.Reference`; the item lowers to a
+  reference to the each's id, which the body's frame binds to the item.
+- The workflow input: a control operand or an arm's result may read
+  `$input[.<field>…]`, lowered to a reference to `contract.InputStep`
+  (`"$input"`, outside the id grammar, so no step can take it). A call
+  input still may not read a field of the input, and literal call inputs
+  stay rejected: the call-only rules are the canonical compiler's (#244).
+  Literals are accepted only as control operands.
 - Scope: an arm sees what its construct saw plus its own earlier steps.
   Nothing inside an arm is visible outside it, including in a sibling arm;
   read the construct's result instead. Such a reference is refused naming
   where the step is: `input "$step.vip" names a step inside arm "then" of
   if "route", which is not visible here: read the construct's result
-  instead`.
+  instead`. An item read outside its each's body is refused the same way
+  (`"$item.loop" reads the item of each "loop", which is readable only
+  inside that each's body`).
+- Parallel is the one exception, decided for slice 1b: a parallel has no
+  result of its own (flow returns none), and once it completes every arm
+  has completed, so its arms' steps (at the arm's top level) are readable
+  after it, as if recorded before it. They are never readable in a sibling
+  arm, which runs concurrently. A reference to `$join.<parallel id>` is
+  refused.
+- Each concurrency is from 1 to 1024 (`lowering.MaxConcurrency`, as
+  `flow.Each`).
 - Compare operators are checked; nesting is bounded at 64 levels
   (`lowering.MaxNesting`, the engine's bound too).
 
@@ -196,12 +215,20 @@ write goes to the arm's frame only, so arm results never reach
   `invalid_condition`. The selected arm runs through the control path
   (`runControlStep`: `ControlBranch` for if, `ControlAction` for choose);
   choose runs the first case whose match equals the key, else default.
-- try-finally runs through `ControlTry`: the finally arm runs after the try
-  arm succeeds or fails, unless the run is canceled (cooperative
-  cancellation, the control path's existing rule; the flow recording's
+- try-finally runs through `ControlTry`: once the try arm has started, the
+  finally arm runs after it succeeds or fails, including when an enclosing
+  each or parallel canceled it because a sibling failed (fail-fast is the
+  construct's own decision, decided by the orchestrator after Review R
+  round 1 on the 1b PR). Only the caller's cancellation of the run itself
+  skips finally (cooperative cancellation); the engine tells the two apart
+  by the run's own context, which it carries in the context, and runs
+  finally in a context canceled only by the run's. The flow recording's
   "finally-not-guaranteed-after-suspension" note stands for durable
-  suspension). A finally failure replaces the try outcome; otherwise a try
-  failure is the run's failure, after finally ran.
+  suspension. A finally failure replaces the try outcome, except in a
+  sibling canceled by fail-fast, where the first error wins (the finally
+  failure still appears in Steps); otherwise a try failure is the run's
+  failure, after finally ran. A finally fail-fast started is still
+  canceled when the caller then cancels the run (Review R round 2).
 - Each construct is itself a step in `Result.Steps`, after its arm's
   steps, carrying its result. It is never `Executed` (that reports a node
   invocation; the arm's steps report their own) and never an external
@@ -209,6 +236,33 @@ write goes to the arm's frame only, so arm results never reach
   are children of its span.
 - A choose case value (`Arm.Match`) must be a JSON string; any other is
   `invalid_control`, never a case that silently cannot match.
+
+- each reads its items (a Go slice or array element by element, keeping the
+  elements' types; anything else must read as a JSON array, else
+  `invalid_items`), refuses more items than the step budget
+  (`step_budget_exceeded`), and runs the body once per item through
+  `ControlEach`: at most `Concurrency` items in flight (a worker pool of
+  that size), each in its own frame binding the each's id to the item.
+  The result is the bodies' results in item order, whatever order they
+  finish in. The first item to fail cancels the items in flight and no
+  further item starts (fail-fast); the run fails with that item's error.
+  When several fail concurrently, "first" is whichever records its failure
+  first, not the lowest index.
+- parallel runs every arm at once through `ControlParallel`, each in its
+  own frame; the first arm to fail (whichever records it first) cancels the
+  others. When all arms succeed,
+  their frames' results join the parallel's frame (the visibility rule
+  above). It has no result.
+- Concurrent arms share the run's bookkeeping, so it is serialised: the
+  step list (`Result.Steps`, in completion order, which is not item order),
+  observer events (one at a time, so an observer need not be
+  goroutine-safe), and the last effectful step (`afterEffect`'s
+  saturation rule). A step's span and external flag are per step.
+- A step inside an each runs once per item, so its inspection attempt id
+  names its iteration: `<run attempt>/<step id>@<iteration path>/<n>`
+  (`attempt:…/line@orders[1]/lines[0]/1`); outside every each it stays
+  `<run attempt>/<step id>/<n>`. The inspection recorder keeps one attempt
+  per id, so each iteration is its own attempt of the step.
 
 A durable runner (`RunJournaled`) refuses a format-2 program with
 `durable_control_unsupported` before touching its journal: replaying arm
@@ -227,13 +281,48 @@ Every `engine.StepResult` and `execution.StepResult` carries:
   time, not stored: the tree is in the artifact digest, so a path cannot
   disagree with the artifact.
 - `IterationPath`: `root` outside every each, as the journal keys a
-  top-level step's effects and waits today. Slice 1b defines it inside an
-  each: `<each id>[<index>]`, joined with `/` for nested eaches
+  top-level step's effects and waits today; inside an each's body
+  `<each id>[<index>]`, joined with `/` for nested eaches
   (`orders[2]/lines[0]`). Ids are unique per workflow, so the each id
-  suffices.
+  suffices. The each step itself runs in its enclosing iteration.
+  Parallel arms do not add to it: an arm is told apart by its invocation
+  path (`fan/0/…`).
 
 A step execution is identified by `(InvocationPath, IterationPath)`, the
-pair `OperationIdentity` and ADR 0027's waits already use.
+pair `OperationIdentity` and ADR 0027's waits already use. For a step at
+the top level this is `(step id, "root")`, which is what E07-T09 slice C's
+engine adapter writes for waits and effects until the engine supplies paths
+(slice 2 adds both paths to `engine.StepIdentity` and `WaitIdentity`).
+#382 is a prerequisite of that change: both identities are hashed into the
+ids the journal and `internal/cluster` store (`WaitIDFor`), so adding fields
+would change every existing wait and step id unless their encoding is made
+stable first, and the cluster's wait id must include the iteration.
+
+- Retry safety (#190) across concurrent arms: an arm's failure is
+  classified when it fails, but a sibling may commit an effect after that
+  and before the construct joins (an each or parallel waits for every arm
+  it started). So a construct re-applies the rule to its failure after the
+  join: once any step with effects has completed, a saturated failure no
+  longer reads as saturation, and the caller does not retry the whole
+  run.
+
+### Joins and scopes (for the durable slices)
+
+Recorded here so slices 2 and 3 key their journal records consistently:
+
+- A scope (`journal.ScopeRecord`) per construct execution, path
+  `<invocation path>@<iteration path>` (`@` appears in no segment), parent
+  path the scope of the construct that encloses it (empty at the top),
+  kind the instruction kind.
+- A join (`journal.JoinRecord`, positional slots since #370) per each or
+  parallel execution: `Expected` = number of items or arms, slot `i` =
+  item `i` or arm `i`. #370 reads a JSON null slot as not yet filled, so a
+  slot always holds the result wrapped, `{"output": <result>}`: an
+  iteration whose body yields null, and every parallel arm (which yields
+  nothing), still fills its slot.
+- An each over no items has no join: `RecordJoin` requires `Expected ≥ 1`,
+  so slice 3 records the empty each's scope as completed with output `[]`
+  and writes no join row.
 
 ## Compatibility (ADR 0001)
 
@@ -249,6 +338,11 @@ pair `OperationIdentity` and ADR 0027's waits already use.
 | In a format-2 program a call reading a construct's value receives it as its input type when it reads exactly as one | behavioral (format 2, construct values only) | None |
 | `internal/program` `Build`/`Decode` refuse format ≠ 0 and control bodies | behavioral, fail closed | None |
 | `StepResult.InvocationPath`, `.IterationPath` (engine, execution) | API, additive | None |
+| `flow.Definition.Lower` lowers each and parallel (1b) | behavioral: programs it refused now lower | None |
+| `flow.Each`'s item source is `$item.<each id>` (was `$item`) in `Program()` | behavioral, source-visible for code reading recorded sources | Read the each id after `$item.` |
+| `contract.Control.Concurrency`, `contract.InputStep` | API and wire, additive, omitted when zero | None |
+| A control operand or arm result may read `$input[.<field>…]` | behavioral: refused before | None |
+| Step attempt ids inside an each carry `@<iteration path>` | behavioral (new steps only); outside every each unchanged | None |
 | Engine refuses unknown formats, misshapen control instructions, control in format 0, control under a durable runner | behavioral, fail closed | None |
 
 ## Evidence (slice 1a)
@@ -275,16 +369,37 @@ scaffolded by `blok new` with a branching workflow. Tests that use new API
 #333 slice 1a PR. `TestCallOnlyLoweringKeepsItsEncodingAndDigest` passes on
 origin/main by design and pins the encoding and digest recorded there.
 
+## Evidence (slice 1b)
+
+RED on origin/main and on slice 1a's head (`6de9353`), each failing at
+`Lower` with "cannot be lowered": `flow/each_parallel_test.go` (each order
+and measured concurrency, fail-fast cancellation, parallel arms meeting at a
+rendezvous neither can pass alone, then read after the join) and
+`TestLoopWorkflowOverHTTP` (the starter's composition with a loop over the
+posted lines). Tests that use new API (`each_parallel_nested_test.go`,
+`internal/engine/each_parallel_test.go`, `TestEachAndParallelScopes`) are
+RED under named mutations in the 1b PR, including the race detector for the
+serialised step list and events.
+
 ## Limits
 
-- Each, parallel, child and template still do not lower (slice 1b for
-  each and parallel; child needs a child-run path; template has no defined
-  substitution semantics).
-- `$input` fields cannot be read by a call or a control operand; branch on
-  a node's output.
+- Child and template still do not lower (child needs a child-run path;
+  template has no defined substitution semantics).
+- A call cannot read a field of the workflow input (the canonical
+  compiler's rule); a control operand can.
 - `internal/program`'s artifact format (version 1) refuses control
   programs; a version-2 artifact for them is decided with the durable
   slices.
 - In memory only; nothing here is journaled or resumable.
-- Per-iteration inspection events: with each (1b), one step id runs more
-  than once per run, and inspection attempt ids are keyed by step id.
+- An each runs at most as many items as the step budget; there is no
+  separate bound on the total steps its bodies run.
+- Inspection still shows one step per id: an each body's step is one step
+  with one attempt per iteration (at most 100, the recorder's bound), not
+  one step per iteration, and the step's status is its last event's, so
+  it reads completed or failed from whichever iteration finished last.
+  Attempt ids bound the iteration part: past 48 characters it is replaced
+  by `sha256:<32 hex>` of the path, so an id fits the recorder's 160, and
+  the recorder matches completions on the same bounded form.
+- `flowtest.Result.Step(id)` returns the first execution of id in
+  completion order; inside an each, read `Steps()` and select by
+  `IterationPath`.

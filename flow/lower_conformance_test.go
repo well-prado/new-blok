@@ -366,10 +366,11 @@ type constructCase struct {
 	recorded func(flow.Instruction) bool
 }
 
-// Compare, Default, If, Choose and TryFinally lower to control instructions
-// (#333, ADR 0028; control_run_test.go runs them). Each, Parallel, Child and
-// Template have no form in the engine program yet, so Lower must reject each
-// one rather than lowering only its arm calls. Every construct's own input
+// Compare, Default, If, Choose, TryFinally, Each and Parallel lower to
+// control instructions (#333, ADR 0028; control_run_test.go and
+// each_parallel_test.go run them). Child and Template have no form in the
+// engine program yet, so Lower must reject each one rather than lowering
+// only its arm calls. Every construct's own input
 // references are recorded structurally in Program.
 func TestLowerRejectsEveryControlConstructWithoutAProgramForm(t *testing.T) {
 	n := newConformanceNodes(t)
@@ -458,7 +459,7 @@ func TestLowerRejectsEveryControlConstructWithoutAProgramForm(t *testing.T) {
 			}
 			program, err := tc.lower()
 			switch tc.kind {
-			case "if", "choose", "try-finally", "compare", "default":
+			case "if", "choose", "try-finally", "compare", "default", "each", "parallel":
 				if err != nil || program.Format != contract.ControlFormat {
 					t.Fatalf("Lower err=%v format=%d; want the construct lowered", err, program.Format)
 				}

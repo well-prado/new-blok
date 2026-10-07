@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"reflect"
+	"sync"
 	"time"
 
 	"github.com/well-prado/new-blok/contract"
@@ -271,7 +272,7 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 	// Spans are allocated here, not by an exporter, so the context handed to
 	// nodes, workers and child runs exists before any exporter sees it.
 	tracing := observing && e.tracing.Enabled()
-	var runSpan, stepSpan observe.Span
+	var runSpan observe.Span
 	if tracing {
 		parent := invocation.Trace
 		if !parent.Valid() {
@@ -279,7 +280,13 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 		}
 		runSpan = e.tracing.Root(parent)
 	}
-	emit := func(event inspection.Event) {
+	// Steps in concurrent arms (each, parallel) report at once: events,
+	// the step list and effected are shared, so each is serialised.
+	var emitMu, stepsMu, effectedMu sync.Mutex
+	// emitIn publishes one event of a step running in iteration. A step
+	// inside an each runs once per item, so its attempt id names the
+	// iteration as well; outside every each it is unchanged.
+	emitIn := func(event inspection.Event, iteration string) {
 		if !observing {
 			return
 		}
@@ -293,10 +300,17 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 			event.At = time.Now().UTC()
 		}
 		if event.Attempt > 0 && event.StepID != "" {
-			event.AttemptID = invocation.AttemptID + "/" + event.StepID + "/" + fmt.Sprint(event.Attempt)
+			step := event.StepID
+			if iteration != "" && iteration != rootIteration {
+				step += "@" + boundedIteration(iteration)
+			}
+			event.AttemptID = invocation.AttemptID + "/" + step + "/" + fmt.Sprint(event.Attempt)
 		}
+		emitMu.Lock()
+		defer emitMu.Unlock()
 		e.observer.Observe(event)
 	}
+	emit := func(event inspection.Event) { emitIn(event, rootIteration) }
 	var inputJSON json.RawMessage
 	if payloads {
 		inputJSON = marshalObservation(input)
@@ -324,16 +338,30 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 		}
 		emit(terminal)
 	}()
+	// The run's own context lets a construct tell the caller's cancellation
+	// from its own fail-fast cancellation of siblings (runTry).
+	ctx = context.WithValue(ctx, runContextKey{}, ctx)
 	state := make(map[string]any)
 	result = Result{State: state, Trace: runSpan}
 	// effected is the last completed step that declared effects: once it has
 	// run, a later failure is no longer safe to retry (see afterEffect).
 	effected := ""
-	// external marks the current step as an external call for observers:
-	// its node declares effects (ADR 0022).
-	external := false
-	appendStep := func(step StepResult) {
+	lastEffected := func() string {
+		effectedMu.Lock()
+		defer effectedMu.Unlock()
+		return effected
+	}
+	setEffected := func(step string) {
+		effectedMu.Lock()
+		effected = step
+		effectedMu.Unlock()
+	}
+	// recordStep appends a finished step and reports it. external marks an
+	// external call for observers: its node declares effects (ADR 0022).
+	recordStep := func(step StepResult, stepSpan observe.Span, external bool) {
+		stepsMu.Lock()
 		result.Steps = append(result.Steps, step)
+		stepsMu.Unlock()
 		event := inspection.Event{Kind: inspection.StepCompleted, StepID: step.ID, Attempt: step.Attempt, Trace: stepSpan, External: external}
 		if payloads {
 			event.Input = marshalObservation(step.Input)
@@ -353,7 +381,7 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 			}
 		}
 		event.At = step.FinishedAt
-		emit(event)
+		emitIn(event, step.IterationPath)
 	}
 	// runBlock runs one block of instructions in its frame: the program at
 	// the root, or one arm of a control instruction (ADR 0028).
@@ -378,10 +406,14 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 				return &Error{Code: "canceled", Class: "cancellation", Step: instruction.ID, Err: err}
 			}
 			step := StepResult{ID: instruction.ID, InvocationPath: f.invocation(instruction.ID), IterationPath: f.iteration}
-			external = false
+			// Per instruction, so steps in concurrent arms never share them.
+			external := false
+			var stepSpan observe.Span
 			if tracing {
 				stepSpan = f.span.Child()
 			}
+			appendStep := func(step StepResult) { recordStep(step, stepSpan, external) }
+			emit := func(event inspection.Event) { emitIn(event, f.iteration) }
 			switch instruction.Kind {
 			case "wait":
 				if journal == nil || instruction.Wait == nil {
@@ -500,7 +532,7 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 						step.FinishedAt = time.Now().UTC()
 						appendStep(step)
 						if len(definition.Descriptor().Effects) > 0 {
-							effected = instruction.ID
+							setEffected(instruction.ID)
 						}
 						continue
 					}
@@ -543,7 +575,7 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 							err = fmt.Errorf("%w (effect reconciliation unconfirmed: %v)", err, journalErr)
 						}
 					}
-					step.Error = classifyJournaledFailure("node_error", instruction.ID, err, definition.Descriptor().Effects, effected, journal != nil)
+					step.Error = classifyJournaledFailure("node_error", instruction.ID, err, definition.Descriptor().Effects, lastEffected(), journal != nil)
 					step.FinishedAt = time.Now().UTC()
 					appendStep(step)
 					return step.Error
@@ -557,7 +589,7 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 							err = fmt.Errorf("%w (effect reconciliation unconfirmed: %v)", err, journalErr)
 						}
 					}
-					step.Error = classifyJournaledFailure("invalid_output", instruction.ID, err, definition.Descriptor().Effects, effected, journal != nil)
+					step.Error = classifyJournaledFailure("invalid_output", instruction.ID, err, definition.Descriptor().Effects, lastEffected(), journal != nil)
 					step.FinishedAt = time.Now().UTC()
 					appendStep(step)
 					return step.Error
@@ -572,7 +604,7 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 							err = fmt.Errorf("%w (effect reconciliation unconfirmed: %v)", err, journalErr)
 						}
 					}
-					step.Error = classifyJournaledFailure("output_ownership", instruction.ID, err, definition.Descriptor().Effects, effected, journal != nil)
+					step.Error = classifyJournaledFailure("output_ownership", instruction.ID, err, definition.Descriptor().Effects, lastEffected(), journal != nil)
 					step.FinishedAt = time.Now().UTC()
 					appendStep(step)
 					return step.Error
@@ -601,7 +633,7 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 					}
 					if encodeErr != nil {
 						if len(definition.Descriptor().Effects) > 0 {
-							step.Error = classifyJournaledFailure("journal_step_complete", instruction.ID, encodeErr, definition.Descriptor().Effects, effected, true)
+							step.Error = classifyJournaledFailure("journal_step_complete", instruction.ID, encodeErr, definition.Descriptor().Effects, lastEffected(), true)
 						} else {
 							step.Error = &Error{Code: "journal_step_complete", Class: "persistence", Step: instruction.ID, Err: encodeErr}
 						}
@@ -613,7 +645,7 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 				f.values[instruction.ID] = committed
 				step.Output = committed
 				if len(definition.Descriptor().Effects) > 0 {
-					effected = instruction.ID
+					setEffected(instruction.ID)
 				}
 			case "output":
 				step.StartedAt = time.Now().UTC()
@@ -630,24 +662,23 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 				}
 				result.Output = output
 				step.Output = output
-			case "compare", "default", "if", "choose", "try-finally":
+			case "compare", "default", "if", "choose", "try-finally", "each", "parallel":
 				step.StartedAt = time.Now().UTC()
 				step.Attempt = 1
 				if observing {
 					emit(inspection.Event{Kind: inspection.StepProcessing, StepID: step.ID, Attempt: step.Attempt, AttemptID: invocation.AttemptID, Trace: stepSpan})
 				}
-				own := stepSpan
-				output, err := runControl(ctx, f, instruction, func(ctx context.Context, arm contract.Arm) (any, error) {
-					armFrame := f.arm(instruction.ID, arm)
+				output, err := runControl(ctx, f, instruction, e.maxSteps, func(ctx context.Context, armFrame *frame, arm contract.Arm) (any, error) {
 					// The arm's steps are children of the construct's span.
-					armFrame.span = own
+					armFrame.span = stepSpan
 					return runArm(ctx, armFrame, instruction.ID, arm)
 				})
-				// The arms' steps reported themselves; the construct's own
-				// event keeps its span and is not an external call.
-				stepSpan, external = own, false
 				if err != nil {
-					step.Error = err
+					// An arm's failure was classified when it failed, but a
+					// concurrent sibling may have committed an effect since,
+					// before the construct joined: decide retry safety
+					// again now (#190).
+					step.Error = afterEffect(err, lastEffected())
 					step.FinishedAt = time.Now().UTC()
 					appendStep(step)
 					return step.Error
@@ -665,7 +696,7 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 		}
 		return nil
 	}
-	if err := runBlock(ctx, &frame{values: state, iteration: rootIteration, span: runSpan}, program.Instructions); err != nil {
+	if err := runBlock(ctx, &frame{values: state, iteration: rootIteration, input: input, span: runSpan}, program.Instructions); err != nil {
 		return result, err
 	}
 	return result, nil
