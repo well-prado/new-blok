@@ -233,6 +233,15 @@ func TestUncertainOutcomeFailsClosedAndReplayGetsFreshLineage(t *testing.T) {
 	if replay.RunID == admission.RunID || replay.ReplayOf != admission.RunID {
 		t.Fatalf("replay lineage=%+v original=%+v", replay, admission)
 	}
+	// The lineage is read back from the store, not only from Replay's
+	// return value (#340, mutation M48d).
+	stored, err := journal.Run(context.Background(), replay.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ReplayOf != admission.RunID || stored.State != runAccepted || stored.ArtifactDigest != "sha256:artifact" {
+		t.Fatalf("stored replay=%+v, want replay_of %q on the source artifact", stored, admission.RunID)
+	}
 	replayIdentity := identity
 	replayIdentity.RunID = replay.RunID
 	if replayIdentity.Key() == identity.Key() {
