@@ -399,6 +399,66 @@ stores. `:memory:` is unchanged (`journal_mode=MEMORY`, no switch).
 | `Open` fails unless the file ends up in WAL (#320) | behavioral | None for files this backend creates. Before, the answer of `PRAGMA journal_mode=WAL` was ignored, so a file SQLite would not switch opened in its old mode; it is now refused with an error naming the mode it stayed in |
 | Pooled connections no longer request WAL when they connect; they rely on the mode persisted in the file (#320) | behavioral (internal) | None. `Open` switches the file before it returns a handle, and SQLite keeps WAL in the file across connections and restarts |
 
+## Crash-safe backup and restore (#343)
+
+A backup should be like a photo: restoring from it must not change it.
+Before #343, `Restore` opened the backup through `Open`, read-write, which
+switched the file to WAL (header bytes 18–19 went from 1 1 to 2 2) and
+made a read-only backup unrestorable; a restored copy that failed its
+check stayed at the destination and refused every retry with `already
+exists`; `Backup` ran `VACUUM INTO` straight to the destination, so a crash
+or a full disk left a partial file there that refused every retry the same
+way; and nothing synced a directory after a rename.
+
+`Backup` now runs `VACUUM INTO` to a temporary file (`.backup-<random>`)
+beside the destination, syncs it, renames it to the destination and syncs
+the directory. On failure it removes the temporary file; a crash can leave
+it (and its `-journal`) behind, but never at the destination. Like
+`Restore`, it refuses a destination that exists or has a `-wal`, `-shm` or
+`-journal` file beside it, at the start and just before the rename: SQLite
+would read a leftover one into the backup whenever it is opened. Refusing
+was chosen over removing it, since the leftover may belong to a database
+still in use; the operator removes it. A destination directory `Backup`
+creates has its parent synced.
+
+`Restore` checks the backup through a connection opened `mode=ro&immutable=1`,
+not through `Open`. Immutable means SQLite takes no lock and creates no
+`-wal`, `-shm` or `-journal` file, so the check works on a read-only file in
+a read-only directory whatever journal mode the header names; `mode=ro`
+alone cannot open a WAL-mode file there, since it must create the `-shm`.
+Immutable also means SQLite reads the database file alone, exactly the
+bytes `Restore` copies, ignoring any log beside it. `Restore` therefore
+refuses a source with a non-empty `-wal` or `-journal` file beside it
+rather than restore it without the changes those hold: folding them in
+would write to the backup. A file `Backup` wrote is in rollback mode and
+self-contained. The source must not be written while `Restore` runs.
+
+`Restore` refuses a destination that exists or has a `-wal`, `-shm` or
+`-journal` file beside it, at the start and again just before the rename.
+SQLite reads such a file as the database's own: before Review R of #343, a
+log an old database at the destination left behind was replayed into the
+restored copy (a 400-row backup restored with `nil` and held the old
+database's 7 rows, passing `integrity_check`). The leftover is refused, not
+removed, since it may belong to a database still in use. The check is not
+atomic with the rename: a file another process creates at the destination
+in that moment is replaced. A destination directory `Restore` creates has
+its parent synced. The copy is written to `.restore-*` beside the destination,
+synced, renamed to the destination, the directory synced, and the copy then
+opened through `Open` and checked again; if that fails, the destination
+and any `-wal`, `-shm` or `-journal` beside it are removed and the
+directory synced. So when `Restore` returns an error the destination does
+not exist; a crash before the rename leaves at most the temporary file, and
+a crash after it leaves the whole, synced copy of the checked backup.
+
+| Change | Class | Migration |
+| --- | --- | --- |
+| `Restore` never writes to its source and restores from a read-only file or directory (#343) | behavioral (bug fix) | None. A backup's bytes and checksum are unchanged by `Restore` |
+| `Restore` refuses a source with a non-empty `-wal` or `-journal` file beside it (#343) | behavioral (breaking for such sources) | Restore a file written by `Backup`, or checkpoint the source (open and close it with no other connection) first. Before, `Restore` folded the log into the source by writing to it, or, with another connection open, silently restored without the log's changes |
+| `Restore` removes the destination when the restored check fails (#343) | behavioral (bug fix) | None. A retry is no longer refused with `already exists` |
+| `Restore` refuses a destination with a `-wal`, `-shm` or `-journal` file beside it (#343) | behavioral (bug fix) | Remove the leftover if no database uses it. Before, a leftover log was replayed into the restored database |
+| `Restore` syncs the directory after the rename, and the parent of a directory it creates (#343) | durability (bug fix) | None. Not done on Windows (unsupported, #297). A crash can leave `.restore-*` files beside the destination; they never block a retry and may be deleted |
+| `Backup` writes to a temporary file, syncs it, renames it and syncs the directory; a failed or interrupted backup leaves nothing at the destination; it refuses a destination with a `-wal`, `-shm` or `-journal` beside it (#343) | behavioral (bug fix) | None. A crash can leave `.backup-*` files (and their `-journal`) beside the destination; they never block a retry and may be deleted. The rename replaces a file another process creates at the destination between `Backup`'s check and the rename; `VACUUM INTO` alone refused one |
+
 ## Recovery records are write-once (#334)
 
 A run's recovery records are its receipts: a scope's output, a child run's
@@ -549,6 +609,23 @@ The same test truncates a closed database and requires opening or integrity
 checking to fail closed. `sqlite_test.go` creates a backup with
 `VACUUM INTO`, reopens it through the selected backend, runs an integrity check,
 and reads the committed row.
+
+`backup_test.go` (#343) restores a corrupt backup, which must be refused
+before anything is copied (mutation M49b, skipping the source check, fails
+it), and a copy damaged between the rename and the restored check, which
+must fail and leave no destination (M49b2, skipping that check, fails it),
+and refuses a destination with a leftover `-wal` (a real stale log), `-shm`
+or `-journal` beside it, at the start and when one appears during the copy.
+It requires the backup's SHA-256 and modification time to be unchanged by
+`Restore`, with the backup and its directory read-only and with a WAL-mode
+file, run as an unprivileged user when the tests run as root. It kills a
+real child process with SIGKILL before and after `Restore`'s rename, while
+`VACUUM INTO` is part way through writing a 48 MiB backup, and before
+`Backup`'s rename, and retries in the parent. On Linux with
+`BLOK_TEST_SMALL_FS`, as below, a backup and a restore that do not fit on a
+full tmpfs must fail, leave nothing at or beside the destination, and
+succeed once space is freed. No test can observe a missing fsync without
+cutting power; the PRs for #343 record an `strace` of the syncs instead.
 
 A killed process cannot tell a flushed commit from one still in the
 operating system's cache, so the crash test stays green with
