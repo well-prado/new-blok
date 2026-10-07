@@ -240,6 +240,9 @@ func TestUpgradeCountsWaitingRunUntilItIsCanceled(t *testing.T) {
 	ctx := context.Background()
 	runID := admitUpgradeRun(t, j, "waiting", "sha256:old")
 	scheduleUpgradeWait(t, j, runID, "wait-approval")
+	if wait, err := j.Wait(ctx, "wait-approval"); err != nil || wait.RunID != runID || wait.State != waitWaiting {
+		t.Fatalf("wait=%+v err=%v, want %q on run %s", wait, err, waitWaiting, runID)
+	}
 	requireUpgradeHeld(t, j, 1)
 	if err := j.CancelRun(ctx, runID, "make room for the upgrade"); !errors.Is(err, ErrRunActiveWork) {
 		t.Fatalf("CancelRun on a waiting run err=%v, want ErrRunActiveWork", err)
@@ -299,4 +302,26 @@ func TestUpgradeCountsOnlyUnfinishedRunsOnOldArtifact(t *testing.T) {
 		t.Fatal(err)
 	}
 	requireUpgradeHeld(t, j, 4)
+}
+
+// #48 V4 (#340): a running run, with an attempt dispatched and in flight,
+// holds its artifact and cannot be canceled to make room.
+func TestUpgradeCountsRunningRunWithAttemptInFlight(t *testing.T) {
+	j := newUpgradeJournal(t)
+	runID := admitUpgradeRun(t, j, "running", "sha256:old")
+	op, err := j.BeginEffect(context.Background(), EffectIntent{Identity: OperationIdentity{RunID: runID, ArtifactDigest: "sha256:old", InvocationPath: "charge", IterationPath: "root"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.StartAttempt(context.Background(), op.Key); err != nil {
+		t.Fatal(err)
+	}
+	requireUpgradeHeld(t, j, 1)
+	if err := j.CancelRun(context.Background(), runID, "make room for the upgrade"); !errors.Is(err, ErrRunActiveWork) {
+		t.Fatalf("CancelRun on a running run err=%v, want ErrRunActiveWork", err)
+	}
+	if state := runState(t, j, runID); state != runAccepted {
+		t.Fatalf("run state after refused cancel=%q, want %q", state, runAccepted)
+	}
+	requireUpgradeHeld(t, j, 1)
 }
