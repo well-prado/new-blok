@@ -177,7 +177,7 @@ func markRunUncertain(t *testing.T, j *Journal, runID string) {
 // the wait request's shape is a one-line edit here.
 func scheduleUpgradeWait(t *testing.T, j *Journal, runID, waitID string) {
 	t.Helper()
-	if _, err := j.ScheduleWait(context.Background(), WaitRequest{RunID: runID, WaitID: waitID, Name: "approval", DueAt: time.Now().Add(time.Hour)}); err != nil {
+	if _, err := j.ScheduleWait(context.Background(), WaitRequest{RunID: runID, WaitID: waitID, Name: "approval", InvocationPath: "approve", IterationPath: "root", DueAt: time.Now().Add(time.Hour)}); err != nil {
 		t.Fatal(err)
 	}
 }
