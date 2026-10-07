@@ -113,7 +113,8 @@ func emittedCodes(t *testing.T) map[string]bool {
 
 // TestCodeRegistryMatchesSourceAndADR pins the registry: every code the
 // source can emit is registered, every registered code is emitted, codes
-// follow the #28 identifier form, and ADR 0024's table lists exactly them.
+// follow the #28 identifier form, and the tables of ADRs 0024 and 0026 list
+// exactly them.
 func TestCodeRegistryMatchesSourceAndADR(t *testing.T) {
 	registry := map[string]bool{}
 	form := regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
@@ -134,23 +135,32 @@ func TestCodeRegistryMatchesSourceAndADR(t *testing.T) {
 			t.Errorf("registered code %q is never emitted", code)
 		}
 	}
-	adr, err := os.ReadFile(filepath.Join(repoRoot(t), "docs", "decisions", "0024-check-test-inspect-cli-contract.md"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, table, ok := strings.Cut(string(adr), "### Diagnostic codes")
-	if !ok {
-		t.Fatal("ADR 0024 has no diagnostic code table")
-	}
-	table, _, _ = strings.Cut(table, "\n### ")
+	// ADR 0024 lists check, test and inspect's codes; ADR 0026 lists the
+	// codes only blok dev raises.
 	listed := map[string]bool{}
-	for _, line := range strings.Split(table, "\n") {
-		if !strings.HasPrefix(line, "| `") {
-			continue
+	for _, name := range []string{"0024-check-test-inspect-cli-contract.md", "0026-dev-build-watch-reload.md"} {
+		adr, err := os.ReadFile(filepath.Join(repoRoot(t), "docs", "decisions", name))
+		if err != nil {
+			t.Fatal(err)
 		}
-		first := strings.Split(line, "|")[1]
-		for _, match := range regexp.MustCompile("`([a-z0-9_]+)`").FindAllStringSubmatch(first, -1) {
-			listed[match[1]] = true
+		_, table, ok := strings.Cut(string(adr), "### Diagnostic codes")
+		if !ok {
+			t.Fatalf("ADR %s has no diagnostic code table", name)
+		}
+		table, _, _ = strings.Cut(table, "\n### ")
+		for _, line := range strings.Split(table, "\n") {
+			if !strings.HasPrefix(line, "| `") {
+				continue
+			}
+			first := strings.Split(line, "|")[1]
+			for _, match := range regexp.MustCompile("`([a-z0-9_]+)`").FindAllStringSubmatch(first, -1) {
+				listed[match[1]] = true
+			}
+		}
+	}
+	for _, item := range Codes {
+		if strings.HasPrefix(item.Code, "dev_") != (len(item.Commands) == 1 && item.Commands[0] == "dev") {
+			t.Errorf("code %s: a dev_ code is raised by blok dev alone, and only dev_ codes are", item.Code)
 		}
 	}
 	var missing, extra []string
@@ -167,7 +177,7 @@ func TestCodeRegistryMatchesSourceAndADR(t *testing.T) {
 	sort.Strings(missing)
 	sort.Strings(extra)
 	if len(missing)+len(extra) > 0 {
-		t.Fatalf("ADR 0024 table: missing %v, not registered %v", missing, extra)
+		t.Fatalf("ADR 0024 and 0026 tables: missing %v, not registered %v", missing, extra)
 	}
 }
 

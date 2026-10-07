@@ -18,7 +18,34 @@ var (
 	ErrNotReady   = errors.New("deployment: dependencies are not ready")
 	ErrOverloaded = errors.New("deployment: admission capacity exhausted")
 	ErrDraining   = errors.New("deployment: draining")
+	// ErrRetainedIncompatible reports that the durable state retains runs
+	// this executable cannot adopt (another artifact identity, an unknown
+	// checkpoint codec, a missing or changed retained manifest). It is
+	// deterministic: starting the same executable again refuses again.
+	ErrRetainedIncompatible = errors.New("deployment: retained journal incompatible")
 )
+
+// ExitRetainedIncompatible is the exit status of an application that
+// stops because its durable state retains runs it cannot adopt
+// (ErrRetainedIncompatible); ExitCode maps errors to it. It is the
+// structured signal blok dev reads instead of the application's output:
+// it reports dev_durable_incompatible and does not restart the same
+// executable (ADR 0026). 65 is sysexits' EX_DATAERR.
+const ExitRetainedIncompatible = 65
+
+// ExitCode is the exit status for an application whose run ended with
+// err: 0 for nil, ExitRetainedIncompatible for ErrRetainedIncompatible,
+// otherwise 1.
+func ExitCode(err error) int {
+	switch {
+	case err == nil:
+		return 0
+	case errors.Is(err, ErrRetainedIncompatible):
+		return ExitRetainedIncompatible
+	default:
+		return 1
+	}
+}
 
 type Config struct {
 	ListenerAddress string

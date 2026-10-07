@@ -48,7 +48,7 @@ func runWithIO(args []string, out io.Writer, in io.Reader) error {
 }
 
 func writeHelp(out io.Writer) error {
-	_, err := fmt.Fprintln(out, "New Blok — Go application framework\n\nUsage: blok <command>\n\nCommands:\n  new       Create a conventional Go application\n  generate  Generate deterministic typed bindings\n  check     Validate the application without running it\n  test      Run the application's tests with go test\n  inspect   Describe the application's nodes, workflows and triggers\n  version   Print the development version\n  help      Show this help\n\nUse blok <command> --help for command options.")
+	_, err := fmt.Fprintln(out, "New Blok — Go application framework\n\nUsage: blok <command>\n\nCommands:\n  new       Create a conventional Go application\n  generate  Generate deterministic typed bindings\n  check     Validate the application without running it\n  test      Run the application's tests with go test\n  inspect   Describe the application's nodes, workflows and triggers\n  dev       Build, run and watch the application, restarting it on changes\n  version   Print the development version\n  help      Show this help\n\nUse blok <command> --help for command options.")
 	return err
 }
 
@@ -264,7 +264,7 @@ func runGenerate(args []string, out io.Writer) error {
 	if check {
 		return fmt.Errorf("generate: %s is stale", output)
 	}
-	if err := writeAtomic(output, generated); err != nil {
+	if err := generate.WriteFile(output, generated); err != nil {
 		return fmt.Errorf("generate: %w", err)
 	}
 	_, err = fmt.Fprintln(out, "generated "+filepath.ToSlash(output))
@@ -289,30 +289,6 @@ func defaultTypes() (string, error) {
 		return fallback, nil
 	}
 	return filepath.FromSlash(manifest.Types), nil
-}
-
-func writeAtomic(path string, data []byte) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	temporary, err := os.CreateTemp(filepath.Dir(path), ".blok-generate-*")
-	if err != nil {
-		return err
-	}
-	temporaryName := temporary.Name()
-	defer os.Remove(temporaryName)
-	if err := temporary.Chmod(0o644); err != nil {
-		_ = temporary.Close()
-		return err
-	}
-	if _, err := temporary.Write(data); err != nil {
-		_ = temporary.Close()
-		return err
-	}
-	if err := temporary.Close(); err != nil {
-		return err
-	}
-	return os.Rename(temporaryName, path)
 }
 
 func splitChoices(value string) []string {
@@ -367,6 +343,9 @@ func main() {
 // and inspect follow the exit-code contract in ADR 0024; every other command
 // exits 1 on any error, as before.
 func execute(args []string, stdout, stderr io.Writer, stdin io.Reader) int {
+	if len(args) > 0 && args[0] == "dev" {
+		return executeDev(args[1:], stdout, stderr)
+	}
 	if len(args) > 0 && toolCommands[args[0]] {
 		// Signals are caught only for these commands, so Ctrl+C still ends
 		// an interactive blok new at once. Until stop, a further signal is
@@ -467,4 +446,128 @@ func runTool(ctx context.Context, command string, args []string, stdout, stderr 
 		return devtool.ExitOutput
 	}
 	return report.ExitCode
+}
+
+const devUsage = `Usage: blok dev [--json] [--package DIR] [directory] [-- application arguments]
+
+Builds the application's main package, runs it, and watches the project.
+When a watched file changes (blok.json, go.mod, go.sum, the module's Go
+source outside _test.go files, and every file of a node directory) it
+regenerates stale bindings, rebuilds, and replaces the running application.
+A build that fails is reported and the running application keeps serving.
+An application that exits on its own is restarted with backoff.
+
+The application runs in its own process group with BLOK_DEV=1 and
+BLOK_DEV_GENERATION set; stopping asks it alone to exit (SIGTERM), so it can
+drain the workers it owns, and kills its whole group after 10s. Ctrl+C
+stops blok dev; a second Ctrl+C kills the application at once.
+
+Options:
+  --json          write one JSON event per line (blok-dev/v1); the
+                  application's output goes to standard error
+  --package DIR   the main package to build (default ./cmd/<blok.json name>)
+
+SIGHUP and SIGINT stay ignored when blok dev was started with them ignored,
+so nohup blok dev & outlives the terminal; SIGTERM and SIGQUIT always stop it.
+
+Exit codes: 130 stopped by a signal, 1 project unreadable or too large to
+watch, 2 usage, 3 go or the process guard unavailable, 4 output not written.`
+
+// executeDev runs blok dev. The first SIGINT, SIGTERM, SIGHUP or SIGQUIT
+// stops it gracefully; any further one forces the application down.
+// SIGHUP or SIGINT, when blok was started with it ignored, stays ignored:
+// nohup blok dev & survives the terminal closing, as nohup promises. The Go
+// runtime reports an inherited ignore for those two alone (signal.Ignored);
+// SIGTERM and SIGQUIT always stop blok dev.
+func executeDev(args []string, stdout, stderr io.Writer) int {
+	signals := make(chan os.Signal, 4)
+	// Notify with no signals would catch every signal.
+	if caught := notIgnored(toolSignals); len(caught) > 0 {
+		signal.Notify(signals, caught...)
+	}
+	defer signal.Stop(signals)
+	defer catchBrokenPipe()()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	force := make(chan struct{}, 1)
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		for first := true; ; first = false {
+			select {
+			case <-done:
+				return
+			case <-signals:
+			}
+			if first {
+				cancel()
+				continue
+			}
+			select {
+			case force <- struct{}{}:
+			default:
+			}
+		}
+	}()
+	return guarded("dev", stderr, func() int { return runDev(ctx, force, args, stdout, stderr) })
+}
+
+// notIgnored is signals without those the process inherited as ignored.
+// Notify would un-ignore them.
+func notIgnored(signals []os.Signal) []os.Signal {
+	var result []os.Signal
+	for _, item := range signals {
+		if !signal.Ignored(item) {
+			result = append(result, item)
+		}
+	}
+	return result
+}
+
+func runDev(ctx context.Context, force <-chan struct{}, args []string, stdout, stderr io.Writer) int {
+	if hasHelp(args) {
+		if _, err := fmt.Fprintln(stdout, devUsage); err != nil {
+			fmt.Fprintf(stderr, "blok dev: write output: %v\n", err)
+			return devtool.ExitOutput
+		}
+		return devtool.ExitOK
+	}
+	var appArgs []string
+	for index, arg := range args {
+		if arg == "--" {
+			args, appArgs = args[:index], append([]string(nil), args[index+1:]...)
+			break
+		}
+	}
+	flags := flag.NewFlagSet("dev", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	asJSON := false
+	pkg := ""
+	flags.BoolVar(&asJSON, "json", false, "machine-readable events")
+	flags.StringVar(&pkg, "package", "", "main package directory")
+	usage := func(err error) int {
+		fmt.Fprintf(stderr, "blok dev: %v; run blok dev --help\n", err)
+		return devtool.ExitUsage
+	}
+	if err := flags.Parse(reorderFlags(args, map[string]bool{"json": false, "package": true})); err != nil {
+		return usage(err)
+	}
+	if flags.NArg() > 1 {
+		return usage(fmt.Errorf("expected at most one project directory"))
+	}
+	root := "."
+	if flags.NArg() == 1 {
+		root = flags.Arg(0)
+	}
+	options := devtool.DevOptions{Options: devtool.Options{Root: root}, Package: pkg, Args: appArgs, AppStdout: stdout, AppStderr: stderr, Force: force}
+	options.Emit = func(event devtool.DevEvent) error { return devtool.WriteDevHuman(stdout, event) }
+	if asJSON {
+		options.AppStdout = stderr
+		options.Emit = func(event devtool.DevEvent) error { return devtool.WriteDevJSON(stdout, event) }
+	}
+	code, err := devtool.Dev(ctx, options)
+	if err != nil {
+		fmt.Fprintf(stderr, "blok dev: write output: %v\n", err)
+	}
+	return code
 }

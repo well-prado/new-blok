@@ -820,8 +820,11 @@ func OpenRegular(root *os.Root, rel string) (*os.File, fs.FileInfo, error) {
 // the root is ever stat-ed or read, so classification cannot reveal whether
 // an outside path exists. It returns the layout_symlink_* code and, for
 // CodeSymlinkAlias, the symlink-free project-relative path the link
-// resolves to; the link itself is never followed for reading.
-func ClassifyLink(root *os.Root, absRoot, rel string) (code, target string) {
+// resolves to; the link itself is never followed for reading. aliases are
+// other absolute spellings of the root (the path it was reached by, such as
+// macOS's /var for /private/var): an absolute target inside one of them is
+// inside the root too, decided lexically as well (#347).
+func ClassifyLink(root *os.Root, absRoot, rel string, aliases ...string) (code, target string) {
 	pending := strings.Split(rel, "/")
 	var resolved []string // symlink-free elements below the root
 	for hops := 0; len(pending) > 0; {
@@ -854,7 +857,7 @@ func ClassifyLink(root *os.Root, absRoot, rel string) (code, target string) {
 			return CodeSymlinkDangling, ""
 		}
 		if filepath.IsAbs(linkTarget) || filepath.VolumeName(linkTarget) != "" {
-			inside, err := filepath.Rel(absRoot, filepath.Clean(linkTarget))
+			inside, err := RootRelative(linkTarget, absRoot, aliases...)
 			if err != nil || absRoot == "" {
 				return CodeSymlinkEscape, ""
 			}
@@ -863,4 +866,25 @@ func ClassifyLink(root *os.Root, absRoot, rel string) (code, target string) {
 		pending = append(strings.Split(filepath.ToSlash(linkTarget), "/"), pending...)
 	}
 	return CodeSymlinkAlias, path.Join(resolved...)
+}
+
+// RootRelative is the absolute path target relative to absRoot, decided
+// lexically. When target is not inside absRoot but is inside one of
+// aliases (other absolute spellings of the same root), it is relative to
+// that alias instead. Outside all of them, the result starts with "..".
+func RootRelative(target, absRoot string, aliases ...string) (string, error) {
+	target = filepath.Clean(target)
+	inside, err := filepath.Rel(absRoot, target)
+	if err != nil || filepath.IsLocal(inside) {
+		return inside, err
+	}
+	for _, alias := range aliases {
+		if alias == "" {
+			continue
+		}
+		if rel, err := filepath.Rel(alias, target); err == nil && filepath.IsLocal(rel) {
+			return rel, nil
+		}
+	}
+	return inside, nil
 }

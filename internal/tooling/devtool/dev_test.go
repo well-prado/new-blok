@@ -1,0 +1,390 @@
+package devtool
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/well-prado/new-blok/internal/tooling/layout"
+	"github.com/well-prado/new-blok/observe/redact"
+)
+
+// TestWatchedFiles pins which project files restart the application.
+func TestWatchedFiles(t *testing.T) {
+	for name, want := range map[string]bool{
+		"blok.json": true, "go.mod": true, "go.sum": true,
+		"internal/app/app.go": true, "cmd/shop/main.go": true, "workflows/quotes/quotes.go": true,
+		"runtimes/go/nodes/quote/quote.go": true, "nodes/go/quote/types.go": true,
+		// A foreign node's descriptor and sources belong to its node.
+		"runtimes/node/nodes/slow/node.json": true, "nodes/node/slow/index.mjs": true,
+		// Go test files are not built into the application, in a node or
+		// anywhere else.
+		"runtimes/go/nodes/quote/quote_test.go": false, "internal/app/app_test.go": false,
+		"README.md": false, "internal/app/notes.txt": false, "blok.json.bak": false,
+		// "nodes" deeper than the root is an ordinary directory.
+		"internal/nodes/x/y/readme.md": false,
+	} {
+		if got := watchedFile(name); got != want {
+			t.Errorf("watchedFile(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
+
+func writeFiles(t *testing.T, root string, files map[string]string) {
+	t.Helper()
+	for name, content := range files {
+		target := filepath.Join(root, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(target, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestScanStaysInsideTheProject: skipped directories and nested modules are
+// not read, a linked directory is not entered, and a linked source file is
+// recorded as a link, never stat-ed through. Both links leave the project
+// and the build reads both (the linked file, and the linked directory as
+// an imported package), so both are refused (dev_symlink_unwatched): the
+// build would read what they point to, which the watcher never sees.
+func TestScanStaysInsideTheProject(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	writeFiles(t, root, map[string]string{
+		"go.mod": "module example.com/x\n", "blok.json": "{}", "main.go": "package main\n\nimport _ \"example.com/x/linkdir\"\n",
+		"vendor/v/v.go": "package v\n", "testdata/t.go": "package t\n", ".hidden/h.go": "package h\n",
+		"_skip/s.go": "package s\n", "web/node_modules/m/m.go": "package m\n",
+		"nested/go.mod": "module example.com/nested\n", "nested/n.go": "package n\n",
+	})
+	writeFiles(t, outside, map[string]string{"far.go": "package far\n", "dir/inner.go": "package inner\n"})
+	if runtime.GOOS != "windows" {
+		if err := os.Symlink(filepath.Join(outside, "far.go"), filepath.Join(root, "linked.go")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(outside, "dir"), filepath.Join(root, "linkdir")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	scan, problem, err := scanProject(context.Background(), root)
+	if err != nil || problem != nil {
+		t.Fatal(err, problem)
+	}
+	want := []string{"blok.json", "go.mod", "main.go"}
+	if runtime.GOOS != "windows" {
+		want = append(want, "linkdir", "linked.go")
+	}
+	var got []string
+	for name := range scan {
+		got = append(got, name)
+	}
+	if fmt.Sprint(sortedCopy(got)) != fmt.Sprint(sortedCopy(want)) {
+		t.Fatalf("watched %v, want %v", sortedCopy(got), want)
+	}
+	if runtime.GOOS != "windows" {
+		resolved, err := filepath.EvalSymlinks(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		links, err := scan.buildReads(context.Background(), resolved, "example.com/x", ".")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(links) != 2 || links[0].Code != "dev_symlink_unwatched" || links[0].Source != "linkdir" || links[1].Code != "dev_symlink_unwatched" || links[1].Source != "linked.go" {
+			t.Fatalf("links %+v", links)
+		}
+		// Editing the file the link points to is not a change.
+		before := scan
+		writeFiles(t, outside, map[string]string{"far.go": "package far\n\nconst changed = 1\n"})
+		after, _, _ := scanProject(context.Background(), root)
+		if changed := changes(before, after); len(changed) != 0 {
+			t.Fatalf("an edit outside the root was seen: %v", changed)
+		}
+	}
+}
+
+func sortedCopy(values []string) []string {
+	result := append([]string(nil), values...)
+	for i := range result {
+		for j := i + 1; j < len(result); j++ {
+			if result[j] < result[i] {
+				result[i], result[j] = result[j], result[i]
+			}
+		}
+	}
+	return result
+}
+
+// TestScanIsBounded: past either bound a scan fails with
+// layout_limit_exceeded instead of reading on.
+func TestScanIsBounded(t *testing.T) {
+	root := t.TempDir()
+	files := map[string]string{}
+	for index := range 6 {
+		files[fmt.Sprintf("p%d/f.go", index)] = "package p\n"
+	}
+	writeFiles(t, root, files)
+	saved := watchBounds
+	defer func() { watchBounds = saved }()
+	for _, bounds := range []struct{ files, entries int }{{5, 1000}, {1000, 8}} {
+		watchBounds = bounds
+		scan, problem, err := scanProject(context.Background(), root)
+		if err != nil || problem == nil || problem.Code != layout.CodeLimitExceeded || scan != nil {
+			t.Fatalf("bounds %+v: scan=%v problem=%+v err=%v", bounds, scan, problem, err)
+		}
+	}
+	watchBounds = saved
+	if _, problem, err := scanProject(context.Background(), root); err != nil || problem != nil {
+		t.Fatal(err, problem)
+	}
+}
+
+// TestChangesSeeEditsAdditionsDeletionsAndReplacements.
+func TestChangesSeeEditsAdditionsDeletionsAndReplacements(t *testing.T) {
+	root := t.TempDir()
+	writeFiles(t, root, map[string]string{"go.mod": "module x\n", "a.go": "package a\n", "b.go": "package a\n", "c.go": "package a\n"})
+	before, _, _ := scanProject(context.Background(), root)
+	time.Sleep(10 * time.Millisecond)
+	writeFiles(t, root, map[string]string{"a.go": "package a // edited\n", "d.go": "package a\n"})
+	if err := os.Remove(filepath.Join(root, "b.go")); err != nil {
+		t.Fatal(err)
+	}
+	// An editor's save: write a new file and rename it over the old one.
+	writeFiles(t, root, map[string]string{".c.go.swp": "package a // saved\n"})
+	if err := os.Rename(filepath.Join(root, ".c.go.swp"), filepath.Join(root, "c.go")); err != nil {
+		t.Fatal(err)
+	}
+	after, _, _ := scanProject(context.Background(), root)
+	if got := changes(before, after); fmt.Sprint(got) != "[a.go b.go c.go d.go]" {
+		t.Fatalf("changes %v", got)
+	}
+	if got := changes(after, after); len(got) != 0 {
+		t.Fatalf("no-op changes %v", got)
+	}
+}
+
+// TestBackoffDoublesToItsBoundAndResets: restarts wait Backoff, doubling to
+// MaxBackoff; a run that lasted StableAfter starts the sequence again.
+func TestBackoffDoublesToItsBoundAndResets(t *testing.T) {
+	var delays []int64
+	options := DevOptions{Backoff: 100 * time.Millisecond, MaxBackoff: 800 * time.Millisecond, StableAfter: time.Second, Emit: func(event DevEvent) error {
+		delays = append(delays, event.DelayMS)
+		return nil
+	}}
+	options.defaults()
+	loop := &devLoop{options: options, backoff: options.Backoff}
+	for range 6 {
+		loop.scheduleRestart(0)
+	}
+	loop.scheduleRestart(time.Second)
+	loop.scheduleRestart(0)
+	loop.cancelRestart()
+	if fmt.Sprint(delays) != "[100 200 400 800 800 800 100 200]" {
+		t.Fatalf("delays %v", delays)
+	}
+}
+
+// TestDevDefaultsAreBounded: every zero duration takes a positive default,
+// and MaxBackoff never falls below Backoff.
+func TestDevDefaultsAreBounded(t *testing.T) {
+	options := DevOptions{Backoff: time.Minute}
+	options.defaults()
+	for name, value := range map[string]time.Duration{"poll": options.Poll, "quiet": options.Quiet, "max wait": options.MaxWait, "grace": options.StopGrace, "stable": options.StableAfter} {
+		if value <= 0 {
+			t.Errorf("%s default %s", name, value)
+		}
+	}
+	if options.MaxBackoff != time.Minute {
+		t.Errorf("max backoff %s below backoff", options.MaxBackoff)
+	}
+	if DefaultStopGrace <= InterruptGrace || DefaultMaxBackoff < DefaultBackoff || DefaultMaxWait < DefaultQuiet {
+		t.Error("inconsistent defaults")
+	}
+}
+
+// TestOutputTailIsBoundedAndRedacted: the tail keeps the last
+// MaxOutputTail lines, each cut at maxTailLineBytes, and passes the
+// redaction boundary as a block.
+func TestOutputTailIsBoundedAndRedacted(t *testing.T) {
+	tail := &outputTail{}
+	for index := range MaxOutputTail + 5 {
+		fmt.Fprintf(tail, "line %d\n", index)
+	}
+	fmt.Fprint(tail, strings.Repeat("x", 3*maxTailLineBytes))
+	lines := tail.lines()
+	if len(lines) != MaxOutputTail || lines[0] != "line 6" || len(lines[MaxOutputTail-1]) != maxTailLineBytes {
+		t.Fatalf("tail %d lines, first %q", len(lines), lines[0])
+	}
+	secret := &outputTail{}
+	fmt.Fprint(secret, "starting\nAuthorization: Bearer abcdefghijklmnopqrstuvwxyz0123456789\n")
+	joined := strings.Join(secret.lines(), "\n")
+	if strings.Contains(joined, "abcdefghij") || !strings.Contains(joined, redact.MessageMarker) {
+		t.Fatalf("credential not redacted: %q", joined)
+	}
+}
+
+// TestWithEnvReplacesBlokSettings: the caller cannot choose the generation.
+func TestWithEnvReplacesBlokSettings(t *testing.T) {
+	env := withEnv([]string{"A=1", EnvDevGeneration + "=99", "blok_dev=0"}, EnvDev+"=1", EnvDevGeneration+"=3")
+	if fmt.Sprint(env) != "[A=1 BLOK_DEV=1 BLOK_DEV_GENERATION=3]" {
+		t.Fatalf("env %v", env)
+	}
+}
+
+// TestMainPackageMustBeInsideTheRoot.
+func TestMainPackageMustBeInsideTheRoot(t *testing.T) {
+	root := t.TempDir()
+	writeFiles(t, root, map[string]string{"cmd/app/main.go": "package main\n", "file.go": "package x\n"})
+	loop := &devLoop{root: root}
+	for requested, want := range map[string]string{
+		"./cmd/app": "", "cmd/app": "", "": "dev_main_package_missing", "../x": "dev_main_package_missing",
+		"/abs": "dev_main_package_missing", "./cmd/../cmd/app": "dev_main_package_missing", "./cmd/none": "dev_main_package_missing",
+		"./file.go": "dev_main_package_missing",
+	} {
+		loop.options.Package = requested
+		_, problem := loop.mainPackage(Workspace{})
+		got := ""
+		if problem != nil {
+			got = problem.Code
+		}
+		if got != want {
+			t.Errorf("package %q: %q, want %q", requested, got, want)
+		}
+	}
+}
+
+// BenchmarkScanAtTheBounds measures one watcher scan of a project near the
+// watch bounds: 19,801 watched files (MaxWatchedFiles is 20,000) among
+// 99,102 directory entries (MaxWatchEntries is 100,000). ADR 0026 records
+// the result.
+func BenchmarkScanAtTheBounds(b *testing.B) {
+	root := b.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module example.com/x\n"), 0o644); err != nil {
+		b.Fatal(err)
+	}
+	for group := range 99 {
+		dir := filepath.Join(root, "internal", fmt.Sprintf("p%02d", group))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			b.Fatal(err)
+		}
+		for index := range 1000 {
+			name := fmt.Sprintf("f%04d.txt", index)
+			if index%5 == 0 {
+				name = fmt.Sprintf("f%04d.go", index)
+			}
+			if err := os.WriteFile(filepath.Join(dir, name), nil, 0o644); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+	scan, problem, err := scanProject(context.Background(), root)
+	if err != nil || problem != nil || len(scan) != 19801 {
+		b.Fatal(len(scan), err, problem)
+	}
+	for b.Loop() {
+		if _, problem, err := scanProject(context.Background(), root); err != nil || problem != nil {
+			b.Fatal(err, problem)
+		}
+	}
+}
+
+// TestNextScanInterval pins the watcher's pacing with literal values, so a
+// change to ScanDuty (10) or MaxScanBackoff (10 s) fails here: the pause
+// after a scan is ScanDuty times its duration but never past 10 s, however
+// long a scan stalled (a stopped process, a cold cache); failed scans
+// double it from Poll up to 10 s; and one successful scan returns it to
+// Poll.
+func TestNextScanInterval(t *testing.T) {
+	const poll = 250 * time.Millisecond
+	for _, item := range []struct {
+		took     time.Duration
+		failures int
+		want     time.Duration
+	}{
+		{time.Millisecond, 0, poll},
+		{100 * time.Millisecond, 0, time.Second},
+		{900 * time.Millisecond, 0, 9 * time.Second},
+		{3 * time.Second, 0, 10 * time.Second},
+		{30 * time.Second, 0, 10 * time.Second},
+		{time.Millisecond, 1, 500 * time.Millisecond},
+		{time.Millisecond, 2, time.Second},
+		{time.Millisecond, 5, 8 * time.Second},
+		{time.Millisecond, 6, 10 * time.Second},
+		{time.Millisecond, 1000, 10 * time.Second},
+		{30 * time.Second, 3, 10 * time.Second},
+	} {
+		loop := &devLoop{options: DevOptions{Poll: poll}, scanTook: item.took, scanFailures: item.failures}
+		if got := loop.nextScan(); got != item.want {
+			t.Errorf("a scan of %s after %d failures: next in %s, want %s", item.took, item.failures, got, item.want)
+		}
+	}
+	loop := &devLoop{options: DevOptions{Poll: poll}}
+	for range 6 {
+		loop.observeScan(time.Millisecond, true)
+	}
+	if got := loop.nextScan(); got != 10*time.Second {
+		t.Fatalf("after 6 failed scans: next in %s, want 10s", got)
+	}
+	loop.observeScan(time.Millisecond, false)
+	if got := loop.nextScan(); got != poll {
+		t.Fatalf("after a successful scan: next in %s, want Poll (%s)", got, poll)
+	}
+}
+
+// TestResumeCommandIsQuotedOrOmitted: the resume command of a
+// dev_durable_incompatible refusal is a POSIX shell command whose words
+// are quoted, and when redaction would replace it (a credential-shaped
+// argument), it is omitted, never replaced by text that is not a command:
+// the remediation names the kept executable and says why.
+func TestResumeCommandIsQuotedOrOmitted(t *testing.T) {
+	loop := &devLoop{root: "/work/my app", kept: []keptBuild{{number: 2, path: "/tmp/blok-dev-1/build-2/app"}}}
+	loop.options.Args = []string{"--flag", "it's quoted"}
+	var event DevEvent
+	problem := loop.durableIncompatible(3, &event)
+	want := `cd '/work/my app' && /tmp/blok-dev-1/build-2/app --flag 'it'\''s quoted'`
+	if event.Resume != want || !strings.Contains(problem.Remediation, want) {
+		t.Fatalf("resume %q, remediation %q; want %q in both", event.Resume, problem.Remediation, want)
+	}
+	const secret = "ghp_0123456789abcdefghijABCDEFGHIJ012345"
+	loop.options.Args = []string{"--token=" + secret}
+	event = DevEvent{}
+	problem = loop.durableIncompatible(3, &event)
+	if event.Resume != "" {
+		t.Fatalf("a credential-shaped resume command was kept as %q", event.Resume)
+	}
+	for _, text := range []string{secret, redact.Marker, redact.MessageMarker} {
+		if strings.Contains(problem.Remediation, text) {
+			t.Fatalf("remediation holds %q: %s", text, problem.Remediation)
+		}
+	}
+	if !strings.Contains(problem.Remediation, "/tmp/blok-dev-1/build-2/app") || !strings.Contains(problem.Remediation, "not shown") {
+		t.Fatalf("remediation does not name the kept executable or say why the command is not shown: %s", problem.Remediation)
+	}
+}
+
+// TestShellQuote: a word is left bare only when it is made of characters a
+// POSIX shell gives no meaning to; every other word is single-quoted.
+func TestShellQuote(t *testing.T) {
+	for _, bare := range []string{"app", "/tmp/blok-dev-1/build-2/app", "--flag=a,b:c+d@e%f", "x_y-z.1"} {
+		if got := shellQuote(bare); got != bare {
+			t.Errorf("shellQuote(%q) = %q, want it bare", bare, got)
+		}
+	}
+	for word, want := range map[string]string{"": "''", "a b": "'a b'", "it's": `'it'\''s'`} {
+		if got := shellQuote(word); got != want {
+			t.Errorf("shellQuote(%q) = %q, want %q", word, got, want)
+		}
+	}
+	for _, special := range []string{"$", ";", "&", "|", "`", "*", "?", "~", "(", ")", "<", ">", "\\", "\"", "'", "!", "#", "{", "}", "[", "]", "\n", "\t", " "} {
+		word := "a" + special + "b"
+		if got := shellQuote(word); !strings.HasPrefix(got, "'") {
+			t.Errorf("shellQuote(%q) = %q, want it quoted", word, got)
+		}
+	}
+}

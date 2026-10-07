@@ -12,3 +12,5 @@ import (
 var toolSignals = []os.Signal{os.Interrupt, syscall.SIGTERM}
 
 func ignoreBrokenPipe() {}
+
+func catchBrokenPipe() func() { return func() {} }

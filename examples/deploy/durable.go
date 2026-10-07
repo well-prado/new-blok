@@ -105,8 +105,15 @@ func NewDurable(c deployment.Config, path string) (*appdeploy.Deployment, error)
 				return errors.New("deployment: journal unavailable")
 			}
 			// Check before registering: never repair a missing retained artifact.
+			// A refusal decided by the journal's content
+			// (app.RetainedIncompatibleError) is the structured
+			// deployment.ErrRetainedIncompatible (exit status
+			// deployment.ExitRetainedIncompatible); failing to read it is not.
 			if err := probe(ctx); err != nil {
-				return errors.New("deployment: retained journal incompatible")
+				if refusal := (*app.RetainedIncompatibleError)(nil); errors.As(err, &refusal) {
+					return deployment.ErrRetainedIncompatible
+				}
+				return errors.New("deployment: retained journal unreadable")
 			}
 			identity, _ := manifest.Digest()
 			canonical, _ := manifest.Canonical()

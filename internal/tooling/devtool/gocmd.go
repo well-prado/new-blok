@@ -35,6 +35,10 @@ type goCommand struct {
 	// what may not come from it.
 	env            []string
 	stdout, stderr func([]byte)
+	// remove is a directory the guard removes after killing the go
+	// command's group if blok dies (blok dev's build directory, which the
+	// go command may still be writing when the session guard removes it).
+	remove string
 }
 
 // goRun is the outcome of one go command.
@@ -107,7 +111,7 @@ func runGo(ctx context.Context, spec goCommand) (goRun, error) {
 	if err := command.Start(); err != nil {
 		return goRun{}, &startError{err: err}
 	}
-	guard, err := startGuard(command.Process)
+	guard, err := startGuard(command.Process, spec.remove)
 	if err != nil {
 		_ = killGroup(command.Process)
 		_ = command.Wait()
