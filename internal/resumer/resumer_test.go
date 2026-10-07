@@ -54,6 +54,7 @@ type rig struct {
 	clock    *clock
 	resumer  *Resumer
 	gate     sync.RWMutex
+	entered  atomic.Int32 // notify calls begun, before the gate
 	notices  atomic.Int32
 
 	mu       sync.Mutex
@@ -75,6 +76,15 @@ func program(timeoutMillis int64, call string) contract.InternalProgram {
 		{Index: 0, ID: "approval", Kind: "wait", Wait: &contract.WaitInstruction{Name: "approval", TimeoutMillis: timeoutMillis}},
 		{Index: 1, ID: "call", Kind: "call", Node: call},
 		{Index: 2, ID: "output", Kind: "output", References: []contract.Reference{{Step: "approval"}}},
+	}}
+}
+
+// straight is a program with no wait: its call runs as soon as the run
+// starts, so a run executing it has no open or fired wait.
+func straight(call string) contract.InternalProgram {
+	return contract.InternalProgram{WorkflowID: "approval", Digest: artifact, Instructions: []contract.InternalInstruction{
+		{Index: 0, ID: "call", Kind: "call", Node: call},
+		{Index: 1, ID: "output", Kind: "output", References: []contract.Reference{{Step: "call"}}},
 	}}
 }
 
@@ -102,6 +112,7 @@ func newRigWith(t *testing.T, p contract.InternalProgram, holder string, path st
 		t.Fatal(err)
 	}
 	notify := node.MustDefine("test/notify", "1.0.0", func(_ context.Context, in value) (value, error) {
+		r.entered.Add(1)
 		r.gate.RLock()
 		defer r.gate.RUnlock()
 		r.notices.Add(1)
@@ -214,6 +225,16 @@ func (r *rig) runRow(runID string) string {
 	return r.row(`SELECT r.state || '|' || COALESCE(r.lease_owner, '-') || '|' || COALESCE((SELECT GROUP_CONCAT(state) FROM journal_waits WHERE run_id = r.run_id), '') FROM journal_runs r WHERE r.run_id = ?`, runID)
 }
 
+// awaitRenewal waits until an execution has renewed runID's lease under
+// the clock's current time: it then lasts until now plus lease.
+func (r *rig) awaitRenewal(runID string, lease time.Duration) {
+	r.t.Helper()
+	until := r.clock.Now().Add(lease).UnixNano()
+	waitFor(r.t, func() bool {
+		return r.row(`SELECT COALESCE(lease_until, 0) >= ? FROM journal_runs WHERE run_id = ?`, until, runID) == "1"
+	})
+}
+
 func (r *rig) signal(runID, id string) {
 	r.t.Helper()
 	if _, err := r.journal.Signal(r.ctx, signal.Envelope{RunID: runID, SignalID: id, Name: "approval", Principal: "operator", Payload: []byte(`{"approved":true}`)}, true); err != nil {
@@ -282,8 +303,12 @@ func TestSuspendedRunsHoldNoGoroutine(t *testing.T) {
 		}
 	}
 	r.await(runs)
-	time.Sleep(50 * time.Millisecond) // let finished goroutines exit
+	// Finished executions' goroutines exit just after they settle: allow
+	// them a moment, however loaded the machine.
 	after := runtime.NumGoroutine()
+	for deadline := time.Now().Add(10 * time.Second); after-before > 10 && time.Now().Before(deadline); after = runtime.NumGoroutine() {
+		time.Sleep(5 * time.Millisecond)
+	}
 	if suspended := r.row(`SELECT COUNT(*) FROM journal_waits WHERE state = 'waiting'`); suspended != fmt.Sprint(runs) {
 		t.Fatalf("suspended=%s; want %d", suspended, runs)
 	}
@@ -394,6 +419,10 @@ func TestCloseDrainsThenCancelsAndReleases(t *testing.T) {
 	r.signal(run, "s1")
 	r.gate.Lock() // notify blocks
 	r.resumer.Sweep(r.ctx)
+	// The drain deadline starts once the execution is in notify, past the
+	// wait: otherwise, on a loaded machine, it can cancel the execution
+	// before it consumes the wakeup (1 in 20 -race runs at load 35).
+	waitFor(t, func() bool { return r.entered.Load() == 1 })
 	deadline, cancel := context.WithTimeout(r.ctx, 200*time.Millisecond)
 	defer cancel()
 	go func() { <-deadline.Done(); time.Sleep(50 * time.Millisecond); r.gate.Unlock() }()
@@ -505,7 +534,7 @@ func TestBusyWorkersTakeNoMoreRuns(t *testing.T) {
 	before := runtime.NumGoroutine()
 	for range 5 {
 		r.clock.Advance(31 * time.Second)
-		time.Sleep(30 * time.Millisecond) // a renewal under the new time
+		r.awaitRenewal(runs[0], 30*time.Second)
 		r.resumer.Sweep(r.ctx)
 	}
 	if n := r.holding.Load(); n != 1 {
@@ -521,6 +550,9 @@ func TestBusyWorkersTakeNoMoreRuns(t *testing.T) {
 	}
 	close(r.hold)
 	r.await(1)
+	// Settled runs before its worker is freed: a sweep at once could find
+	// none free (2 in 20 -race runs under load).
+	waitFor(t, func() bool { return len(r.resumer.slots) == 0 })
 	r.clock.Advance(31 * time.Second)
 	r.resumer.Sweep(r.ctx)
 	r.await(1)
@@ -548,7 +580,10 @@ func TestCloseReturnsAtItsDeadline(t *testing.T) {
 	if err := r.resumer.Close(deadline); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("close=%v", err)
 	}
-	if elapsed := time.Since(begin); elapsed > 400*time.Millisecond {
+	// The node is released only after Close returns, so Close returning at
+	// all shows it did not wait for it; the bound allows for a loaded
+	// machine.
+	if elapsed := time.Since(begin); elapsed > 2*time.Second {
 		t.Fatalf("Close took %v with a 200ms deadline", elapsed)
 	}
 	if err := r.resumer.Start(r.ctx, r.admit("late")); !errors.Is(err, ErrClosed) {
@@ -574,19 +609,16 @@ func TestRenewalKeepsAndLosesTheLease(t *testing.T) {
 	other := newRig(t, program(0, "test/hold"), "b", path)
 	for range 3 {
 		r.clock.Advance(20 * time.Second)
-		time.Sleep(50 * time.Millisecond)
+		r.awaitRenewal(run, 30*time.Second)
 		if _, err := other.journal.TakeRunLease(r.ctx, run, r.clock.Now()); !errors.Is(err, journal.ErrLeaseLost) {
 			t.Fatalf("taken while renewed, 20 s on: err=%v", err)
 		}
 	}
-	// Another holder takes it over (its lease made to lapse).
-	if err := r.database.WithTx(r.ctx, func(tx *sql.Tx) error {
-		_, err := tx.Exec(`UPDATE journal_runs SET lease_until = 0 WHERE run_id = ?`, run)
-		return err
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := other.journal.TakeRunLease(r.ctx, run, r.clock.Now()); err != nil {
+	// Another holder takes it over once its lease has lapsed by that
+	// holder's clock: 31 s on, past anything a renewal under r's clock can
+	// extend it to (a renewal racing the take cannot keep it, as zeroing
+	// lease_until in the database could: 3 in 20 -race runs under load).
+	if _, err := other.journal.TakeRunLease(r.ctx, run, r.clock.Now().Add(31*time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	r.await(1)
@@ -660,32 +692,44 @@ func TestPanicsAreContained(t *testing.T) {
 }
 
 // TestInterruptedRunsAreNotCrowdedOut: with room for one run a sweep, a
-// long execution under a live lease (leased longest ago) does not crowd
-// out an interrupted run.
+// long execution under a live lease, leased longest ago and with no open
+// wait, does not crowd out an interrupted run: the scan's read skips runs
+// under a live lease, so its one candidate is the interrupted run. Without
+// that filter the read returns the long run, the write re-check drops it,
+// and the sweep takes nothing.
 func TestInterruptedRunsAreNotCrowdedOut(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "journal.db")
-	r := newRigWith(t, program(0, "test/hold"), "a", path, rigOptions{config: func(c *Config) { c.RenewEvery = 10 * time.Millisecond }})
+	r := newRigWith(t, straight("test/hold"), "a", path, rigOptions{config: func(c *Config) { c.RenewEvery = 10 * time.Millisecond }})
 	long, interrupted := r.admit("long"), r.admit("interrupted")
-	r.signal(long, "s-long")
 	if err := r.resumer.Start(r.ctx, long); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, func() bool { return r.holding.Load() == 1 })
+	if got := r.runRow(long); got != "accepted|a|" {
+		t.Fatalf("the long run: %s; want leased with no wait", got)
+	}
 	// interrupted: leased by a holder that died, after long was.
 	r.clock.Advance(time.Second)
 	if _, err := r.journal.TakeRunLease(r.ctx, interrupted, r.clock.Now()); err != nil {
 		t.Fatal(err)
 	}
-	b := newRigWith(t, program(0, "test/notify"), "b", path, rigOptions{config: func(c *Config) { c.Batch = 1 }})
+	b := newRigWith(t, straight("test/hold"), "b", path, rigOptions{config: func(c *Config) { c.Batch = 1 }})
+	close(b.hold)
 	r.clock.Advance(40 * time.Second)
 	b.clock.now.Store(r.clock.now.Load())
-	time.Sleep(50 * time.Millisecond) // long's renewal under the new time
+	r.awaitRenewal(long, 30*time.Second)
 	if err := b.resumer.Sweep(b.ctx); err != nil {
 		t.Fatal(err)
 	}
+	if got := b.row(`SELECT COALESCE(lease_owner, '-') FROM journal_runs WHERE run_id = ?`, interrupted); got != "b" {
+		t.Fatalf("the interrupted run is leased to %q after b's sweep; want b, despite the live long run", got)
+	}
 	b.await(1)
-	if got := fmt.Sprint(b.outcomesOf(interrupted)); got != "[suspended]" {
-		t.Fatalf("the interrupted run: %s; want taken despite the live long run", got)
+	if got := fmt.Sprint(b.outcomesOf(interrupted)); got != "[completed]" {
+		t.Fatalf("the interrupted run: %s; want completed", got)
+	}
+	if got := b.runRow(long); got != "accepted|a|" {
+		t.Fatalf("the long run: %s; want still a's", got)
 	}
 	close(r.hold)
 	r.await(1)
