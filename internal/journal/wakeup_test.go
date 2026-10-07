@@ -18,11 +18,11 @@ import (
 )
 
 // wakeupRows lists every wait as wait_id|state|signal_id|lease_owner|
-// lease_until (nanoseconds after fixtureBase, or "" with no lease), then
-// every signal as signal_id|state, each in insertion order.
+// lease_until of its run's lease (nanoseconds after fixtureBase, or "" with
+// no lease), then every signal as signal_id|state, each in insertion order.
 func wakeupRows(t *testing.T, j *Journal) []string {
 	t.Helper()
-	rows := waitRows(t, j.database, fmt.Sprintf(`SELECT wait_id || '|' || state || '|' || signal_id || '|' || COALESCE(lease_owner, '') || '|' || COALESCE(lease_until - %d, '') FROM journal_waits ORDER BY rowid`, fixtureBase.UnixNano()))
+	rows := waitRows(t, j.database, fmt.Sprintf(`SELECT w.wait_id || '|' || w.state || '|' || w.signal_id || '|' || COALESCE(r.lease_owner, '') || '|' || COALESCE(r.lease_until - %d, '') FROM journal_waits w JOIN journal_runs r ON r.run_id = w.run_id ORDER BY w.rowid`, fixtureBase.UnixNano()))
 	return append(rows, waitRows(t, j.database, `SELECT signal_id || '|' || state FROM journal_signals ORDER BY rowid`)...)
 }
 
