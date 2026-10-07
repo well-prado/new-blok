@@ -187,8 +187,8 @@ func TestOriginMainWaitsMigrateToStepIdentity(t *testing.T) {
 	}
 	database, j := newJournalAtPath(t, path, Config{Clock: ticking(fixtureBase.Add(48 * time.Hour))})
 	defer database.Close()
-	if got := oneRow(t, database, `SELECT version || '|' || upgraded_from FROM blok_schema_versions WHERE component = 'journal'`); got != "6|3" {
-		t.Fatalf("journal stamp=%s; want 6 upgraded from 3", got)
+	if got := oneRow(t, database, `SELECT version || '|' || upgraded_from FROM blok_schema_versions WHERE component = 'journal'`); got != "7|3" {
+		t.Fatalf("journal stamp=%s; want 7 upgraded from 3", got)
 	}
 	unique := waitRows(t, database, `SELECT (SELECT group_concat(name, ',') FROM pragma_index_info(l.name)) FROM pragma_index_list('journal_waits') l WHERE l."unique" = 1 AND l.origin = 'u'`)
 	if !reflect.DeepEqual(unique, []string{"run_id,invocation_path,iteration_path"}) {
@@ -283,7 +283,7 @@ func TestOriginMainWaitsMigrateToStepIdentity(t *testing.T) {
 // inside the journal's schema transaction migrating the aaf633c database,
 // just before it commits and just after. Before, the database is exactly
 // origin/main's: the old shape, every row, stamp 3. After, it is migrated
-// and stamped 6 with every row (its claimed and signalled waits fired). Either way the next open leaves it
+// and stamped 7 with every row (its claimed and signalled waits fired). Either way the next open leaves it
 // migrated with every row.
 func TestWaitIdentityMigrationSurvivesAKill(t *testing.T) {
 	if os.Getenv("NEWBLOK_332_MIGRATION_CHILD") == "1" {
@@ -320,13 +320,13 @@ func TestWaitIdentityMigrationSurvivesAKill(t *testing.T) {
 			if phase == "before" && !reflect.DeepEqual(killed, legacy) {
 				t.Fatalf("a migration killed before commit changed the database:\n got %+v\nwant %+v", killed, legacy)
 			}
-			if phase == "after" && (killed.stamp != "6|3" || !strings.Contains(killed.scopes, "attempt_id") || strings.Contains(killed.schema, "UNIQUE (run_id, name)") || !reflect.DeepEqual(killed.waits, fired(legacy.waits)) || !reflect.DeepEqual(killed.signals, legacy.signals)) {
+			if phase == "after" && (killed.stamp != "7|3" || !strings.Contains(killed.scopes, "attempt_id") || strings.Contains(killed.schema, "UNIQUE (run_id, name)") || !reflect.DeepEqual(killed.waits, fired(legacy.waits)) || !reflect.DeepEqual(killed.signals, legacy.signals)) {
 				t.Fatalf("a migration killed after commit:\n got %+v\nwant migrated with %+v", killed, legacy)
 			}
 			database, _ := newJournalAtPath(t, path, Config{})
 			database.Close()
 			reopened := legacyWaitDump(t, path)
-			if reopened.stamp != "6|3" || !strings.Contains(reopened.scopes, "attempt_id") || !strings.Contains(reopened.schema, "iteration_path") || !reflect.DeepEqual(reopened.waits, fired(legacy.waits)) || !reflect.DeepEqual(reopened.signals, legacy.signals) {
+			if reopened.stamp != "7|3" || !strings.Contains(reopened.scopes, "attempt_id") || !strings.Contains(reopened.schema, "iteration_path") || !reflect.DeepEqual(reopened.waits, fired(legacy.waits)) || !reflect.DeepEqual(reopened.signals, legacy.signals) {
 				t.Fatalf("reopened after the kill:\n got %+v\nwant migrated with %+v", reopened, legacy)
 			}
 		})
@@ -343,8 +343,8 @@ func TestUnstampedStepIdentityShapeIsClassified4(t *testing.T) {
 	if _, err := New(context.Background(), database, Config{}); err != nil {
 		t.Fatal(err)
 	}
-	if got := oneRow(t, database, `SELECT version || '|' || upgraded_from FROM blok_schema_versions WHERE component = 'journal'`); got != "6|4" {
-		t.Fatalf("journal stamp=%s; want 6 upgraded from 4, classified from its shape", got)
+	if got := oneRow(t, database, `SELECT version || '|' || upgraded_from FROM blok_schema_versions WHERE component = 'journal'`); got != "7|4" {
+		t.Fatalf("journal stamp=%s; want 7 upgraded from 4, classified from its shape", got)
 	}
 	database.Close()
 }

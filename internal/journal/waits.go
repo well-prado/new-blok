@@ -99,6 +99,15 @@ func (j *Journal) ScheduleWait(ctx context.Context, request WaitRequest) (WaitRe
 	}
 	var record WaitRecord
 	err := j.withTx(ctx, "wait-schedule", func(tx *sql.Tx) error {
+		var err error
+		record, err = j.scheduleWait(ctx, tx, request)
+		return err
+	})
+	return record, err
+}
+
+func (j *Journal) scheduleWait(ctx context.Context, tx *sql.Tx, request WaitRequest) (record WaitRecord, err error) {
+	err = func() error {
 		// No conflict target: both the wait ID and the step identity are
 		// uniqueness constraints, and either one is a duplicate.
 		result, err := tx.ExecContext(ctx, `INSERT INTO journal_waits (wait_id, run_id, name, invocation_path, iteration_path, due_at, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`, request.WaitID, request.RunID, request.Name, request.InvocationPath, request.IterationPath, request.DueAt.UTC().UnixNano(), waitWaiting, j.now(), j.now())
@@ -132,7 +141,7 @@ func (j *Journal) ScheduleWait(ctx context.Context, request WaitRequest) (WaitRe
 		record.SignalID = signalID
 		record.Payload = append([]byte(nil), payload...)
 		return nil
-	})
+	}()
 	return record, err
 }
 

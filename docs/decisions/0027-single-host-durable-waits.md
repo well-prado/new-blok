@@ -210,31 +210,45 @@ both; a top-level step's invocation path is its ID).
 
 - **Lease.** `VerifyRun` refuses a run that is not live, whose artifact or
   input differs, or whose lease is no longer the token's
-  (`ErrLeaseLost`). Every commit checks the lease again in its own
-  transaction, so an execution whose lease was taken over cannot commit.
-  An effect's dispatch is checked by a read just before it is recorded.
-- **Calls.** A call with declared effects is recorded as dispatched
-  (`BeginEffect`, `StartAttempt`) before the node runs, and committed
-  (`CommitEffect`) after; one found dispatched on replay is marked
-  uncertain and the run fails as uncertain, never charging twice. A call
-  with no effects journals nothing before it runs (running it again is
-  safe) and its result is committed in one transaction.
+  (`ErrLeaseLost`). Every write a `RunJournal` makes runs in a transaction
+  that first checks the lease (and, except for the run's end, that the run
+  is live): recording a dispatch, marking one uncertain on replay or after
+  a node failure, committing a step, scheduling or acknowledging a wait,
+  and ending the run. A stale execution therefore changes nothing; only
+  its next node runs before it learns, since a pure node journals nothing
+  before it runs (Review R round 1 on #380).
+- **Calls.** A call with declared effects is recorded as dispatched before
+  the node runs, in one transaction, and committed after; one found
+  dispatched on replay is marked uncertain and the run fails as uncertain,
+  never charging twice. A call with no effects journals nothing before it
+  runs (running it again is safe) and its result is committed in one
+  transaction. Every step's operation records the engine's digest of the
+  step's input (`journal_operations.input_digest`, schema 7): a replay
+  that resolves a different input at the same step (a later loop
+  iteration, or an upgrade that resolves inputs differently) is
+  `ErrRequestConflict`, never served the recorded result. Step results are
+  bounded by `MaxStepResultBytes` (1 MiB, as a run's output).
 - **Waits.** `Await` looks the step's wait up by run, invocation path and
-  iteration path, and schedules it the first time. Its ID is derived from
-  the engine's operation key (which covers the wait's name and timeout) and
-  the iteration path, so every replay reads the same wait and a changed
+  iteration path, and schedules it the first time. Its ID is a digest of
+  an explicit encoding of the run, artifact, step, the engine's digest of
+  the wait plan (name and timeout) and the iteration path, owned by the
+  journal (not of the engine's identity struct, whose encoding could move
+  with a field rename), so every replay reads the same wait and a changed
   plan at the same step is `ErrRequestConflict`. A wait without a timeout
   is due at the end of time: only a signal fires it. Waiting suspends the
   run; fired or acknowledged returns the stored outcome (the signal, or a
   timeout when no signal fired it); canceled is `ErrWaitCanceled`.
 - **Acknowledgement.** A fired wait's outcome read by `Await` is
-  acknowledged in the transaction of the next commit: the next step's
-  result, or the run's end through `RunJournal.CompleteRun` or `FailRun`.
-  Never before: a crash between reading the outcome and that commit leaves
-  the wait fired, the run is listed again once its lease lapses, and the
-  replay reads the same outcome. `Journal.CompleteRun` refuses a run with
-  a fired, unacknowledged wait (`ErrRunActiveWork`); `Journal.FailRun` does
-  not, because a failure ends the run whatever woke it.
+  acknowledged in the transaction of the next durable progress: the next
+  step's result, the schedule of the next wait (a run waiting at b right
+  after a is woken for b only, not again for a), the run found still
+  waiting at a wait, or the run's end through `RunJournal.CompleteRun`,
+  `FailRun` or `MarkRunUncertain`. Never before: a crash between reading
+  the outcome and that progress leaves the wait fired, the run is listed
+  again once its lease lapses, and the replay reads the same outcome.
+  `Journal.CompleteRun` refuses a run with a fired, unacknowledged wait
+  (`ErrRunActiveWork`); `Journal.FailRun` does not, because a failure ends
+  the run whatever woke it.
 
 The engine's `StepJournal` has no hook for a wait step's own commit, so a
 wakeup is consumed with the step after it rather than with the wait step;
@@ -263,6 +277,8 @@ inside an arm) before durable loops reach the cluster runtime. ADR 0031
 | `Journal.ForRun`, `RunJournal` (engine `StepJournal` and `WaitJournal`), `Journal.WaitAt`, `ErrWaitCanceled` (slice C1) | API, additive | None |
 | `Journal.CompleteRun` refuses a run with a fired, unacknowledged wait (slice C1) | behavioral | Acknowledge the wait (`AcknowledgeWait`, or a `RunJournal` commit) before completing |
 | Journal schema 5 → 6 (slice B) | schema, one-way | On open; `resumed` waits remapped on every open |
+| Journal schema 6 → 7: `journal_operations.input_digest` (slice C1) | schema, one-way | On open, `from < 7`; operations recorded before it have no digest and are not compared |
+| `RunJournal.MarkRunUncertain`, `MaxStepResultBytes`, `ErrStepResultLimit` (slice C1) | API, additive | None |
 
 ## Evidence
 
@@ -304,7 +320,9 @@ probes), `TestTakeRunLeaseHoldsARunThatNeverSuspended`,
 `TestCompleteRunRefusesAnUnconsumedWakeup`,
 `TestEngineReplaysAfterACrashMidResumption`,
 `TestEngineEffectInterruptedByACrashIsUncertain` (the last two kill a real
-process).
+process); after Review R round 1, `TestWaitAfterWaitIsNotWokenAgain`,
+`TestStaleExecutionWritesNothing`, `TestStepResultIsBoundToItsInput`,
+`TestRunJournalMarksARunUncertain`, `TestStepResultIsBounded`.
 
 ## Limits
 
@@ -320,10 +338,13 @@ process).
   token after the run has ended. That is harmless (resumption listings and
   claims only consider live runs); slice C's runner releases the lease when
   a run ends.
-- The lease token fences the journal's lease calls, not the engine's
-  step writes: a stale execution learns it lost the run at its next renew
-  or acknowledgement. Slice C acknowledges inside the resumed step's own
-  transaction, so the step commits only under the current token.
+- The lease token fences journal writes, not nodes: a stale execution's
+  next node still runs (a pure node journals nothing first) before its
+  write is refused and it stops. Effects are recorded under the lease
+  before they dispatch, so a stale execution never dispatches one.
+- The journal's own `Journal` methods (`ScheduleWait`, `MarkUncertain`,
+  `MarkRunUncertain`, …) take no lease; only `RunJournal`, the engine's
+  path, is fenced.
 - Mixed versions: a binary from before this slice, still running during an
   upgrade, may be executing a run whose wakeup it marked `resumed`; the
   first open by this binary remaps that wait to `fired` and a holder may

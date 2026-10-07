@@ -221,11 +221,12 @@ func New(ctx context.Context, database store.Database, config Config) (*Journal,
 // #332's wait identity (journal_waits keyed by step and iteration instead
 // of by name), 5 with #334's scope attempt (journal_scopes.attempt_id,
 // which fences scope completion), 6 with #332's wakeup durability (fired
-// waits, run leases). New refuses a journal stamped with a
+// waits, run leases), 7 with #332's step input digest (an engine step's
+// result is bound to its input). New refuses a journal stamped with a
 // newer one. Raise it with every change an older binary would misread,
 // together with the migration step that makes it. It is a variable only so
 // tests can stand in for an older binary.
-var schemaVersion = 6
+var schemaVersion = 7
 
 // inferSchemaVersion classifies a journal written before the stamp existed
 // by its shape: 0 when it has no tables yet, 4 when its waits carry an
@@ -343,6 +344,13 @@ func (j *Journal) migrate(ctx context.Context, tx *sql.Tx, from int) error {
 			}
 		}
 	}
+	// An engine step's result records the digest of its input (#332), so a
+	// replay that resolves a different input is refused, not served it.
+	if from < 7 {
+		if err := ensureColumn(ctx, tx, "journal_operations", "input_digest", `TEXT`); err != nil {
+			return err
+		}
+	}
 	return remapResumedWaits(ctx, tx)
 }
 
@@ -430,6 +438,7 @@ var schemaStatements = []string{
 		input_json BLOB,
 		created_at INTEGER NOT NULL,
 		updated_at INTEGER NOT NULL,
+		input_digest TEXT,
 		FOREIGN KEY (run_id) REFERENCES journal_runs(run_id)
 	)`,
 	`CREATE TABLE IF NOT EXISTS journal_attempts (
@@ -677,6 +686,18 @@ func (j *Journal) BeginEffect(ctx context.Context, intent EffectIntent) (Operati
 	key := intent.Identity.Key()
 	var operation Operation
 	err := j.withTx(ctx, "effect-intent", func(tx *sql.Tx) error {
+		var err error
+		operation, err = j.beginEffect(ctx, tx, intent, key)
+		return err
+	})
+	if err != nil {
+		return Operation{}, fmt.Errorf("journal: effect intent: %w", err)
+	}
+	return operation, nil
+}
+
+func (j *Journal) beginEffect(ctx context.Context, tx *sql.Tx, intent EffectIntent, key string) (operation Operation, err error) {
+	err = func() error {
 		var runState string
 		if err := tx.QueryRowContext(ctx, `SELECT state FROM journal_runs WHERE run_id=?`, intent.Identity.RunID).Scan(&runState); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
@@ -714,11 +735,8 @@ func (j *Journal) BeginEffect(ctx context.Context, intent EffectIntent) (Operati
 			}
 		}
 		return err
-	})
-	if err != nil {
-		return Operation{}, fmt.Errorf("journal: effect intent: %w", err)
-	}
-	return operation, nil
+	}()
+	return operation, err
 }
 
 func (j *Journal) StartAttempt(ctx context.Context, operationKey string) (Attempt, error) {
@@ -727,6 +745,18 @@ func (j *Journal) StartAttempt(ctx context.Context, operationKey string) (Attemp
 	}
 	var attempt Attempt
 	err := j.withTx(ctx, "attempt-start", func(tx *sql.Tx) error {
+		var err error
+		attempt, err = j.startAttempt(ctx, tx, operationKey)
+		return err
+	})
+	if err != nil {
+		return Attempt{}, fmt.Errorf("journal: start attempt: %w", err)
+	}
+	return attempt, nil
+}
+
+func (j *Journal) startAttempt(ctx context.Context, tx *sql.Tx, operationKey string) (attempt Attempt, err error) {
+	err = func() error {
 		operation, err := scanOperation(tx.QueryRowContext(ctx, `SELECT operation_key, run_id, artifact_digest, invocation_path, iteration_path, provider_operation_key, state, current_attempt_id, input_json, result_json FROM journal_operations WHERE operation_key = ?`, operationKey))
 		if err != nil {
 			return err
@@ -760,11 +790,8 @@ func (j *Journal) StartAttempt(ctx context.Context, operationKey string) (Attemp
 		}
 		attempt = Attempt{ID: attemptID, OperationKey: operationKey, AttemptNumber: next, ProviderOperationKey: operation.ProviderOperationKey, State: attemptDispatched, Input: append([]byte(nil), operation.Input...)}
 		return nil
-	})
-	if err != nil {
-		return Attempt{}, fmt.Errorf("journal: start attempt: %w", err)
-	}
-	return attempt, nil
+	}()
+	return attempt, err
 }
 
 func (j *Journal) FailAttempt(ctx context.Context, operationKey, attemptID string, retryable bool, message string) error {
@@ -852,6 +879,12 @@ func (j *Journal) MarkUncertain(ctx context.Context, operationKey, attemptID, ev
 		return errors.New("journal: operation and attempt keys are required")
 	}
 	return j.withTx(ctx, "effect-uncertain", func(tx *sql.Tx) error {
+		return j.markUncertain(ctx, tx, operationKey, attemptID, evidence)
+	})
+}
+
+func (j *Journal) markUncertain(ctx context.Context, tx *sql.Tx, operationKey, attemptID, evidence string) error {
+	return func() error {
 		result, err := tx.ExecContext(ctx, `UPDATE journal_attempts SET state = ?, error_text = ?, finished_at = ? WHERE attempt_id = ? AND operation_key = ? AND state = ?`, attemptUncertain, evidence, j.now(), attemptID, operationKey, attemptDispatched)
 		if err != nil {
 			return err
@@ -875,7 +908,7 @@ func (j *Journal) MarkUncertain(ctx context.Context, operationKey, attemptID, ev
 			return ErrStaleAttempt
 		}
 		return nil
-	})
+	}()
 }
 
 func (j *Journal) CompleteRun(ctx context.Context, runID string, output json.RawMessage) error {
@@ -985,6 +1018,12 @@ func (j *Journal) MarkRunUncertain(ctx context.Context, runID, errorCode, errorC
 		return errors.New("journal: run and safe uncertainty code/class are required")
 	}
 	return j.withTx(ctx, "run-uncertain", func(tx *sql.Tx) error {
+		return j.markRunUncertain(ctx, tx, runID, errorCode, errorClass)
+	})
+}
+
+func (j *Journal) markRunUncertain(ctx context.Context, tx *sql.Tx, runID, errorCode, errorClass string) error {
+	return func() error {
 		result, err := tx.ExecContext(ctx, `UPDATE journal_runs SET state=?,error_code=?,error_class=?,completed_at=? WHERE run_id=? AND state=?`, runUncertain, errorCode, errorClass, j.now(), runID, runAccepted)
 		if err != nil {
 			return err
@@ -1007,7 +1046,7 @@ func (j *Journal) MarkRunUncertain(ctx context.Context, runID, errorCode, errorC
 			return nil
 		}
 		return ErrStaleAttempt
-	})
+	}()
 }
 
 func requireQuiescentRun(ctx context.Context, tx *sql.Tx, runID string) error {
