@@ -335,6 +335,104 @@ func TestRestoreRefusesASourceWithALiveLog(t *testing.T) {
 	requireAbsentFile(t, destination)
 }
 
+// staleLog leaves at path+"-wal" the write-ahead log of another database
+// at path, holding rows rows the database file never received, and removes
+// that database: what a crash, or an operator deleting only app.db, leaves
+// behind.
+func staleLog(t *testing.T, path string, rows int) []byte {
+	t.Helper()
+	database := seedDatabase(t, path, rows, 100)
+	log, err := os.ReadFile(path + "-wal")
+	if err != nil || len(log) == 0 {
+		t.Fatalf("the old database has no log to leave behind: %d bytes, err=%v", len(log), err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+		if err := os.Remove(path + suffix); err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(path+"-wal", log, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return log
+}
+
+// TestRestoreRefusesALeftoverBesideTheDestination (#343, Review R): SQLite
+// reads a -wal, -shm or -journal file beside a database as that database's,
+// so a log an old database at the destination left behind was replayed into
+// the restored copy: from a 400-row backup Restore returned nil and the
+// destination held the old database's 7 rows, passing integrity_check.
+// Restore refuses, and leaves the leftover for the operator.
+func TestRestoreRefusesALeftoverBesideTheDestination(t *testing.T) {
+	ctx := context.Background()
+	const rows, pad = 400, 200
+	database := seedDatabase(t, filepath.Join(t.TempDir(), "journal.db"), rows, pad)
+	backup := filepath.Join(t.TempDir(), "backup.db")
+	if err := database.Backup(ctx, backup); err != nil {
+		t.Fatal(err)
+	}
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
+		t.Run(suffix, func(t *testing.T) {
+			destination := filepath.Join(t.TempDir(), "app.db")
+			var leftover []byte
+			if suffix == "-wal" {
+				leftover = staleLog(t, destination, 7)
+			} else {
+				leftover = bytes.Repeat([]byte{0x5A}, 4096)
+				if err := os.WriteFile(destination+suffix, leftover, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err := (Backend{}).Restore(ctx, backup, destination)
+			if err == nil {
+				restored := -1
+				if db, openErr := (Backend{}).Open(ctx, destination); openErr == nil {
+					_ = db.WithTx(ctx, func(tx *sql.Tx) error {
+						return tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM entries`).Scan(&restored)
+					})
+					_ = db.Close()
+				}
+				t.Fatalf("Restore beside a leftover %s returned nil; the restored database holds %d rows of the backup's %d", suffix, restored, rows)
+			}
+			if !strings.Contains(err.Error(), suffix) {
+				t.Fatalf("Restore beside a leftover %s: err=%v; want it to name the leftover", suffix, err)
+			}
+			requireAbsentFile(t, destination)
+			if got, err := os.ReadFile(destination + suffix); err != nil || !bytes.Equal(got, leftover) {
+				t.Fatalf("Restore changed the leftover %s (err=%v)", suffix, err)
+			}
+		})
+	}
+}
+
+// TestRestoreRechecksForALeftoverBeforeInstalling (#343, Review R): a log
+// that appears beside the destination while Restore copies is caught by the
+// check just before the rename, not only by the one at the start.
+func TestRestoreRechecksForALeftoverBeforeInstalling(t *testing.T) {
+	ctx := context.Background()
+	const rows, pad = 400, 200
+	database := seedDatabase(t, filepath.Join(t.TempDir(), "journal.db"), rows, pad)
+	backup := filepath.Join(t.TempDir(), "backup.db")
+	if err := database.Backup(ctx, backup); err != nil {
+		t.Fatal(err)
+	}
+	parent := t.TempDir()
+	destination := filepath.Join(parent, "app.db")
+	restoreCopied = func(string) { staleLog(t, destination, 7) }
+	t.Cleanup(func() { restoreCopied = nil })
+	err := (Backend{}).Restore(ctx, backup, destination)
+	if err == nil || !strings.Contains(err.Error(), "-wal") {
+		t.Fatalf("Restore with a log left beside the destination during the copy: err=%v; want it refused", err)
+	}
+	requireAbsentFile(t, destination)
+	if left := entries(t, parent); !slices.Equal(left, []string{"app.db-wal"}) {
+		t.Fatalf("the refused Restore left %v; want only the leftover app.db-wal", left)
+	}
+}
+
 // Child processes for TestProcessKillDuringRestore and
 // TestProcessKillDuringBackup.
 const (
@@ -342,6 +440,8 @@ const (
 	crashSourceEnv = "NEWBLOK_SQLITE_CRASH_SOURCE"
 	crashTargetEnv = "NEWBLOK_SQLITE_CRASH_TARGET"
 	crashMarkerEnv = "NEWBLOK_SQLITE_CRASH_MARKER"
+	// crashDoneSuffix marks a child whose Backup or Restore returned nil.
+	crashDoneSuffix = ".done"
 )
 
 // TestProcessKillDuringRestore (#343) kills a real child process with
@@ -492,6 +592,8 @@ func startCrashPointChild(t *testing.T, test, phase, source, destination string)
 	t.Helper()
 	marker := filepath.Join(t.TempDir(), "marker")
 	command := exec.Command(os.Args[0], "-test.run=^"+test+"$", "-test.count=1")
+	// Kept for diagnosing a child that fails instead of parking.
+	command.Stdout, command.Stderr = &bytes.Buffer{}, &bytes.Buffer{}
 	command.Env = append(os.Environ(),
 		crashChildEnv+"="+phase,
 		crashSourceEnv+"="+source,
@@ -541,6 +643,9 @@ func runCrashPointChild(phase string) {
 		panic("unknown phase " + phase)
 	}
 	if err != nil {
+		panic(err)
+	}
+	if err := os.WriteFile(marker+crashDoneSuffix, nil, 0o600); err != nil {
 		panic(err)
 	}
 	panic("the child passed its crash point")

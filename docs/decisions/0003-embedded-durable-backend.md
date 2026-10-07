@@ -179,7 +179,7 @@ release supports:
 
 | Component | Owner | Version | History |
 | --- | --- | --- | --- |
-| `journal` | `internal/journal` | 4 | 1 before #281; 2 with #281's erasure tables; 3 with #286's reconciliation tenant; 4 with #332's wait identity (ADR 0027) |
+| `journal` | `internal/journal` | 5 | 1 before #281; 2 with #281's erasure tables; 3 with #286's reconciliation tenant; 4 with #332's wait identity (ADR 0027); 5 with #334's scope attempt (below) |
 | `audit` | `contract/audit` | 1 | the #80 tables, unchanged since |
 | `worker` | `trigger/worker` | 2 | 1 before #290; 2 with #290's `worker_compacted` and `worker_meta` |
 | `approval` | `contract/approval` | 1 | `approval_decisions_v1` as #75 introduced it |
@@ -425,7 +425,18 @@ bytes `Restore` copies, ignoring any log beside it. `Restore` therefore
 refuses a source with a non-empty `-wal` or `-journal` file beside it
 rather than restore it without the changes those hold: folding them in
 would write to the backup. A file `Backup` wrote is in rollback mode and
-self-contained. The copy is written to `.restore-*` beside the destination,
+self-contained. The source must not be written while `Restore` runs.
+
+`Restore` refuses a destination that exists or has a `-wal`, `-shm` or
+`-journal` file beside it, at the start and again just before the rename.
+SQLite reads such a file as the database's own: before Review R of #343, a
+log an old database at the destination left behind was replayed into the
+restored copy (a 400-row backup restored with `nil` and held the old
+database's 7 rows, passing `integrity_check`). The leftover is refused, not
+removed, since it may belong to a database still in use. The check is not
+atomic with the rename: a file another process creates at the destination
+in that moment is replaced. A destination directory `Restore` creates has
+its parent synced. The copy is written to `.restore-*` beside the destination,
 synced, renamed to the destination, the directory synced, and the copy then
 opened through `Open` and checked again; if that fails, the destination
 and any `-wal`, `-shm` or `-journal` beside it are removed and the
@@ -438,8 +449,76 @@ a crash after it leaves the whole, synced copy of the checked backup.
 | `Restore` never writes to its source and restores from a read-only file or directory (#343) | behavioral (bug fix) | None. A backup's bytes and checksum are unchanged by `Restore` |
 | `Restore` refuses a source with a non-empty `-wal` or `-journal` file beside it (#343) | behavioral (breaking for such sources) | Restore a file written by `Backup`, or checkpoint the source (open and close it with no other connection) first. Before, `Restore` folded the log into the source by writing to it, or, with another connection open, silently restored without the log's changes |
 | `Restore` removes the destination when the restored check fails (#343) | behavioral (bug fix) | None. A retry is no longer refused with `already exists` |
-| `Restore` syncs the directory after the rename (#343) | durability (bug fix) | None. Not on Windows, which cannot sync a directory and is not supported (#297). A crash can leave `.restore-*` files beside the destination; they never block a retry and may be deleted |
+| `Restore` refuses a destination with a `-wal`, `-shm` or `-journal` file beside it (#343) | behavioral (bug fix) | Remove the leftover if no database uses it. Before, a leftover log was replayed into the restored database |
+| `Restore` syncs the directory after the rename, and the parent of a directory it creates (#343) | durability (bug fix) | None. Not done on Windows (unsupported, #297). A crash can leave `.restore-*` files beside the destination; they never block a retry and may be deleted |
 | `Backup` writes to a temporary file, syncs it, renames it and syncs the directory; a failed or interrupted backup leaves nothing at the destination (#343) | behavioral (bug fix) | None. A crash can leave `.backup-*` files (and their `-journal`) beside the destination; they never block a retry and may be deleted. The rename replaces a file another process creates at the destination between `Backup`'s check and the rename; `VACUUM INTO` alone refused one |
+
+## Recovery records are write-once (#334)
+
+A run's recovery records are its receipts: a scope's output, a child run's
+answer, a join's count of returned branches, the checkpoint it resumes from.
+Before #334 a late or stale writer could change them: `CompleteScope`
+overwrote a committed output, `StartScope` restarted a canceled scope (which
+could then be completed), a checkpoint could name another artifact than the
+run's admitted one, and a run that had ended still took new scopes and
+checkpoints. (Joins and children are the second part of #334.)
+
+A scope has two terminal states, completed and canceled, and never leaves
+either. Each write now runs in the journal's writer transaction, reads what
+is stored, and either moves the record forward (a scope from running to one
+of its terminal states), repeats it byte for byte (an idempotent retry,
+which succeeds and writes nothing), or is refused with a typed error and
+changes nothing:
+
+- `ErrRecordFinal`: the scope is final. `CompleteScope` on a completed
+  scope with another output, or from another attempt; `StartScope` on a
+  canceled scope. (`StartScope` on a completed scope is not an error: it
+  returns `AlreadyCompleted`.)
+- `ErrStaleAttempt`: `CompleteScope` from an attempt that a later
+  `StartScope` superseded, or with no attempt id.
+- `ErrNotFound`: `CompleteScope` on a canceled scope, as before #334; and
+  any write for an unknown run, where SQLite's foreign-key error used to
+  leak.
+- `ErrRunNotActive`: `StartScope` or `SaveCheckpoint` for a run that is
+  not accepted (canceled, completed, failed or uncertain).
+- `ErrArtifactMismatch`: a checkpoint, or a `Recover`, naming another
+  artifact than the run was admitted under.
+
+For a caller of `CompleteScope`, `ErrStaleAttempt`, `ErrRecordFinal` and
+`ErrNotFound` all mean it lost the scope: a superseded attempt sees
+`ErrStaleAttempt` while the scope runs, `ErrRecordFinal` once the current
+attempt has completed it, and `ErrNotFound` once it was canceled.
+
+A run whose checkpoint was written before #334 under another artifact than
+it was admitted under fails closed: `Recover` refuses it under either
+artifact, and `SaveCheckpoint` cannot replace the row. Resolving it is an
+operator decision, not something the journal guesses.
+
+The scope attempt is a new `journal_scopes.attempt_id` column, and it
+raises the journal to version 5 (§ Schema versions). An older binary that
+opened such a database would ignore the column, so it would honour neither
+the fence nor the finality: the #334 review ran the aaf633c binary on one,
+and it restarted a fenced scope without touching `attempt_id` and
+overwrote a completed output this binary had refused. A rollback would
+silently void the guarantees above; with the raise, a version-4 or older
+binary from #291 on refuses the database at open instead
+(`store.NewerSchemaError`; older binaries have no stamp check, see Limits
+under § Schema versions).
+The migration adds the column when the version found is older than 5; it
+uses `ensureColumn`, so a database a pre-release build of #334 already gave
+the column under an older stamp migrates too. Version 5 has no shape for
+`inferSchemaVersion`: every database with the column was written after the
+stamp existed (#291), so it is stamped and never classified by shape. A
+scope a version-4 binary left running has the empty attempt id, which no
+caller holds, so only a fresh `StartScope` can complete it.
+
+| Change | Class | Migration |
+| --- | --- | --- |
+| `journal_scopes.attempt_id TEXT NOT NULL DEFAULT ''` (#334) | schema, additive | Added when the version found is older than 5; existing rows get `''`, which no attempt matches until the next `StartScope` |
+| `StartScope` returns `ScopeAttempt{AttemptID, AlreadyCompleted}` instead of a bool; `CompleteScope` takes the attempt id (#334) | breaking (internal API) | Callers keep the attempt id `StartScope` returned and pass it to `CompleteScope`. Outside `internal/journal` only `contract/audit`'s tests call them |
+| Completed and canceled scopes are final; scopes are fenced by attempt; checkpoints are bound to the admitted artifact and an accepted run; `StartScope` needs an accepted run; `Recover` checks the admitted artifact (#334) | behavioral (bug fix) | None for a caller that writes each record forward once. A write that used to overwrite, or a restart of a canceled scope, now returns one of the typed errors above. Nothing in the repository restarted a canceled scope |
+| Journal schema version 5 (#334) | behavioral (breaking for downgrades) | None for upgrades. A binary supporting journal 4 or older refuses a database this release opened, with `store.NewerSchemaError` (from #291 on; see Limits under § Schema versions); restore a backup taken before the upgrade, as for every raise above |
+| `ErrRecordFinal`, `ScopeAttempt` (#334) | additive | None |
 
 ## Alternatives considered
 
@@ -476,7 +555,9 @@ and reads the committed row.
 `backup_test.go` (#343) restores a corrupt backup, which must be refused
 before anything is copied (mutation M49b, skipping the source check, fails
 it), and a copy damaged between the rename and the restored check, which
-must fail and leave no destination (M49b2, skipping that check, fails it).
+must fail and leave no destination (M49b2, skipping that check, fails it),
+and refuses a destination with a leftover `-wal` (a real stale log), `-shm`
+or `-journal` beside it, at the start and when one appears during the copy.
 It requires the backup's SHA-256 and modification time to be unchanged by
 `Restore`, with the backup and its directory read-only and with a WAL-mode
 file, run as an unprivileged user when the tests run as root. It kills a
