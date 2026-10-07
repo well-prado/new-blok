@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -41,9 +42,22 @@ type RunJournal struct {
 	runID   string
 	token   int64
 
+	input json.RawMessage
+
 	mu       sync.Mutex
 	artifact string
 	pending  []string
+}
+
+// WithInput gives VerifyRun the run's input as the runner hands it to the
+// engine, encoded with json.Marshal. It is accepted when it is the same
+// JSON value as the input the run was admitted with, whatever its key
+// order: a typed input encodes its fields in declaration order, not the
+// order of the admitted JSON. Without it, VerifyRun expects the admitted
+// input re-encoded with sorted keys.
+func (r *RunJournal) WithInput(encoded json.RawMessage) *RunJournal {
+	r.input = append(json.RawMessage(nil), encoded...)
+	return r
 }
 
 // ForRun returns the engine journal for runID under lease token, from
@@ -77,15 +91,22 @@ func (r *RunJournal) VerifyRun(ctx context.Context, runID, artifact, inputDigest
 		return ErrRunNotActive
 	}
 	// The engine digests its input re-encoded; compare the same encoding.
-	var input any
-	if err := json.Unmarshal(run.Input, &input); err != nil {
+	var stored any
+	if err := json.Unmarshal(run.Input, &stored); err != nil {
 		return err
 	}
-	canonical, err := json.Marshal(input)
+	encoded, err := json.Marshal(stored)
 	if err != nil {
 		return err
 	}
-	if run.ArtifactDigest != artifact || digestBytes(canonical) != inputDigest {
+	if r.input != nil {
+		var given any
+		if err := json.Unmarshal(r.input, &given); err != nil || !reflect.DeepEqual(stored, given) {
+			return ErrRequestConflict
+		}
+		encoded = r.input
+	}
+	if run.ArtifactDigest != artifact || digestBytes(encoded) != inputDigest {
 		return ErrRequestConflict
 	}
 	if err := r.journal.withRead(ctx, func(tx *sql.Tx) error {

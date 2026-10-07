@@ -2,9 +2,9 @@
 
 - Status: in progress for E07-T09 (#332), delivered in slices. Slice A
   (merged, #350) records wait identity and signal routing; slice B (#366,
-  #378) makes wakeups crash-safe; slice C1 (this revision) makes
-  `internal/journal` the engine's step and wait journal; slice C2 (the
-  single-host resumer) completes it
+  #378) makes wakeups crash-safe; slice C1 (#380) makes
+  `internal/journal` the engine's step and wait journal; slice C2 (this
+  revision, with its benchmarks to follow) adds the single-host resumer
 - Date: 2026-10-07
 - Roadmap: E07-T09 ([#332](https://github.com/well-prado/new-blok/issues/332)),
   closing gaps in E07-T04 (#46); prerequisite of E07-T10 (#333, nested
@@ -262,6 +262,50 @@ first one's outcome: it needs the iteration path (and the invocation path
 inside an arm) before durable loops reach the cluster runtime. ADR 0031
 (#333, in progress) has a durable runner refuse control flow until then.
 
+## Single-host resumer (slice C2)
+
+`internal/resumer` executes durable runs on one host. It is a package of
+its own, not part of `internal/journal`: the journal stays storage (no
+goroutines, tickers or engine execution), the engine stays free of
+storage, and only an application that runs durable workflows links the
+resumer (`internal/journal`'s other importers, such as `agent/policy`, do
+not gain a scheduler).
+
+- `New(Config{Journal, Engine, Workflows, Interval, Batch, Workers, Lease,
+  Clock})`: `Workflows` maps a workflow name to its program and an input
+  decoder, as `internal/cluster` does; a run executes only the program
+  whose digest is its admitted artifact (another is left, not failed: a
+  different build may know it).
+- `Start(runID)` takes a just-admitted run's lease (`TakeRunLease`) and
+  executes it. `Run(ctx)` sweeps at once and every interval (and on
+  `Wake`): `PendingResumptions` (woken runs), `ClaimDueWaits` (due
+  timers), `InterruptedRuns` (below), each up to `Batch`, executed by at
+  most `Workers` at a time.
+- An execution decodes the run's input, runs `RunJournaled` through
+  `ForRun(run, token).WithInput(...)`, renews the lease every third of its
+  length (an `ErrLeaseLost` renewal cancels it), and settles: a completed
+  run through `RunJournal.CompleteRun`, a workflow failure through
+  `FailRun`, an uncertain effect through `MarkRunUncertain`; a suspension
+  just releases the lease. A lost lease, a stop, a journal fault or an
+  unknown workflow settles nothing and releases the lease.
+- **Suspended runs hold nothing.** An execution returns at a wait and its
+  goroutine ends; the run is a waiting row and a released lease
+  (`TestSuspendedRunsHoldNoGoroutine`: 500 suspended runs, no goroutine
+  growth; slice C2's benchmarks measure 10,000).
+- **Interrupted runs.** `Journal.InterruptedRuns` leases live runs that
+  were leased before, hold no live lease and have neither an open nor a
+  fired wait: their execution stopped without suspending or ending (the
+  holder died, lost its lease, or was stopped), including after it
+  consumed a wakeup. A run admitted and never leased is its admitter's.
+- **Shutdown.** `Close(ctx)` stops sweeping, waits for running executions
+  until `ctx` ends, then cancels the rest; every execution releases its
+  lease as it ends, so another resumer takes its run at once (as an
+  interrupted run, or a woken one if its wakeup was not yet consumed).
+- **Typed inputs.** A typed input encodes its fields in declaration order,
+  not the admitted JSON's; `RunJournal.WithInput` lets `VerifyRun` accept
+  it when it is the same JSON value as the admitted input (C1 compared the
+  sorted-key encoding only, so a two-field typed input could not run).
+
 ## Compatibility
 
 | Change | Class | Migration |
@@ -279,6 +323,7 @@ inside an arm) before durable loops reach the cluster runtime. ADR 0031
 | Journal schema 5 → 6 (slice B) | schema, one-way | On open; `resumed` waits remapped on every open |
 | Journal schema 6 → 7: `journal_operations.input_digest` (slice C1) | schema, one-way | On open, `from < 7`; operations recorded before it have no digest and are not compared |
 | `RunJournal.MarkRunUncertain`, `MaxStepResultBytes`, `ErrStepResultLimit` (slice C1) | API, additive | None |
+| `internal/resumer`; `Journal.InterruptedRuns`, `RunLease`; `RunJournal.WithInput` (slice C2) | API, additive | None |
 
 ## Evidence
 
@@ -350,8 +395,11 @@ process); after Review R round 1, `TestWaitAfterWaitIsNotWokenAgain`,
   first open by this binary remaps that wait to `fired` and a holder may
   then list and execute the same run: a double-resume window that lasts
   until the old process stops. Upgrade by stopping old processes first.
-- No single-host runner resumes runs through `RunJournal` yet: slice C2
-  lists resumptions on start, executes them, renews and releases leases.
+- `InterruptedRuns` scans live runs without an index on their state; a
+  run that keeps failing with a journal fault, or whose workflow is not
+  registered, is taken again every sweep (least recently leased first).
+- The resumer settles what the engine reports; an application's admission
+  path calls `Start` (no admission is wired to it in this slice).
 - Every step is at the `root` iteration until #333 passes iteration paths
   to the engine (ADR 0031, in progress, refuses durable control flow until
   then).
