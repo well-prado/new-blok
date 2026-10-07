@@ -82,7 +82,7 @@ func (r *rig) contentRun(label string, reconciled bool) contentRun {
 	if err := r.journal.SaveCheckpoint(ctx, journal.Checkpoint{RunID: run.RunID, ArtifactDigest: digest("artifact"), CheckpointDigest: digest("checkpoint"), State: quoted("CHECKPOINT")}); err != nil {
 		r.t.Fatal(err)
 	}
-	if _, err := r.journal.ScheduleWait(ctx, journal.WaitRequest{RunID: run.RunID, WaitID: "wait-" + label, Name: "approved", DueAt: r.clock.Add(time.Minute)}); err != nil {
+	if _, err := r.journal.ScheduleWait(ctx, journal.WaitRequest{RunID: run.RunID, WaitID: "wait-" + label, Name: "approved", InvocationPath: "approve", IterationPath: "root", DueAt: r.clock.Add(time.Minute)}); err != nil {
 		r.t.Fatal(err)
 	}
 	if _, err := r.journal.Signal(ctx, signal.Envelope{RunID: run.RunID, SignalID: "signal-" + label, Name: "approved", Payload: quoted("SIGNAL"), Principal: "alice"}, true); err != nil {

@@ -301,8 +301,8 @@ func TestMigrationSurvivesACrash(t *testing.T) {
 	if n := r.count(`SELECT COUNT(*) FROM sqlite_master WHERE name = 'journal_audit'`); n != 0 {
 		t.Fatal("the reopened journal did not migrate")
 	}
-	if version, stamped := journalStamp(t, r.db); !stamped || version != 3 {
-		t.Fatalf("the reopened journal is stamped %d (%v); want 3", version, stamped)
+	if version, stamped := journalStamp(t, r.db); !stamped || version != 4 {
+		t.Fatalf("the reopened journal is stamped %d (%v); want 4", version, stamped)
 	}
 	r.mustVerify(2)
 }

@@ -64,7 +64,7 @@ type component struct {
 // schema version this binary supports, opened as an application composes
 // it. Approval needs audit on the same database, so it opens audit first.
 var components = []component{
-	{"journal", 3, func(ctx context.Context, db store.Database) error {
+	{"journal", 4, func(ctx context.Context, db store.Database) error {
 		_, err := journal.New(ctx, db, journal.Config{})
 		return err
 	}},
@@ -305,7 +305,8 @@ func TestEveryComponentMigratesAnOlderStampForward(t *testing.T) {
 // TestOriginMainDatabaseIsClassifiedAndStamped opens the database
 // origin/main wrote at ef330a3, where nothing is stamped. Each component
 // is classified by its tables' shape, migrated, and stamped in the same
-// transaction; its data still works; and reopening changes nothing.
+// transaction; its data still works; and reopening changes nothing. The
+// journal there predates #332's wait identity, so it is classified 3.
 func TestOriginMainDatabaseIsClassifiedAndStamped(t *testing.T) {
 	ctx := context.Background()
 	db := open(t, fixture(t, mainFixture))
@@ -316,10 +317,14 @@ func TestOriginMainDatabaseIsClassifiedAndStamped(t *testing.T) {
 		if err := c.open(ctx, db); err != nil {
 			t.Fatalf("%s: %v", c.name, err)
 		}
-		// origin/main wrote every component at the version this binary
+		// ef330a3 wrote every other component at the version this binary
 		// supports, so each is classified as that version.
-		if s, found := stampOf(t, db, c.name); !found || s != (stamp{version: c.version, from: c.version}) {
-			t.Fatalf("%s stamp=%+v found=%v; want %d classified from its shape", c.name, s, found, c.version)
+		from := c.version
+		if c.name == "journal" {
+			from = 3
+		}
+		if s, found := stampOf(t, db, c.name); !found || s != (stamp{version: c.version, from: from}) {
+			t.Fatalf("%s stamp=%+v found=%v; want %d upgraded from %d, classified from its shape", c.name, s, found, c.version, from)
 		}
 	}
 	// The queue's tombstone still deduplicates the compacted job (#290).
