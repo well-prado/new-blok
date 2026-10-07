@@ -213,10 +213,16 @@ both; a top-level step's invocation path is its ID).
   (`ErrLeaseLost`). A run's engine input (the engine's digest of the input
   its runner hands it, a typed decode of the admitted JSON re-encoded) is
   fixed once: at admission when the admitter knows it
-  (`AdmissionRequest.EngineInput`, as `internal/cluster` stores
-  `json.Marshal` of the decoded input), otherwise by the run's first
-  execution (`journal_runs.engine_input_digest`, schema 7). A later
-  execution with another engine input is refused. The admitted bytes are
+  (`AdmissionRequest.EngineInput`, the decoded value itself, which `Admit`
+  digests with the engine's own `engine.InputDigest`, so no caller
+  encoding can differ from the engine's; a value `json.Marshal` refuses is
+  refused at admission), otherwise by the run's first execution
+  (`journal_runs.engine_input_digest`, schema 7). A later execution with
+  another engine input is refused, and so is a repeat admission of the
+  request key naming another engine input than the one fixed (Review R
+  round 3 on #380: caller bytes with other whitespace, HTML escaping, key
+  order or `\u` escapes than `json.Marshal`'s fixed an identity no
+  execution could match). The admitted bytes are
   never compared with a re-encoding: a run admitted with valid input always
   runs, whether its typed decode reorders fields, keeps an integer beyond
   float64's exact range, drops an unknown field or zero-fills an optional
@@ -345,7 +351,9 @@ process); after Review R round 1, `TestWaitAfterWaitIsNotWokenAgain`,
 `TestRunJournalMarksARunUncertain`, `TestStepResultIsBounded`; after
 round 2, `TestEveryValidInputRuns`, `TestEngineInputIsFixedOnce`,
 `TestPermanentErrors`, `TestWritesAfterTheRunEndedAreRefused`,
-`TestWaitIDFormatIsPinned`, `TestOversizeStepResultIsRecognizable`.
+`TestWaitIDFormatIsPinned`, `TestOversizeStepResultIsRecognizable`; after
+round 3, `TestEngineInputFixedAtAdmissionRuns`,
+`TestEngineInputMustEncode`, `TestRepeatAdmissionComparesEngineInput`.
 
 ## Limits
 

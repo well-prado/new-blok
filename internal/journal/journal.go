@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/well-prado/new-blok/contract/audit"
+	"github.com/well-prado/new-blok/internal/engine"
 	"github.com/well-prado/new-blok/internal/migration"
 	"github.com/well-prado/new-blok/store"
 )
@@ -100,11 +101,13 @@ type AdmissionRequest struct {
 	Workflow       string
 	ArtifactDigest string
 	Input          json.RawMessage
-	// EngineInput, when set, is the input as the run's runner will hand it
-	// to the engine, encoded with json.Marshal (a typed decode of Input,
-	// re-encoded): the run's engine-input identity, fixed at admission.
-	// Without it, the first execution's engine input fixes it (VerifyRun).
-	EngineInput json.RawMessage
+	// EngineInput, when set, is the value the run's runner will hand the
+	// engine (a typed decode of Input): its engine-input identity, fixed at
+	// admission. Admit digests it exactly as the engine does
+	// (engine.InputDigest), so pass the value, not an encoding of it; a
+	// value json.Marshal refuses is refused. Without it, the first
+	// execution's engine input fixes the identity (VerifyRun).
+	EngineInput any
 }
 
 type Admission struct {
@@ -606,7 +609,11 @@ func (j *Journal) Admit(ctx context.Context, request AdmissionRequest) (Admissio
 	digest := digestBytes(request.Input)
 	var engineInput any
 	if request.EngineInput != nil {
-		engineInput = digestBytes(request.EngineInput)
+		bound, err := engine.InputDigest(request.EngineInput)
+		if err != nil {
+			return Admission{}, fmt.Errorf("journal: admit: the engine input cannot be encoded: %w", err)
+		}
+		engineInput = bound
 	}
 	runID, err := randomID("run")
 	if err != nil {
@@ -633,6 +640,15 @@ func (j *Journal) Admit(ctx context.Context, request AdmissionRequest) (Admissio
 			}
 			if existing.Principal != request.Principal || existing.Workflow != request.Workflow || existing.ArtifactDigest != request.ArtifactDigest || existing.InputDigest != digest {
 				return ErrRequestConflict
+			}
+			if engineInput != nil {
+				var bound sql.NullString
+				if err := tx.QueryRowContext(ctx, `SELECT engine_input_digest FROM journal_runs WHERE run_id = ?`, existing.RunID).Scan(&bound); err != nil {
+					return err
+				}
+				if bound.Valid && bound.String != engineInput {
+					return ErrRequestConflict
+				}
 			}
 			admission.RunID = existing.RunID
 			admission.Accepted = false
@@ -1165,9 +1181,6 @@ func (j *Journal) now() int64 { return j.clock().UTC().UnixNano() }
 func validateAdmission(request AdmissionRequest) error {
 	if request.RequestKey == "" || request.Workflow == "" || request.ArtifactDigest == "" || !json.Valid(request.Input) {
 		return errors.New("journal: request key, workflow, artifact digest and valid JSON input are required")
-	}
-	if request.EngineInput != nil && !json.Valid(request.EngineInput) {
-		return errors.New("journal: the engine input must be valid JSON")
 	}
 	return nil
 }

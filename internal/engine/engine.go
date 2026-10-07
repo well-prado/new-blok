@@ -216,6 +216,19 @@ func (e *Engine) EmitRunTerminal(invocation inspection.Invocation, workflow stri
 	})
 }
 
+// InputDigest is a run's engine-input identity: the digest of the input's
+// json.Marshal encoding, as a journaled run verifies it on every execution.
+// An admitter fixing the identity up front uses it too, so the two cannot
+// drift.
+func InputDigest(input any) (string, error) {
+	encoded, err := json.Marshal(input)
+	if err != nil {
+		return "", err
+	}
+	hash := sha256.Sum256(encoded)
+	return "sha256:" + hex.EncodeToString(hash[:]), nil
+}
+
 func (e *Engine) run(ctx context.Context, program contract.InternalProgram, input any, runID string, journal StepJournal, invocation inspection.Invocation, requested, terminalOwned bool) (result Result, runErr error) {
 	if e == nil {
 		return Result{}, &Error{Code: "nil_engine", Class: "configuration"}
@@ -227,12 +240,10 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 		return Result{}, &Error{Code: "step_budget_exceeded", Class: "admission"}
 	}
 	if journal != nil {
-		encodedInput, err := json.Marshal(input)
+		inputDigest, err := InputDigest(input)
 		if err != nil {
 			return Result{}, &Error{Code: "journal_input_encode", Class: "persistence", Err: err}
 		}
-		inputHash := sha256.Sum256(encodedInput)
-		inputDigest := "sha256:" + hex.EncodeToString(inputHash[:])
 		if err := journal.VerifyRun(ctx, runID, program.Digest, inputDigest); err != nil {
 			return Result{}, &Error{Code: "journal_run_mismatch", Class: "persistence", Err: err}
 		}
