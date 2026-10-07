@@ -60,11 +60,14 @@ var (
 // Permanent reports an error no retry of the run can fix: a conflict with
 // what the run already recorded (ErrRequestConflict: another engine input,
 // step input or wait plan), a canceled wait the run reached
-// (ErrWaitCanceled), a step result over the bound (ErrStepResultLimit). A
-// runner settles such a run as failed. A lost lease (another holder runs
-// it) and storage faults are not permanent.
+// (ErrWaitCanceled), a step result over the bound (ErrStepResultLimit), a
+// child run of another principal or one that would close a cycle
+// (ErrChildPrincipalMismatch, ErrChildCycle; #372). A runner settles such
+// a run as failed. A lost lease (another holder runs it) and storage
+// faults are not permanent.
 func Permanent(err error) bool {
-	return errors.Is(err, ErrRequestConflict) || errors.Is(err, ErrWaitCanceled) || errors.Is(err, ErrStepResultLimit)
+	return errors.Is(err, ErrRequestConflict) || errors.Is(err, ErrWaitCanceled) || errors.Is(err, ErrStepResultLimit) ||
+		errors.Is(err, ErrChildPrincipalMismatch) || errors.Is(err, ErrChildCycle)
 }
 
 // uncertainStep marks an effect whose outcome is unknown; the engine fails
