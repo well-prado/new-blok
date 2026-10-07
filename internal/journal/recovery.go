@@ -35,11 +35,17 @@ var (
 	// byte for byte (for a scope, from the attempt that completed it),
 	// succeeds instead.
 	ErrRecordFinal = errors.New("journal: recovery record is final")
-	// ErrRecordConflict: the write contradicts what the record fixed when it
-	// was created (a join's expected count, a child's run id) or does not
-	// move it forward (a join's completed count going down, or staying the
-	// same with other results; a running child written as running with
-	// another result).
+	// ErrRecordConflict: the write contradicts what the record holds: a
+	// join's expected count, a filled join slot given another value, a
+	// child's run id, or a row the pre-#334 upsert left in a shape the write
+	// cannot extend. Branches
+	// filling different slots of one join never get it, whatever their order
+	// or handle: each write merges into the stored slots in the writer
+	// transaction. Two writers filling the same slot with different values
+	// do: the first wins and the other gets ErrRecordConflict, the same
+	// error a stale or wrong writer gets for a slot already filled. The
+	// engine either serialises a join's fan-in or, on ErrRecordConflict,
+	// re-reads the join and decides; retrying the same write cannot succeed.
 	ErrRecordConflict = errors.New("journal: recovery record conflicts with the recorded one")
 	// ErrChildRunNotFound: a new child record names a run the journal does
 	// not hold.
@@ -278,7 +284,9 @@ func (j *Journal) CancelScope(ctx context.Context, runID, path, reason string) e
 // a run the journal holds (ErrChildRunNotFound); another id is
 // ErrRecordConflict. A record moves from running to completed only: a
 // completed record is ErrRecordFinal unless the write repeats it byte for
-// byte. The parent run must exist (ErrNotFound).
+// byte. A running record has no result: a running write with one is an
+// invalid record, whether it would create the record or update it. The
+// parent run must exist (ErrNotFound).
 func (j *Journal) RecordChild(ctx context.Context, record ChildRecord) error {
 	if record.RunID == "" || record.Path == "" || record.ChildRunID == "" {
 		return errors.New("journal: child run, path and child identity are required")
@@ -288,6 +296,9 @@ func (j *Journal) RecordChild(ctx context.Context, record ChildRecord) error {
 	}
 	if record.State != childRunning && record.State != childCompleted {
 		return errors.New("journal: child state must be running or completed")
+	}
+	if record.State == childRunning && len(record.Result) > 0 {
+		return errors.New("journal: a running child has no result")
 	}
 	return j.withTx(ctx, "child", func(tx *sql.Tx) error {
 		if _, _, err := runStateAndArtifact(ctx, tx, record.RunID); err != nil {
@@ -325,26 +336,48 @@ func (j *Journal) RecordChild(ctx context.Context, record ChildRecord) error {
 	})
 }
 
-// RecordJoin records how many of a join's branches have come back. It only
-// moves forward: Expected is fixed when the record is created, Completed
-// never decreases, and the same count with other results is
-// ErrRecordConflict. The join completes when Completed reaches Expected;
-// a completed join is ErrRecordFinal unless the write repeats it byte for
-// byte. State is derived from the counts. The run must exist (ErrNotFound).
+// RecordJoin records which of a join's branches have come back. Results
+// are positional: one slot per expected branch, in branch order, JSON null
+// (or empty) while that branch has not come back, and Completed is the
+// number of filled slots. No results at all is Expected empty slots. A
+// branch whose own result is JSON null must therefore be recorded wrapped,
+// or it reads as not yet back.
+//
+// Expected is fixed when the record is created. A write merges into the
+// stored slots inside the writer transaction: it may fill empty slots, and
+// an empty slot in the write leaves the stored one as it is, so branches
+// that fill different slots never conflict, in any order or from any
+// handle. A write that would change a filled slot, or names another
+// Expected, is ErrRecordConflict (ErrRecordFinal once every slot is filled:
+// a completed join is final). A write that brings nothing new, such as an
+// identical retry, succeeds and changes nothing. State is derived from the
+// slots; a caller State that disagrees, results of another length than
+// Expected, or a Completed that is not the number of filled slots is an
+// invalid record. The run must exist (ErrNotFound). A row the pre-#334
+// upsert left in another shape (a state other than running or completed,
+// or results that are not one slot per branch) is refused with
+// ErrRecordConflict unless the write is identical to it.
 func (j *Journal) RecordJoin(ctx context.Context, record JoinRecord) error {
-	if record.RunID == "" || record.Path == "" || record.Expected < 1 || record.Completed < 0 || record.Completed > record.Expected {
+	if record.RunID == "" || record.Path == "" || record.Expected < 1 {
 		return errors.New("journal: invalid join record")
 	}
-	encoded, err := json.Marshal(record.Results)
+	incoming, err := joinSlots(record.Results, record.Expected)
 	if err != nil {
 		return err
+	}
+	if filledSlots(incoming) != record.Completed {
+		return errors.New("journal: invalid join record: completed is not the number of filled slots")
 	}
 	state := joinRunning
 	if record.Completed == record.Expected {
 		state = joinCompleted
 	}
 	if record.State != "" && record.State != state {
-		return errors.New("journal: invalid join record")
+		return errors.New("journal: invalid join record: state contradicts the slots")
+	}
+	encoded, err := json.Marshal(incoming)
+	if err != nil {
+		return err
 	}
 	return j.withTx(ctx, "join", func(tx *sql.Tx) error {
 		if _, _, err := runStateAndArtifact(ctx, tx, record.RunID); err != nil {
@@ -361,18 +394,89 @@ func (j *Journal) RecordJoin(ctx context.Context, record JoinRecord) error {
 		if err != nil {
 			return err
 		}
-		if expected == record.Expected && completed == record.Completed && bytes.Equal(results, encoded) {
+		if expected == record.Expected && completed == record.Completed && stored == state && bytes.Equal(results, encoded) {
 			return nil
 		}
+		final := ErrRecordConflict
 		if stored == joinCompleted {
-			return ErrRecordFinal
+			final = ErrRecordFinal
 		}
-		if expected != record.Expected || record.Completed <= completed {
+		if expected != record.Expected {
+			return final
+		}
+		var current []json.RawMessage
+		if json.Unmarshal(results, &current) != nil || len(current) != expected || filledSlots(current) != completed {
 			return ErrRecordConflict
 		}
-		result, err := tx.ExecContext(ctx, `UPDATE journal_joins SET completed = ?, results_json = ?, state = ? WHERE run_id = ? AND path = ? AND state = ? AND expected = ? AND completed < ?`, record.Completed, encoded, state, record.RunID, record.Path, joinRunning, record.Expected, record.Completed)
-		return requireOneRow(result, err)
+		merged := make([]json.RawMessage, expected)
+		added := 0
+		for i := range merged {
+			merged[i] = current[i]
+			switch {
+			case !slotFilled(incoming[i]):
+			case !slotFilled(current[i]):
+				merged[i] = incoming[i]
+				added++
+			case !bytes.Equal(current[i], incoming[i]):
+				return final
+			}
+		}
+		if added == 0 {
+			return nil
+		}
+		next := completed + added
+		nextState := joinRunning
+		if next == expected {
+			nextState = joinCompleted
+		}
+		mergedJSON, err := json.Marshal(merged)
+		if err != nil {
+			return err
+		}
+		// The fence also refuses a row the pre-#334 upsert left in a state
+		// other than running: it changes no row.
+		updated, err := tx.ExecContext(ctx, `UPDATE journal_joins SET completed = ?, results_json = ?, state = ? WHERE run_id = ? AND path = ? AND state = ? AND expected = ? AND completed = ?`, next, mergedJSON, nextState, record.RunID, record.Path, joinRunning, expected, completed)
+		return requireOneRow(updated, err)
 	})
+}
+
+// joinSlots normalises a join's results to exactly expected slots, an
+// empty slot as JSON null; no results at all is expected empty slots.
+func joinSlots(results []json.RawMessage, expected int) ([]json.RawMessage, error) {
+	if len(results) == 0 {
+		results = make([]json.RawMessage, expected)
+	}
+	if len(results) != expected {
+		return nil, errors.New("journal: invalid join record: results must have one slot per expected branch")
+	}
+	slots := make([]json.RawMessage, expected)
+	for i, slot := range results {
+		trimmed := bytes.TrimSpace(slot)
+		if !slotFilled(trimmed) {
+			slots[i] = json.RawMessage("null")
+			continue
+		}
+		if !json.Valid(trimmed) {
+			return nil, errors.New("journal: invalid join record: a result is not valid JSON")
+		}
+		slots[i] = append(json.RawMessage(nil), trimmed...)
+	}
+	return slots, nil
+}
+
+func slotFilled(slot json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(slot)
+	return len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null"))
+}
+
+func filledSlots(slots []json.RawMessage) int {
+	filled := 0
+	for _, slot := range slots {
+		if slotFilled(slot) {
+			filled++
+		}
+	}
+	return filled
 }
 
 // requireOneRow is a fenced UPDATE's outcome: it must have moved exactly

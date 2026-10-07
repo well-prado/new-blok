@@ -415,22 +415,45 @@ A scope has two terminal states, completed and canceled; a join and a
 child have one, completed. No record leaves a terminal state. Each write
 now runs in the journal's writer transaction, reads what is stored, and
 either moves the record forward (a scope from running to one of its
-terminal states; a join to a higher completed count, completing when it
-reaches the expected one; a child from running to completed), repeats it
-byte for byte (an idempotent retry, which succeeds and writes nothing), or
-is refused with a typed error and changes nothing. A join's state is
-derived from its counts; a caller's `State` that disagrees with them is an
-invalid record.
+terminal states; a join by filling empty slots, completing when every
+slot is filled; a child from running to completed), brings nothing new (an
+idempotent retry, which succeeds and writes nothing), or is refused with a
+typed error and changes nothing.
+
+**A join's results are positional slots.** `Results` holds exactly
+`Expected` slots in branch order, as the engine's parallel runner fills its
+results by branch position; a slot is JSON null (or empty) until its
+branch comes back, and `Completed` is the number of filled slots. No
+results at all means `Expected` empty slots. `Expected` is fixed when the
+join is created, and a filled slot never changes. A write merges into the
+stored slots inside the writer transaction: it fills the empty slots it
+carries, and its own empty slots leave the stored ones as they are. So
+branches that come back in any order, or from different journal handles,
+each fill their own slot without conflicting; two writers filling the same
+slot with different values do conflict, and the first one wins. The join
+is completed, and final, when every slot is filled. A record whose results
+are not `Expected` slots, whose `Completed` is not its number of filled
+slots, or whose `State` contradicts them is an invalid record and nothing
+is stored. Because null marks an empty slot, a branch whose own result is
+JSON null must be recorded wrapped (for example `{"value":null}`), or it
+reads as not yet back. A running child has no result: a running write with
+one is an invalid record, whether it would create the child record or
+update it.
 
 - `ErrRecordFinal`: the record is final. `CompleteScope` on a completed
   scope with another output, or from another attempt; `StartScope` on a
   canceled scope; `RecordJoin` or `RecordChild` writing a completed record
   differently. (`StartScope` on a completed scope is not an error: it
   returns `AlreadyCompleted`.)
-- `ErrRecordConflict`: the write contradicts what the record fixed at
-  creation (a join's expected count, a child's run id) or does not move it
-  forward (a join's completed count going down, or staying the same with
-  other results; a running child written as running with another result).
+- `ErrRecordConflict`: the write contradicts what the record holds: a
+  join's expected count, a filled join slot given another value, a child's
+  run id, or a row the pre-#334 upsert left in a shape the write cannot
+  extend (a state other than running or completed, or join results that are
+  not one slot per branch). Since branches filling different slots never
+  conflict, it means a slot was already filled with another value, by a
+  racing writer or a stale one; retrying the same write cannot succeed, so
+  the engine either serialises a join's fan-in or re-reads the join and
+  decides.
 - `ErrChildRunNotFound`: a new child record names a run the journal does
   not hold. It is checked when the record is created, not on later writes,
   so a child run compacted afterwards does not strand its parent's record.
@@ -479,7 +502,7 @@ caller holds, so only a fresh `StartScope` can complete it.
 | Completed and canceled scopes are final; scopes are fenced by attempt; checkpoints are bound to the admitted artifact and an accepted run; `StartScope` needs an accepted run; `Recover` checks the admitted artifact (#334) | behavioral (bug fix) | None for a caller that writes each record forward once. A write that used to overwrite, or a restart of a canceled scope, now returns one of the typed errors above. Nothing in the repository restarted a canceled scope |
 | Journal schema version 5 (#334) | behavioral (breaking for downgrades) | None for upgrades. A binary supporting journal 4 or older refuses a database this release opened, with `store.NewerSchemaError` (from #291 on; see Limits under § Schema versions); restore a backup taken before the upgrade, as for every raise above |
 | `ErrRecordFinal`, `ScopeAttempt` (#334) | additive | None |
-| Joins are monotonic and final once completed; a child record keeps the child run it was created with, must name an existing run when created, and moves only from running to completed; `RecordJoin` and `RecordChild` refuse an unknown run with `ErrNotFound`; a join's `State` must agree with its counts (#334, part 2) | behavioral (bug fix) | None for a caller that records each join and child forward. A write that used to overwrite or regress one now returns one of the typed errors above; a child record naming a run the journal does not hold is refused. Existing rows are read as before. No schema change, so no version raise: nothing on disk changes shape, and a version-5 binary reads every row this one writes |
+| Join results are positional slots (one per expected branch, filled once, merged per write); joins are final once every slot is filled; a child record keeps the child run it was created with, must name an existing run when created, and moves only from running to completed; `RecordJoin` and `RecordChild` refuse an unknown run with `ErrNotFound`; a join's `Completed` and `State` must agree with its slots, and a running child has no result (#334, part 2) | behavioral (bug fix) | None for a caller that records each join and child forward. A write that used to overwrite or regress one now returns one of the typed errors above; a child record naming a run the journal does not hold is refused; a join written with results that are not `Expected` slots is refused (the repository's callers already wrote one result per branch). Existing rows are read as before. No schema change, so no version raise: nothing on disk changes shape, and a version-5 binary reads every row this one writes |
 | `ErrRecordConflict`, `ErrChildRunNotFound` (#334, part 2) | additive | None |
 
 ## Alternatives considered
