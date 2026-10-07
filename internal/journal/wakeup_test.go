@@ -497,22 +497,115 @@ func TestLeaseTokenFencesStaleExecutions(t *testing.T) {
 	t.Run("two journals under one holder name", func(t *testing.T) {
 		first, second := twoHolders(t, Config{Holder: "same"}, Config{Holder: "same"})
 		run := admitWaiting(t, first, "run", nil)
-		token, err := first.TakeRunLease(ctx, run, at(0))
+		old, err := first.TakeRunLease(ctx, run, at(0))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := second.ReleaseRunLease(ctx, run, token+1); !errors.Is(err, ErrLeaseLost) {
-			t.Fatalf("the other journal released it: err=%v", err)
-		}
 		if _, err := second.TakeRunLease(ctx, run, at(time.Second)); !errors.Is(err, ErrLeaseLost) {
-			t.Fatalf("the other journal took it: err=%v", err)
+			t.Fatalf("the other journal took a live lease: err=%v", err)
+		}
+		current, err := second.TakeRunLease(ctx, run, at(31*time.Second))
+		if err != nil {
+			t.Fatalf("the other journal could not take the lapsed lease: %v", err)
+		}
+		for _, change := range []func() error{
+			func() error { return first.RenewRunLease(ctx, run, old, at(32*time.Second)) },
+			func() error { return first.ReleaseRunLease(ctx, run, old) },
+		} {
+			if err := change(); !errors.Is(err, ErrLeaseLost) {
+				t.Fatalf("the first journal's earlier token: err=%v; want ErrLeaseLost", err)
+			}
 		}
 		for range 2 {
-			if err := first.ReleaseRunLease(ctx, run, token); err != nil {
+			if err := second.ReleaseRunLease(ctx, run, current); err != nil {
 				t.Fatal(err)
 			}
 		}
 	})
+}
+
+// TestAcknowledgedRetryNeedsTheCurrentToken is Review R round 3's probe:
+// acknowledging a wait that is already acknowledged is a no-op only under
+// the run's current lease token. A claims w1, B takes the lapsed run and
+// acknowledges it; A's stale token, a made-up one, and B's retry under
+// any but its current token are ErrLeaseLost.
+// On daff569 both returned nil.
+func TestAcknowledgedRetryNeedsTheCurrentToken(t *testing.T) {
+	ctx := context.Background()
+	a, b := twoHolders(t, Config{Holder: "a"}, Config{Holder: "b"})
+	admitWaiting(t, a, "run", map[string]time.Time{"w1": fixtureBase})
+	claimed, err := a.ClaimDueWaits(ctx, fixtureBase, 10)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim=%v err=%v", waitIDs(claimed), err)
+	}
+	swept, err := b.PendingResumptions(ctx, fixtureBase.Add(31*time.Second), 10)
+	if err != nil || len(swept) != 1 {
+		t.Fatalf("sweep=%v err=%v", waitIDs(swept), err)
+	}
+	if err := b.AcknowledgeWait(ctx, "w1", swept[0].LeaseToken); err != nil {
+		t.Fatal(err)
+	}
+	for _, stale := range []int64{claimed[0].LeaseToken, 999} {
+		if err := a.AcknowledgeWait(ctx, "w1", stale); !errors.Is(err, ErrLeaseLost) {
+			t.Fatalf("acknowledged again under token %d: err=%v; want ErrLeaseLost", stale, err)
+		}
+	}
+	// The current holder too: only its current token makes the retry a no-op.
+	if err := b.AcknowledgeWait(ctx, "w1", swept[0].LeaseToken+1); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("the current holder's retry under another token: err=%v; want ErrLeaseLost", err)
+	}
+	if err := b.AcknowledgeWait(ctx, "w1", swept[0].LeaseToken); err != nil {
+		t.Fatalf("the current holder's retry: %v", err)
+	}
+}
+
+// TestLeaseTokensAreJournalWide: lease tokens come from one sequence for
+// the whole journal, so a token from one run never fences another. On
+// daff569 each run counted from 1, and run x's token released run y.
+func TestLeaseTokensAreJournalWide(t *testing.T) {
+	ctx := context.Background()
+	database, j := newJournal(t, "tokens.db", Config{Holder: "a"})
+	defer database.Close()
+	x, y := admitWaiting(t, j, "x", nil), admitWaiting(t, j, "y", nil)
+	tx, err := j.TakeRunLease(ctx, x, fixtureBase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ty, err := j.TakeRunLease(ctx, y, fixtureBase)
+	if err != nil || ty == tx {
+		t.Fatalf("y token=%d x token=%d err=%v; want distinct", ty, tx, err)
+	}
+	if err := j.ReleaseRunLease(ctx, y, tx); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("released y with x's token: err=%v; want ErrLeaseLost", err)
+	}
+}
+
+// TestRewokenRunRanksByItsNewWakeup is Review R round 3's fairness probe:
+// run r was leased and released long ago; s wakes, then r wakes again. A
+// run's turn is the later of its last lease and its first pending wakeup,
+// so s, which woke first, is listed first. On daff569 r's old lease put it
+// ahead.
+func TestRewokenRunRanksByItsNewWakeup(t *testing.T) {
+	ctx := context.Background()
+	database, j := newJournal(t, "rewoken.db", Config{Holder: "a", Clock: ticking(fixtureBase)})
+	defer database.Close()
+	r := admitWaiting(t, j, "r", map[string]time.Time{"r": fixtureBase.Add(time.Hour)})
+	s := admitWaiting(t, j, "s", map[string]time.Time{"s": fixtureBase.Add(time.Hour)})
+	token, err := j.TakeRunLease(ctx, r, fixtureBase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := j.ReleaseRunLease(ctx, r, token); err != nil {
+		t.Fatal(err)
+	}
+	for _, run := range []struct{ id, name string }{{s, "s"}, {r, "r"}} {
+		if _, err := j.Signal(ctx, signal.Envelope{RunID: run.id, SignalID: run.name, Name: run.name, Principal: "operator", Payload: []byte(`{}`)}, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if listed, err := j.PendingResumptions(ctx, fixtureBase.Add(time.Minute), 1); err != nil || !reflect.DeepEqual(waitIDs(listed), []string{"s@a"}) {
+		t.Fatalf("listed %v err=%v; want s, which woke first", waitIDs(listed), err)
+	}
 }
 
 // TestTakeRunLeaseHoldsARunThatNeverSuspended is Review R round 2's S2

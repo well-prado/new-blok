@@ -75,8 +75,13 @@ const (
 	waitsWithRun = ` FROM journal_waits w JOIN journal_runs r ON r.run_id = w.run_id`
 )
 
-// ErrLeaseLost: another holder has the run, or this holder no longer does.
-var ErrLeaseLost = errors.New("journal: the run lease is held by another holder")
+// ErrLeaseLost: another holder has the run, or this execution's lease is no
+// longer the run's current one.
+var ErrLeaseLost = errors.New("journal: the run lease was lost")
+
+// metaLeaseToken names the journal-wide lease token sequence in
+// journal_meta.
+const metaLeaseToken = "lease_token"
 
 type SignalResult struct {
 	Accepted  bool
@@ -275,10 +280,10 @@ func (j *Journal) ClaimDueWaits(ctx context.Context, now time.Time, limit int) (
 // PendingResumptions takes the run lease of up to limit live runs that have
 // a fired wait and no live run lease, and returns those runs' fired waits:
 // the caller executes them. Runs are served in the order they last got
-// attention, the later of their last lease and (never leased) their first
-// wakeup, so neither a run whose resumption never finishes nor a stream of
-// newly woken runs can starve the others. Run it on
-// start, and periodically, to resume the runs whose wakeup a crash or a
+// attention: the later of their last lease (if any) and their first
+// pending wakeup. Neither a run whose resumption never finishes nor a
+// stream of newly woken runs can starve the others. Run it on start, and
+// periodically, to resume the runs whose wakeup a crash or a
 // lapsed lease interrupted.
 func (j *Journal) PendingResumptions(ctx context.Context, now time.Time, limit int) ([]WaitRecord, error) {
 	if limit <= 0 {
@@ -287,7 +292,7 @@ func (j *Journal) PendingResumptions(ctx context.Context, now time.Time, limit i
 	var records []WaitRecord
 	err := j.withTx(ctx, "wait-lease", func(tx *sql.Tx) error {
 		runs, err := queryStrings(ctx, tx, `SELECT w.run_id`+waitsWithRun+` WHERE w.state = ? AND r.state = ? AND (r.lease_until IS NULL OR r.lease_until <= ?)
-			GROUP BY w.run_id ORDER BY COALESCE(MAX(r.leased_at), MIN(w.fired_at)), w.run_id LIMIT ?`, waitFired, runAccepted, now.UTC().UnixNano(), limit)
+			GROUP BY w.run_id ORDER BY MAX(COALESCE(MAX(r.leased_at), 0), MIN(w.fired_at)), w.run_id LIMIT ?`, waitFired, runAccepted, now.UTC().UnixNano(), limit)
 		if err != nil {
 			return err
 		}
@@ -318,15 +323,21 @@ func (j *Journal) PendingResumptions(ctx context.Context, now time.Time, limit i
 
 // takeRunLease leases a live run to this holder until now plus the wakeup
 // lease, when no holder (this one included) has it under a live lease, and
-// returns the new lease token: every acquisition gets the next one, so an
-// execution under an older lease, even this holder's, is fenced out. A
-// holder that wants to keep a run it holds renews it instead.
+// returns the new lease token, or 0 when it is held. Tokens come from one
+// journal-wide sequence, so every acquisition, of any run, gets a token no
+// other has: an execution under an older lease, even this holder's, or a
+// token of another run, is fenced out. A holder that wants to keep a run it
+// holds renews it instead.
 func (j *Journal) takeRunLease(ctx context.Context, tx *sql.Tx, runID string, now time.Time) (int64, error) {
-	var token int64
-	err := tx.QueryRowContext(ctx, `UPDATE journal_runs SET lease_owner = ?, lease_until = ?, leased_at = ?, lease_token = COALESCE(lease_token, 0) + 1 WHERE run_id = ? AND state = ? AND (lease_until IS NULL OR lease_until <= ?) RETURNING lease_token`, j.holder, now.Add(j.lease).UTC().UnixNano(), j.now(), runID, runAccepted, now.UTC().UnixNano()).Scan(&token)
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, nil
+	var free bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM journal_runs WHERE run_id = ? AND state = ? AND (lease_until IS NULL OR lease_until <= ?))`, runID, runAccepted, now.UTC().UnixNano()).Scan(&free); err != nil || !free {
+		return 0, err
 	}
+	var token int64
+	if err := tx.QueryRowContext(ctx, `INSERT INTO journal_meta (name, value) VALUES (?, 1) ON CONFLICT(name) DO UPDATE SET value = value + 1 RETURNING value`, metaLeaseToken).Scan(&token); err != nil {
+		return 0, err
+	}
+	_, err := tx.ExecContext(ctx, `UPDATE journal_runs SET lease_owner = ?, lease_until = ?, leased_at = ?, lease_token = ? WHERE run_id = ?`, j.holder, now.Add(j.lease).UTC().UnixNano(), j.now(), token, runID)
 	return token, err
 }
 
@@ -422,7 +433,8 @@ func queryStrings(ctx context.Context, tx *sql.Tx, query string, args ...any) ([
 
 // AcknowledgeWait records that the engine committed the step a fired wait
 // resumed: the wakeup is consumed and the wait leaves PendingResumptions.
-// Acknowledging it again is a no-op; a wait that has not fired is
+// Acknowledging it again is a no-op under the current lease token, and
+// ErrLeaseLost under any other; a wait that has not fired is
 // ErrWaitNotFired. token must be the run's current lease, held by this
 // holder: an execution whose lease was taken over, by another holder or by
 // this one again, gets ErrLeaseLost. It does not touch the run lease: the
@@ -442,7 +454,8 @@ func (j *Journal) AcknowledgeWait(ctx context.Context, waitID string, token int6
 		}
 		switch state {
 		case waitAcknowledged:
-			return nil
+			// A retry is a no-op only under the current lease.
+			return j.checkRunLease(ctx, tx, runID, token, true)
 		case waitFired:
 			if err := j.checkRunLease(ctx, tx, runID, token, false); err != nil {
 				return err

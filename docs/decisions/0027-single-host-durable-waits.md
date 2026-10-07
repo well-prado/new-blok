@@ -120,12 +120,13 @@ given a signal, including a pending one at schedule time), then
 `acknowledged`; or `canceled`. Firing records `fired_at`. A fired wait is
 a wakeup the run has not consumed yet, and it stays fired until
 `AcknowledgeWait`, which the engine calls once it has committed the step
-the wait resumed (slice C wires that). Acknowledging again is a no-op; a
-wait that has not fired is `ErrWaitNotFired`.
+the wait resumed (slice C wires that). Acknowledging again is a no-op
+under the current lease token, and `ErrLeaseLost` under any other; a wait
+that has not fired is `ErrWaitNotFired`.
 
 **Run leases** (Review R round 1 on #366, orchestrator decision: the
-lease is on the run, so slice C and #333 have one executor per run; round
-2: fenced by a token per acquisition). Each `Journal` has a holder name
+lease is on the run, so slice C and #333 have one executor per run; rounds
+2 and 3: fenced by a journal-wide token per acquisition). Each `Journal` has a holder name
 (`Config.Holder`, which must be unique per process; random by default) and
 a lease length (`Config.WakeupLease`, 30 s by default). A run lease is
 `lease_owner`, `lease_until`, `leased_at` and `lease_token` on
@@ -133,14 +134,17 @@ a lease length (`Config.WakeupLease`, 30 s by default). A run lease is
 is given, whoever holds it, the caller included: a holder that wants to
 keep a run renews it, never takes it again.
 
-Every acquisition (a claim, a resumption listing, `TakeRunLease`) gets the
-run's next `lease_token`, returned in `WaitRecord.LeaseToken` or by
-`TakeRunLease`. Renewing, releasing and acknowledging require the current
-token, so an execution whose lease was taken over, by another holder or by
-the same holder again (its own sweep after a stall, or after another holder
-took the run and died), gets `ErrLeaseLost` and must stop. The token is the
-capability: two journals that share a holder name cannot release each
-other's lease.
+Every acquisition (a claim, a resumption listing, `TakeRunLease`) draws the
+next value of one journal-wide sequence (the `lease_token` counter in
+`journal_meta`, which compaction never resets) and stores it as
+the run's `lease_token`, returned in `WaitRecord.LeaseToken` or by
+`TakeRunLease`. Renewing, releasing and acknowledging (an acknowledged
+retry included) require the run's current token, so an execution whose
+lease was taken over, by another holder or by the same holder again (its
+own sweep after a stall, or after another holder took the run and died),
+gets `ErrLeaseLost` and must stop, and a token from one run never passes on
+another. The token is a fencing counter, not a capability: it is not
+secret, and it orders acquisitions; it does not authenticate the caller.
 
 - `ClaimDueWaits(now, limit)` fires due waits of live (`accepted`) runs,
   and takes the lease of each of their runs that is not held. It returns
@@ -154,10 +158,12 @@ other's lease.
 - `PendingResumptions(now, limit)` takes, in one write-first transaction,
   the lease of up to `limit` live runs that have a fired wait and are not
   held, and returns their fired waits. Runs are served in the order they
-  last got attention: their last lease (`leased_at`, on the journal's
-  clock), or their first wakeup when never leased. A run whose resumption
-  never finishes and a stream of newly woken runs therefore take turns;
-  neither starves the other. Run it on start and periodically.
+  last got attention: the later of their last lease (`leased_at`, on the
+  journal's clock; none counts as earliest) and their first pending wakeup
+  (`fired_at`). A run whose resumption never finishes and a stream of newly
+  woken runs therefore take turns, neither starving the other, and a run
+  leased long ago that wakes again queues behind runs that woke before it.
+  Run it on start and periodically.
 - `TakeRunLease(runID, now)` leases a run its holder starts executing
   without a wakeup, a run just admitted for example, so the waits it
   schedules are not handed to another holder while it runs. Admission does
@@ -238,7 +244,9 @@ release), `TestAnyLiveLeaseHoldsTheRun`, `TestClaimSkipsEndedRuns`,
 `TestPendingResumptionsIsFair`, `TestReopenDoesNotWaitForAWriter`; after
 round 2, `TestLeaseTokenFencesStaleExecutions` (the reviewer's three
 probes), `TestTakeRunLeaseHoldsARunThatNeverSuspended`,
-`TestNewWakeupsDoNotStarveALeasedRun`.
+`TestNewWakeupsDoNotStarveALeasedRun`; after round 3,
+`TestAcknowledgedRetryNeedsTheCurrentToken`, `TestLeaseTokensAreJournalWide`,
+`TestRewokenRunRanksByItsNewWakeup`.
 
 ## Limits
 
@@ -250,6 +258,10 @@ probes), `TestTakeRunLeaseHoldsARunThatNeverSuspended`,
   twice. The engine's step journal makes replay of committed steps
   idempotent; fencing the stale holder's later writes is not part of this
   slice.
+- `RenewRunLease` and `ReleaseRunLease` still succeed under the current
+  token after the run has ended. That is harmless (resumption listings and
+  claims only consider live runs); slice C's runner releases the lease when
+  a run ends.
 - The lease token fences the journal's lease calls, not the engine's
   step writes: a stale execution learns it lost the run at its next renew
   or acknowledgement. Slice C acknowledges inside the resumed step's own
