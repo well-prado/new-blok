@@ -402,36 +402,57 @@ stores. `:memory:` is unchanged (`journal_mode=MEMORY`, no switch).
 A run's recovery records are its receipts: a scope's output, a child run's
 answer, a join's count of returned branches, the checkpoint it resumes from.
 Before #334 a late or stale writer could change them: `CompleteScope`
-overwrote a committed output, a checkpoint could name another artifact than
-the run's admitted one, and a canceled run still took new scopes and
+overwrote a committed output, `StartScope` restarted a canceled scope (which
+could then be completed), a checkpoint could name another artifact than the
+run's admitted one, and a run that had ended still took new scopes and
 checkpoints. (Joins and children are the second part of #334.)
 
-Each write now runs in the journal's writer transaction, reads what is
-stored, and either moves the record forward to its one terminal value,
-repeats it byte for byte (an idempotent retry, which succeeds and writes
-nothing), or is refused with a typed error and changes nothing:
-`ErrRecordFinal` (the scope is completed and the write would change it),
-`ErrStaleAttempt` (a scope attempt superseded by a later `StartScope`),
-`ErrRunNotActive` (a scope or checkpoint for a run that is not accepted),
-`ErrArtifactMismatch` (a checkpoint, or a `Recover`, naming another artifact
-than the run was admitted under) and `ErrNotFound` (an unknown run, where
-SQLite's foreign-key error used to leak).
+A scope has two terminal states, completed and canceled, and never leaves
+either. Each write now runs in the journal's writer transaction, reads what
+is stored, and either moves the record forward (a scope from running to one
+of its terminal states), repeats it byte for byte (an idempotent retry,
+which succeeds and writes nothing), or is refused with a typed error and
+changes nothing:
 
-The scope attempt is a new `journal_scopes.attempt_id` column. It does not
-raise the journal's schema version (§ Schema versions): the column is
-additive with a default, an older binary neither reads nor needs it, and
-nothing it writes is misread by this one (a scope it started has an empty
-attempt id, which the next `StartScope` replaces). The step is
-shape-guarded and runs on every open, like the journal's other column
-additions. What an older binary cannot do is honour the fence; running one
-brings #334's defects back for as long as it runs, as running any binary
-from before a fix does.
+- `ErrRecordFinal`: the scope is final. `CompleteScope` on a completed
+  scope with another output, or from another attempt; `StartScope` on a
+  canceled scope. (`StartScope` on a completed scope is not an error: it
+  returns `AlreadyCompleted`.)
+- `ErrStaleAttempt`: `CompleteScope` from an attempt that a later
+  `StartScope` superseded, or with no attempt id.
+- `ErrNotFound`: `CompleteScope` on a canceled scope, as before #334; and
+  any write for an unknown run, where SQLite's foreign-key error used to
+  leak.
+- `ErrRunNotActive`: `StartScope` or `SaveCheckpoint` for a run that is
+  not accepted (canceled, completed, failed or uncertain).
+- `ErrArtifactMismatch`: a checkpoint, or a `Recover`, naming another
+  artifact than the run was admitted under.
+
+For a caller of `CompleteScope`, `ErrStaleAttempt`, `ErrRecordFinal` and
+`ErrNotFound` all mean it lost the scope: a superseded attempt sees
+`ErrStaleAttempt` while the scope runs, `ErrRecordFinal` once the current
+attempt has completed it, and `ErrNotFound` once it was canceled.
+
+A run whose checkpoint was written before #334 under another artifact than
+it was admitted under fails closed: `Recover` refuses it under either
+artifact, and `SaveCheckpoint` cannot replace the row. Resolving it is an
+operator decision, not something the journal guesses.
+
+The scope attempt is a new `journal_scopes.attempt_id` column. An older
+binary opens a database that has it and ignores it, so it neither honours
+the fence nor the finality: the #334 review ran the aaf633c binary, which restarted a
+fenced scope without touching `attempt_id` and overwrote a completed output
+this binary had refused. A rollback would silently void the guarantees
+above, so the column must be version-gated (§ Schema versions). The raise
+(journal 5, the column step gated on the version found) lands together with
+#350's version-aware migration; until then the column is added by a
+shape-guarded step on every open.
 
 | Change | Class | Migration |
 | --- | --- | --- |
-| `journal_scopes.attempt_id TEXT NOT NULL DEFAULT ''` (#334) | schema, additive | Added on open; existing rows get `''`. No version raise, for the reason above |
+| `journal_scopes.attempt_id TEXT NOT NULL DEFAULT ''` (#334) | schema, additive | Added on open; existing rows get `''`, which no attempt matches until the next `StartScope`. Version raise pending #350 (above) |
 | `StartScope` returns `ScopeAttempt{AttemptID, AlreadyCompleted}` instead of a bool; `CompleteScope` takes the attempt id (#334) | breaking (internal API) | Callers keep the attempt id `StartScope` returned and pass it to `CompleteScope`. Outside `internal/journal` only `contract/audit`'s tests call them |
-| A completed scope is final; scopes are fenced by attempt; checkpoints are bound to the admitted artifact and an accepted run; `StartScope` needs an accepted run; `Recover` checks the admitted artifact (#334) | behavioral (bug fix) | None for a caller that writes each record forward once. A write that used to overwrite now returns one of the typed errors above |
+| Completed and canceled scopes are final; scopes are fenced by attempt; checkpoints are bound to the admitted artifact and an accepted run; `StartScope` needs an accepted run; `Recover` checks the admitted artifact (#334) | behavioral (bug fix) | None for a caller that writes each record forward once. A write that used to overwrite, or a restart of a canceled scope, now returns one of the typed errors above. Nothing in the repository restarted a canceled scope |
 | `ErrRecordFinal`, `ScopeAttempt` (#334) | additive | None |
 
 ## Alternatives considered

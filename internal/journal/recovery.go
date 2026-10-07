@@ -27,10 +27,12 @@ var ErrArtifactMismatch = errors.New("journal: checkpoint artifact does not matc
 // one terminal value. Each refusal below leaves the stored record exactly as
 // it was.
 var (
-	// ErrRecordFinal: the record is already completed, and the write would
-	// change it. Repeating the write that completed it, byte for byte (and,
-	// for a scope, from the attempt that completed it), succeeds.
-	ErrRecordFinal = errors.New("journal: recovery record is already completed")
+	// ErrRecordFinal: the record has reached its terminal value and the
+	// write would change it: a completed scope given another output or by
+	// another attempt, or a canceled scope started again. Repeating the
+	// write that completed a scope, byte for byte and from the attempt that
+	// completed it, succeeds instead.
+	ErrRecordFinal = errors.New("journal: recovery record is final")
 )
 
 type Checkpoint struct {
@@ -130,7 +132,8 @@ func (j *Journal) SaveCheckpoint(ctx context.Context, checkpoint Checkpoint) err
 }
 
 // StartScope is idempotent after a crash. A completed path is returned with
-// AlreadyCompleted so recovery never dispatches its effect again. Otherwise
+// AlreadyCompleted so recovery never dispatches its effect again, and a
+// canceled one is refused with ErrRecordFinal: it stays canceled. Otherwise
 // it starts a new attempt, which fences out every earlier one: CompleteScope
 // accepts only the AttemptID returned here last. The run must be accepted
 // (ErrRunNotActive otherwise, ErrNotFound when unknown).
@@ -168,6 +171,9 @@ func (j *Journal) StartScope(ctx context.Context, record ScopeRecord) (ScopeAtte
 				started.AlreadyCompleted = true
 				return nil
 			}
+			if state == checkpointCanceled {
+				return ErrRecordFinal
+			}
 			// Existing rows may predate input capture. Never backfill an unknown
 			// historical input from a later recovery request.
 			_, queryErr = tx.ExecContext(ctx, `UPDATE journal_scopes SET state = ?, attempt_id = ?, updated_at = ? WHERE run_id = ? AND path = ?`, checkpointRunning, attemptID, j.now(), record.RunID, record.Path)
@@ -188,14 +194,20 @@ func (j *Journal) StartScope(ctx context.Context, record ScopeRecord) (ScopeAtte
 }
 
 // CompleteScope commits a scope's output, once. attemptID is the one
-// StartScope returned last for the scope; an earlier attempt is refused with
-// ErrStaleAttempt. A completed scope is refused with ErrRecordFinal unless
-// this is the completing attempt repeating the same output byte for byte,
-// which succeeds and changes nothing. A canceled or unknown scope is
-// ErrNotFound.
+// StartScope returned last for the scope; an earlier attempt, or none, is
+// refused with ErrStaleAttempt. A completed scope is refused with
+// ErrRecordFinal unless this is the completing attempt repeating the same
+// output byte for byte, which succeeds and changes nothing. A canceled or
+// unknown scope is ErrNotFound. ErrStaleAttempt, ErrRecordFinal and, for a
+// canceled scope, ErrNotFound all mean the caller lost the scope: a
+// superseded attempt sees ErrStaleAttempt while the scope runs and
+// ErrRecordFinal once another attempt completed it.
 func (j *Journal) CompleteScope(ctx context.Context, runID, path, attemptID string, output json.RawMessage) error {
-	if runID == "" || path == "" || attemptID == "" || !json.Valid(output) {
-		return errors.New("journal: valid scope identity, attempt and output are required")
+	if runID == "" || path == "" || !json.Valid(output) {
+		return errors.New("journal: valid scope identity and output are required")
+	}
+	if attemptID == "" {
+		return ErrStaleAttempt
 	}
 	return j.withTx(ctx, "scope-complete", func(tx *sql.Tx) error {
 		var state, current string
@@ -218,8 +230,18 @@ func (j *Journal) CompleteScope(ctx context.Context, runID, path, attemptID stri
 		case current != attemptID:
 			return ErrStaleAttempt
 		}
-		_, err = tx.ExecContext(ctx, `UPDATE journal_scopes SET state = ?, output_json = ?, updated_at = ? WHERE run_id = ? AND path = ? AND state = ? AND attempt_id = ?`, checkpointCompleted, []byte(output), j.now(), runID, path, checkpointRunning, attemptID)
-		return err
+		result, err := tx.ExecContext(ctx, `UPDATE journal_scopes SET state = ?, output_json = ?, updated_at = ? WHERE run_id = ? AND path = ? AND state = ? AND attempt_id = ?`, checkpointCompleted, []byte(output), j.now(), runID, path, checkpointRunning, attemptID)
+		if err != nil {
+			return err
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if changed != 1 {
+			return ErrStaleAttempt
+		}
+		return nil
 	})
 }
 
@@ -290,6 +312,8 @@ func (j *Journal) Recover(ctx context.Context, runID, artifactDigest, checkpoint
 		}
 		// A checkpoint written before #334 may name another artifact than
 		// the one its run was admitted under; it is not this run's to resume.
+		// Such a run fails closed: it is recovered under neither artifact,
+		// and SaveCheckpoint cannot replace the row.
 		if _, admitted, err := runState(ctx, tx, runID); err != nil {
 			return err
 		} else if admitted != artifactDigest {

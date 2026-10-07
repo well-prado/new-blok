@@ -201,27 +201,93 @@ func TestRecoverRefusesALegacyCheckpointForAnotherArtifact(t *testing.T) {
 	if _, err := j.Recover(ctx, run.RunID, "sha256:other", "sha256:codec"); !errors.Is(err, ErrArtifactMismatch) {
 		t.Errorf("legacy checkpoint for another artifact recovered: err=%v", err)
 	}
+	// It fails closed: not recovered under the admitted artifact either,
+	// and not replaceable by a checkpoint for it.
+	if _, err := j.Recover(ctx, run.RunID, "sha256:admitted", "sha256:codec"); !errors.Is(err, ErrArtifactMismatch) {
+		t.Errorf("legacy checkpoint recovered under the admitted artifact: err=%v", err)
+	}
+	if err := j.SaveCheckpoint(ctx, Checkpoint{RunID: run.RunID, ArtifactDigest: "sha256:admitted", CheckpointDigest: "sha256:codec", State: []byte(`{}`)}); !errors.Is(err, ErrArtifactMismatch) {
+		t.Errorf("legacy checkpoint replaced: err=%v", err)
+	}
 }
 
-// P5 (#334, D7): a canceled run takes no new scope or checkpoint.
-func TestCanceledRunTakesNoScopeOrCheckpoint(t *testing.T) {
+// P5 (#334, D7): a run that is no longer accepted (canceled, completed,
+// failed or uncertain) takes no new scope or checkpoint.
+func TestInactiveRunTakesNoScopeOrCheckpoint(t *testing.T) {
 	ctx := context.Background()
-	j, runID := fencingRun(t, "canceled")
-	if err := j.CancelRun(ctx, runID, "caller canceled"); err != nil {
-		t.Fatal(err)
+	for name, end := range map[string]func(*Journal, string) error{
+		"canceled":  func(j *Journal, runID string) error { return j.CancelRun(ctx, runID, "caller canceled") },
+		"completed": func(j *Journal, runID string) error { return j.CompleteRun(ctx, runID, []byte(`{}`)) },
+		"failed":    func(j *Journal, runID string) error { return j.FailRun(ctx, runID, "boom", "permanent") },
+		"uncertain": func(j *Journal, runID string) error { return j.MarkRunUncertain(ctx, runID, "timeout", "transient") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			j, runID := fencingRun(t, "inactive-"+name)
+			if err := end(j, runID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := j.StartScope(ctx, ScopeRecord{RunID: runID, Path: "late", Kind: "call"}); !errors.Is(err, ErrRunNotActive) {
+				t.Errorf("scope after the run ended %s: err=%v, want ErrRunNotActive", name, err)
+			}
+			if err := j.SaveCheckpoint(ctx, Checkpoint{RunID: runID, ArtifactDigest: "sha256:admitted", CheckpointDigest: "sha256:codec", State: []byte(`{"pc":"late"}`)}); !errors.Is(err, ErrRunNotActive) {
+				t.Errorf("checkpoint after the run ended %s: err=%v, want ErrRunNotActive", name, err)
+			}
+			got := recovered(t, j, runID)
+			if len(got.Scopes) != 0 || string(got.Checkpoint.State) != `{}` {
+				t.Fatalf("%s run changed: %+v", name, got)
+			}
+		})
 	}
-	if _, err := j.StartScope(ctx, ScopeRecord{RunID: runID, Path: "late", Kind: "call"}); !errors.Is(err, ErrRunNotActive) {
-		t.Errorf("scope after cancel: err=%v, want ErrRunNotActive", err)
-	}
-	if err := j.SaveCheckpoint(ctx, Checkpoint{RunID: runID, ArtifactDigest: "sha256:admitted", CheckpointDigest: "sha256:codec", State: []byte(`{"pc":"late"}`)}); !errors.Is(err, ErrRunNotActive) {
-		t.Errorf("checkpoint after cancel: err=%v, want ErrRunNotActive", err)
-	}
-	got := recovered(t, j, runID)
-	if len(got.Scopes) != 0 || string(got.Checkpoint.State) != `{}` {
-		t.Fatalf("canceled run changed: %+v", got)
-	}
+	j, _ := fencingRun(t, "inactive-unknown")
 	if _, err := j.StartScope(ctx, ScopeRecord{RunID: "run:missing", Path: "late", Kind: "call"}); !errors.Is(err, ErrNotFound) {
 		t.Errorf("scope of an unknown run: err=%v, want ErrNotFound", err)
+	}
+}
+
+// A canceled scope is final (#334 review): StartScope used to restart it
+// with a fresh attempt, which could then complete it, so Recover showed
+// the canceled effect as completed with an output.
+func TestCanceledScopeStaysCanceled(t *testing.T) {
+	ctx := context.Background()
+	j, runID := fencingRun(t, "scope-canceled")
+	started, err := j.StartScope(ctx, ScopeRecord{RunID: runID, Path: "charge", Kind: "call"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := j.CancelScope(ctx, runID, "charge", "caller canceled"); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := j.StartScope(ctx, ScopeRecord{RunID: runID, Path: "charge", Kind: "call"})
+	if !errors.Is(err, ErrRecordFinal) {
+		t.Errorf("restarting a canceled scope: start=%+v err=%v, want ErrRecordFinal", restarted, err)
+	}
+	for _, attempt := range []string{started.AttemptID, restarted.AttemptID} {
+		if attempt == "" {
+			continue
+		}
+		if err := j.CompleteScope(ctx, runID, "charge", attempt, []byte(`{"charged":true}`)); !errors.Is(err, ErrNotFound) {
+			t.Errorf("completing a canceled scope: err=%v, want ErrNotFound", err)
+		}
+	}
+	scopes := recovered(t, j, runID).Scopes
+	if len(scopes) != 1 || scopes[0].State != checkpointCanceled || len(scopes[0].Output) != 0 || scopes[0].Error != "caller canceled" {
+		t.Fatalf("canceled scope changed: %+v", scopes)
+	}
+}
+
+// An empty attempt id can never be the current attempt: it is refused
+// with ErrStaleAttempt, not an untyped argument error (#334 review).
+func TestCompleteScopeWithoutAttemptIsStale(t *testing.T) {
+	ctx := context.Background()
+	j, runID := fencingRun(t, "scope-no-attempt")
+	if _, err := j.StartScope(ctx, ScopeRecord{RunID: runID, Path: "each/0", Kind: "each"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.CompleteScope(ctx, runID, "each/0", "", []byte(`{}`)); !errors.Is(err, ErrStaleAttempt) {
+		t.Errorf("completing without an attempt: err=%v, want ErrStaleAttempt", err)
+	}
+	if scopes := recovered(t, j, runID).Scopes; len(scopes) != 1 || scopes[0].State != checkpointRunning {
+		t.Fatalf("scope changed: %+v", scopes)
 	}
 }
 
