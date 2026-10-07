@@ -487,49 +487,71 @@ wait`)
 }
 
 // TestDevPollAdaptsToScanCost (review R2): the pause after each scan is at
-// least ScanDuty times what the scan took, so on a project slow to scan
-// the watcher uses at most about 1/ScanDuty of a CPU instead of scanning
-// back to back.
+// least ScanDuty times what the scan took (up to MaxScanBackoff), so on a
+// project slow to scan the watcher uses at most about 1/ScanDuty of a CPU
+// instead of scanning back to back.
+//
+// It measures only what the loop reports, never a wall-clock budget: the
+// scans run as slowly as the machine makes them (-race, a loaded host), and
+// every pause is compared with the scan that set it (#359).
 func TestDevPollAdaptsToScanCost(t *testing.T) {
 	options, _, _ := heldApp(t, `trap 'exit 0' TERM
 sleep 300 &
 wait`)
-	// 10,000 entries nothing watches, so each scan costs real stats.
-	for group := range 10 {
+	// 2,000 entries nothing watches, so each scan costs real work: a few
+	// milliseconds on a quiet machine, a hundred or more under -race on a
+	// loaded one. Each pause is ten times that, so a large tree would make
+	// a loaded run take minutes.
+	for group := range 4 {
 		dir := filepath.Join(options.Root, "assets", fmt.Sprintf("g%02d", group))
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		for index := range 1000 {
+		for index := range 500 {
 			if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("a%04d.txt", index)), nil, 0o644); err != nil {
 				t.Fatal(err)
 			}
 		}
 	}
-	options.Poll = 5 * time.Millisecond
+	// Poll is far below ScanDuty times any scan, so every pause the loop
+	// takes is set by the scan before it, not by Poll.
+	options.Poll = 100 * time.Microsecond
 	scans := observeScans(t)
 	session := startDev(t, options)
 	session.await(func(e DevEvent) bool { return e.Event == EventAppStarted && e.Build == 1 }, "build 1 started")
-	// However slow the machine (-race), wait for enough scans to compare.
-	waitFor(t, "8 scans", func() bool { return len(scans()) >= 8 })
+	// However slow the machine, wait for enough scans to compare, as long
+	// as they keep coming: no pause is longer than MaxScanBackoff, so only a
+	// watcher that stopped scanning goes a minute past it without one.
+	const want = 8
+	for seen, last := 0, time.Now(); ; time.Sleep(25 * time.Millisecond) {
+		count := len(scans())
+		if count >= want {
+			break
+		}
+		if count > seen {
+			seen, last = count, time.Now()
+		}
+		if stalled := time.Since(last); stalled > MaxScanBackoff+time.Minute {
+			t.Fatalf("no scan for %s after %d of %d: the watcher stopped scanning\n%s", stalled, seen, want, session.dump())
+		}
+	}
 	observed := scans()
 	session.stop()
-	var busy time.Duration
+	// Each pause is held against the scan that set it, which is what bounds
+	// the watcher's CPU share. A share over the whole window would also
+	// count how much one scan's cost differs from the next, which load
+	// alone changes.
 	for index := 1; index < len(observed); index++ {
 		previous, next := observed[index-1], observed[index]
-		if previous.took*ScanDuty <= options.Poll {
+		pause := min(previous.took*ScanDuty, MaxScanBackoff)
+		if pause <= options.Poll {
 			t.Fatalf("a scan took %s, too fast for this test to tell ScanDuty from Poll", previous.took)
 		}
-		// The next scan starts no sooner than ScanDuty times the previous
-		// one's duration after it ended.
-		if idle := next.at.Sub(previous.at) - next.took; idle < previous.took*ScanDuty-time.Millisecond {
-			t.Fatalf("scan %d started %s after one that took %s; want at least %s", index, idle, previous.took, previous.took*ScanDuty)
+		// The next scan starts no sooner than that pause after the
+		// previous one ended.
+		if idle := next.at.Sub(previous.at) - next.took; idle < pause-time.Millisecond {
+			t.Fatalf("scan %d started %s after one that took %s; want at least %s", index, idle, previous.took, pause)
 		}
-		busy += next.took
-	}
-	window := observed[len(observed)-1].at.Sub(observed[0].at)
-	if share := float64(busy) / float64(window); share > 1.5/ScanDuty {
-		t.Fatalf("the watcher scanned %.0f%% of the time, want at most about %d%%", 100*share, 100/ScanDuty)
 	}
 }
 
