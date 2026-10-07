@@ -301,11 +301,10 @@ func seedRecoveryRun(tb testing.TB, j *Journal, key, childRunID string) recovery
 	return recoveryRun{runID: runID, operationKey: operation.Key}
 }
 
-// scheduleRetentionWait is the only ScheduleWait call in these tests: its
-// request gains the wait's step identity in #350.
+// scheduleRetentionWait is the only ScheduleWait call in these tests.
 func scheduleRetentionWait(tb testing.TB, j *Journal, runID, waitID, name string) {
 	tb.Helper()
-	if _, err := j.ScheduleWait(context.Background(), WaitRequest{RunID: runID, WaitID: waitID, Name: name, DueAt: time.Now().Add(time.Hour)}); err != nil {
+	if _, err := j.ScheduleWait(context.Background(), WaitRequest{RunID: runID, WaitID: waitID, Name: name, InvocationPath: name, IterationPath: "root", DueAt: time.Now().Add(time.Hour)}); err != nil {
 		tb.Fatal(err)
 	}
 }
