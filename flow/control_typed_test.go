@@ -260,3 +260,49 @@ func TestConstructValuesAreNeverInventedForTypedNodes(t *testing.T) {
 		t.Fatalf("null into a struct: err=%v; want input_type_mismatch, not a zero struct", err)
 	}
 }
+
+// Review R round 3 on #379: the node's input schema checks a construct's
+// value as resolved, before it is converted to the node's type. A literal
+// missing a required field must be refused, not filled in with the field's
+// Go zero value by the conversion and then accepted.
+
+type zipIn struct {
+	Quantity int    `json:"quantity"`
+	Zip      string `json:"zip"`
+}
+
+func TestSchemaChecksConstructValueBeforeConversion(t *testing.T) {
+	n := newTypedNodes(t)
+	ran := false
+	zip := node.MustDefine("zip", "1.0.0", func(_ context.Context, in zipIn) (int, error) { ran = true; return in.Quantity, nil },
+		node.Description("zip"), node.Schemas([]byte(`{"type":"object","properties":{"quantity":{"type":"integer"},"zip":{"type":"string"}},"required":["quantity","zip"]}`), []byte(`{"type":"integer"}`)))
+	definition := flow.MustDefine(controlSpec, func(b *flow.Builder, in flow.Ref[orderOut]) flow.Ref[int] {
+		order := flow.Call(b, "order", n.order, in)
+		return flow.Call(b, "apply", zip, flow.Default(b, "pick", flow.Select[orderOut, zipIn](order, "shipping"), flow.Ref[zipIn](flow.Lit(map[string]any{"quantity": 3}))))
+	})
+	program, err := definition.Lower()
+	if err != nil {
+		t.Fatalf("Lower: %v", err)
+	}
+	application, err := app.New(app.Config{Workflows: []app.Workflow{{Name: controlSpec.Name}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := application.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	registry := map[string]node.Any{"order": n.order.Any(), "zip": zip.Any()}
+	result, err := execution.NewRunner(application, registry).Run(context.Background(), program, orderOut{}, inspection.Invocation{})
+	if err == nil || !strings.HasPrefix(err.Error(), "invalid_input: ") || !strings.Contains(err.Error(), "zip") {
+		t.Fatalf("err=%v output=%#v; want invalid_input naming the missing zip", err, result.Output)
+	}
+	t.Logf("refused: %v", err)
+	if ran {
+		t.Fatal("the node ran on a value its schema refuses")
+	}
+	for _, step := range result.Steps {
+		if step.ID == "apply" && step.Executed {
+			t.Fatalf("step apply executed: %+v", step)
+		}
+	}
+}
