@@ -1,43 +1,39 @@
 {
-  "schemaVersion": "store-spike/v1",
-  "selectedBackend": "sqlite",
-  "alternative": "bbolt",
+  "schemaVersion": "store/v2",
+  "backend": "sqlite",
   "durability": {
-    "sqlite": {
-      "journalMode": "WAL",
-      "synchronous": "FULL",
-      "busyTimeoutMillis": 5000,
-      "foreignKeys": true,
-      "acknowledgmentBarrier": "WithTx returns only after sql.Tx.Commit succeeds"
-    },
-    "bbolt": {
-      "noSync": false,
-      "noGrowSync": false,
-      "acknowledgmentBarrier": "Update returns only after the bbolt transaction commit"
-    }
+    "pooledConnections": 8,
+    "journalMode": "WAL",
+    "synchronous": "FULL",
+    "busyTimeoutMillis": 5000,
+    "foreignKeys": true,
+    "secureDelete": true
+  },
+  "acknowledgment": {
+    "rowsVisibleBeforeCommit": 0,
+    "rowsVisibleAfterCommitBeforeReturn": 1,
+    "failedCommitAcknowledged": false,
+    "rowsAfterFailedCommit": 0,
+    "writeAfterFailedCommit": "ok"
   },
   "crashCases": [
-    {"name": "before commit", "killPoint": "transaction callback after write", "expectedRows": 0, "expectedIntegrity": "ok"},
-    {"name": "during commit", "killPoint": "commit-boundary race after marker and before process exit", "expectedRows": "0 or 1", "expectedIntegrity": "ok"},
-    {"name": "after commit", "killPoint": "after commit before process exit", "expectedRows": 1, "expectedIntegrity": "ok"}
+    {"phase": "before", "killPoint": "transaction callback after write", "expectedRows": [0], "expectedIntegrity": "ok"},
+    {"phase": "during", "killPoint": "commit-boundary race after marker and before process exit", "expectedRows": [0, 1], "expectedIntegrity": "ok"},
+    {"phase": "after", "killPoint": "after commit before process exit", "expectedRows": [1], "expectedIntegrity": "ok"}
   ],
   "corruptionCase": {
-    "action": "truncate a closed database file",
-    "expected": "open or integrity check fails closed"
+    "action": "truncate-half",
+    "expected": "fails_closed"
   },
-  "benchmark": {
-    "command": "go run ./cmd/store-spike -operations=100 -workers=4",
-    "measurements": ["single commit", "one batch commit", "concurrent commits"],
-    "filesystem": "runtime temporary directory; record mount settings with each run",
-    "limitations": [
-      "Synthetic rows are not an application workload.",
-      "Timing is comparative spike evidence, not a throughput or fleet-capacity claim.",
-      "The benchmark does not establish multi-host failover or disk-loss survival."
-    ]
-  },
-  "expected": {
+  "effects": {
     "successfulEffects": 1,
     "failedEffects": 0,
     "duplicateAcknowledgments": 0
-  }
+  },
+  "limits": [
+    "Synthetic rows are not an application workload.",
+    "A killed process cannot tell a flushed commit from one in the operating system cache; the durability settings are read back instead.",
+    "The crash cases exercise one local filesystem and do not establish disk-loss survival or multi-host failover.",
+    "The bbolt comparison and the benchmark timings are spike evidence from cmd/store-spike (ADR 0003, spike-linux-arm64-go1.27.1.json); no test re-runs them."
+  ]
 }
