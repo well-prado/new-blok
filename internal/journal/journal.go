@@ -266,6 +266,7 @@ func (j *Journal) migrate(ctx context.Context, tx *sql.Tx) error {
 		{"journal_operations", "input_json", `BLOB`},
 		{"journal_attempts", "input_json", `BLOB`},
 		{"journal_scopes", "input_json", `BLOB`},
+		{"journal_scopes", "attempt_id", `TEXT NOT NULL DEFAULT ''`},
 	} {
 		if err := ensureColumn(ctx, tx, column.table, column.name, column.declaration); err != nil {
 			return err
@@ -382,6 +383,7 @@ var schemaStatements = []string{
 		output_json BLOB,
 		input_json BLOB,
 		error_text TEXT NOT NULL DEFAULT '',
+		attempt_id TEXT NOT NULL DEFAULT '',
 		updated_at INTEGER NOT NULL,
 		PRIMARY KEY (run_id, path),
 		FOREIGN KEY (run_id) REFERENCES journal_runs(run_id)

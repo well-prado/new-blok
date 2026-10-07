@@ -73,10 +73,11 @@ func (r *rig) contentRun(label string, reconciled bool) contentRun {
 			r.t.Fatal(err)
 		}
 	}
-	if _, err := r.journal.StartScope(ctx, journal.ScopeRecord{RunID: run.RunID, Path: "step", Kind: "step", Input: quoted("SCOPE-INPUT")}); err != nil {
+	scope, err := r.journal.StartScope(ctx, journal.ScopeRecord{RunID: run.RunID, Path: "step", Kind: "step", Input: quoted("SCOPE-INPUT")})
+	if err != nil {
 		r.t.Fatal(err)
 	}
-	if err := r.journal.CompleteScope(ctx, run.RunID, "step", quoted("SCOPE-OUTPUT")); err != nil {
+	if err := r.journal.CompleteScope(ctx, run.RunID, "step", scope.AttemptID, quoted("SCOPE-OUTPUT")); err != nil {
 		r.t.Fatal(err)
 	}
 	if err := r.journal.SaveCheckpoint(ctx, journal.Checkpoint{RunID: run.RunID, ArtifactDigest: digest("artifact"), CheckpointDigest: digest("checkpoint"), State: quoted("CHECKPOINT")}); err != nil {

@@ -397,6 +397,43 @@ stores. `:memory:` is unchanged (`journal_mode=MEMORY`, no switch).
 | `Open` fails unless the file ends up in WAL (#320) | behavioral | None for files this backend creates. Before, the answer of `PRAGMA journal_mode=WAL` was ignored, so a file SQLite would not switch opened in its old mode; it is now refused with an error naming the mode it stayed in |
 | Pooled connections no longer request WAL when they connect; they rely on the mode persisted in the file (#320) | behavioral (internal) | None. `Open` switches the file before it returns a handle, and SQLite keeps WAL in the file across connections and restarts |
 
+## Recovery records are write-once (#334)
+
+A run's recovery records are its receipts: a scope's output, a child run's
+answer, a join's count of returned branches, the checkpoint it resumes from.
+Before #334 a late or stale writer could change them: `CompleteScope`
+overwrote a committed output, a checkpoint could name another artifact than
+the run's admitted one, and a canceled run still took new scopes and
+checkpoints. (Joins and children are the second part of #334.)
+
+Each write now runs in the journal's writer transaction, reads what is
+stored, and either moves the record forward to its one terminal value,
+repeats it byte for byte (an idempotent retry, which succeeds and writes
+nothing), or is refused with a typed error and changes nothing:
+`ErrRecordFinal` (the scope is completed and the write would change it),
+`ErrStaleAttempt` (a scope attempt superseded by a later `StartScope`),
+`ErrRunNotActive` (a scope or checkpoint for a run that is not accepted),
+`ErrArtifactMismatch` (a checkpoint, or a `Recover`, naming another artifact
+than the run was admitted under) and `ErrNotFound` (an unknown run, where
+SQLite's foreign-key error used to leak).
+
+The scope attempt is a new `journal_scopes.attempt_id` column. It does not
+raise the journal's schema version (§ Schema versions): the column is
+additive with a default, an older binary neither reads nor needs it, and
+nothing it writes is misread by this one (a scope it started has an empty
+attempt id, which the next `StartScope` replaces). The step is
+shape-guarded and runs on every open, like the journal's other column
+additions. What an older binary cannot do is honour the fence; running one
+brings #334's defects back for as long as it runs, as running any binary
+from before a fix does.
+
+| Change | Class | Migration |
+| --- | --- | --- |
+| `journal_scopes.attempt_id TEXT NOT NULL DEFAULT ''` (#334) | schema, additive | Added on open; existing rows get `''`. No version raise, for the reason above |
+| `StartScope` returns `ScopeAttempt{AttemptID, AlreadyCompleted}` instead of a bool; `CompleteScope` takes the attempt id (#334) | breaking (internal API) | Callers keep the attempt id `StartScope` returned and pass it to `CompleteScope`. Outside `internal/journal` only `contract/audit`'s tests call them |
+| A completed scope is final; scopes are fenced by attempt; checkpoints are bound to the admitted artifact and an accepted run; `StartScope` needs an accepted run; `Recover` checks the admitted artifact (#334) | behavioral (bug fix) | None for a caller that writes each record forward once. A write that used to overwrite now returns one of the typed errors above |
+| `ErrRecordFinal`, `ScopeAttempt` (#334) | additive | None |
+
 ## Alternatives considered
 
 The executable spike compares SQLite with `go.etcd.io/bbolt` v1.5.0. bbolt is
