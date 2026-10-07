@@ -3,8 +3,10 @@ package sqlite
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	sqldriver "database/sql/driver"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -335,21 +337,56 @@ func (c *connection) queueWriter(ctx context.Context) (func(), error) {
 	}
 }
 
+// Backup writes a transaction-consistent copy of the database to
+// destination, which must not exist nor have a -wal, -shm or -journal file
+// beside it: SQLite would read a leftover one into the backup when it is
+// opened, so it is refused, not removed (#343). The check is repeated just
+// before the rename, which replaces a file another process creates there in
+// that moment (see install). VACUUM INTO writes the copy to a
+// temporary file beside destination; the file is synced, renamed into place
+// and its directory synced, so destination never names a partial copy: a
+// crash or a failure (a full disk, a canceled ctx) leaves destination absent
+// and Backup can be retried (#343). A crash can leave the temporary file
+// (.backup-*, with its -journal) behind; it never blocks a retry.
 func (c *connection) Backup(ctx context.Context, destination string) error {
 	if destination == "" || destination == ":memory:" {
 		return errors.New("sqlite: backup destination is required")
 	}
-	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
+	directory := filepath.Dir(destination)
+	if err := createDirectory(directory); err != nil {
 		return fmt.Errorf("sqlite: create backup parent: %w", err)
 	}
-	if _, err := os.Stat(destination); err == nil {
-		return fmt.Errorf("sqlite: backup destination already exists: %s", destination)
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("sqlite: inspect backup destination: %w", err)
+	if err := requireAbsent(destination, "backup destination"); err != nil {
+		return err
 	}
-	if _, err := c.database.ExecContext(ctx, "VACUUM INTO ?", destination); err != nil {
+	// VACUUM INTO creates the file itself, with SQLite's usual permissions,
+	// and refuses one that exists and is not empty.
+	suffix := make([]byte, 8)
+	if _, err := rand.Read(suffix); err != nil {
+		return fmt.Errorf("sqlite: name backup temporary: %w", err)
+	}
+	temporary := filepath.Join(directory, ".backup-"+hex.EncodeToString(suffix))
+	installed := false
+	defer func() {
+		if !installed {
+			// SQLite deletes VACUUM INTO's rollback journal itself when
+			// the statement fails; removeFiles also takes one it left.
+			_ = removeFiles(temporary)
+		}
+	}()
+	if _, err := c.database.ExecContext(ctx, "VACUUM INTO ?", temporary); err != nil {
 		return fmt.Errorf("sqlite: backup: %w", err)
 	}
+	if err := syncFile(temporary); err != nil {
+		return fmt.Errorf("sqlite: sync backup: %w", err)
+	}
+	if backupWritten != nil {
+		backupWritten(temporary)
+	}
+	if err := install(temporary, destination, "backup"); err != nil {
+		return err
+	}
+	installed = true
 	return nil
 }
 
@@ -448,8 +485,11 @@ func (c *connection) Integrity(ctx context.Context) error {
 
 func (c *connection) Close() error { return c.database.Close() }
 
-// Test-only crash points of Restore, called when set.
+// Test-only crash points of Backup and Restore, called when set.
 var (
+	// backupWritten runs once Backup's temporary file is written and
+	// synced, before it is renamed to the destination.
+	backupWritten func(temporary string)
 	// restoreCopied runs once Restore's temporary copy is written and
 	// synced, before it is renamed to the destination.
 	restoreCopied func(temporary string)
@@ -633,8 +673,8 @@ func install(temporary, destination, what string) error {
 	return nil
 }
 
-// removeDatabase removes a database Restore installed, with its side
-// files, and syncs its directory.
+// removeDatabase removes a database Backup or Restore installed, with its
+// side files, and syncs its directory.
 func removeDatabase(path string) error {
 	err := removeFiles(path)
 	if syncErr := syncDirectory(filepath.Dir(path)); syncErr != nil {
@@ -653,6 +693,19 @@ func removeFiles(path string) error {
 		}
 	}
 	return errors.Join(failures...)
+}
+
+// syncFile flushes path's contents to stable storage.
+func syncFile(path string) error {
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
 }
 
 // createDirectory creates directory and any missing parents, and syncs the
