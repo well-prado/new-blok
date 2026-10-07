@@ -367,7 +367,7 @@ type constructCase struct {
 }
 
 // Compare, Default, If, Choose and TryFinally lower to control instructions
-// (#333, ADR 0031; control_run_test.go runs them). Each, Parallel, Child and
+// (#333, ADR 0028; control_run_test.go runs them). Each, Parallel, Child and
 // Template have no form in the engine program yet, so Lower must reject each
 // one rather than lowering only its arm calls. Every construct's own input
 // references are recorded structurally in Program.

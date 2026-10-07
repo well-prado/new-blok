@@ -59,17 +59,20 @@ type Result struct {
 type StepResult struct {
 	ID string
 	// InvocationPath and IterationPath identify this execution of the step
-	// (ADR 0031): its id at the root or "<construct path>/<arm>/<id>"
+	// (ADR 0028): its id at the root or "<construct path>/<arm>/<id>"
 	// inside an arm, and "root" outside every each.
 	InvocationPath string
 	IterationPath  string
-	Executed       bool
-	Input          any
-	Attempt        int
-	Output         any
-	Error          error
-	StartedAt      time.Time
-	FinishedAt     time.Time
+	// Executed reports that this step invoked a node. A control
+	// instruction never does itself (its arms' steps report their own), so
+	// its step is not Executed even when it ran.
+	Executed   bool
+	Input      any
+	Attempt    int
+	Output     any
+	Error      error
+	StartedAt  time.Time
+	FinishedAt time.Time
 }
 
 type Engine struct {
@@ -352,7 +355,7 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 		emit(event)
 	}
 	// runBlock runs one block of instructions in its frame: the program at
-	// the root, or one arm of a control instruction (ADR 0031).
+	// the root, or one arm of a control instruction (ADR 0028).
 	var runBlock func(context.Context, *frame, []contract.InternalInstruction) error
 	// runArm runs one arm in its frame and returns the arm's result.
 	runArm := func(ctx context.Context, f *frame, owner string, arm contract.Arm) (any, error) {
@@ -376,7 +379,7 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 			step := StepResult{ID: instruction.ID, InvocationPath: f.invocation(instruction.ID), IterationPath: f.iteration}
 			external = false
 			if tracing {
-				stepSpan = runSpan.Child()
+				stepSpan = f.span.Child()
 			}
 			switch instruction.Kind {
 			case "wait":
@@ -427,6 +430,12 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 				}
 				external = len(definition.Descriptor().Effects) > 0
 				callInput, err := resolveCallInput(f, instruction, input)
+				if err == nil && program.Format == contract.ControlFormat {
+					// A control program's values may be JSON literals or
+					// typed nils: hand the node its own input type. Call-only
+					// programs keep passing the referenced value as is.
+					callInput, err = definition.ConvertInput(callInput)
+				}
 				if err != nil {
 					step.Error = &Error{Code: "invalid_input_reference", Class: "validation", Step: instruction.ID, Err: err}
 					step.FinishedAt = time.Now().UTC()
@@ -624,7 +633,10 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 				}
 				own := stepSpan
 				output, err := runControl(ctx, f, instruction, func(ctx context.Context, arm contract.Arm) (any, error) {
-					return runArm(ctx, f.arm(instruction.ID, arm), instruction.ID, arm)
+					armFrame := f.arm(instruction.ID, arm)
+					// The arm's steps are children of the construct's span.
+					armFrame.span = own
+					return runArm(ctx, armFrame, instruction.ID, arm)
 				})
 				// The arms' steps reported themselves; the construct's own
 				// event keeps its span and is not an external call.
@@ -648,7 +660,7 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 		}
 		return nil
 	}
-	if err := runBlock(ctx, &frame{values: state, iteration: rootIteration}, program.Instructions); err != nil {
+	if err := runBlock(ctx, &frame{values: state, iteration: rootIteration, span: runSpan}, program.Instructions); err != nil {
 		return result, err
 	}
 	return result, nil

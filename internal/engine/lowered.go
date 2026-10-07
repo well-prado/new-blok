@@ -7,11 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"reflect"
 
 	"github.com/well-prado/new-blok/contract"
+	"github.com/well-prado/new-blok/contract/observe"
 )
 
-// Control instructions flow lowers (ADR 0031, #333). The interpreter runs
+// Control instructions flow lowers (ADR 0028, #333). The interpreter runs
 // them in memory; a durable runner refuses them until their scopes, joins
 // and children are journaled.
 
@@ -29,6 +31,9 @@ type frame struct {
 	// the root; iteration is the iteration path, "root" outside each.
 	prefix    string
 	iteration string
+	// span is the trace span the frame's steps are children of: the run's
+	// at the root, the construct's inside an arm.
+	span observe.Span
 }
 
 // invocation is the invocation path of the instruction id in this frame:
@@ -42,7 +47,7 @@ func (f *frame) invocation(id string) string {
 
 // arm returns the frame that runs arm of the construct id in this frame.
 func (f *frame) arm(id string, arm contract.Arm) *frame {
-	return &frame{values: map[string]any{}, parent: f, prefix: f.invocation(id) + "/" + arm.Name, iteration: f.iteration}
+	return &frame{values: map[string]any{}, parent: f, prefix: f.invocation(id) + "/" + arm.Name, iteration: f.iteration, span: f.span}
 }
 
 func (f *frame) resolve(reference contract.Reference) (any, error) {
@@ -178,7 +183,8 @@ func (s shape) check(instruction contract.InternalInstruction) error {
 		if arm.Name != want[index] {
 			return fmt.Errorf("arm %d is named %q, want %q", index, arm.Name, want[index])
 		}
-		if (len(arm.Match) > 0) != (instruction.Kind == "choose" && arm.Name != "default") || len(arm.Match) > 0 && !json.Valid(arm.Match) {
+		var match string
+		if (len(arm.Match) > 0) != (instruction.Kind == "choose" && arm.Name != "default") || len(arm.Match) > 0 && json.Unmarshal(arm.Match, &match) != nil {
 			return fmt.Errorf("arm %q has an invalid case value", arm.Name)
 		}
 		if (arm.Output == nil) != (arm.Name == "finally") {
@@ -235,10 +241,10 @@ func runControl(ctx context.Context, f *frame, instruction contract.InternalInst
 		}
 		return matched, nil
 	case "default":
-		if operands[0] != nil {
-			return operands[0], nil
+		if isNull(operands[0]) {
+			return operands[1], nil
 		}
-		return operands[1], nil
+		return operands[0], nil
 	case "if":
 		selected, ok := operands[0].(bool)
 		if !ok {
@@ -269,6 +275,28 @@ func runControl(ctx context.Context, f *frame, instruction contract.InternalInst
 		}}}}
 	}
 	return runControlStep(ctx, step, 0, maxNesting)
+}
+
+// isNull reports whether value's JSON form is null: nil, or a nil pointer,
+// slice, map or interface of any type, or a value whose own encoding is
+// null. A reference hands on Go values, so an unset optional field is a
+// typed nil, never nil itself.
+func isNull(value any) bool {
+	if value == nil {
+		return true
+	}
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
+	case reflect.Pointer, reflect.Slice, reflect.Map, reflect.Interface:
+		if reflected.IsNil() {
+			return true
+		}
+	}
+	if _, ok := value.(json.Marshaler); ok {
+		encoded, err := json.Marshal(value)
+		return err == nil && string(encoded) == "null"
+	}
+	return false
 }
 
 func isAbsent(err error) bool {

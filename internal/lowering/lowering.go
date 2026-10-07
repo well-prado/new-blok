@@ -31,7 +31,7 @@ const (
 	joinPrefix = "$join."
 )
 
-// MaxNesting bounds how deeply control constructs nest (ADR 0031).
+// MaxNesting bounds how deeply control constructs nest (ADR 0028).
 const MaxNesting = 64
 
 // operators are the comparisons a compare instruction lowers with.
@@ -82,7 +82,7 @@ type Options struct {
 	// key in Node, referenced by later instructions as "$child.<id>".
 	Children bool
 	// Control lowers compare, default, if, choose and try-finally into
-	// control instructions (ADR 0031). flow.Definition.Lower sets it; the
+	// control instructions (ADR 0028). flow.Definition.Lower sets it; the
 	// agent catalog does not, so a composed workflow with control flow
 	// stays not agent-safe.
 	Control bool

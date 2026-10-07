@@ -138,14 +138,14 @@ type InternalProgram struct {
 	// Format is the instruction set the program uses. Zero, omitted from
 	// the encoding, is the original call set (call, wait, output), so every
 	// program that set describes encodes exactly as it did before #333.
-	// ControlFormat adds the control instructions flow lowers (ADR 0031).
+	// ControlFormat adds the control instructions flow lowers (ADR 0028).
 	Format       int                   `json:"format,omitempty"`
 	Instructions []InternalInstruction `json:"instructions"`
 	Bindings     []Binding             `json:"bindings,omitempty"`
 }
 
 // ControlFormat is the InternalProgram.Format of a program holding control
-// instructions: compare, default, if, choose and try-finally (ADR 0031).
+// instructions: compare, default, if, choose and try-finally (ADR 0028).
 const ControlFormat = 2
 
 type InternalInstruction struct {
@@ -162,7 +162,7 @@ type InternalInstruction struct {
 	Control *Control `json:"control,omitempty"`
 }
 
-// Control is the body of a control instruction (ADR 0031). Operands are
+// Control is the body of a control instruction (ADR 0028). Operands are
 // positional: compare reads left and right, default value and fallback, if
 // and choose their condition. Arms hold the nested instructions: if has
 // "then" and "else", choose one "case-<n>" arm per case (in case order)

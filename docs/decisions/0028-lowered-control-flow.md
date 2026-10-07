@@ -1,4 +1,4 @@
-# ADR 0031: Lowered control flow and its execution paths
+# ADR 0028: Lowered control flow and its execution paths
 
 - Status: in progress for E07-T10 (#333), delivered as stacked PRs. Slice 1a
   (this revision) lowers and runs compare, default, if, choose and
@@ -50,7 +50,11 @@ so a construct nests: `flow.If(arm.Builder(), …)`. Recording a step on an
 enclosing builder while one of its arms is being built is refused
 (`flow: step "x" was recorded on an enclosing builder while one of its arms
 was being built; …`): with arms recorded separately it would otherwise run
-outside the arm, before the construct.
+outside the arm, before the construct. An arm's builder is sealed when its
+arm returns; a step recorded on it later (an `ArmBuilder` kept and used from
+a sibling arm) would be in no arm the program runs, and is refused too
+(`flow: step "x" was recorded on the builder of an arm that has already been
+built; …`).
 
 Arm names, which are also path segments: if `then`, `else`; choose
 `case-<n>` (cases in sorted key order, the key in `Case`) then `default`;
@@ -65,6 +69,10 @@ instruction is present, and every new field is `omitempty`, so a call-only
 program encodes byte for byte as before and keeps its artifact digest
 (`internal/program` hashes the encoded instructions). The engine refuses an
 unknown format and a control instruction in a format-0 program.
+`internal/program`'s version-1 artifact holds the call set only: `Build` and
+`Decode` refuse a program of another format or any instruction with a
+control body (`unsupported_program_format`), so a control program is never
+written into v1 and read back without its format.
 
 `contract.InternalInstruction` gains `Control *Control`:
 
@@ -145,8 +153,21 @@ write goes to the arm's frame only, so arm results never reach
   lte take two numbers or two strings (byte order); anything else is
   `invalid_comparison`.
 - default: the value, unless its path reaches nothing (a missing field, a
-  field of null) or it is null; then the fallback. Any other read error is
+  field of null) or its JSON form is null — nil, or a nil pointer, slice,
+  map or interface of any type (a reference hands on Go values, so an unset
+  optional field is a typed nil), or a value encoding itself as null; then
+  the fallback. An empty slice or map is a value. Any other read error is
   `invalid_operand`.
+- Values reach nodes as the node's type. A literal operand is a JSON value
+  (numbers as `json.Number`, objects as maps), and a reference hands on the
+  Go value it reaches (a `*T` field where the node takes a `T`). In a
+  format-2 program every call's input goes through
+  `node.Any.ConvertInput`: a value already of the node's input type passes
+  as is, any other is converted through its JSON encoding, as a durable
+  adapter restores a persisted output. A node never receives a value of
+  another type. Values that reach no node (the workflow output, a compare)
+  stay as they are: a literal fallback in the output is its JSON value.
+  Call-only programs are unchanged (no conversion).
 - if / choose: the condition is read as JSON (a named bool or string type
   selects like the plain one); a condition of another type is
   `invalid_condition`. The selected arm runs through the control path
@@ -159,8 +180,12 @@ write goes to the arm's frame only, so arm results never reach
   suspension). A finally failure replaces the try outcome; otherwise a try
   failure is the run's failure, after finally ran.
 - Each construct is itself a step in `Result.Steps`, after its arm's
-  steps, carrying its result; its inspection event keeps its own span and
-  is never an external call.
+  steps, carrying its result. It is never `Executed` (that reports a node
+  invocation; the arm's steps report their own) and never an external
+  call. Its trace span is a child of its enclosing span; its arm's steps
+  are children of its span.
+- A choose case value (`Arm.Match`) must be a JSON string; any other is
+  `invalid_control`, never a case that silently cannot match.
 
 A durable runner (`RunJournaled`) refuses a format-2 program with
 `durable_control_unsupported` before touching its journal: replaying arm
@@ -196,10 +221,20 @@ pair `OperationIdentity` and ADR 0027's waits already use.
 | `flow.Program()`: an arm's instructions are in its construct's `Arms`, not in the workflow's list | behavioral, source-visible for code walking `Program().Instructions` | Walk `Arms` recursively |
 | `flow.Instruction.Arms`, `.Literals`, `flow.Arm`, `ArmBuilder.Builder()` | API, additive | None |
 | Recording a step on an enclosing builder inside an arm is a `Define` error | behavioral: such a step used to run before the construct | Record it on the arm |
+| Recording a step on an arm's builder after its arm returned is a `Define` error | behavioral: such a step used to run outside the construct | Record it inside the arm's callback |
+| `node.Any.ConvertInput` | API, additive | None |
+| In a format-2 program a call's input is converted to the node's input type | behavioral (format 2 only) | None |
+| `internal/program` `Build`/`Decode` refuse format ≠ 0 and control bodies | behavioral, fail closed | None |
 | `StepResult.InvocationPath`, `.IterationPath` (engine, execution) | API, additive | None |
 | Engine refuses unknown formats, misshapen control instructions, control in format 0, control under a durable runner | behavioral, fail closed | None |
 
 ## Evidence (slice 1a)
+
+Review R round 1 found the typed cases: every control test had passed
+`map[string]any` between nodes. `flow/control_typed_test.go` runs typed Go
+nodes (typed nil `*string`, `*int`, `*struct`, nil `[]string`, int and
+struct literals into typed nodes) and was RED before the fixes, as were the
+sealed-arm, v1-artifact, choose-match and span tests.
 
 RED on origin/main 79ee0a7 (each fails at `Lower` with "cannot be lowered",
 the builder test with `Define err=<nil>`): `flow/control_run_test.go`,
@@ -218,9 +253,9 @@ origin/main by design and pins the encoding and digest recorded there.
   substitution semantics).
 - `$input` fields cannot be read by a call or a control operand; branch on
   a node's output.
-- `internal/program`'s artifact format (`Build`, version 1) still accepts
-  only the call set; whether control programs get a version-2 artifact is
-  decided with the durable slices.
+- `internal/program`'s artifact format (version 1) refuses control
+  programs; a version-2 artifact for them is decided with the durable
+  slices.
 - In memory only; nothing here is journaled or resumable.
 - Per-iteration inspection events: with each (1b), one step id runs more
   than once per run, and inspection attempt ids are keyed by step id.

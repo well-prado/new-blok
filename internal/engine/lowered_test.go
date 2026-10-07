@@ -212,3 +212,16 @@ func TestObservedRunReportsConstructsAroundTheirArms(t *testing.T) {
 		t.Fatalf("paths=%v", paths)
 	}
 }
+
+// A choose case value is a JSON string: lowering writes one, and a program
+// whose case is any other value is refused instead of never matching.
+func TestChooseCaseMustBeAString(t *testing.T) {
+	program := controlProgram(contract.InternalInstruction{ID: "c", Kind: "choose", Control: &contract.Control{Operands: []contract.Operand{literal(`"1"`)}, Arms: []contract.Arm{
+		{Name: "case-0", Match: json.RawMessage(`1`), Output: ptr(literal("1"))}, {Name: "default", Output: ptr(literal("2"))},
+	}}}, outputOf("c"))
+	_, err := New(nil).Run(context.Background(), program, nil)
+	var classified *Error
+	if !errors.As(err, &classified) || classified.Code != "invalid_control" || !strings.Contains(err.Error(), `arm "case-0" has an invalid case value`) {
+		t.Fatalf("err=%v", err)
+	}
+}

@@ -318,3 +318,23 @@ func canonical(t *testing.T, value any) string {
 	}
 	return string(encoded)
 }
+
+// An arm's builder is sealed when its arm returns: a step recorded on it
+// later would be in no arm the program runs, so it is refused (Review R
+// round 1 on #379).
+func TestStepRecordedOnAClosedArmIsRefused(t *testing.T) {
+	n := newControlNodes(t)
+	_, err := flow.Define(controlSpec, func(b *flow.Builder, in flow.Ref[object]) flow.Ref[object] {
+		var kept *flow.ArmBuilder
+		return flow.If(b, "route", flow.Compare(b, "big", "eq", in, in),
+			func(arm *flow.ArmBuilder) flow.Ref[object] { kept = arm; return flow.ArmCall(arm, "vip", n.vip, in) },
+			func(arm *flow.ArmBuilder) flow.Ref[object] {
+				flow.ArmCall(kept, "late", n.standard, in)
+				return flow.ArmCall(arm, "standard", n.standard, in)
+			})
+	})
+	want := `flow: step "late" was recorded on the builder of an arm that has already been built; record it inside that arm's callback`
+	if err == nil || err.Error() != want {
+		t.Fatalf("Define err=%v; want %q", err, want)
+	}
+}

@@ -56,7 +56,7 @@ type Result struct {
 type StepResult struct {
 	ID string
 	// InvocationPath and IterationPath identify this execution of the step
-	// inside nested control flow (ADR 0031): the step id at the top level,
+	// inside nested control flow (ADR 0028): the step id at the top level,
 	// "<construct path>/<arm>/<id>" inside an arm; "root" outside every
 	// loop.
 	InvocationPath        string

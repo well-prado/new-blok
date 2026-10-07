@@ -11,7 +11,7 @@ import (
 // A call-only workflow lowers to the program it lowered to before #333, byte
 // for byte, so its artifact digest is unchanged: the control instruction
 // set is a new program format, never a re-encoding of the old one (ADR
-// 0031). The expected encoding and digest were recorded on origin/main
+// 0028). The expected encoding and digest were recorded on origin/main
 // 79ee0a7.
 func TestCallOnlyLoweringKeepsItsEncodingAndDigest(t *testing.T) {
 	n := newConformanceNodes(t)

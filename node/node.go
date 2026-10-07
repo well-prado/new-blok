@@ -206,6 +206,28 @@ func (n Any) DecodeOutput(data []byte) (any, error) {
 	return value.Elem().Interface(), nil
 }
 
+// ConvertInput returns value as the node's declared Go input type. A value
+// already of that type, or any value for a node whose input type is an
+// interface, is returned as is; any other is converted through its JSON
+// encoding, as a durable adapter restores a persisted value. The engine uses
+// it for control programs, whose literals are JSON values and whose
+// references hand on Go values (a *T field read where a node takes a T): a
+// node never receives a value of another type.
+func (n Any) ConvertInput(value any) (any, error) {
+	if n.inputType == nil || n.inputType.Kind() == reflect.Interface || value != nil && reflect.TypeOf(value) == n.inputType {
+		return value, nil
+	}
+	data, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	converted := reflect.New(n.inputType)
+	if err := json.Unmarshal(data, converted.Interface()); err != nil {
+		return nil, err
+	}
+	return converted.Elem().Interface(), nil
+}
+
 func (n Any) Mock(output any, returned error) (Any, error) {
 	if returned == nil {
 		if err := validateRuntimeSchema(n.descriptor.OutputSchema, output); err != nil {

@@ -103,7 +103,7 @@ func (d Definition[I, O]) Program() Program { return cloneProgram(d.program) }
 // of letting the engine fall back to the workflow input (#244).
 //
 // Compare, Default, If, Choose and TryFinally lower to control instructions
-// whose arms nest their own instructions (ADR 0031, #333); a program holding
+// whose arms nest their own instructions (ADR 0028, #333); a program holding
 // one has Format contract.ControlFormat. An arm's steps are visible only
 // inside that arm: later instructions read the construct's result. Each,
 // Parallel, Template and Child are still rejected.
@@ -198,6 +198,9 @@ type Builder struct {
 	// recording is set while one of this builder's arms is being built. A
 	// step recorded on this builder then would land outside the arm.
 	recording bool
+	// sealed is set on an arm's builder once its arm is built: a step
+	// recorded on it later would be in no arm the program runs.
+	sealed bool
 }
 
 // arm records one arm on its own builder and returns it with the source the
@@ -211,6 +214,7 @@ func (builder *Builder) arm(name string, build func(*ArmBuilder) string) Arm {
 	builder.recording = true
 	output := build(&ArmBuilder{parent: child})
 	builder.recording = previous
+	child.sealed = true
 	return Arm{Name: name, Instructions: child.program.Instructions, Output: output}
 }
 
@@ -250,6 +254,9 @@ func Call[I, O any](builder *Builder, id string, definition node.Definition[I, O
 func (builder *Builder) reserveID(id string) {
 	if builder == nil {
 		violate("flow: nil builder")
+	}
+	if builder.sealed {
+		violate(fmt.Sprintf("flow: step %q was recorded on the builder of an arm that has already been built; record it inside that arm's callback", id))
 	}
 	if builder.recording {
 		violate(fmt.Sprintf("flow: step %q was recorded on an enclosing builder while one of its arms was being built; record it on the arm (ArmCall, or the arm's Builder)", id))
@@ -357,6 +364,11 @@ func Parallel(builder *Builder, id string, arms ...func(*ArmBuilder)) {
 	builder.record(Instruction{Kind: "parallel", ID: id, Data: map[string]any{"policy": "fail-fast", "cancellation": "cooperative"}, Arms: recorded})
 }
 
+// TryFinally runs tryArm, then finallyArm whether tryArm succeeded or failed,
+// and returns tryArm's result. A failing finallyArm fails the construct with
+// its own error; otherwise a failing tryArm fails it after finallyArm ran.
+// finallyArm does not run when the run is canceled (cancellation is
+// cooperative), nor, once runs are durable, after a suspension.
 func TryFinally[T any](builder *Builder, id string, tryArm func(*ArmBuilder) Ref[T], finallyArm func(*ArmBuilder)) Ref[T] {
 	if tryArm == nil || finallyArm == nil {
 		violate("flow: try and finally arms are required")
@@ -389,6 +401,10 @@ func Compare[T any](builder *Builder, id, operator string, left, right Ref[T]) R
 	return Ref[bool]{expression: expression{Kind: "operation", Source: output}}
 }
 
+// Default returns value unless it is absent, then fallback. Absent means its
+// path reaches nothing (a missing field, a field of null) or its JSON form is
+// null (nil, or a nil pointer, slice or map). A literal fallback is a JSON
+// value: a node it reaches receives it as the node's own input type.
 func Default[T any](builder *Builder, id string, value, fallback Ref[T]) Ref[T] {
 	builder.reserveID(id)
 	output := "$op." + id

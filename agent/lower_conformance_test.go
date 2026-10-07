@@ -355,7 +355,7 @@ func TestCatalogLowersAcceptedWorkflowsExactlyLikeFlowLower(t *testing.T) {
 
 // Every workflow flow.Lower rejects, the catalog rejects too, as not
 // agent-safe, and for the same reason: its error carries flow.Lower's.
-// Control flow flow.Lower now lowers (#333, ADR 0031) stays not agent-safe
+// Control flow flow.Lower now lowers (#333, ADR 0028) stays not agent-safe
 // in the catalog, which rejects its construct by kind.
 func TestCatalogRejectsWhatFlowLowerRejectsForTheSameReason(t *testing.T) {
 	n := newConfNodes(&recorder{})

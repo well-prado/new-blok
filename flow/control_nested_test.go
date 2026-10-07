@@ -11,7 +11,7 @@ import (
 
 // Nested constructs run through the public runner, each arm reading values
 // from the scopes around it, and every step reports the invocation and
-// iteration path later durable slices key their records by (ADR 0031).
+// iteration path later durable slices key their records by (ADR 0028).
 func TestNestedControlFlowRunsAndReportsPaths(t *testing.T) {
 	n := newControlNodes(t)
 	definition := flow.MustDefine(controlSpec, func(b *flow.Builder, in flow.Ref[object]) flow.Ref[object] {
@@ -71,7 +71,7 @@ func TestNestedControlFlowRunsAndReportsPaths(t *testing.T) {
 	}
 }
 
-// The control instruction encoding is the program format ADR 0031 records.
+// The control instruction encoding is the program format ADR 0028 records.
 func TestControlProgramEncoding(t *testing.T) {
 	n := newControlNodes(t)
 	lowered, err := flow.MustDefine(controlSpec, func(b *flow.Builder, in flow.Ref[object]) flow.Ref[object] {
