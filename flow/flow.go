@@ -372,8 +372,10 @@ func Parallel(builder *Builder, id string, arms ...func(*ArmBuilder)) {
 // TryFinally runs tryArm, then finallyArm whether tryArm succeeded or failed,
 // and returns tryArm's result. A failing finallyArm fails the construct with
 // its own error; otherwise a failing tryArm fails it after finallyArm ran.
-// finallyArm does not run when the run is canceled (cancellation is
-// cooperative), nor, once runs are durable, after a suspension.
+// finallyArm also runs when an enclosing Each or Parallel canceled tryArm
+// because a sibling failed. It does not run when the caller cancels the run
+// (cancellation is cooperative), nor, once runs are durable, after a
+// suspension.
 func TryFinally[T any](builder *Builder, id string, tryArm func(*ArmBuilder) Ref[T], finallyArm func(*ArmBuilder)) Ref[T] {
 	if tryArm == nil || finallyArm == nil {
 		violate("flow: try and finally arms are required")

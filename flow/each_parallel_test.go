@@ -242,3 +242,58 @@ func TestParallelArmsRunConcurrentlyAndJoinBeforeTheirResultsAreRead(t *testing.
 		t.Fatalf("fail-fast: err=%v canceled=%d; want stock's failure and price canceled", err, n.canceled.Load())
 	}
 }
+
+// A finally runs when its try was canceled because a sibling iteration
+// failed (fail-fast is the construct's own decision), and is skipped only
+// when the caller cancels the run (Review R round 1 on #383).
+func TestFinallyRunsOnFailFastAndOnlyCallerCancellationSkipsIt(t *testing.T) {
+	var released atomic.Int32
+	release := node.MustDefine("release", "1.0.0", func(context.Context, object) (object, error) {
+		released.Add(1)
+		return object{"released": true}, nil
+	}, node.Description("release"), node.Schemas([]byte(`{"type":"object"}`), []byte(`{"type":"object"}`)))
+	define := func(n *loopNodes) flow.Definition[object, []object] {
+		n.extra = map[string]node.Any{"release": release.Any()}
+		return flow.MustDefine(controlSpec, func(b *flow.Builder, in flow.Ref[object]) flow.Ref[[]object] {
+			return flow.Each(b, "lines", flow.Select[object, []object](in, "lines"), 4, func(arm *flow.ArmBuilder, line flow.Ref[object]) flow.Ref[object] {
+				return flow.TryFinally(arm.Builder(), "guard",
+					func(try *flow.ArmBuilder) flow.Ref[object] { return flow.ArmCall(try, "line", n.line, line) },
+					func(finally *flow.ArmBuilder) { flow.ArmCall(finally, "release", release, line) })
+			})
+		})
+	}
+
+	n := newLoopNodes()
+	_, err := runLoop(t, n, define(n), object{"lines": lines("block", "block", "block", "boom")})
+	if err == nil || !strings.Contains(err.Error(), "boom failed") || n.canceled.Load() != 3 {
+		t.Fatalf("fail-fast: err=%v canceled=%d", err, n.canceled.Load())
+	}
+	if released.Load() != 4 {
+		t.Fatalf("fail-fast: finally ran %d times, want 4 (every try started)", released.Load())
+	}
+
+	released.Store(0)
+	n = newLoopNodes()
+	program, err := define(n).Lower()
+	if err != nil {
+		t.Fatal(err)
+	}
+	application, err := app.New(app.Config{Workflows: []app.Workflow{{Name: controlSpec.Name}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := application.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		for n.inFlight.Load() < 2 {
+			time.Sleep(time.Millisecond)
+		}
+		cancel()
+	}()
+	_, err = execution.NewRunner(application, n.registry()).Run(ctx, program, object{"lines": lines("block", "block")}, inspection.Invocation{})
+	if !errors.Is(err, context.Canceled) || released.Load() != 0 {
+		t.Fatalf("caller cancellation: err=%v finally ran %d times, want 0", err, released.Load())
+	}
+}

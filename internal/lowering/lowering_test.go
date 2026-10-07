@@ -1,6 +1,7 @@
 package lowering
 
 import (
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
@@ -204,5 +205,23 @@ func TestEachAndParallelScopes(t *testing.T) {
 	bad.Data["concurrency"] = 0
 	if err := lower("$join.loop", bad); err == nil || err.Error() != `flow: each "loop": concurrency 0 is not between 1 and 1024` {
 		t.Errorf("unbounded each: err=%v", err)
+	}
+}
+
+// A decoded recording holds counts as float64 or json.Number; a whole one
+// lowers as flow's int does, a fractional one is refused.
+func TestEachConcurrencyReadsDecodedNumbers(t *testing.T) {
+	for _, concurrency := range []any{2, int64(2), float64(2), json.Number("2")} {
+		each := eachOf("loop", "$input", []Instruction{call("line", "$item.loop")}, "$step.line")
+		each.Data["concurrency"] = concurrency
+		result, err := Lower("w", "1.0.0", []Instruction{each}, "$join.loop", Options{Control: true})
+		if err != nil || result.Program.Instructions[0].Control.Concurrency != 2 {
+			t.Errorf("%T: err=%v", concurrency, err)
+		}
+	}
+	each := eachOf("loop", "$input", []Instruction{call("line", "$item.loop")}, "$step.line")
+	each.Data["concurrency"] = 2.5
+	if _, err := Lower("w", "1.0.0", []Instruction{each}, "$join.loop", Options{Control: true}); err == nil || !strings.Contains(err.Error(), "concurrency 2.5 is not between 1 and 1024") {
+		t.Errorf("fractional: err=%v", err)
 	}
 }

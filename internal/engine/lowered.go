@@ -3,6 +3,8 @@ package engine
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -558,6 +560,23 @@ func describe(value any) string {
 	}
 	return fmt.Sprintf("a %T", value)
 }
+
+// maxIterationInAttempt bounds the iteration path an attempt id carries, so
+// an attempt id stays within what inspection records (160 characters)
+// whatever the each and step ids: a longer path is replaced by its digest.
+const maxIterationInAttempt = 48
+
+func boundedIteration(iteration string) string {
+	if len(iteration) <= maxIterationInAttempt {
+		return iteration
+	}
+	sum := sha256.Sum256([]byte(iteration))
+	return "sha256:" + hex.EncodeToString(sum[:16])
+}
+
+// runContextKey holds the run's own context: its cancellation is the
+// caller's, any other a construct's internal fail-fast.
+type runContextKey struct{}
 
 // rootIteration is the iteration path outside every each, as the journal
 // keys a top-level step's effects and waits.

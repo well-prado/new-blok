@@ -282,8 +282,8 @@ func (l *lowerer) control(instruction Instruction, current *scope, depth int) (*
 			return fail(fmt.Errorf("items %w", err))
 		}
 		control.Operands = append(control.Operands, items)
-		concurrency, _ := instruction.Data["concurrency"].(int)
-		if concurrency < 1 || concurrency > MaxConcurrency {
+		concurrency, ok := wholeNumber(instruction.Data["concurrency"])
+		if !ok || concurrency < 1 || concurrency > MaxConcurrency {
 			return fail(fmt.Errorf("concurrency %v is not between 1 and %d", instruction.Data["concurrency"], MaxConcurrency))
 		}
 		control.Concurrency = concurrency
@@ -339,6 +339,23 @@ func (l *lowerer) control(instruction Instruction, current *scope, depth int) (*
 		}
 	}
 	return control, nil
+}
+
+// wholeNumber reads a recorded count: an int as flow records it, or the
+// float64 or json.Number a decoded recording holds, if it is whole.
+func wholeNumber(value any) (int, bool) {
+	switch typed := value.(type) {
+	case int:
+		return typed, true
+	case int64:
+		return int(typed), int64(int(typed)) == typed
+	case float64:
+		return int(typed), float64(int(typed)) == typed
+	case json.Number:
+		parsed, err := typed.Int64()
+		return int(parsed), err == nil && int64(int(parsed)) == parsed
+	}
+	return 0, false
 }
 
 // checkArms checks a construct has the arms its kind lowers with, named

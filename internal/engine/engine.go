@@ -302,7 +302,7 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 		if event.Attempt > 0 && event.StepID != "" {
 			step := event.StepID
 			if iteration != "" && iteration != rootIteration {
-				step += "@" + iteration
+				step += "@" + boundedIteration(iteration)
 			}
 			event.AttemptID = invocation.AttemptID + "/" + step + "/" + fmt.Sprint(event.Attempt)
 		}
@@ -338,6 +338,9 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 		}
 		emit(terminal)
 	}()
+	// The run's own context lets a construct tell the caller's cancellation
+	// from its own fail-fast cancellation of siblings (runTry).
+	ctx = context.WithValue(ctx, runContextKey{}, ctx)
 	state := make(map[string]any)
 	result = Result{State: state, Trace: runSpan}
 	// effected is the last completed step that declared effects: once it has
@@ -671,7 +674,11 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 					return runArm(ctx, armFrame, instruction.ID, arm)
 				})
 				if err != nil {
-					step.Error = err
+					// An arm's failure was classified when it failed, but a
+					// concurrent sibling may have committed an effect since,
+					// before the construct joined: decide retry safety
+					// again now (#190).
+					step.Error = afterEffect(err, lastEffected())
 					step.FinishedAt = time.Now().UTC()
 					appendStep(step)
 					return step.Error

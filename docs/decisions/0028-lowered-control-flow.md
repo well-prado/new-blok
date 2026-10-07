@@ -209,11 +209,16 @@ write goes to the arm's frame only, so arm results never reach
   `invalid_condition`. The selected arm runs through the control path
   (`runControlStep`: `ControlBranch` for if, `ControlAction` for choose);
   choose runs the first case whose match equals the key, else default.
-- try-finally runs through `ControlTry`: the finally arm runs after the try
-  arm succeeds or fails, unless the run is canceled (cooperative
-  cancellation, the control path's existing rule; the flow recording's
+- try-finally runs through `ControlTry`: once the try arm has started, the
+  finally arm runs after it succeeds or fails, including when an enclosing
+  each or parallel canceled it because a sibling failed (fail-fast is the
+  construct's own decision, decided by the orchestrator after Review R
+  round 1 on the 1b PR). Only the caller's cancellation of the run itself
+  skips finally (cooperative cancellation); the engine tells the two apart
+  by the run's own context, which it carries in the context, and runs
+  finally in a context canceled only by the run's. The flow recording's
   "finally-not-guaranteed-after-suspension" note stands for durable
-  suspension). A finally failure replaces the try outcome; otherwise a try
+  suspension. A finally failure replaces the try outcome; otherwise a try
   failure is the run's failure, after finally ran.
 - Each construct is itself a step in `Result.Steps`, after its arm's
   steps, carrying its result. It is never `Executed` (that reports a node
@@ -230,10 +235,13 @@ write goes to the arm's frame only, so arm results never reach
   `ControlEach`: at most `Concurrency` items in flight (a worker pool of
   that size), each in its own frame binding the each's id to the item.
   The result is the bodies' results in item order, whatever order they
-  finish in. The first failing item cancels the items in flight and no
+  finish in. The first item to fail cancels the items in flight and no
   further item starts (fail-fast); the run fails with that item's error.
+  When several fail concurrently, "first" is whichever records its failure
+  first, not the lowest index.
 - parallel runs every arm at once through `ControlParallel`, each in its
-  own frame; the first failure cancels the others. When all arms succeed,
+  own frame; the first arm to fail (whichever records it first) cancels the
+  others. When all arms succeed,
   their frames' results join the parallel's frame (the visibility rule
   above). It has no result.
 - Concurrent arms share the run's bookkeeping, so it is serialised: the
@@ -276,6 +284,18 @@ pair `OperationIdentity` and ADR 0027's waits already use. For a step at
 the top level this is `(step id, "root")`, which is what E07-T09 slice C's
 engine adapter writes for waits and effects until the engine supplies paths
 (slice 2 adds both paths to `engine.StepIdentity` and `WaitIdentity`).
+#382 is a prerequisite of that change: both identities are hashed into the
+ids the journal and `internal/cluster` store (`WaitIDFor`), so adding fields
+would change every existing wait and step id unless their encoding is made
+stable first, and the cluster's wait id must include the iteration.
+
+- Retry safety (#190) across concurrent arms: an arm's failure is
+  classified when it fails, but a sibling may commit an effect after that
+  and before the construct joins (an each or parallel waits for every arm
+  it started). So a construct re-applies the rule to its failure after the
+  join: once any step with effects has completed, a saturated failure no
+  longer reads as saturation, and the caller does not retry the whole
+  run.
 
 ### Joins and scopes (for the durable slices)
 
@@ -291,6 +311,9 @@ Recorded here so slices 2 and 3 key their journal records consistently:
   slot always holds the result wrapped, `{"output": <result>}`: an
   iteration whose body yields null, and every parallel arm (which yields
   nothing), still fills its slot.
+- An each over no items has no join: `RecordJoin` requires `Expected ≥ 1`,
+  so slice 3 records the empty each's scope as completed with output `[]`
+  and writes no join row.
 
 ## Compatibility (ADR 0001)
 
@@ -363,4 +386,11 @@ serialised step list and events.
   separate bound on the total steps its bodies run.
 - Inspection still shows one step per id: an each body's step is one step
   with one attempt per iteration (at most 100, the recorder's bound), not
-  one step per iteration.
+  one step per iteration, and the step's status is its last event's, so
+  it reads completed or failed from whichever iteration finished last.
+  Attempt ids bound the iteration part: past 48 characters it is replaced
+  by `sha256:<32 hex>` of the path, so an id fits the recorder's 160, and
+  the recorder matches completions on the same bounded form.
+- `flowtest.Result.Step(id)` returns the first execution of id in
+  completion order; inside an each, read `Steps()` and select by
+  `IterationPath`.
