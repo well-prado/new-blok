@@ -63,6 +63,19 @@ inserted, and different content under the same ID is `ErrConflict`.
 `journal.PlanUpgrade` stays an unaudited, read-only preview; only
 `DecideUpgrade` is a decision.
 
+Both count the same runs (#340): every run on the old artifact that is not
+`completed`, `failed` or `canceled`. That is an `accepted` run, including one
+suspended on a wait (a wait does not change the run's state); an `uncertain`
+run, whose effect outcome awaits reconciliation; and a run in any state this
+binary does not know, so the count fails closed. While that count is above
+zero, an upgrade that discards runs is refused (`ErrUpgradeWouldDiscard`,
+recorded as `would_discard_accepted_work`, a label kept for compatibility)
+and one that retains them reports them as `AffectedRuns`. `CancelRun` does not
+make room: it refuses a run with an uncertain effect (`ErrUncertain`) or an
+active wait (`ErrRunActiveWork`). No journal call moves a run out of
+`uncertain` (reconciliation decides the effect, not the run), so an uncertain
+run keeps its artifact retained.
+
 ### 2. Reliability policy: mandatory audit is not telemetry
 
 | Path | Policy |
