@@ -6,7 +6,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -134,10 +136,12 @@ func (j *Journal) Shares(database store.Database) bool {
 // same record appended again is a no-op (inserted is false); a different
 // record under the same id is ErrConflict. A record whose id Prune retired
 // is not written again: of the same kind it is a no-op (inserted is false),
-// of another kind ErrConflict (#294). Every store failure is
-// ErrUnavailable, and the caller must return it so its transaction rolls
-// back. Owners pass the record to Notify after commit only when inserted, so
-// a retried decision is not mirrored twice.
+// valid under today's rules or not, and of another kind ErrConflict (#294).
+// An owner recording a decision for the first time must therefore treat
+// inserted == false as ErrConflict: its record was not written. Every store
+// failure is ErrUnavailable, and the caller must return it so its
+// transaction rolls back. Owners pass the record to Notify after commit only
+// when inserted, so a retried decision is not mirrored twice.
 func (j *Journal) Append(ctx context.Context, tx *sql.Tx, r Record) (record Record, inserted bool, err error) {
 	if j == nil || tx == nil {
 		return Record{}, false, ErrRequired
@@ -155,6 +159,24 @@ func (j *Journal) Append(ctx context.Context, tx *sql.Tx, r Record) (record Reco
 	}
 	r.At = r.At.UTC()
 	r = clone(r)
+	// An id Prune retired is never written again (#294): its tombstone says
+	// the record existed and retention removed it. A retried or re-delivered
+	// decision, or a compaction backfill, of the same kind is a no-op, as for
+	// an existing record; another kind under that id is a different record.
+	// The tombstone is read before the record is validated: a pruned record
+	// accepted under an older sensitivity rule is not written again either
+	// way, and must not turn its owner's retry or compaction into an error.
+	var prunedKind string
+	err = tx.QueryRowContext(ctx, `SELECT kind FROM audit_pruned_v1 WHERE id_digest = ?`, Digest([]byte(r.ID))).Scan(&prunedKind)
+	switch {
+	case err == nil:
+		if prunedKind != string(r.Kind) {
+			return Record{}, false, ErrConflict
+		}
+		return r, false, nil
+	case !errors.Is(err, sql.ErrNoRows):
+		return Record{}, false, unavailableErr(err)
+	}
 	if err := r.Validate(); err != nil {
 		return Record{}, false, err
 	}
@@ -167,21 +189,6 @@ func (j *Journal) Append(ctx context.Context, tx *sql.Tx, r Record) (record Reco
 	switch {
 	case err == nil:
 		if !bytes.Equal(existing, encoded) {
-			return Record{}, false, ErrConflict
-		}
-		return r, false, nil
-	case !errors.Is(err, sql.ErrNoRows):
-		return Record{}, false, unavailableErr(err)
-	}
-	// An id Prune retired is never written again (#294): its tombstone says
-	// the record existed and retention removed it. A retried or re-delivered
-	// decision, or a compaction backfill, of the same kind is a no-op, as for
-	// an existing record; another kind under that id is a different record.
-	var prunedKind string
-	err = tx.QueryRowContext(ctx, `SELECT kind FROM audit_pruned_v1 WHERE id_digest = ?`, Digest([]byte(r.ID))).Scan(&prunedKind)
-	switch {
-	case err == nil:
-		if prunedKind != string(r.Kind) {
 			return Record{}, false, ErrConflict
 		}
 		return r, false, nil
@@ -396,7 +403,8 @@ type Owner interface {
 // Verify reads every record and checks it against its digest, its indexed
 // columns and the record count, and that no prune tombstone has its id
 // (ErrCorrupt: Append never writes a pruned id again, so a record next to
-// its own tombstone was written around retention, #294). It then
+// its own tombstone was written around retention, #294; the error names
+// the record's id, and Prune removes such a record again). It then
 // cross-checks each owner's durable decisions against the records
 // (ErrMismatch): a decision without its record or tombstone, or a record
 // naming a decision the owner does not have. Run it after a restore with
@@ -415,21 +423,26 @@ func (j *Journal) Verify(ctx context.Context, owners ...Owner) (int, error) {
 			return err
 		}
 		defer rows.Close()
+		// Record ids are checked against the tombstones in batches, one
+		// indexed IN lookup per pruneBatch records.
+		var batch []string
 		for rows.Next() {
 			_, record, err := scanVerified(rows)
 			if err != nil {
 				return err
 			}
-			var pruned int
-			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM audit_pruned_v1 WHERE id_digest = ?`, Digest([]byte(record.ID))).Scan(&pruned); err != nil {
-				return err
-			}
-			if pruned != 0 {
-				return ErrCorrupt
+			if batch = append(batch, record.ID); len(batch) == pruneBatch {
+				if err := checkNotPruned(ctx, tx, batch); err != nil {
+					return err
+				}
+				batch = batch[:0]
 			}
 			verified++
 		}
 		if err := rows.Err(); err != nil {
+			return err
+		}
+		if err := checkNotPruned(ctx, tx, batch); err != nil {
 			return err
 		}
 		var count int
@@ -447,6 +460,41 @@ func (j *Journal) Verify(ctx context.Context, owners ...Owner) (int, error) {
 		return nil
 	})
 	return verified, err
+}
+
+// checkNotPruned is ErrCorrupt, naming the first record in ids (in the
+// order given) that has a prune tombstone of its id digest, whatever kind
+// the tombstone names: Append never writes a pruned id again (#294).
+func checkNotPruned(ctx context.Context, tx *sql.Tx, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = Digest([]byte(id))
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id_digest FROM audit_pruned_v1 WHERE id_digest IN (?`+strings.Repeat(", ?", len(ids)-1)+`)`, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	pruned := map[string]bool{}
+	for rows.Next() {
+		var digest string
+		if err := rows.Scan(&digest); err != nil {
+			return err
+		}
+		pruned[digest] = true
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for i, id := range ids {
+		if pruned[args[i].(string)] {
+			return fmt.Errorf("%w: record %q is next to a prune tombstone of its id (#294)", ErrCorrupt, id)
+		}
+	}
+	return nil
 }
 
 func crossCheck(ctx context.Context, tx *sql.Tx, owner Owner) error {

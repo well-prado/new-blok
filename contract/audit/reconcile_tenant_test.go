@@ -338,8 +338,8 @@ func TestPruningTheRecordDoesNotChangeWhoOwnsTheReconciliation(t *testing.T) {
 	// record again (#294): its prune tombstone says retention removed it,
 	// and only a record that never existed is backfilled. Until #294 this
 	// test pinned the opposite, one record under the deciding tenant next
-	// to its own tombstone, which outlived retention with every
-	// re-delivery and which Verify now reports as ErrCorrupt.
+	// to its own tombstone, back after retention had removed it, which
+	// Verify now reports as ErrCorrupt.
 	if r.records("tenant-a") != 0 || r.records("") != 0 || r.records("tenant-b") != 0 {
 		t.Fatalf("records after prune a=%d system=%d b=%d, want none", r.records("tenant-a"), r.records(""), r.records("tenant-b"))
 	}

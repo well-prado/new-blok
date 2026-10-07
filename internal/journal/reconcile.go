@@ -196,6 +196,12 @@ func (j *Journal) reconcileOnce(ctx context.Context, operationKey, actor, eviden
 		}
 		reconciliation = Reconciliation{OperationKey: operationKey, Actor: actor, Evidence: evidence, Result: append([]byte(nil), result...), State: operationCommitted}
 		record, inserted, err = j.audit.Append(ctx, tx, reconciliationRecord(caller, operationKey, actor, evidenceDigest, resultDigest, runID, now))
+		if err == nil && !inserted {
+			// A first reconciliation whose record already exists or was
+			// pruned (a stale or planted tombstone, #294) would commit
+			// without writing or mirroring its record: refuse it instead.
+			return audit.ErrConflict
+		}
 		return err
 	})
 	if err != nil {
