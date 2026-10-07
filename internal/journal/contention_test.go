@@ -51,7 +51,7 @@ func TestJournalTransitionsWaitForConcurrentWriter(t *testing.T) {
 				}
 			}
 			if name == "wait-claim" {
-				if _, err := j.ScheduleWait(ctx, WaitRequest{RunID: run.RunID, WaitID: "wait", Name: "ready", DueAt: time.Unix(1, 0)}); err != nil {
+				if _, err := j.ScheduleWait(ctx, WaitRequest{RunID: run.RunID, WaitID: "wait", Name: "ready", InvocationPath: "ready", IterationPath: "root", DueAt: time.Unix(1, 0)}); err != nil {
 					t.Fatal(err)
 				}
 			}

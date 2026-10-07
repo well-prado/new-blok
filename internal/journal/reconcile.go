@@ -41,9 +41,12 @@ type Reconciliation struct {
 }
 
 type UpgradePlan struct {
-	FromDigest   string
-	ToDigest     string
-	RetainRuns   bool
+	FromDigest string
+	ToDigest   string
+	RetainRuns bool
+	// AffectedRuns counts the runs on FromDigest that have not finished:
+	// every run not completed, failed or canceled (unfinishedRuns). They
+	// still need that artifact to resume, recover or be reconciled.
 	AffectedRuns int
 }
 
@@ -327,6 +330,23 @@ func (j *Journal) AuditedIDs(ctx context.Context, tx *sql.Tx, fn func(string) er
 	return rows.Err()
 }
 
+// unfinishedRuns counts the runs on digest an upgrade that drops that
+// artifact would strand (#340). Only completed, failed and canceled are
+// terminal. Everything else counts: an accepted run, including one
+// suspended on a wait (a wait does not change the run's state); an
+// uncertain run, whose effect outcome awaits reconciliation and which no
+// journal call moves out of uncertain, so it pins its artifact; and any
+// state this binary does not know, so the count fails closed.
+func unfinishedRuns(ctx context.Context, tx *sql.Tx, digest string) (int, error) {
+	var count int
+	err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM journal_runs WHERE artifact_digest = ? AND state NOT IN (?, ?, ?)`, digest, runCompleted, runFailed, runCanceled).Scan(&count)
+	return count, err
+}
+
+// PlanUpgrade previews an upgrade from fromDigest to toDigest. Without
+// retainRuns it refuses with ErrUpgradeWouldDiscard while any run on
+// fromDigest is unfinished (unfinishedRuns); with retainRuns it reports
+// them as AffectedRuns, and the caller must keep fromDigest for them.
 func (j *Journal) PlanUpgrade(ctx context.Context, fromDigest, toDigest string, retainRuns bool) (UpgradePlan, error) {
 	if err := j.RequireArtifact(ctx, fromDigest); err != nil {
 		return UpgradePlan{}, err
@@ -335,8 +355,9 @@ func (j *Journal) PlanUpgrade(ctx context.Context, fromDigest, toDigest string, 
 		return UpgradePlan{}, err
 	}
 	var affected int
-	err := j.withRead(ctx, func(tx *sql.Tx) error {
-		return tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM journal_runs WHERE artifact_digest = ? AND state = ?`, fromDigest, runAccepted).Scan(&affected)
+	err := j.withRead(ctx, func(tx *sql.Tx) (err error) {
+		affected, err = unfinishedRuns(ctx, tx, fromDigest)
+		return err
 	})
 	if err != nil {
 		return UpgradePlan{}, err
@@ -347,8 +368,9 @@ func (j *Journal) PlanUpgrade(ctx context.Context, fromDigest, toDigest string, 
 	return UpgradePlan{FromDigest: fromDigest, ToDigest: toDigest, RetainRuns: retainRuns, AffectedRuns: affected}, nil
 }
 
-// DecideUpgrade is the audited deployment decision: PlanUpgrade's checks
-// plus a durable record of who decided, between which artifacts, under which
+// DecideUpgrade is the audited deployment decision: PlanUpgrade's checks,
+// counting the same unfinished runs inside the decision's transaction, plus
+// a durable record of who decided, between which artifacts, under which
 // retention choice, and whether it was accepted or refused, committed in one
 // transaction. A refusal is recorded too and still returns
 // ErrUpgradeWouldDiscard. Without audit, or when the record cannot be
@@ -376,8 +398,8 @@ func (j *Journal) DecideUpgrade(ctx context.Context, actor, fromDigest, toDigest
 				return err
 			}
 		}
-		var affected int
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM journal_runs WHERE artifact_digest = ? AND state = ?`, fromDigest, runAccepted).Scan(&affected); err != nil {
+		affected, err := unfinishedRuns(ctx, tx, fromDigest)
+		if err != nil {
 			return err
 		}
 		outcome, reason, action := audit.OutcomeAccepted, "", "upgrade.discard-runs"
@@ -393,7 +415,6 @@ func (j *Journal) DecideUpgrade(ctx context.Context, actor, fromDigest, toDigest
 				digests[name] = digest
 			}
 		}
-		var err error
 		record, _, err = j.audit.Append(ctx, tx, audit.Record{
 			ID: id, Kind: audit.KindDeployment, Tenant: audit.TenantFrom(ctx), Actor: actor,
 			Subject: fromDigest + " -> " + toDigest, Action: action, Outcome: outcome, Reason: reason, Digests: digests,
