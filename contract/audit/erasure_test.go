@@ -89,7 +89,13 @@ func (r *rig) contentRun(label string, reconciled bool) contentRun {
 	if _, err := r.journal.Signal(ctx, signal.Envelope{RunID: run.RunID, SignalID: "signal-" + label, Name: "approved", Payload: quoted("SIGNAL"), Principal: "alice"}, true); err != nil {
 		r.t.Fatal(err)
 	}
-	if err := r.journal.RecordChild(ctx, journal.ChildRecord{RunID: run.RunID, Path: "child", ChildRunID: "run:child-" + label, State: "completed", Result: quoted("CHILD")}); err != nil {
+	// The child record must name a run the journal holds (#334). The child
+	// carries no marker and stays accepted, so compaction leaves it alone.
+	child, err := r.journal.Admit(ctx, journal.AdmissionRequest{RequestKey: "child-of-" + label, Workflow: "orders", ArtifactDigest: digest("artifact"), Input: []byte(`{}`)})
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	if err := r.journal.RecordChild(ctx, journal.ChildRecord{RunID: run.RunID, Path: "child", ChildRunID: child.RunID, State: "completed", Result: quoted("CHILD")}); err != nil {
 		r.t.Fatal(err)
 	}
 	if err := r.journal.RecordJoin(ctx, journal.JoinRecord{RunID: run.RunID, Path: "join", Expected: 1, Completed: 1, Results: []json.RawMessage{quoted("JOIN")}}); err != nil {

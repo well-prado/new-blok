@@ -91,7 +91,7 @@ func TestSignalsByNameQueueFirstInFirstOut(t *testing.T) {
 	if w := r.wait("w2", "approve", "2"); w.SignalID != "between" {
 		t.Fatalf("w2 took %q; want between", w.SignalID)
 	}
-	want := []string{"w0|resumed|early-a", "w1|resumed|early-b", "w2|resumed|between", "early-a|stored", "early-b|stored", "between|stored"}
+	want := []string{"w0|fired|early-a", "w1|fired|early-b", "w2|fired|between", "early-a|stored", "early-b|stored", "between|stored"}
 	if got := r.rows(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("rows:\n got %q\nwant %q", got, want)
 	}
@@ -106,13 +106,13 @@ func TestLoopOfThreeIterationsReceivesEverySignal(t *testing.T) {
 	if result := r.send("before-0"); result != pending {
 		t.Fatalf("before-0=%+v", result)
 	}
-	if w := r.wait("loop[0]", "approve", "0"); w.State != waitResumed || w.SignalID != "before-0" {
+	if w := r.wait("loop[0]", "approve", "0"); w.State != waitFired || w.SignalID != "before-0" {
 		t.Fatalf("loop[0]=%+v", w)
 	}
 	if result := r.send("between-1"); result != pending {
 		t.Fatalf("between-1, sent between iterations=%+v; want pending", result)
 	}
-	if w := r.wait("loop[1]", "approve", "1"); w.State != waitResumed || w.SignalID != "between-1" {
+	if w := r.wait("loop[1]", "approve", "1"); w.State != waitFired || w.SignalID != "between-1" {
 		t.Fatalf("loop[1]=%+v", w)
 	}
 	if w := r.wait("loop[2]", "approve", "2"); w.State != waitWaiting {
@@ -121,7 +121,7 @@ func TestLoopOfThreeIterationsReceivesEverySignal(t *testing.T) {
 	if result := r.send("during-2"); result != delivered {
 		t.Fatalf("during-2, sent while loop[2] is open=%+v", result)
 	}
-	want := []string{"loop[0]|resumed|before-0", "loop[1]|resumed|between-1", "loop[2]|resumed|during-2", "before-0|stored", "between-1|stored", "during-2|stored"}
+	want := []string{"loop[0]|fired|before-0", "loop[1]|fired|between-1", "loop[2]|fired|during-2", "before-0|stored", "between-1|stored", "during-2|stored"}
 	if got := r.rows(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("rows:\n got %q\nwant %q", got, want)
 	}
@@ -227,7 +227,7 @@ func TestConcurrentDuplicateSignalsDeliverOnce(t *testing.T) {
 			t.Fatalf("%s: results=%v; want %v", c.signalID, counts, want)
 		}
 	}
-	want := []string{"open|resumed|once", "once|stored", "queued|pending"}
+	want := []string{"open|fired|once", "once|stored", "queued|pending"}
 	got := append(waitRows(t, database, `SELECT wait_id || '|' || state || '|' || signal_id FROM journal_waits`), waitRows(t, database, `SELECT signal_id || '|' || state FROM journal_signals ORDER BY rowid`)...)
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("rows:\n got %q\nwant %q", got, want)

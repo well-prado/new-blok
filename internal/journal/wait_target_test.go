@@ -50,7 +50,7 @@ func TestTargetedSignalReachesOnlyItsWait(t *testing.T) {
 	if result, err := send("to-2", "approval", WaitTarget{WaitID: "approve[2]"}); err != nil || result != delivered {
 		t.Fatalf("retry once approve[2] exists=%+v err=%v", result, err)
 	}
-	want := []string{"approve[0]|resumed|to-0", "approve[1]|resumed|to-1", "approve[2]|resumed|to-2", "approve[3]|waiting|", "to-1|stored", "to-0|stored", "to-1-again|late", "to-2|stored"}
+	want := []string{"approve[0]|fired|to-0", "approve[1]|fired|to-1", "approve[2]|fired|to-2", "approve[3]|waiting|", "to-1|stored", "to-0|stored", "to-1-again|late", "to-2|stored"}
 	if got := r.rows(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("rows:\n got %q\nwant %q", got, want)
 	}

@@ -5,7 +5,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"slices"
+	"sync"
 	"testing"
 
 	"github.com/well-prado/new-blok/store/sqlite"
@@ -39,7 +42,11 @@ func TestRecoveryReusesCompletedNestedPathsAndRejectsChangedArtifact(t *testing.
 	if err := j.CompleteScope(context.Background(), run.RunID, "parallel/0/each/0", started.AttemptID, []byte(`{"value":1}`)); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.RecordChild(context.Background(), ChildRecord{RunID: run.RunID, Path: "child/0", ChildRunID: "child-run", State: childCompleted, Result: []byte(`{"ok":true}`)}); err != nil {
+	child, err := j.Admit(context.Background(), AdmissionRequest{RequestKey: "recovery-child", Workflow: "nested", ArtifactDigest: "sha256:artifact", Input: []byte(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := j.RecordChild(context.Background(), ChildRecord{RunID: run.RunID, Path: "child/0", ChildRunID: child.RunID, State: childCompleted, Result: []byte(`{"ok":true}`)}); err != nil {
 		t.Fatal(err)
 	}
 	if err := j.RecordJoin(context.Background(), JoinRecord{RunID: run.RunID, Path: "parallel/0", Expected: 2, Completed: 2, Results: []json.RawMessage{[]byte(`1`), []byte(`2`)}}); err != nil {
@@ -146,6 +153,413 @@ func recovered(t *testing.T, j *Journal, runID string) Recovery {
 		t.Fatal(err)
 	}
 	return recovery
+}
+
+// slots builds a join's results, one per branch; "" is an empty slot.
+func slots(values ...string) []json.RawMessage {
+	out := make([]json.RawMessage, len(values))
+	for i, value := range values {
+		if value != "" {
+			out[i] = json.RawMessage(value)
+		}
+	}
+	return out
+}
+
+// storedSlots reads a join's stored slots back through Recover, "" for an
+// empty one.
+func storedSlots(t *testing.T, j *Journal, runID, path string) (JoinRecord, []string) {
+	t.Helper()
+	for _, join := range recovered(t, j, runID).Joins {
+		if join.Path != path {
+			continue
+		}
+		values := make([]string, len(join.Results))
+		for i, slot := range join.Results {
+			if string(slot) != "null" {
+				values[i] = string(slot)
+			}
+		}
+		return join, values
+	}
+	t.Fatalf("join %s not stored", path)
+	return JoinRecord{}, nil
+}
+
+// P2 (#334, D6): a completed join is final. Re-recording a completed 2-of-2
+// join as 1 of 3 used to store expected=2 completed=1 state=running.
+func TestCompletedJoinCannotRegress(t *testing.T) {
+	ctx := context.Background()
+	j, runID := fencingRun(t, "join-final")
+	done := JoinRecord{RunID: runID, Path: "parallel/0", Expected: 2, Completed: 2, Results: slots(`1`, `2`)}
+	if err := j.RecordJoin(ctx, done); err != nil {
+		t.Fatal(err)
+	}
+	for name, write := range map[string]JoinRecord{
+		"1 of 3":       {RunID: runID, Path: "parallel/0", Expected: 3, Completed: 1, Results: slots(`9`, ``, ``)},
+		"other result": {RunID: runID, Path: "parallel/0", Expected: 2, Completed: 2, Results: slots(`1`, `9`)},
+	} {
+		if err := j.RecordJoin(ctx, write); !errors.Is(err, ErrRecordFinal) {
+			t.Errorf("%s over a completed join: err=%v, want ErrRecordFinal", name, err)
+		}
+	}
+	unchanged := func(when string) {
+		t.Helper()
+		join, values := storedSlots(t, j, runID, "parallel/0")
+		if join.Expected != 2 || join.Completed != 2 || join.State != joinCompleted || !slices.Equal(values, []string{`1`, `2`}) {
+			t.Fatalf("completed join changed %s: %+v", when, join)
+		}
+	}
+	unchanged("by the refused writes")
+	if err := j.RecordJoin(ctx, done); err != nil {
+		t.Fatalf("identical retry of the completing join: %v", err)
+	}
+	unchanged("by the identical retry")
+}
+
+// A join's results are positional (#334 review): one slot per expected
+// branch, null while the branch has not come back, and Completed counts the
+// filled slots. A filled slot never changes; Expected is fixed at creation.
+func TestJoinSlotsAreFilledOnce(t *testing.T) {
+	ctx := context.Background()
+	j, runID := fencingRun(t, "join-slots")
+	two := JoinRecord{RunID: runID, Path: "parallel/0", Expected: 3, Completed: 2, Results: slots(`1`, `2`, ``)}
+	if err := j.RecordJoin(ctx, two); err != nil {
+		t.Fatal(err)
+	}
+	for name, write := range map[string]JoinRecord{
+		// The #370 review's probe: completing it with other values used to
+		// store [7,8,9].
+		"filled slots changed":      {RunID: runID, Path: "parallel/0", Expected: 3, Completed: 3, Results: slots(`7`, `8`, `9`)},
+		"one filled slot changed":   {RunID: runID, Path: "parallel/0", Expected: 3, Completed: 2, Results: slots(`1`, `8`, ``)},
+		"expected changed":          {RunID: runID, Path: "parallel/0", Expected: 4, Completed: 3, Results: slots(`1`, `2`, `3`, ``)},
+		"same count, other results": {RunID: runID, Path: "parallel/0", Expected: 3, Completed: 2, Results: slots(`7`, `8`, ``)},
+	} {
+		if err := j.RecordJoin(ctx, write); !errors.Is(err, ErrRecordConflict) {
+			t.Errorf("%s: err=%v, want ErrRecordConflict", name, err)
+		}
+	}
+	if join, values := storedSlots(t, j, runID, "parallel/0"); join.Completed != 2 || join.State != joinRunning || !slices.Equal(values, []string{`1`, `2`, ``}) {
+		t.Fatalf("running join changed: %+v", join)
+	}
+	// Writes that bring nothing new change nothing: an identical retry, and
+	// a writer that knows fewer branches than are stored.
+	for name, write := range map[string]JoinRecord{
+		"identical retry": two,
+		"fewer branches":  {RunID: runID, Path: "parallel/0", Expected: 3, Completed: 1, Results: slots(`1`, ``, ``)},
+	} {
+		if err := j.RecordJoin(ctx, write); err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	if join, values := storedSlots(t, j, runID, "parallel/0"); join.Completed != 2 || !slices.Equal(values, []string{`1`, `2`, ``}) {
+		t.Fatalf("join changed by a write with nothing new: %+v", join)
+	}
+	if err := j.RecordJoin(ctx, JoinRecord{RunID: runID, Path: "parallel/0", Expected: 3, Completed: 3, Results: slots(`1`, `2`, `3`)}); err != nil {
+		t.Fatalf("moving forward: %v", err)
+	}
+	if join, values := storedSlots(t, j, runID, "parallel/0"); join.Completed != 3 || join.State != joinCompleted || !slices.Equal(values, []string{`1`, `2`, `3`}) {
+		t.Fatalf("join did not complete: %+v", join)
+	}
+	if err := j.RecordJoin(ctx, JoinRecord{RunID: "run:missing", Path: "parallel/0", Expected: 1}); !errors.Is(err, ErrNotFound) {
+		t.Errorf("join of an unknown run: err=%v, want ErrNotFound", err)
+	}
+}
+
+// A join record that does not describe its own slots is refused and
+// nothing is stored: results of another length than Expected, a Completed
+// that is not the number of filled slots, or a State the counts contradict.
+// No results at all is Expected empty slots.
+func TestJoinRecordMustDescribeItsSlots(t *testing.T) {
+	ctx := context.Background()
+	j, runID := fencingRun(t, "join-shape")
+	for name, write := range map[string]JoinRecord{
+		"fewer slots than expected": {RunID: runID, Path: "parallel/bad", Expected: 3, Completed: 2, Results: slots(`1`, `2`)},
+		"more slots than expected":  {RunID: runID, Path: "parallel/bad", Expected: 1, Completed: 1, Results: slots(`1`, `2`)},
+		"completed above filled":    {RunID: runID, Path: "parallel/bad", Expected: 3, Completed: 3, Results: slots(`1`, ``, ``)},
+		"completed below filled":    {RunID: runID, Path: "parallel/bad", Expected: 3, Completed: 1, Results: slots(`1`, `2`, ``)},
+		"completed without results": {RunID: runID, Path: "parallel/bad", Expected: 2, Completed: 1},
+		"state contradicts counts":  {RunID: runID, Path: "parallel/bad", Expected: 2, Completed: 1, Results: slots(`1`, ``), State: joinCompleted},
+	} {
+		if err := j.RecordJoin(ctx, write); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	if joins := recovered(t, j, runID).Joins; len(joins) != 0 {
+		t.Fatalf("a malformed join was stored: %+v", joins)
+	}
+	if err := j.RecordJoin(ctx, JoinRecord{RunID: runID, Path: "parallel/0", Expected: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.RecordJoin(ctx, JoinRecord{RunID: runID, Path: "parallel/0", Expected: 2, Results: []json.RawMessage{}}); err != nil {
+		t.Errorf("an empty retry of an empty join: %v", err)
+	}
+	if join, values := storedSlots(t, j, runID, "parallel/0"); join.Completed != 0 || !slices.Equal(values, []string{``, ``}) {
+		t.Fatalf("empty join stored as %+v", join)
+	}
+}
+
+// Branches come back in any order, and each fills only its own slot
+// (#334 review): slot 2, then slot 0, then the rest.
+func TestJoinFillsSlotsOutOfOrder(t *testing.T) {
+	ctx := context.Background()
+	j, runID := fencingRun(t, "join-order")
+	for _, write := range [][]string{{``, ``, `"c"`}, {`"a"`, ``, ``}, {``, `"b"`, ``}} {
+		filled := 0
+		for _, value := range write {
+			if value != "" {
+				filled++
+			}
+		}
+		if err := j.RecordJoin(ctx, JoinRecord{RunID: runID, Path: "parallel/0", Expected: 3, Completed: filled, Results: slots(write...)}); err != nil {
+			t.Fatalf("filling %q: %v", write, err)
+		}
+	}
+	if join, values := storedSlots(t, j, runID, "parallel/0"); join.Completed != 3 || join.State != joinCompleted || !slices.Equal(values, []string{`"a"`, `"b"`, `"c"`}) {
+		t.Fatalf("join = %+v %q", join, values)
+	}
+}
+
+// Two journal handles on one database fill a join concurrently (#334
+// review): branches filling different slots both succeed, and of two
+// filling the same slot with different values one wins and the other is
+// ErrRecordConflict.
+func TestConcurrentJoinFillsFromTwoHandles(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "join-handles.db")
+	first, j := newJournalAtPath(t, path, Config{})
+	defer first.Close()
+	second, k := newJournalAtPath(t, path, Config{})
+	defer second.Close()
+	run, err := j.Admit(ctx, AdmissionRequest{RequestKey: "join-handles", Workflow: "nested", ArtifactDigest: "sha256:admitted", Input: []byte(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	race := func(path string, a, b []string) (error, error) {
+		t.Helper()
+		if err := j.RecordJoin(ctx, JoinRecord{RunID: run.RunID, Path: path, Expected: 2}); err != nil {
+			t.Fatal(err)
+		}
+		errs := make([]error, 2)
+		var group sync.WaitGroup
+		for i, write := range []struct {
+			journal *Journal
+			values  []string
+		}{{j, a}, {k, b}} {
+			group.Add(1)
+			go func() {
+				defer group.Done()
+				errs[i] = write.journal.RecordJoin(ctx, JoinRecord{RunID: run.RunID, Path: path, Expected: 2, Completed: 1, Results: slots(write.values...)})
+			}()
+		}
+		group.Wait()
+		return errs[0], errs[1]
+	}
+	stored := func(path string) []string {
+		var values []string
+		if err := first.WithTx(ctx, func(tx *sql.Tx) error {
+			var encoded []byte
+			if err := tx.QueryRowContext(ctx, `SELECT results_json FROM journal_joins WHERE run_id = ? AND path = ?`, run.RunID, path).Scan(&encoded); err != nil {
+				return err
+			}
+			var raw []json.RawMessage
+			if err := json.Unmarshal(encoded, &raw); err != nil {
+				return err
+			}
+			for _, slot := range raw {
+				values = append(values, string(slot))
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return values
+	}
+	for round := range 10 {
+		path := fmt.Sprintf("different/%d", round)
+		if a, b := race(path, []string{`"A"`, ``}, []string{``, `"B"`}); a != nil || b != nil {
+			t.Fatalf("branches filling different slots: %v, %v", a, b)
+		}
+		if got := stored(path); !slices.Equal(got, []string{`"A"`, `"B"`}) {
+			t.Fatalf("different slots stored %q", got)
+		}
+		path = fmt.Sprintf("same/%d", round)
+		a, b := race(path, []string{`"A"`, ``}, []string{`"Z"`, ``})
+		if (a == nil) == (b == nil) || !errors.Is(errors.Join(a, b), ErrRecordConflict) {
+			t.Fatalf("branches filling the same slot: %v, %v; want one winner and one ErrRecordConflict", a, b)
+		}
+		if got := stored(path); !slices.Equal(got, []string{`"A"`, `null`}) && !slices.Equal(got, []string{`"Z"`, `null`}) {
+			t.Fatalf("same slot stored %q", got)
+		}
+	}
+}
+
+// A slot is compared in its compact JSON form, the form it is stored in
+// (#370 review): repeating a slot written with spaces, or with characters
+// json.Marshal escapes (<, >, &), is the same slot, so a writer that resends
+// the slots it already knows while filling a new one is not refused.
+func TestJoinSlotsCompareInCompactForm(t *testing.T) {
+	ctx := context.Background()
+	j, runID := fencingRun(t, "join-compact")
+	for _, first := range []string{`{"a": 1}`, `"<b>"`, `"x&y"`, " [1, 2] "} {
+		path := "parallel/" + first
+		if err := j.RecordJoin(ctx, JoinRecord{RunID: runID, Path: path, Expected: 2, Completed: 1, Results: slots(first, ``)}); err != nil {
+			t.Fatalf("seeding %s: %v", first, err)
+		}
+		if err := j.RecordJoin(ctx, JoinRecord{RunID: runID, Path: path, Expected: 2, Completed: 2, Results: slots(first, `2`)}); err != nil {
+			t.Errorf("resending %s while filling the next slot: %v", first, err)
+		}
+		if err := j.RecordJoin(ctx, JoinRecord{RunID: runID, Path: path, Expected: 2, Completed: 2, Results: slots(first, `2`)}); err != nil {
+			t.Errorf("retrying the completing write with %s: %v", first, err)
+		}
+		if join, _ := storedSlots(t, j, runID, path); join.Completed != 2 || join.State != joinCompleted {
+			t.Errorf("join with %s = %+v", first, join)
+		}
+	}
+	// The compact form still tells different values apart: key order and
+	// number spelling are not normalised.
+	if err := j.RecordJoin(ctx, JoinRecord{RunID: runID, Path: "parallel/order", Expected: 2, Completed: 1, Results: slots(`{"a":1,"b":2}`, ``)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.RecordJoin(ctx, JoinRecord{RunID: runID, Path: "parallel/order", Expected: 2, Completed: 2, Results: slots(`{"b":2,"a":1}`, `2`)}); !errors.Is(err, ErrRecordConflict) {
+		t.Errorf("reordered keys: err=%v, want ErrRecordConflict", err)
+	}
+}
+
+// Rows the pre-#334 upsert wrote can hold what the writes no longer
+// produce: a join or child in a state other than running or completed, or
+// a join whose results are not one slot per branch. They are refused, not
+// overwritten, and an identical write of such a join still succeeds.
+func TestLegacyJoinAndChildRowsAreNotOverwritten(t *testing.T) {
+	ctx := context.Background()
+	database, j := newJournal(t, "legacy-records.db", Config{})
+	defer database.Close()
+	if err := j.RegisterArtifact(ctx, ArtifactRecord{Digest: "sha256:admitted", Version: "1.0.0", ManifestJSON: []byte(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	run, err := j.Admit(ctx, AdmissionRequest{RequestKey: "legacy", Workflow: "nested", ArtifactDigest: "sha256:admitted", Input: []byte(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := j.Admit(ctx, AdmissionRequest{RequestKey: "legacy-child", Workflow: "nested", ArtifactDigest: "sha256:admitted", Input: []byte(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := j.SaveCheckpoint(ctx, Checkpoint{RunID: run.RunID, ArtifactDigest: "sha256:admitted", CheckpointDigest: "sha256:codec", State: []byte(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	execAll(t, database,
+		`INSERT INTO journal_joins (run_id, path, expected, completed, results_json, state) VALUES ('`+run.RunID+`', 'failed', 2, 1, '["1",null]', 'failed')`,
+		`INSERT INTO journal_joins (run_id, path, expected, completed, results_json, state) VALUES ('`+run.RunID+`', 'packed', 3, 1, '[1]', 'running')`,
+		`INSERT INTO journal_joins (run_id, path, expected, completed, results_json, state) VALUES ('`+run.RunID+`', 'miscounted', 2, 2, '[1,null]', 'running')`,
+		`INSERT INTO journal_joins (run_id, path, expected, completed, results_json, state) VALUES ('`+run.RunID+`', 'nil-results', 2, 0, 'null', 'running')`,
+		`INSERT INTO journal_children (run_id, path, child_run_id, state, result_json) VALUES ('`+run.RunID+`', 'child', '`+child.RunID+`', 'failed', NULL)`)
+	if err := j.RecordJoin(ctx, JoinRecord{RunID: run.RunID, Path: "failed", Expected: 2, Completed: 2, Results: slots(`"1"`, `"2"`)}); !errors.Is(err, ErrRecordConflict) {
+		t.Errorf("completing a legacy failed join: err=%v, want ErrRecordConflict", err)
+	}
+	if err := j.RecordJoin(ctx, JoinRecord{RunID: run.RunID, Path: "packed", Expected: 3, Completed: 2, Results: slots(`1`, `2`, ``)}); !errors.Is(err, ErrRecordConflict) {
+		t.Errorf("extending a legacy packed join: err=%v, want ErrRecordConflict", err)
+	}
+	if err := j.RecordChild(ctx, ChildRecord{RunID: run.RunID, Path: "child", ChildRunID: child.RunID, State: childCompleted, Result: []byte(`{"ok":true}`)}); !errors.Is(err, ErrRecordConflict) {
+		t.Errorf("completing a legacy failed child: err=%v, want ErrRecordConflict", err)
+	}
+	if err := j.RecordJoin(ctx, JoinRecord{RunID: run.RunID, Path: "miscounted", Expected: 2, Completed: 2, Results: slots(`1`, `2`)}); !errors.Is(err, ErrRecordConflict) {
+		t.Errorf("filling a legacy join whose count disagrees with its slots: err=%v, want ErrRecordConflict", err)
+	}
+	// A write that brings nothing new changes nothing on a row that reads
+	// as slots, whatever its state; a row that does not read as slots
+	// refuses it.
+	if err := j.RecordJoin(ctx, JoinRecord{RunID: run.RunID, Path: "failed", Expected: 2}); err != nil {
+		t.Errorf("an empty write to a legacy failed join: %v", err)
+	}
+	for _, path := range []string{"packed", "miscounted"} {
+		if err := j.RecordJoin(ctx, JoinRecord{RunID: run.RunID, Path: path, Expected: map[string]int{"packed": 3, "miscounted": 2}[path]}); !errors.Is(err, ErrRecordConflict) {
+			t.Errorf("an empty write to the legacy %s join: err=%v, want ErrRecordConflict", path, err)
+		}
+	}
+	// A join the pre-#334 upsert stored with nil results (results_json
+	// 'null') is read as its empty slots, so it can still be filled.
+	if err := j.RecordJoin(ctx, JoinRecord{RunID: run.RunID, Path: "nil-results", Expected: 2, Completed: 1, Results: slots(``, `"b"`)}); err != nil {
+		t.Errorf("filling a legacy join stored with nil results: %v", err)
+	}
+	got := recovered(t, j, run.RunID)
+	states := map[string]string{}
+	for _, join := range got.Joins {
+		states[join.Path] = fmt.Sprintf("%s %d/%d %s", join.State, join.Completed, join.Expected, join.Results)
+	}
+	if states["failed"] != `failed 1/2 ["1" null]` || states["packed"] != `running 1/3 [1]` || states["miscounted"] != `running 2/2 [1 null]` || states["nil-results"] != `running 1/2 [null "b"]` || len(got.Children) != 1 || got.Children[0].State != "failed" || len(got.Children[0].Result) != 0 {
+		t.Fatalf("legacy rows changed: joins=%v children=%+v", states, got.Children)
+	}
+}
+
+// P3 and P3b (#334, D6): a child record keeps the child run it was created
+// with, never leaves completed, and must name a run that exists.
+func TestChildRecordIsBoundToItsChildRun(t *testing.T) {
+	ctx := context.Background()
+	j, runID := fencingRun(t, "child-bound")
+	var children []string
+	for _, key := range []string{"child-a", "child-b"} {
+		child, err := j.Admit(ctx, AdmissionRequest{RequestKey: key, Workflow: "nested", ArtifactDigest: "sha256:admitted", Input: []byte(`{}`)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		children = append(children, child.RunID)
+	}
+	if err := j.RecordChild(ctx, ChildRecord{RunID: runID, Path: "child/missing", ChildRunID: "run:does-not-exist"}); !errors.Is(err, ErrChildRunNotFound) {
+		t.Errorf("child pointing at a missing run: err=%v, want ErrChildRunNotFound", err)
+	}
+	if got := recovered(t, j, runID).Children; len(got) != 0 {
+		t.Errorf("missing child was recorded: %+v", got)
+	}
+	if err := j.RecordChild(ctx, ChildRecord{RunID: runID, Path: "child/0", ChildRunID: children[1], State: childRunning}); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.RecordChild(ctx, ChildRecord{RunID: runID, Path: "child/0", ChildRunID: children[0], State: childRunning}); !errors.Is(err, ErrRecordConflict) {
+		t.Errorf("running child re-pointed: err=%v, want ErrRecordConflict", err)
+	}
+	// A running child has no result: written as running with one, it is
+	// refused whether it would create the record or update it, and neither
+	// completes it nor changes it (#334 review).
+	if err := j.RecordChild(ctx, ChildRecord{RunID: runID, Path: "child/0", ChildRunID: children[1], State: childRunning, Result: []byte(`{"early":true}`)}); err == nil {
+		t.Errorf("running child given a result: accepted")
+	}
+	if err := j.RecordChild(ctx, ChildRecord{RunID: runID, Path: "child/early", ChildRunID: children[1], State: childRunning, Result: []byte(`{"early":true}`)}); err == nil {
+		t.Errorf("running child created with a result: accepted")
+	}
+	if got := recovered(t, j, runID).Children; len(got) != 1 || got[0].State != childRunning || len(got[0].Result) != 0 {
+		t.Errorf("running child changed: %+v", got)
+	}
+	done := ChildRecord{RunID: runID, Path: "child/0", ChildRunID: children[1], State: childCompleted, Result: []byte(`{"ok":true}`)}
+	if err := j.RecordChild(ctx, done); err != nil {
+		t.Fatal(err)
+	}
+	for name, stale := range map[string]struct {
+		record ChildRecord
+		want   error
+	}{
+		"other child":     {ChildRecord{RunID: runID, Path: "child/0", ChildRunID: children[0], State: childCompleted, Result: []byte(`{"ok":true}`)}, ErrRecordConflict},
+		"back to running": {ChildRecord{RunID: runID, Path: "child/0", ChildRunID: children[1], State: childRunning}, ErrRecordFinal},
+		"other result":    {ChildRecord{RunID: runID, Path: "child/0", ChildRunID: children[1], State: childCompleted, Result: []byte(`{"ok":false}`)}, ErrRecordFinal},
+	} {
+		if err := j.RecordChild(ctx, stale.record); !errors.Is(err, stale.want) {
+			t.Errorf("%s: err=%v, want %v", name, err, stale.want)
+		}
+	}
+	unchanged := func(when string) {
+		t.Helper()
+		got := recovered(t, j, runID).Children
+		if len(got) != 1 || got[0].Path != "child/0" || got[0].ChildRunID != children[1] || got[0].State != childCompleted || string(got[0].Result) != `{"ok":true}` {
+			t.Fatalf("completed child changed %s: %+v", when, got)
+		}
+	}
+	unchanged("by the refused writes")
+	if err := j.RecordChild(ctx, done); err != nil {
+		t.Fatalf("identical retry: %v", err)
+	}
+	unchanged("by the identical retry")
+	if err := j.RecordChild(ctx, ChildRecord{RunID: "run:missing", Path: "child/0", ChildRunID: children[0]}); !errors.Is(err, ErrNotFound) {
+		t.Errorf("child of an unknown parent: err=%v, want ErrNotFound", err)
+	}
 }
 
 // P4 (#334, D7): a checkpoint names the artifact its run was admitted
@@ -390,8 +804,8 @@ func TestVersion4JournalGainsScopeAttempts(t *testing.T) {
 
 	database, j = newJournalAtPath(t, path, Config{})
 	defer database.Close()
-	if got := oneRow(t, database, `SELECT version || '|' || upgraded_from FROM blok_schema_versions WHERE component = 'journal'`); got != "5|4" {
-		t.Fatalf("journal stamp=%s; want 5 upgraded from 4", got)
+	if got := oneRow(t, database, `SELECT version || '|' || upgraded_from FROM blok_schema_versions WHERE component = 'journal'`); got != "6|4" {
+		t.Fatalf("journal stamp=%s; want 6 (#332 after #334's 5) upgraded from 4", got)
 	}
 	if err := j.CompleteScope(ctx, run.RunID, "each/0", "", []byte(`{"v":"guessed"}`)); !errors.Is(err, ErrStaleAttempt) {
 		t.Errorf("completing a pre-#334 scope without an attempt: err=%v, want ErrStaleAttempt", err)
