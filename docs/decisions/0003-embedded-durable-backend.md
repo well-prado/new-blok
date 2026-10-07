@@ -406,25 +406,75 @@ answer, a join's count of returned branches, the checkpoint it resumes from.
 Before #334 a late or stale writer could change them: `CompleteScope`
 overwrote a committed output, `StartScope` restarted a canceled scope (which
 could then be completed), a checkpoint could name another artifact than the
-run's admitted one, and a run that had ended still took new scopes and
-checkpoints. (Joins and children are the second part of #334.)
+run's admitted one, a run that had ended still took new scopes and
+checkpoints, and `RecordJoin` and `RecordChild` upserted unconditionally: a
+completed 2-of-2 join went back to running 1 of 3, a completed child back
+to running, and a child record could name a run that did not exist.
 
-A scope has two terminal states, completed and canceled, and never leaves
-either. Each write now runs in the journal's writer transaction, reads what
-is stored, and either moves the record forward (a scope from running to one
-of its terminal states), repeats it byte for byte (an idempotent retry,
-which succeeds and writes nothing), or is refused with a typed error and
-changes nothing:
+A scope has two terminal states, completed and canceled; a join and a
+child have one, completed. No record leaves a terminal state. Each write
+now runs in the journal's writer transaction, reads what is stored, and
+either moves the record forward (a scope from running to one of its
+terminal states; a join by filling empty slots, completing when every
+slot is filled; a child from running to completed), brings nothing new (an
+idempotent retry, which succeeds and writes nothing), or is refused with a
+typed error and changes nothing.
 
-- `ErrRecordFinal`: the scope is final. `CompleteScope` on a completed
+**A join's results are positional slots.** `Results` holds exactly
+`Expected` slots in branch order, as the engine's parallel runner fills its
+results by branch position; a slot is JSON null (or empty) until its
+branch comes back, and `Completed` is the number of filled slots. No
+results at all means `Expected` empty slots. `Expected` is fixed when the
+join is created, and a filled slot never changes. A write merges into the
+stored slots inside the writer transaction: it fills the empty slots it
+carries, and its own empty slots leave the stored ones as they are. So
+branches that come back in any order, or from different journal handles,
+each fill their own slot without conflicting; two writers filling the same
+slot with different values do conflict, and the first one wins. The join
+is completed, and final, when every slot is filled. A record whose results
+are not `Expected` slots, whose `Completed` is not its number of filled
+slots, or whose `State` contradicts them is an invalid record and nothing
+is stored. Because null marks an empty slot, a branch whose own result is
+JSON null must be recorded wrapped (for example `{"value":null}`), or it
+reads as not yet back. Slots are compared in the compact JSON form
+`json.Marshal` stores them in (spacing dropped; `<`, `>` and `&`
+escaped), so a writer resending a slot it already knows, spelled
+differently, is not refused; nothing else is normalised, so reordered
+object keys or `1.0` for `1` are another value. A running child has no
+result: a running write with one is an invalid record, whether it would
+create the child record or update it.
+
+A join row the pre-#334 upsert left is never changed. One whose results
+are not one slot per branch, or whose completed count disagrees with its
+slots, cannot be read as slots: every write but an identical one is
+`ErrRecordConflict`. One in a state other than running or completed
+refuses a write that would fill a slot, and a write that brings nothing
+new succeeds and changes nothing, as for any join. One stored with no
+results (`results_json` null, from a nil `Results`) reads as its empty
+slots and can be filled. A child row in a state other than running or
+completed refuses completion.
+
+- `ErrRecordFinal`: the record is final. `CompleteScope` on a completed
   scope with another output, or from another attempt; `StartScope` on a
-  canceled scope. (`StartScope` on a completed scope is not an error: it
+  canceled scope; `RecordJoin` or `RecordChild` writing a completed record
+  differently. (`StartScope` on a completed scope is not an error: it
   returns `AlreadyCompleted`.)
+- `ErrRecordConflict`: the write contradicts what the record holds: a
+  join's expected count, a filled join slot given another value, a child's
+  run id, or a row the pre-#334 upsert left in a shape the write cannot
+  extend (above). Since branches filling different slots never conflict,
+  it means a slot was already filled with another value, by a
+  racing writer or a stale one; retrying the same write cannot succeed, so
+  the engine either serialises a join's fan-in or re-reads the join and
+  decides.
+- `ErrChildRunNotFound`: a new child record names a run the journal does
+  not hold. It is checked when the record is created, not on later writes,
+  so a child run compacted afterwards does not strand its parent's record.
 - `ErrStaleAttempt`: `CompleteScope` from an attempt that a later
   `StartScope` superseded, or with no attempt id.
 - `ErrNotFound`: `CompleteScope` on a canceled scope, as before #334; and
-  any write for an unknown run, where SQLite's foreign-key error used to
-  leak.
+  any write for an unknown run (a scope, checkpoint, join or child's parent
+  run), where SQLite's foreign-key error used to leak.
 - `ErrRunNotActive`: `StartScope` or `SaveCheckpoint` for a run that is
   not accepted (canceled, completed, failed or uncertain).
 - `ErrArtifactMismatch`: a checkpoint, or a `Recover`, naming another
@@ -465,6 +515,8 @@ caller holds, so only a fresh `StartScope` can complete it.
 | Completed and canceled scopes are final; scopes are fenced by attempt; checkpoints are bound to the admitted artifact and an accepted run; `StartScope` needs an accepted run; `Recover` checks the admitted artifact (#334) | behavioral (bug fix) | None for a caller that writes each record forward once. A write that used to overwrite, or a restart of a canceled scope, now returns one of the typed errors above. Nothing in the repository restarted a canceled scope |
 | Journal schema version 5 (#334) | behavioral (breaking for downgrades) | None for upgrades. A binary supporting journal 4 or older refuses a database this release opened, with `store.NewerSchemaError` (from #291 on; see Limits under § Schema versions); restore a backup taken before the upgrade, as for every raise above |
 | `ErrRecordFinal`, `ScopeAttempt` (#334) | additive | None |
+| Join results are positional slots (one per expected branch, filled once, merged per write); joins are final once every slot is filled; a child record keeps the child run it was created with, must name an existing run when created, and moves only from running to completed; `RecordJoin` and `RecordChild` refuse an unknown run with `ErrNotFound`; a join's `Completed` and `State` must agree with its slots, and a running child has no result (#334, part 2) | behavioral (bug fix) | None for a caller that records each join and child forward. A write that used to overwrite or regress one now returns one of the typed errors above; a child record naming a run the journal does not hold is refused; a join written with results that are not `Expected` slots is refused (the repository's callers already wrote one result per branch). Existing rows are read as before. No schema change, so no version raise: nothing on disk changes shape, and a version-5 binary reads every row this one writes |
+| `ErrRecordConflict`, `ErrChildRunNotFound` (#334, part 2) | additive | None |
 
 ## Alternatives considered
 
