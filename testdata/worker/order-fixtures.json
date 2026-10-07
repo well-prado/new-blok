@@ -1,43 +1,81 @@
 {
-  "schemaVersion": "worker-order/v1",
-  "cases": [
+  "schemaVersion": "worker-order/v2",
+  "scenarios": [
     {
       "name": "duplicate delivery",
-      "deliveries": 2,
-      "acceptedJobs": 1,
-      "committedOrders": 1,
-      "outboxEvents": 1,
-      "observableOrderEffects": 1,
-      "expectedErrorCount": 0
+      "deliveries": [{"requestKey": "dup", "sku": "coffee", "quantity": 2}, {"requestKey": "dup", "sku": "coffee", "quantity": 2}],
+      "publisher": "ok",
+      "expect": {"accepted": 1, "errors": [], "jobs": 1, "jobState": "completed", "jobAttempt": 1, "orders": 1, "outbox": 1, "outboxState": "sent", "outboxAttempts": 1, "publishes": 1}
     },
     {
-      "name": "provider timeout",
-      "dispatchAttempts": 2,
-      "stableEventIdentity": true,
-      "committedOutboxEvents": 1,
-      "observableEffectCount": 1,
-      "expectedErrorCount": 1
+      "name": "conflicting request reuse",
+      "deliveries": [{"requestKey": "reuse", "sku": "coffee", "quantity": 2}, {"requestKey": "reuse", "sku": "coffee", "quantity": 3}],
+      "publisher": "ok",
+      "expect": {"accepted": 1, "errors": ["request_conflict"], "jobs": 1, "jobState": "completed", "jobAttempt": 1, "orders": 1, "outbox": 1, "outboxState": "sent", "outboxAttempts": 1, "publishes": 1}
     },
     {
       "name": "validation failure",
-      "handlerAttempts": 1,
-      "deadLettered": true,
-      "committedOrders": 0,
-      "outboxEvents": 0,
-      "expectedErrorCount": 1
+      "deliveries": [{"requestKey": "invalid", "sku": "coffee", "quantity": 0}],
+      "publisher": "ok",
+      "expect": {"accepted": 1, "errors": [], "jobs": 1, "jobState": "dead", "jobAttempt": 1, "orders": 0, "outbox": 0, "outboxState": "", "outboxAttempts": 0, "publishes": 0}
     },
     {
-      "name": "crash before worker acknowledgment",
-      "preCommitBusinessRows": 0,
-      "postRecoveryBusinessRows": 1,
-      "postRecoveryJobState": "completed",
-      "duplicateAcknowledgments": 0,
-      "expectedErrorCount": 0
+      "name": "unknown sku",
+      "deliveries": [{"requestKey": "unknown", "sku": "tea", "quantity": 1}],
+      "publisher": "ok",
+      "expect": {"accepted": 1, "errors": [], "jobs": 1, "jobState": "dead", "jobAttempt": 1, "orders": 0, "outbox": 0, "outboxState": "", "outboxAttempts": 0, "publishes": 0}
+    },
+    {
+      "name": "provider timeout",
+      "deliveries": [{"requestKey": "timeout", "sku": "coffee", "quantity": 1}],
+      "publisher": "timeout-once",
+      "expect": {"accepted": 1, "errors": ["publish_timeout"], "jobs": 1, "jobState": "completed", "jobAttempt": 1, "orders": 1, "outbox": 1, "outboxState": "sent", "outboxAttempts": 2, "publishes": 2}
+    },
+    {
+      "name": "provider down",
+      "deliveries": [{"requestKey": "down", "sku": "coffee", "quantity": 1}],
+      "publisher": "fail-always",
+      "outboxMaxAttempts": 2,
+      "expect": {"accepted": 1, "errors": ["publish_failed", "publish_failed"], "jobs": 1, "jobState": "completed", "jobAttempt": 1, "orders": 1, "outbox": 1, "outboxState": "dead", "outboxAttempts": 2, "publishes": 2}
+    },
+    {
+      "name": "outbox write keeps failing",
+      "deliveries": [{"requestKey": "blocked", "sku": "coffee", "quantity": 1}],
+      "publisher": "ok",
+      "foreignEvent": true,
+      "expect": {"accepted": 1, "errors": [], "jobs": 1, "jobState": "dead", "jobAttempt": 3, "orders": 0, "outbox": 0, "outboxState": "", "outboxAttempts": 0, "publishes": 0}
+    }
+  ],
+  "crashes": [
+    {
+      "phase": "producer-before-commit",
+      "afterCrash": {"accepted": 0, "errors": [], "jobs": 0, "jobState": "", "jobAttempt": 0, "orders": 0, "outbox": 0, "outboxState": "", "outboxAttempts": 0, "publishes": 0},
+      "atCrashTime": {"accepted": 1, "errors": [], "jobs": 1, "jobState": "completed", "jobAttempt": 1, "orders": 1, "outbox": 1, "outboxState": "sent", "outboxAttempts": 1, "publishes": 1},
+      "afterLeases": {"accepted": 1, "errors": [], "jobs": 1, "jobState": "completed", "jobAttempt": 1, "orders": 1, "outbox": 1, "outboxState": "sent", "outboxAttempts": 1, "publishes": 1}
+    },
+    {
+      "phase": "producer-after-commit",
+      "afterCrash": {"accepted": 0, "errors": [], "jobs": 1, "jobState": "pending", "jobAttempt": 0, "orders": 0, "outbox": 0, "outboxState": "", "outboxAttempts": 0, "publishes": 0},
+      "atCrashTime": {"accepted": 0, "errors": [], "jobs": 1, "jobState": "completed", "jobAttempt": 1, "orders": 1, "outbox": 1, "outboxState": "sent", "outboxAttempts": 1, "publishes": 1},
+      "afterLeases": {"accepted": 0, "errors": [], "jobs": 1, "jobState": "completed", "jobAttempt": 1, "orders": 1, "outbox": 1, "outboxState": "sent", "outboxAttempts": 1, "publishes": 1}
+    },
+    {
+      "phase": "handler-between-order-and-outbox",
+      "afterCrash": {"accepted": 0, "errors": [], "jobs": 1, "jobState": "processing", "jobAttempt": 1, "orders": 0, "outbox": 0, "outboxState": "", "outboxAttempts": 0, "publishes": 0},
+      "atCrashTime": {"accepted": 0, "errors": [], "jobs": 1, "jobState": "processing", "jobAttempt": 1, "orders": 0, "outbox": 0, "outboxState": "", "outboxAttempts": 0, "publishes": 0},
+      "afterLeases": {"accepted": 0, "errors": [], "jobs": 1, "jobState": "completed", "jobAttempt": 2, "orders": 1, "outbox": 1, "outboxState": "sent", "outboxAttempts": 1, "publishes": 1}
+    },
+    {
+      "phase": "dispatcher-after-publish",
+      "afterCrash": {"accepted": 0, "errors": [], "jobs": 1, "jobState": "completed", "jobAttempt": 1, "orders": 1, "outbox": 1, "outboxState": "dispatching", "outboxAttempts": 1, "publishes": 1},
+      "atCrashTime": {"accepted": 0, "errors": [], "jobs": 1, "jobState": "completed", "jobAttempt": 1, "orders": 1, "outbox": 1, "outboxState": "dispatching", "outboxAttempts": 1, "publishes": 1},
+      "afterLeases": {"accepted": 0, "errors": [], "jobs": 1, "jobState": "completed", "jobAttempt": 1, "orders": 1, "outbox": 1, "outboxState": "sent", "outboxAttempts": 2, "publishes": 2}
     }
   ],
   "limits": [
     "The local worker uses SQLite durable transactions and does not claim multi-host queue ownership.",
-    "External publishers must deduplicate by the stable event ID; a crash after publish and before outbox commit remains uncertain.",
-    "Dead-letter messages contain safe framework diagnostics, not arbitrary handler error text."
+    "A crash after an external publish and before the outbox marks the event sent publishes it again after the outbox lease, under the same event ID; publishers must deduplicate by it.",
+    "Dead-letter messages contain safe framework diagnostics, not arbitrary handler error text.",
+    "Crashes are SIGKILL of a child test process parked at the named point; power loss and storage faults are not simulated."
   ]
 }
