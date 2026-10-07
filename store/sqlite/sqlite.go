@@ -448,9 +448,27 @@ func (c *connection) Integrity(ctx context.Context) error {
 
 func (c *connection) Close() error { return c.database.Close() }
 
+// Test-only crash points of Restore, called when set.
+var (
+	// restoreCopied runs once Restore's temporary copy is written and
+	// synced, before it is renamed to the destination.
+	restoreCopied func(temporary string)
+	// restoreInstalled runs once the copy is renamed to the destination and
+	// the directory synced, before the restored database is checked.
+	restoreInstalled func(destination string)
+)
+
 // Restore copies an integrity-checked SQLite backup into a new destination.
-// The destination is never overwritten; an interrupted copy leaves only its
-// temporary file and cannot replace a usable database.
+// The destination is never overwritten. The backup is only read: it is
+// checked through a read-only, immutable connection and copied through a
+// read-only file, so its bytes are unchanged and it may be read-only, on a
+// read-only directory (#343). The copy is written to a temporary file beside
+// the destination, synced, renamed into place and its directory synced, then
+// opened and checked again; if that check fails the destination is removed.
+// So when Restore returns an error the destination does not exist, and an
+// interrupted Restore leaves at most its temporary file (.restore-*), which
+// never blocks a retry. A crash after the rename leaves the whole, synced
+// copy of the checked backup at the destination.
 func (Backend) Restore(ctx context.Context, source, destination string) error {
 	if source == "" || destination == "" || source == ":memory:" || destination == ":memory:" || source == destination {
 		return errors.New("sqlite: distinct source and destination paths are required")
@@ -458,26 +476,20 @@ func (Backend) Restore(ctx context.Context, source, destination string) error {
 	if _, err := os.Stat(source); err != nil {
 		return fmt.Errorf("sqlite: inspect source: %w", err)
 	}
-	if _, err := os.Stat(destination); err == nil {
-		return fmt.Errorf("sqlite: restore destination already exists: %s", destination)
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("sqlite: inspect destination: %w", err)
+	if err := requireAbsent(destination, "restore destination"); err != nil {
+		return err
 	}
-	sourceDB, err := (Backend{}).Open(ctx, source)
-	if err != nil {
-		return fmt.Errorf("sqlite: open source: %w", err)
+	if err := requireSelfContained(source); err != nil {
+		return err
 	}
-	if err := sourceDB.Integrity(ctx); err != nil {
-		_ = sourceDB.Close()
+	if err := checkSource(ctx, source); err != nil {
 		return fmt.Errorf("sqlite: source integrity: %w", err)
 	}
-	if err := sourceDB.Close(); err != nil {
-		return fmt.Errorf("sqlite: close source: %w", err)
-	}
-	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
+	directory := filepath.Dir(destination)
+	if err := os.MkdirAll(directory, 0o755); err != nil {
 		return fmt.Errorf("sqlite: create destination parent: %w", err)
 	}
-	temporary, err := os.CreateTemp(filepath.Dir(destination), ".restore-*")
+	temporary, err := os.CreateTemp(directory, ".restore-*")
 	if err != nil {
 		return fmt.Errorf("sqlite: create restore temporary: %w", err)
 	}
@@ -504,16 +516,146 @@ func (Backend) Restore(ctx context.Context, source, destination string) error {
 	if err := temporary.Close(); err != nil {
 		return fmt.Errorf("sqlite: close restore: %w", err)
 	}
-	if err := os.Rename(temporaryPath, destination); err != nil {
-		return fmt.Errorf("sqlite: install restore: %w", err)
+	if restoreCopied != nil {
+		restoreCopied(temporaryPath)
 	}
+	if err := install(temporaryPath, destination, "restore"); err != nil {
+		return err
+	}
+	if restoreInstalled != nil {
+		restoreInstalled(destination)
+	}
+	if err := checkRestored(ctx, destination); err != nil {
+		return errors.Join(err, removeDatabase(destination))
+	}
+	return nil
+}
+
+// requireSelfContained refuses a source with a non-empty write-ahead log or
+// rollback journal beside it. Restore reads and copies the database file
+// alone, so changes held in either would be silently left out; Restore will
+// not fold them in, since that writes to the backup. Backup writes a
+// self-contained file.
+func requireSelfContained(source string) error {
+	for _, suffix := range []string{"-wal", "-journal"} {
+		info, err := os.Stat(source + suffix)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("sqlite: inspect source %s: %w", suffix, err)
+		}
+		if info.Size() > 0 {
+			return fmt.Errorf("sqlite: restore source is not self-contained: %s holds changes the database file does not; restore a backup written by Backup, or checkpoint the source first", source+suffix)
+		}
+	}
+	return nil
+}
+
+// checkSource runs PRAGMA integrity_check on a backup without writing to
+// it. The connection is read-only and immutable: SQLite takes no lock and
+// creates no -wal, -shm or -journal file, so it works on a read-only file in
+// a read-only directory, whatever journal mode the file's header names; it
+// reads the database file alone, exactly the bytes Restore copies
+// (requireSelfContained refuses a source whose log holds more).
+func checkSource(ctx context.Context, source string) error {
+	database, err := sql.Open("sqlite", (&url.URL{Scheme: "file", Path: uriPath(source), RawQuery: "mode=ro&immutable=1"}).String())
+	if err != nil {
+		return fmt.Errorf("sqlite: open: %w", err)
+	}
+	defer database.Close()
+	database.SetMaxOpenConns(1)
+	var result string
+	if err := database.QueryRowContext(ctx, "PRAGMA integrity_check").Scan(&result); err != nil {
+		return fmt.Errorf("sqlite: integrity check: %w", err)
+	}
+	if result != "ok" {
+		return fmt.Errorf("sqlite: integrity check failed: %s", result)
+	}
+	return nil
+}
+
+// checkRestored opens the installed copy through the backend and checks its
+// integrity, closing it before it returns so a failed copy can be removed.
+func checkRestored(ctx context.Context, destination string) error {
 	restored, err := (Backend{}).Open(ctx, destination)
 	if err != nil {
 		return fmt.Errorf("sqlite: open restored database: %w", err)
 	}
-	defer restored.Close()
 	if err := restored.Integrity(ctx); err != nil {
+		_ = restored.Close()
 		return fmt.Errorf("sqlite: restored integrity: %w", err)
 	}
+	if err := restored.Close(); err != nil {
+		return fmt.Errorf("sqlite: close restored database: %w", err)
+	}
 	return nil
+}
+
+// requireAbsent fails unless nothing exists at path.
+func requireAbsent(path, what string) error {
+	if _, err := os.Lstat(path); err == nil {
+		return fmt.Errorf("sqlite: %s already exists: %s", what, path)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("sqlite: inspect %s: %w", what, err)
+	}
+	return nil
+}
+
+// install renames a synced temporary file to destination, which must not
+// exist, and syncs the directory so the rename survives a power loss. If the
+// directory cannot be synced, the installed file is removed again.
+// Destination is checked just before the rename; a file created there in
+// between by another process would be replaced.
+func install(temporary, destination, what string) error {
+	if err := requireAbsent(destination, what+" destination"); err != nil {
+		return err
+	}
+	if err := os.Rename(temporary, destination); err != nil {
+		return fmt.Errorf("sqlite: install %s: %w", what, err)
+	}
+	if err := syncDirectory(filepath.Dir(destination)); err != nil {
+		return errors.Join(fmt.Errorf("sqlite: sync %s directory: %w", what, err), removeDatabase(destination))
+	}
+	return nil
+}
+
+// removeDatabase removes a database Restore installed, with its side
+// files, and syncs its directory.
+func removeDatabase(path string) error {
+	err := removeFiles(path)
+	if syncErr := syncDirectory(filepath.Dir(path)); syncErr != nil {
+		err = errors.Join(err, fmt.Errorf("sqlite: sync directory after removing %s: %w", path, syncErr))
+	}
+	return err
+}
+
+// removeFiles removes a database file with any -wal, -shm or -journal file
+// SQLite left beside it.
+func removeFiles(path string) error {
+	var failures []error
+	for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+		if err := os.Remove(path + suffix); err != nil && !errors.Is(err, os.ErrNotExist) {
+			failures = append(failures, fmt.Errorf("sqlite: remove %s: %w", path+suffix, err))
+		}
+	}
+	return errors.Join(failures...)
+}
+
+// syncDirectory flushes a directory's entries, so a file renamed into or
+// removed from it stays so after a power loss. Windows cannot open a
+// directory for flushing; it is not a supported platform (#297).
+func syncDirectory(path string) error {
+	if goruntime.GOOS == "windows" {
+		return nil
+	}
+	directory, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	if err := directory.Sync(); err != nil {
+		_ = directory.Close()
+		return err
+	}
+	return directory.Close()
 }
