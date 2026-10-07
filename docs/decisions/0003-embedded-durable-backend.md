@@ -429,6 +429,30 @@ checking to fail closed. `sqlite_test.go` creates a backup with
 `VACUUM INTO`, reopens it through the selected backend, runs an integrity check,
 and reads the committed row.
 
+A killed process cannot tell a flushed commit from one still in the
+operating system's cache, so the crash test stays green with
+`synchronous=OFF`. `pragmas_test.go` (#337) therefore reads the settings back
+on all eight pooled connections held at once: `synchronous=2`,
+`journal_mode=wal`, `foreign_keys=1`, the configured busy timeout and
+`secure_delete=1`. Each connection applies them from the DSN when it
+connects; `configure` repeats synchronous, busy timeout and foreign keys on
+one connection only.
+
+`internal/journal`'s `TestRealDiskFullFailsClosedAndReopensIntact` (#337)
+fills a real size-limited filesystem with admissions until the commit fails
+`database or disk is full`. The failed admission is not acknowledged and
+nothing of it is visible; every acknowledged one is whole; once space is freed
+the file reopens, passes `PRAGMA integrity_check` and accepts the refused
+admission. It runs only on Linux with `BLOK_TEST_SMALL_FS` naming a directory
+on a small tmpfs (for example `docker run --tmpfs /mnt/small:size=4m`), and
+skips elsewhere. Freeing space must leave room for SQLite to checkpoint the
+whole write-ahead log into the database file. On reopen, `Open`'s WAL-switch
+connection is the file's only connection when it is discarded, and SQLite
+checkpoints the log as the last connection closes. With less room (1 MiB
+freed against a 3 MiB log, in development of the test) the checkpoint stops
+part way: the committed rows stay intact and the file passes its integrity
+check, but the reopened store fails `database or disk is full` again.
+
 The synthetic expected outcomes and material limitations are recorded in
 [`testdata/store/fixtures.json`](../../testdata/store/fixtures.json). These
 tests do not prove disk-loss survival, network filesystems, multi-host locking,
