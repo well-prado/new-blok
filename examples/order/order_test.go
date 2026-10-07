@@ -373,7 +373,8 @@ func pendingEvent(t *testing.T, service *Service, requestKey string) {
 // failing is dead after its last attempt instead of being retried forever.
 func TestOutboxPublishDeadlineAndAttemptsAreBounded(t *testing.T) {
 	ctx := context.Background()
-	database, err := (sqlite.Backend{}).Open(ctx, filepath.Join(t.TempDir(), "orders.db"))
+	// A 10ms busy timeout leaves a 50ms lease's publisher 30ms.
+	database, err := (sqlite.Backend{BusyTimeout: 10 * time.Millisecond}).Open(ctx, filepath.Join(t.TempDir(), "orders.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

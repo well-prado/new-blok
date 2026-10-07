@@ -18,7 +18,12 @@ import (
 
 func openAt(t *testing.T, path string, clock func() time.Time, opts ...Option) (*Service, store.Database) {
 	t.Helper()
-	database, err := (sqlite.Backend{}).Open(context.Background(), path)
+	return openWith(t, sqlite.Backend{}, path, clock, opts...)
+}
+
+func openWith(t *testing.T, backend sqlite.Backend, path string, clock func() time.Time, opts ...Option) (*Service, store.Database) {
+	t.Helper()
+	database, err := backend.Open(context.Background(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,12 +73,15 @@ func leaseUntil(t *testing.T, database store.Database, eventID string) int64 {
 }
 
 // B1: the lease is measured from when the claim holds the write lock, and the
-// publisher's deadline ends with the lease, so a dispatcher that waited for
-// the lock cannot still be publishing when another may claim the event.
+// publisher's deadline ends twice the busy timeout before the lease does,
+// leaving its settlement the longest it can wait for the write lock. A
+// dispatcher that waited for the lock cannot still be publishing, or
+// settling, when another may claim the event.
 func TestOutboxPublishDeadlineEndsWithTheLease(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "orders.db")
-	service, database := openAt(t, path, nil, WithOutboxLease(time.Second))
+	const busy = 400 * time.Millisecond
+	service, database := openWith(t, sqlite.Backend{BusyTimeout: busy}, path, nil, WithOutboxLease(time.Second))
 	pendingEvent(t, service, "req-deadline")
 	released := holdWriteLock(t, path, 300*time.Millisecond)
 	var deadline time.Time
@@ -90,10 +98,10 @@ func TestOutboxPublishDeadlineEndsWithTheLease(t *testing.T) {
 		t.Fatalf("processed=%v err=%v", processed, err)
 	}
 	// The slack covers only the moment between reading the clock and arming
-	// the timer; a lease counted from before the 300ms lock wait misses by
-	// far more.
-	if over := time.Duration(deadline.UnixNano() - until); over > 50*time.Millisecond {
-		t.Fatalf("publish deadline ends %v after the lease", over)
+	// the timer; a lease counted from before the 300ms lock wait, or a
+	// deadline without the settlement's margin, misses by far more.
+	if over := time.Duration(deadline.UnixNano() - (until - int64(2*busy))); over > 50*time.Millisecond {
+		t.Fatalf("publish deadline ends %v after the lease less twice the busy timeout", over)
 	}
 }
 
@@ -365,5 +373,47 @@ func TestOutboxClaimAndSweepUseTheDueIndex(t *testing.T) {
 		if !usesIndex {
 			t.Errorf("%s does not use order_outbox_due: %q", name, plan)
 		}
+	}
+}
+
+// Round 2: the settlement writes first, so it waits for a write lock another
+// process holds instead of failing busy at once.
+func TestOutboxSettleWaitsForAnotherWriter(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "orders.db")
+	service, database := openAt(t, path, nil)
+	pendingEvent(t, service, "req-settle")
+	var released <-chan error
+	processed, err := service.DispatchOne(ctx, func(context.Context, Event) error {
+		// Another handle takes the write lock and keeps it while this
+		// dispatcher settles.
+		released = holdWriteLock(t, path, 100*time.Millisecond)
+		return nil
+	})
+	if holdErr := <-released; holdErr != nil {
+		t.Fatal(holdErr)
+	}
+	if !processed || err != nil {
+		t.Fatalf("processed=%v err=%v", processed, err)
+	}
+	if state := outboxState(t, database, "event:req-settle"); state != EventSent {
+		t.Fatalf("state=%s, want sent", state)
+	}
+}
+
+// Round 2: New refuses a lease no longer than twice the store's busy timeout,
+// which would leave the publisher no time before its settlement's margin.
+func TestOutboxLeaseMustExceedTwiceTheBusyTimeout(t *testing.T) {
+	ctx := context.Background()
+	database, err := (sqlite.Backend{BusyTimeout: time.Second}).Open(ctx, filepath.Join(t.TempDir(), "orders.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if _, err := New(ctx, database, nil, nil, WithOutboxLease(2*time.Second)); err == nil {
+		t.Fatal("lease of twice the busy timeout accepted")
+	}
+	if _, err := New(ctx, database, nil, nil, WithOutboxLease(2*time.Second+time.Millisecond)); err != nil {
+		t.Fatalf("lease just over twice the busy timeout refused: %v", err)
 	}
 }

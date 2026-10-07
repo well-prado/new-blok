@@ -59,6 +59,9 @@ const (
 	// doubles with each later one, up to maxOutboxBackoff.
 	outboxBackoff    = time.Second
 	maxOutboxBackoff = time.Minute
+	// defaultBusyTimeout is assumed for a store that does not report its
+	// busy timeout (store.BusyTimeoutProvider); it is the SQLite backend's.
+	defaultBusyTimeout = 5 * time.Second
 )
 
 // Outbox error codes, recorded in order_outbox.error_text instead of the
@@ -83,6 +86,7 @@ type Service struct {
 	clock       func() time.Time
 	lease       time.Duration
 	maxAttempts int
+	busyTimeout time.Duration
 }
 
 // Option configures a Service.
@@ -90,10 +94,11 @@ type Option func(*Service)
 
 // WithOutboxLease sets how long a claimed event is kept from other
 // dispatchers (DefaultOutboxLease otherwise). It is measured from when the
-// claim holds the write lock, and the publisher's deadline ends with it: a
-// publish still running then has failed. Keep it well above the store's busy
-// timeout: settling a publish waits for the write lock, and a claim whose
-// lease ends meanwhile is taken over and published again.
+// claim holds the write lock. The publisher's deadline ends twice the store's
+// busy timeout before it, the longest the settlement can wait for the write
+// lock (its turn in the handle's writer queue, then SQLite's busy handler),
+// so a publish that meets its deadline is settled inside the lease. New
+// refuses a lease no longer than twice the busy timeout.
 func WithOutboxLease(lease time.Duration) Option {
 	return func(s *Service) { s.lease = lease }
 }
@@ -114,9 +119,17 @@ func New(ctx context.Context, database store.Database, prices map[string]int64, 
 			opt(service)
 		}
 	}
-	if service.lease <= 0 || service.maxAttempts < 1 {
-		return nil, errors.New("order: the outbox lease must be positive and its attempts at least one")
+	if service.maxAttempts < 1 {
+		return nil, errors.New("order: the outbox must allow at least one attempt")
 	}
+	busyTimeout, ok := store.BusyTimeoutOf(database)
+	if !ok {
+		busyTimeout = defaultBusyTimeout
+	}
+	if service.lease <= 2*busyTimeout {
+		return nil, fmt.Errorf("order: outbox lease %v must be longer than twice the store's busy timeout (%v)", service.lease, busyTimeout)
+	}
+	service.busyTimeout = busyTimeout
 	queue, err := worker.New(ctx, database, clock)
 	if err != nil {
 		return nil, err
@@ -241,9 +254,10 @@ func (s *Service) Get(ctx context.Context, requestKey string) (Order, error) {
 	return result, err
 }
 
-// Publisher sends one event. Its context ends with the event's lease: a
-// publish still running then has failed, and the event may be claimed again,
-// so a publisher must honor it.
+// Publisher sends one event. Its context ends twice the store's busy timeout
+// before the event's lease (WithOutboxLease): a publish still running then has
+// failed, and the event may be claimed again once the lease ends, so a
+// publisher must honor it.
 type Publisher func(context.Context, Event) error
 
 // DispatchOne claims the oldest pending event, publishes it, and settles it.
@@ -270,9 +284,10 @@ func (s *Service) DispatchOne(ctx context.Context, publish Publisher) (bool, err
 	if err != nil {
 		return false, fmt.Errorf("order: dispatch: claim: %w", err)
 	}
-	// The publish ends when the lease does, not a full lease after the claim
-	// committed: once the lease ends another dispatcher may claim the event.
-	publishCtx, cancel := context.WithTimeout(ctx, time.Duration(held.leaseUntil-s.now()))
+	// The publish ends inside the lease, not a full lease after the claim
+	// committed, early enough for its settlement to wait out the write lock
+	// before the lease ends and another dispatcher may claim the event.
+	publishCtx, cancel := context.WithTimeout(ctx, time.Duration(held.leaseUntil-int64(2*s.busyTimeout)-s.now()))
 	publishErr := publish(publishCtx, event)
 	cancel()
 	// Settle even when the caller has gone: an unsettled claim would wait out
