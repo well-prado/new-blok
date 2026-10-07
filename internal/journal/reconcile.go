@@ -227,6 +227,19 @@ func reconciliationTenant(stored sql.NullString) (tenant string, owned bool) {
 // prune tombstone proves it had a tenant, so it is not the system
 // tenant's). Rows that already have a tenant are not touched, so reopening
 // changes nothing.
+//
+// It reads audit's tables without a composed audit.Journal, so before it
+// reads them it checks their stamp, as audit.NewJournal would (#321): an
+// audit store stamped newer than this binary understands refuses the open
+// with audit's *store.NewerSchemaError, and no row is given a tenant. The
+// check precedes even asking whether audit_records_v1 exists, because a
+// newer audit may keep its records elsewhere, and "no audit table" would
+// then hand every row to the system tenant. A journal with no row without
+// a tenant reads nothing of audit's and is not refused for it. A row the
+// repair leaves unowned (its record pruned or unverifiable) is tried again
+// on every open and is never deleted, so under a newer audit every open is
+// refused while it exists: for good, unless its record verifies again or
+// an operator sets its tenant by hand (ADR 0003, #321).
 func backfillReconciliationTenants(ctx context.Context, tx *sql.Tx) error {
 	rows, err := tx.QueryContext(ctx, `SELECT operation_key FROM journal_reconciliations WHERE tenant IS NULL ORDER BY operation_key`)
 	if err != nil {
@@ -242,6 +255,9 @@ func backfillReconciliationTenants(ctx context.Context, tx *sql.Tx) error {
 		keys = append(keys, key)
 	}
 	if err := rows.Close(); err != nil || len(keys) == 0 {
+		return err
+	}
+	if err := audit.CheckSchema(ctx, tx); err != nil {
 		return err
 	}
 	audited, err := tableExists(ctx, tx, "audit_records_v1")

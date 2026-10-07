@@ -251,17 +251,125 @@ refuses an incompatible format.
   above; they are not made safe retroactively. The shape-guarded repairs
   keep cleaning up after them on the next open by a current binary, and
   ADR 0006's "one version per store" still applies to them.
-- A component checks only its own stamp. The journal's tenant repair reads
-  audit records and `audit.Verify` reads journal reconciliations; each
-  relies on the binary composing both components, whose own opens check
-  their stamps. An application that opens one of them without the other on
-  a database a newer binary migrated is not protected for the other's
-  tables.
+- A component checks its own stamp, and the stamp of any other component
+  whose tables it reads without composing it (#321, below). A
+  composed component checked its stamp when it was opened.
 - `store/distributed` stores (ADR 0019) have no tables of these components
   and are not stamped.
 - A newer binary's migration is not reversible by an older one: the
   refusal tells the operator to restore a pre-upgrade backup, and a backup
   carries the stamp with it (`VACUUM INTO` copies the table).
+
+### Cross-component reads (#321)
+
+A component reads another's tables in one of two ways. Through a
+**composed** component (the `*audit.Journal` in `journal.Config.Audit`, the
+`audit.Owner` and `audit.RunActivity` values passed to `Verify` and
+`Prune`), which refused a newer stamp of its own when its constructor ran.
+Or through a **bare transaction**, with no such object: then the reader
+checks the other component's stamp itself, in the same transaction, before
+it reads those tables or infers anything from them, including whether they
+exist. The owner of the tables exports the check, so the supported version
+stays the owner's: `audit.CheckSchema` returns audit's
+`store.NewerSchemaError`, the one `audit.NewJournal` returns.
+
+| Reader | Reads | Route | Stamp checked |
+| --- | --- | --- | --- |
+| `internal/journal` tenant repair (`journal.New`, schema transaction, #286) | `audit_records_v1` (`audit.StoredTenant`), `audit_pruned_v1` (`audit.Pruned`), and whether `audit_records_v1` exists | bare transaction | audit's, by `audit.CheckSchema`, before any of them (#321) |
+| `internal/journal` `Reconcile`, `DecideUpgrade`, compaction's record backfill | audit's tables (`Append`, `Recorded`, and `audit.Pruned` only when audit is composed) | composed `*audit.Journal` | by `audit.NewJournal` |
+| `contract/approval` decisions | audit's tables (`Append`) | composed `*audit.Journal` | by `audit.NewJournal` |
+| `contract/audit` `Verify` | `journal_reconciliations`, `approval_decisions_v1` (`AuditedIDs`) | composed `audit.Owner` (the journal, the approval store) | by `journal.New`, by the approval store's constructor |
+| `contract/audit` `Prune` | the journal's run states (`ActiveRuns`) | composed `audit.RunActivity` (the journal) | by `journal.New` |
+| `examples/recipes/shop` `Teardown` | drops `worker_jobs`, `worker_compacted`, `worker_meta` and deletes the `worker` stamp row | bare transaction | none: it removes the worker shape it knows (reported in #321, not changed) |
+
+**Refuse when the repair would read audit.** With audit stamped newer
+than this binary understands, `journal.New` refuses with audit's
+`store.NewerSchemaError` whenever the tenant repair finds a reconciliation
+without a tenant, and gives no row a tenant. The check runs before the
+repair reads any audit record, and before it asks whether
+`audit_records_v1` exists: a newer audit may keep its records elsewhere,
+and "no audit table" would hand every such row to the system tenant. The
+#321 PR shows each order separately. A mutant that checks the stamp only
+after the table probe fails the test whose newer audit moved its records
+out of `audit_records_v1`; that shows the check must precede the probe,
+and says nothing about the record and tombstone reads, which it still
+precedes. A tripwire test counts every read of a record's content
+(`audit_records_v1.record`, which `audit.StoredTenant` verifies and reads
+the tenant from) and of a tombstone's kind (`audit_pruned_v1.kind`, which
+`audit.Pruned` matches on), a read whose result is discarded included.
+Under the newer stamp the refused opens count zero of either; with the
+stamp restored, the same open counts the read the repair needs: the
+record, and the row gets its tenant, or, when the record was pruned, the
+tombstone, and the row stays unowned. It fails under a mutant that reads
+every record and discards the result before the check, under one that
+looks up every tombstone before the check, and under one that reads the
+record first and checks the stamp only before writing; that last mutant
+also fails the test of rows the repair leaves unowned, whose opens then
+never reach the check and succeed. The tripwire counts those two columns
+only: a read that touches neither, such as a row count or a lookup by id
+alone, is not counted. A stamp the check cannot read refuses the open
+with the read's error, naming audit's schema version, and gives no row a
+tenant; a check that took an unreadable stamp for no stamp fails that
+test, where the repair would give the row its record's tenant.
+
+It refuses rather than skipping the repair because #291 refuses every
+stamp it does not understand, and a composed `audit.Journal` would already
+refuse the same database. The journal also has no channel for a non-fatal
+diagnostic, and a skip reported nowhere is the unchecked read this
+replaces.
+
+When the refusal applies. The check cannot tell rows apart without
+reading audit, so it refuses for any row without a tenant. What an open
+the stamp does not refuse does with that row differs (ADR 0021 §8):
+
+- a row a binary from before #286 wrote whose verified audit record is
+  still there: the repair gives it that record's tenant, once;
+- such a row with no audit record and no prune tombstone (it predates
+  audit, or audit was never composed): the repair gives it the system
+  tenant `""`, once;
+- such a row whose record was pruned (a tombstone proves it had a
+  tenant), or whose record fails verification: the repair gives it no
+  tenant, by design (owned by nobody, ADR 0021 §8), and tries it again on
+  every open. Nothing in the framework repairs it: a pruned record never
+  comes back, and an unverifiable one is repaired only if it verifies
+  again. The journal never deletes a reconciliation row either;
+  compaction erases its content in place and keeps the row, tenant still
+  `NULL`.
+
+So a database with a row of the last kind refuses every journal-only
+open under a newer audit stamp, permanently: every open of a binary whose
+audit support is older than the stamp, on every restart, for as long as
+the row exists, which in the framework is for good. A binary that
+supports that audit version opens the database, and with this release's
+repair it leaves the row unowned too: it ends the refusal only for
+itself. The ways out are that binary, a backup taken before the audit
+upgrade, or the out-of-framework tenant assignment ADR 0021 §8 describes
+for an operator who knows the deciding tenant. Before #321 these opens
+succeeded. A database with no row without a tenant reads nothing of
+audit's and is never refused for audit's stamp, so a journal-only binary
+(`examples/deploy` composes no audit) on such a database is not stopped
+by an audit-only upgrade. The #321 PR pins the permanent refusal in a
+test, red under a mutant that refuses only for a row it would write.
+
+This release keeps the wider refusal rather than narrowing it. To tell a
+row the repair already gave up on from one an older binary wrote since,
+the journal would have to record "repair attempted, unrepairable"
+itself: a new journal-owned marker, so a schema change and a version
+bump. It would also stop retrying a row whose record fails verification,
+which changes #286's behaviour. Hitting the refusal takes both residue
+from before #286 and a binary older than the database's audit schema.
+No audit version 2 exists yet, and ADR 0006 already says one version per
+store. The refusal names audit and both versions. The remedy is the one
+#291 gives for any downgrade below a raised version: run a binary that
+supports that audit version, or restore a backup taken before the
+upgrade; for a row of the last kind above, nothing else in the framework
+ends it. If a future audit version makes this reachable, the marker is
+the change to make with it.
+
+| Change | Class | Migration |
+| --- | --- | --- |
+| `journal.New` refuses with `store.NewerSchemaError{Component: "audit"}` when the tenant repair finds a reconciliation without a tenant (from before #286: unrepaired, or with a pruned or unverifiable record) and audit is stamped newer than supported (#321) | behavioral (breaking for downgrades) | None for a database this release's audit understands. Otherwise run a binary that supports that audit version, or restore a backup taken before the upgrade. That binary gives a row its verified record's tenant, or `""` when it has no record and no tombstone; a row whose record was pruned or fails verification stays unowned, so every open by the older binary stays refused for good |
+| `audit.CheckSchema` | additive | None |
 
 ## Alternatives considered
 
