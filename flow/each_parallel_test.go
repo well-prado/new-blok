@@ -297,3 +297,87 @@ func TestFinallyRunsOnFailFastAndOnlyCallerCancellationSkipsIt(t *testing.T) {
 		t.Fatalf("caller cancellation: err=%v finally ran %d times, want 0", err, released.Load())
 	}
 }
+
+// A finally that fail-fast started is still the run's work: when the
+// caller then cancels the run, the finally is canceled too, and Run
+// returns instead of waiting on it (Review R round 2 on #383). The first
+// error, boom's, stays the run's error; the canceled finally is in Steps.
+func TestCallerCancellationStopsAFinallyStartedByFailFast(t *testing.T) {
+	started := make(chan struct{}, 4)
+	var stopped atomic.Int32
+	unstick := make(chan struct{})
+	t.Cleanup(func() { close(unstick) })
+	hold := node.MustDefine("hold", "1.0.0", func(ctx context.Context, in object) (object, error) {
+		if in["sku"] != "block" {
+			return object{}, nil
+		}
+		started <- struct{}{}
+		select {
+		case <-ctx.Done():
+			stopped.Add(1)
+			return nil, ctx.Err()
+		case <-unstick:
+			return nil, errors.New("finally was never canceled")
+		}
+	}, node.Description("hold"), node.Schemas([]byte(`{"type":"object"}`), []byte(`{"type":"object"}`)))
+	n := newLoopNodes()
+	n.extra = map[string]node.Any{"hold": hold.Any()}
+	program, err := flow.MustDefine(controlSpec, func(b *flow.Builder, in flow.Ref[object]) flow.Ref[[]object] {
+		return flow.Each(b, "lines", flow.Select[object, []object](in, "lines"), 4, func(arm *flow.ArmBuilder, line flow.Ref[object]) flow.Ref[object] {
+			return flow.TryFinally(arm.Builder(), "guard",
+				func(try *flow.ArmBuilder) flow.Ref[object] { return flow.ArmCall(try, "line", n.line, line) },
+				func(finally *flow.ArmBuilder) { flow.ArmCall(finally, "hold", hold, line) })
+		})
+	}).Lower()
+	if err != nil {
+		t.Fatal(err)
+	}
+	application, err := app.New(app.Config{Workflows: []app.Workflow{{Name: controlSpec.Name}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := application.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type outcome struct {
+		result execution.Result
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		result, err := execution.NewRunner(application, n.registry()).Run(ctx, program, object{"lines": lines("block", "block", "block", "boom")}, inspection.Invocation{})
+		done <- outcome{result, err}
+	}()
+	// boom fails, fail-fast cancels the three blocked tries, and their
+	// finally starts: the run itself is not canceled yet.
+	select {
+	case <-started:
+	case out := <-done:
+		t.Fatalf("Run returned before any finally started: %v", out.err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("no finally started after fail-fast")
+	}
+	cancel()
+	select {
+	case out := <-done:
+		if out.err == nil || !strings.Contains(out.err.Error(), "boom failed") {
+			t.Fatalf("Run returned %v; want boom's error, the first one", out.err)
+		}
+		if stopped.Load() == 0 {
+			t.Fatal("Run returned but no finally saw its context canceled")
+		}
+		canceledFinally := false
+		for _, step := range out.result.Steps {
+			if step.ID == "hold" && errors.Is(step.Error, context.Canceled) {
+				canceledFinally = true
+			}
+		}
+		if !canceledFinally {
+			t.Fatalf("no canceled finally in Steps: %+v", out.result.Steps)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not return within 1s of the caller canceling: the finally was not canceled")
+	}
+}

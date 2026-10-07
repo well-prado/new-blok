@@ -224,8 +224,11 @@ write goes to the arm's frame only, so arm results never reach
   by the run's own context, which it carries in the context, and runs
   finally in a context canceled only by the run's. The flow recording's
   "finally-not-guaranteed-after-suspension" note stands for durable
-  suspension. A finally failure replaces the try outcome; otherwise a try
-  failure is the run's failure, after finally ran.
+  suspension. A finally failure replaces the try outcome, except in a
+  sibling canceled by fail-fast, where the first error wins (the finally
+  failure still appears in Steps); otherwise a try failure is the run's
+  failure, after finally ran. A finally fail-fast started is still
+  canceled when the caller then cancels the run (Review R round 2).
 - Each construct is itself a step in `Result.Steps`, after its arm's
   steps, carrying its result. It is never `Executed` (that reports a node
   invocation; the arm's steps report their own) and never an external
