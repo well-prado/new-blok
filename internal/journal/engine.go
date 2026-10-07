@@ -116,8 +116,12 @@ func (r *RunJournal) VerifyRun(ctx context.Context, runID, artifact, inputDigest
 			if err != nil {
 				return err
 			}
-			if changed, err := result.RowsAffected(); err != nil || changed != 1 {
-				return errors.Join(ErrRequestConflict, err)
+			changed, err := result.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if changed != 1 {
+				return ErrRequestConflict
 			}
 			return nil
 		}); err != nil {

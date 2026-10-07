@@ -17,9 +17,16 @@ import (
 // program that echo a typed input of type T through one pure step.
 func echoRun[T any](t *testing.T, key, raw, schema string) (*Journal, string, int64, *engine.Engine, contract.InternalProgram) {
 	t.Helper()
+	return echoRunFixed[T](t, key, raw, schema, nil)
+}
+
+// echoRunFixed is echoRun with the run's engine input fixed at admission
+// (AdmissionRequest.EngineInput) when engineInput is not nil.
+func echoRunFixed[T any](t *testing.T, key, raw, schema string, engineInput any) (*Journal, string, int64, *engine.Engine, contract.InternalProgram) {
+	t.Helper()
 	database, j := newJournal(t, key+".db", Config{Holder: "a"})
 	t.Cleanup(func() { database.Close() })
-	admitted, err := j.Admit(context.Background(), AdmissionRequest{RequestKey: key, Workflow: "echo", ArtifactDigest: engineArtifact, Input: []byte(raw)})
+	admitted, err := j.Admit(context.Background(), AdmissionRequest{RequestKey: key, Workflow: "echo", ArtifactDigest: engineArtifact, Input: []byte(raw), EngineInput: engineInput})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,8 +140,7 @@ func TestEngineInputIsFixedOnce(t *testing.T) {
 		t.Fatalf("another input on a later execution: err=%v permanent=%v; want refused, permanently", err, Permanent(err))
 	}
 
-	canonical, _ := json.Marshal(order{Value: 1})
-	admitted, err := j.Admit(ctx, AdmissionRequest{RequestKey: "canonical", Workflow: "echo", ArtifactDigest: engineArtifact, Input: []byte(`{"value":1}`), EngineInput: canonical})
+	admitted, err := j.Admit(ctx, AdmissionRequest{RequestKey: "canonical", Workflow: "echo", ArtifactDigest: engineArtifact, Input: []byte(`{"value":1}`), EngineInput: order{Value: 1}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,6 +154,110 @@ func TestEngineInputIsFixedOnce(t *testing.T) {
 	if _, err := runner.RunJournaled(ctx, program, order{Value: 1}, admitted.RunID, j.ForRun(admitted.RunID, lease)); err != nil {
 		t.Fatalf("the input fixed at admission: %v", err)
 	}
+}
+
+// TestEngineInputFixedAtAdmissionRuns is Review R round 3's S1 probes on
+// #380: a run whose engine input is fixed at admission runs, whatever the
+// admitted bytes look like next to the engine's encoding: whitespace,
+// HTML characters json.Marshal escapes, keys in another order than the
+// typed struct, an optional field zero-filled, a \u escape. On aac2338
+// (EngineInput as the caller's bytes) each failed journal_run_mismatch on
+// every execution.
+func TestEngineInputFixedAtAdmissionRuns(t *testing.T) {
+	ctx := context.Background()
+	const orderSchema = `{"type":"object","properties":{"value":{"type":"integer"},"kind":{"type":"string"}},"required":["value"]}`
+	check := func(t *testing.T, j *Journal, run string, token int64, runner *engine.Engine, program contract.InternalProgram, input any) {
+		t.Helper()
+		for range 2 {
+			if _, err := runner.RunJournaled(ctx, program, input, run, j.ForRun(run, token)); err != nil {
+				t.Fatalf("input %#v: %v", input, err)
+			}
+		}
+	}
+	for _, c := range []struct{ name, raw string }{
+		{"whitespace and an optional field left out", `{"value": 1, "kind": ""}`},
+		{"HTML characters", `{"value":1,"kind":"<a>&"}`},
+		{"keys in another order", `{"kind":"x","value":1}`},
+		{"a unicode escape", `{"value":1,"kind":"\u00e9"}`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			input := decoded[order](t, c.raw)
+			j, run, token, runner, program := echoRunFixed[order](t, "fixed", c.raw, orderSchema, input)
+			check(t, j, run, token, runner, program, input)
+		})
+	}
+	t.Run("a struct whose fields reverse the input's key order", func(t *testing.T) {
+		const raw = `{"a":1,"b":2}`
+		input := decoded[reversed](t, raw)
+		j, run, token, runner, program := echoRunFixed[reversed](t, "reversed", raw, `{"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"integer"}},"required":["a","b"]}`, input)
+		check(t, j, run, token, runner, program, input)
+	})
+}
+
+// TestEngineInputMustEncode: an engine input json.Marshal refuses is
+// refused at admission, and no run is admitted for it.
+func TestEngineInputMustEncode(t *testing.T) {
+	ctx := context.Background()
+	database, j := newJournal(t, "encode.db", Config{Holder: "a"})
+	defer database.Close()
+	for _, c := range []struct {
+		name  string
+		input any
+	}{
+		{"invalid JSON bytes", json.RawMessage(`{"value":`)},
+		{"an unencodable value", make(chan int)},
+	} {
+		key := "encode-" + c.name
+		if _, err := j.Admit(ctx, AdmissionRequest{RequestKey: key, Workflow: "echo", ArtifactDigest: engineArtifact, Input: []byte(`{"value":1}`), EngineInput: c.input}); err == nil {
+			t.Fatalf("%s: admitted; want refused", c.name)
+		}
+		admitted, err := j.Admit(ctx, AdmissionRequest{RequestKey: key, Workflow: "echo", ArtifactDigest: engineArtifact, Input: []byte(`{"value":1}`)})
+		if err != nil || !admitted.Accepted {
+			t.Fatalf("%s: the refused admission left a run behind: accepted=%v err=%v", c.name, admitted.Accepted, err)
+		}
+	}
+}
+
+// TestRepeatAdmissionComparesEngineInput: a repeat admission of a request
+// key whose run's engine input is fixed (at admission or by its first
+// execution) and that names another engine input is a conflict; the same
+// engine input, or none, is the same run.
+func TestRepeatAdmissionComparesEngineInput(t *testing.T) {
+	ctx := context.Background()
+	request := func(key string, engineInput any) AdmissionRequest {
+		return AdmissionRequest{RequestKey: key, Workflow: "echo", ArtifactDigest: engineArtifact, Input: []byte(`{"value":1}`), EngineInput: engineInput}
+	}
+	same := func(t *testing.T, j *Journal, run string, r AdmissionRequest) {
+		t.Helper()
+		admitted, err := j.Admit(ctx, r)
+		if err != nil || admitted.Accepted || admitted.RunID != run {
+			t.Fatalf("repeat admission with engine input %#v: %+v err=%v; want run %s", r.EngineInput, admitted, err, run)
+		}
+	}
+	t.Run("fixed at admission", func(t *testing.T) {
+		database, j := newJournal(t, "repeat.db", Config{Holder: "a"})
+		defer database.Close()
+		first, err := j.Admit(ctx, request("repeat", order{Value: 1}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := j.Admit(ctx, request("repeat", order{Value: 2})); !errors.Is(err, ErrRequestConflict) {
+			t.Fatalf("another engine input: %v; want ErrRequestConflict", err)
+		}
+		same(t, j, first.RunID, request("repeat", order{Value: 1}))
+		same(t, j, first.RunID, request("repeat", nil))
+	})
+	t.Run("fixed by the first execution", func(t *testing.T) {
+		j, run, token, runner, program := echoRun[order](t, "executed", `{"value":1}`, `{"type":"object"}`)
+		same(t, j, run, request("executed", order{Value: 2}))
+		if _, err := runner.RunJournaled(ctx, program, order{Value: 1}, run, j.ForRun(run, token)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := j.Admit(ctx, request("executed", order{Value: 2})); !errors.Is(err, ErrRequestConflict) {
+			t.Fatalf("another engine input than the first execution's: %v; want ErrRequestConflict", err)
+		}
+		same(t, j, run, request("executed", order{Value: 1}))
+	})
 }
 
 // TestPermanentErrors: the conflicts no retry can fix are permanent; a
