@@ -72,7 +72,7 @@ func NewJournal(ctx context.Context, database store.Database, cfg Config) (*Jour
 	// while it loses (#235, #291).
 	err := migration.Retry(ctx, func() error {
 		return database.WithTx(ctx, func(tx *sql.Tx) error {
-			return migration.Apply(ctx, tx, migration.Schema{Component: "audit", Supported: schemaVersion, Infer: migration.Present("audit_records_v1")}, func(int) error {
+			return migration.Apply(ctx, tx, migration.Schema{Component: schemaComponent, Supported: schemaVersion, Infer: migration.Present("audit_records_v1")}, func(int) error {
 				return createTables(ctx, tx)
 			})
 		})
@@ -86,8 +86,12 @@ func NewJournal(ctx context.Context, database store.Database, cfg Config) (*Jour
 // schemaVersion is the highest audit schema version this binary
 // understands (#291). Version 1 is the shape #80 introduced, with
 // audit_pruned_v1; no audit migration has changed it since. NewJournal
-// refuses a store stamped with a newer one.
+// refuses a store stamped with a newer one, and CheckSchema refuses it to
+// an owner reading the audit tables without a Journal.
 const schemaVersion = 1
+
+// schemaComponent names audit's row in the schema version table.
+const schemaComponent = "audit"
 
 func createTables(ctx context.Context, tx *sql.Tx) error {
 	for _, statement := range []string{
@@ -212,8 +216,9 @@ func (j *Journal) Recorded(ctx context.Context, tx *sql.Tx, id string) (bool, er
 // id. The record is verified first (digest, shape, indexed columns), and one
 // that fails is ErrCorrupt, so an owner never adopts an altered tenant. It
 // needs no composed Journal, so an owner can call it while migrating; the
-// audit tables must exist. An owner uses it to fix, once, the tenant of a
-// decision that predates its own tenant column.
+// audit tables must exist, and the owner must have called CheckSchema in
+// tx first. An owner uses it to fix, once, the tenant of a decision that
+// predates its own tenant column.
 func StoredTenant(ctx context.Context, tx *sql.Tx, id string) (tenant string, found bool, err error) {
 	if tx == nil {
 		return "", false, ErrRequired
@@ -234,7 +239,8 @@ func StoredTenant(ctx context.Context, tx *sql.Tx, id string) (tenant string, fo
 // by Prune: its tombstone (the sha256 of the id, and the kind) exists. An
 // owner uses it to tell a decision whose record was pruned from one that
 // never had a record, which StoredTenant alone cannot. The audit tables
-// must exist.
+// must exist; an owner without a composed Journal calls CheckSchema in tx
+// first.
 func Pruned(ctx context.Context, tx *sql.Tx, id string, kind Kind) (bool, error) {
 	if tx == nil {
 		return false, ErrRequired
@@ -244,6 +250,31 @@ func Pruned(ctx context.Context, tx *sql.Tx, id string, kind Kind) (bool, error)
 		return false, unavailableErr(err)
 	}
 	return found > 0, nil
+}
+
+// CheckSchema refuses, inside tx, an audit store this binary does not
+// understand: one stamped with a newer audit schema version (#291) is
+// refused with a *store.NewerSchemaError naming audit and both versions,
+// exactly as NewJournal refuses it. A store with no audit stamp (no audit
+// tables yet, or tables from before #291) is the shape this binary knows.
+//
+// An owner that reads the audit tables without a composed Journal, as
+// StoredTenant and Pruned allow while it migrates, calls CheckSchema first,
+// before it reads them or infers anything from them, including whether
+// they exist (#321): a composed Journal already checked the stamp when it
+// was opened, but a bare transaction did not.
+func CheckSchema(ctx context.Context, tx *sql.Tx) error {
+	if tx == nil {
+		return ErrRequired
+	}
+	version, stamped, err := migration.Stamped(ctx, tx, schemaComponent)
+	if err != nil {
+		return err
+	}
+	if stamped && version > schemaVersion {
+		return &store.NewerSchemaError{Component: schemaComponent, Version: version, Supported: schemaVersion}
+	}
+	return nil
 }
 
 // Notify offers committed records to the optional Mirror. Owners call it
