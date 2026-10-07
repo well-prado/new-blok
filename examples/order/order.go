@@ -87,6 +87,9 @@ type Service struct {
 	lease       time.Duration
 	maxAttempts int
 	busyTimeout time.Duration
+	// afterOrderInsert, test-only, runs in the handler's transaction between
+	// the order row and its outbox event, where the crash tests kill it.
+	afterOrderInsert func()
 }
 
 // Option configures a Service.
@@ -218,6 +221,9 @@ func (s *Service) ProcessOnce(ctx context.Context) (bool, error) {
 		_, err := tx.ExecContext(ctx, `INSERT INTO orders (order_id, request_key, sku, quantity, total_cents, created_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(request_key) DO NOTHING`, orderID, request.RequestKey, request.SKU, request.Quantity, int64(request.Quantity)*price, s.now())
 		if err != nil {
 			return storeFailure(err)
+		}
+		if s.afterOrderInsert != nil {
+			s.afterOrderInsert()
 		}
 		payload, err := json.Marshal(map[string]any{"orderId": orderID, "totalCents": int64(request.Quantity) * price})
 		if err != nil {
