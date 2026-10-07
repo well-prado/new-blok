@@ -86,9 +86,9 @@ type Recovery struct {
 	Joins      []JoinRecord
 }
 
-// runState reads a run's state and admitted artifact, ErrNotFound when the
-// journal does not hold it.
-func runState(ctx context.Context, tx *sql.Tx, runID string) (state, artifact string, err error) {
+// runStateAndArtifact reads a run's state and admitted artifact,
+// ErrNotFound when the journal does not hold it.
+func runStateAndArtifact(ctx context.Context, tx *sql.Tx, runID string) (state, artifact string, err error) {
 	err = tx.QueryRowContext(ctx, `SELECT state, artifact_digest FROM journal_runs WHERE run_id = ?`, runID).Scan(&state, &artifact)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", "", ErrNotFound
@@ -108,7 +108,7 @@ func (j *Journal) SaveCheckpoint(ctx context.Context, checkpoint Checkpoint) err
 		checkpoint.Status = checkpointRunning
 	}
 	return j.withTx(ctx, "checkpoint", func(tx *sql.Tx) error {
-		state, admitted, err := runState(ctx, tx, checkpoint.RunID)
+		state, admitted, err := runStateAndArtifact(ctx, tx, checkpoint.RunID)
 		if err != nil {
 			return err
 		}
@@ -153,7 +153,7 @@ func (j *Journal) StartScope(ctx context.Context, record ScopeRecord) (ScopeAtte
 	}
 	var started ScopeAttempt
 	err = j.withTx(ctx, "scope-start", func(tx *sql.Tx) error {
-		run, _, err := runState(ctx, tx, record.RunID)
+		run, _, err := runStateAndArtifact(ctx, tx, record.RunID)
 		if err != nil {
 			return err
 		}
@@ -314,7 +314,7 @@ func (j *Journal) Recover(ctx context.Context, runID, artifactDigest, checkpoint
 		// the one its run was admitted under; it is not this run's to resume.
 		// Such a run fails closed: it is recovered under neither artifact,
 		// and SaveCheckpoint cannot replace the row.
-		if _, admitted, err := runState(ctx, tx, runID); err != nil {
+		if _, admitted, err := runStateAndArtifact(ctx, tx, runID); err != nil {
 			return err
 		} else if admitted != artifactDigest {
 			return ErrArtifactMismatch
