@@ -137,7 +137,8 @@ func (s *JournalStore) Record(ctx context.Context, id string, p Proposal, grant 
 			}
 			d = existing
 			// A retried decision writes the same record: a no-op when it
-			// exists, and the missing record when an earlier store lacked it.
+			// exists or Prune removed it (#294), and the missing record
+			// when an earlier store lacked it.
 			record, inserted, err = s.audit.Append(ctx, tx, decisionRecord(ctx, d, p))
 			return err
 		}
@@ -155,6 +156,12 @@ func (s *JournalStore) Record(ctx context.Context, id string, p Proposal, grant 
 			return err
 		}
 		record, inserted, err = s.audit.Append(ctx, tx, decisionRecord(ctx, d, p))
+		if err == nil && !inserted {
+			// A first decision whose record already exists or was pruned
+			// (a stale or planted tombstone, #294) would commit without
+			// writing or mirroring its record: refuse it instead.
+			return audit.ErrConflict
+		}
 		return err
 	})
 	if err != nil {
