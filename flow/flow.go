@@ -408,8 +408,10 @@ func Compare[T any](builder *Builder, id, operator string, left, right Ref[T]) R
 
 // Default returns value unless it is absent, then fallback. Absent means its
 // path reaches nothing (a missing field, a field of null) or its JSON form is
-// null (nil, or a nil pointer, slice or map). A literal fallback is a JSON
-// value: a node it reaches receives it as the node's own input type.
+// null (nil, or a nil pointer, slice or map, through any pointers). A
+// literal fallback is a JSON value: a typed node it reaches receives it as
+// the node's own input type when it reads exactly as one (ADR 0028); as the
+// workflow's output it stays the JSON value (a []any for a Ref[[]string]).
 func Default[T any](builder *Builder, id string, value, fallback Ref[T]) Ref[T] {
 	builder.reserveID(id)
 	output := "$op." + id

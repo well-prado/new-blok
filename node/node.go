@@ -206,26 +206,108 @@ func (n Any) DecodeOutput(data []byte) (any, error) {
 	return value.Elem().Interface(), nil
 }
 
-// ConvertInput returns value as the node's declared Go input type. A value
-// already of that type, or any value for a node whose input type is an
-// interface, is returned as is; any other is converted through its JSON
-// encoding, as a durable adapter restores a persisted value. The engine uses
-// it for control programs, whose literals are JSON values and whose
-// references hand on Go values (a *T field read where a node takes a T): a
-// node never receives a value of another type.
-func (n Any) ConvertInput(value any) (any, error) {
-	if n.inputType == nil || n.inputType.Kind() == reflect.Interface || value != nil && reflect.TypeOf(value) == n.inputType {
-		return value, nil
+// ConvertInput returns value as the node's declared Go input type when it
+// has an exact reading as that type, and value unchanged otherwise, so that
+// Invoke refuses it with input_type_mismatch as it refuses any other value
+// of the wrong type. The engine calls it only for a value a control
+// construct produced (ADR 0028): a JSON literal, an each's results, a value
+// a construct handed on. It never invents a value the source does not hold:
+//
+//   - a value of the input type, or any value for an interface input type,
+//     is returned as is;
+//   - a non-nil pointer to the input type is dereferenced;
+//   - nil (or a nil pointer) becomes the zero value only of a type that can
+//     itself be nil (pointer, slice, map, interface);
+//   - a JSON value (nil, bool, string, json.Number, float64, map[string]any,
+//     []any of JSON values) is decoded into the type, refusing a field the
+//     type does not declare;
+//   - a slice or array converts element by element into a slice type.
+//
+// Values are never re-encoded through their own MarshalJSON, so a type that
+// encodes itself as something else is never read as that.
+func (n Any) ConvertInput(value any) any {
+	if n.inputType == nil || n.inputType.Kind() == reflect.Interface {
+		return value
 	}
-	data, err := json.Marshal(value)
-	if err != nil {
-		return nil, err
+	if converted, ok := convertInput(value, n.inputType); ok {
+		return converted.Interface()
 	}
-	converted := reflect.New(n.inputType)
-	if err := json.Unmarshal(data, converted.Interface()); err != nil {
-		return nil, err
+	return value
+}
+
+func convertInput(value any, target reflect.Type) (reflect.Value, bool) {
+	if value == nil {
+		return nilOf(target)
 	}
-	return converted.Elem().Interface(), nil
+	current := reflect.ValueOf(value)
+	switch {
+	case current.Type() == target:
+		return current, true
+	case current.Kind() == reflect.Pointer && current.IsNil():
+		return nilOf(target)
+	case current.Kind() == reflect.Pointer && current.Type().Elem() == target:
+		return current.Elem(), true
+	case jsonValue(value):
+		data, err := json.Marshal(value)
+		if err != nil {
+			return reflect.Value{}, false
+		}
+		decoder := json.NewDecoder(bytes.NewReader(data))
+		decoder.DisallowUnknownFields()
+		converted := reflect.New(target)
+		if err := decoder.Decode(converted.Interface()); err != nil {
+			return reflect.Value{}, false
+		}
+		return converted.Elem(), true
+	case (current.Kind() == reflect.Slice || current.Kind() == reflect.Array) && target.Kind() == reflect.Slice:
+		if current.Kind() == reflect.Slice && current.IsNil() {
+			return reflect.Zero(target), true
+		}
+		converted := reflect.MakeSlice(target, current.Len(), current.Len())
+		for index := 0; index < current.Len(); index++ {
+			element, ok := convertInput(current.Index(index).Interface(), target.Elem())
+			if !ok {
+				return reflect.Value{}, false
+			}
+			converted.Index(index).Set(element)
+		}
+		return converted, true
+	}
+	return reflect.Value{}, false
+}
+
+// nilOf is target's zero value when null has a reading as target.
+func nilOf(target reflect.Type) (reflect.Value, bool) {
+	switch target.Kind() {
+	case reflect.Pointer, reflect.Slice, reflect.Map, reflect.Interface:
+		return reflect.Zero(target), true
+	}
+	return reflect.Value{}, false
+}
+
+// jsonValue reports whether value is made only of the values JSON decodes
+// into an interface: nil, bool, string, json.Number, float64,
+// map[string]any and []any of them.
+func jsonValue(value any) bool {
+	switch typed := value.(type) {
+	case nil, bool, string, json.Number, float64:
+		return true
+	case map[string]any:
+		for _, member := range typed {
+			if !jsonValue(member) {
+				return false
+			}
+		}
+		return true
+	case []any:
+		for _, element := range typed {
+			if !jsonValue(element) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 func (n Any) Mock(output any, returned error) (Any, error) {

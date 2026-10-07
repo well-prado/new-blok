@@ -379,7 +379,15 @@ func isNull(value any) bool {
 	}
 	reflected := reflect.ValueOf(value)
 	switch reflected.Kind() {
-	case reflect.Pointer, reflect.Slice, reflect.Map, reflect.Interface:
+	case reflect.Pointer, reflect.Interface:
+		if reflected.IsNil() {
+			return true
+		}
+		if _, ok := value.(json.Marshaler); !ok {
+			// A non-nil pointer encodes as what it points to.
+			return isNull(reflected.Elem().Interface())
+		}
+	case reflect.Slice, reflect.Map:
 		if reflected.IsNil() {
 			return true
 		}
@@ -389,6 +397,24 @@ func isNull(value any) bool {
 		return err == nil && string(encoded) == "null"
 	}
 	return false
+}
+
+// controlIDs adds the id of every control instruction in instructions, at
+// any depth, to ids: the steps whose values a construct produced.
+func controlIDs(instructions []contract.InternalInstruction, ids map[string]bool) map[string]bool {
+	if ids == nil {
+		ids = map[string]bool{}
+	}
+	for _, instruction := range instructions {
+		if instruction.Control == nil {
+			continue
+		}
+		ids[instruction.ID] = true
+		for _, arm := range instruction.Control.Arms {
+			controlIDs(arm.Instructions, ids)
+		}
+	}
+	return ids
 }
 
 func isAbsent(err error) bool {

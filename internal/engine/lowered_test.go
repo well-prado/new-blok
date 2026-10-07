@@ -225,3 +225,21 @@ func TestChooseCaseMustBeAString(t *testing.T) {
 		t.Fatalf("err=%v", err)
 	}
 }
+
+// isNull follows the JSON form through pointers: a non-nil pointer to a nil
+// pointer encodes as null.
+func TestIsNullFollowsPointers(t *testing.T) {
+	var inner *string
+	empty := ""
+	cases := []struct {
+		value any
+		want  bool
+	}{
+		{nil, true}, {inner, true}, {&inner, true}, {any(&empty), false}, {[]string{}, false}, {map[string]any(nil), true},
+	}
+	for index, tc := range cases {
+		if got := isNull(tc.value); got != tc.want {
+			t.Errorf("case %d (%#v): isNull=%v want %v", index, tc.value, got, tc.want)
+		}
+	}
+}

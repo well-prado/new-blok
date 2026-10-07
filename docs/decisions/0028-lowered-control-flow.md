@@ -177,16 +177,33 @@ write goes to the arm's frame only, so arm results never reach
   optional field is a typed nil), or a value encoding itself as null; then
   the fallback. An empty slice or map is a value. Any other read error is
   `invalid_operand`.
-- Values reach nodes as the node's type. A literal operand is a JSON value
-  (numbers as `json.Number`, objects as maps), and a reference hands on the
-  Go value it reaches (a `*T` field where the node takes a `T`). In a
-  format-2 program every call's input goes through
-  `node.Any.ConvertInput`: a value already of the node's input type passes
-  as is, any other is converted through its JSON encoding, as a durable
-  adapter restores a persisted output. A node never receives a value of
-  another type. Values that reach no node (the workflow output, a compare)
-  stay as they are: a literal fallback in the output is its JSON value.
-  Call-only programs are unchanged (no conversion).
+- Values a construct produced reach a typed node as its type, and nothing
+  else changes. A literal operand is a JSON value (numbers as
+  `json.Number`, objects as maps), an each's result is a `[]any`, and a
+  construct hands on the Go value it read (a `*T` field where the node
+  takes a `T`). So a call whose input reference names a control
+  instruction (its result, or an each's item) is converted by
+  `node.Any.ConvertInput` just before the node is invoked, and only to a
+  value the source exactly holds: a value of the type as is, a non-nil
+  `*T` dereferenced, null only into a type that can be nil, a JSON value
+  decoded with unknown fields refused, a slice element by element. Anything
+  else is passed unchanged, so the node refuses it with its own
+  `input_type_mismatch: expected <type>, got <type>`, as outside control
+  flow. Values are never re-encoded through their own `MarshalJSON`. The
+  node's input schema is checked on the value as resolved, before any
+  conversion, exactly as in a call-only program.
+  Every other call — reading the workflow input or a node's output — runs
+  exactly as in a call-only program, even in a format-2 program (Review R
+  round 2 found that converting every call made a program's calls behave
+  differently once any construct was added: a nil `*T` became a zero `T`,
+  an unknown field was dropped). Converting only construct values keeps
+  the rule local to what control flow introduced.
+  A literal reaching a node whose input type is an interface (`any`) keeps
+  its JSON form: numbers arrive as `json.Number`.
+  Values that reach no node are not converted: the workflow output and a
+  construct's own result are what the construct produced, so a `Default`
+  with a literal `[]string` fallback returns `[]any` as the run's output,
+  not a `[]string` (`Ref[T]` types the authoring, not the run's output).
 - if / choose: the condition is read as JSON (a named bool or string type
   selects like the plain one); a condition of another type is
   `invalid_condition`. The selected arm runs through the control path
@@ -286,7 +303,7 @@ Recorded here so slices 2 and 3 key their journal records consistently:
 | Recording a step on an enclosing builder inside an arm is a `Define` error | behavioral: such a step used to run before the construct | Record it on the arm |
 | Recording a step on an arm's builder after its arm returned is a `Define` error | behavioral: such a step used to run outside the construct | Record it inside the arm's callback |
 | `node.Any.ConvertInput` | API, additive | None |
-| In a format-2 program a call's input is converted to the node's input type | behavioral (format 2 only) | None |
+| In a format-2 program a call reading a construct's value receives it as its input type when it reads exactly as one | behavioral (format 2, construct values only) | None |
 | `internal/program` `Build`/`Decode` refuse format ≠ 0 and control bodies | behavioral, fail closed | None |
 | `StepResult.InvocationPath`, `.IterationPath` (engine, execution) | API, additive | None |
 | `flow.Definition.Lower` lowers each and parallel (1b) | behavioral: programs it refused now lower | None |
@@ -302,7 +319,13 @@ Review R round 1 found the typed cases: every control test had passed
 `map[string]any` between nodes. `flow/control_typed_test.go` runs typed Go
 nodes (typed nil `*string`, `*int`, `*struct`, nil `[]string`, int and
 struct literals into typed nodes) and was RED before the fixes, as were the
-sealed-arm, v1-artifact, choose-match and span tests.
+sealed-arm, v1-artifact, choose-match and span tests. Round 2 added
+`TestControlProgramsReadReferencesLikeCallOnlyPrograms` (the same call with
+and without an unrelated compare must fail the same way: nil `*string` and
+nil `*struct` with `null_not_allowed`, an unknown field with
+`unknown_field`, a self-redacting `*secret` and a node's own `*int` with
+`input_type_mismatch`), `TestConstructValuesAreNeverInventedForTypedNodes`
+and `node`'s `TestConvertInputNeverInventsAValue`.
 
 RED on origin/main 79ee0a7 (each fails at `Lower` with "cannot be lowered",
 the builder test with `Define err=<nil>`): `flow/control_run_test.go`,
