@@ -22,7 +22,7 @@ func TestJournalInspectionReadsActualWaitUncertainAndChildLineage(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = j.ScheduleWait(ctx, WaitRequest{RunID: waiting.RunID, WaitID: "wait-real", Name: "approval", DueAt: time.Now().Add(time.Hour)}); err != nil {
+	if _, err = j.ScheduleWait(ctx, WaitRequest{RunID: waiting.RunID, WaitID: "wait-real", Name: "approval", InvocationPath: "approve", IterationPath: "root", DueAt: time.Now().Add(time.Hour)}); err != nil {
 		t.Fatal(err)
 	}
 	page, err := inspect.InspectSource(ctx, j, "alice", inspection.Policy{Fields: map[inspection.Field]bool{inspection.FieldInput: true, inspection.FieldOutput: true}, MaxPageSize: 10}, inspection.Query{Version: inspection.Version, RunID: waiting.RunID})

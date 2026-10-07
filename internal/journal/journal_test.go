@@ -8,8 +8,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -454,6 +456,9 @@ func TestIntegrityFailureFailsClosed(t *testing.T) {
 	}
 }
 
+// TestWriteFailureDoesNotAcknowledgeAdmission covers a store that refuses
+// before any transaction starts; TestRealDiskFullFailsClosedAndReopensIntact
+// covers a real ENOSPC inside one, on Linux.
 func TestWriteFailureDoesNotAcknowledgeAdmission(t *testing.T) {
 	database, err := (sqlite.Backend{}).Open(context.Background(), filepath.Join(t.TempDir(), "journal.db"))
 	if err != nil {
@@ -479,6 +484,208 @@ func TestWriteFailureDoesNotAcknowledgeAdmission(t *testing.T) {
 	if err != nil || !admission.Accepted {
 		t.Fatalf("admission after failed write=%+v err=%v", admission, err)
 	}
+}
+
+// smallFilesystemEnv names a directory on a small, size-limited filesystem
+// that TestRealDiskFullFailsClosedAndReopensIntact may fill. CI and local
+// runs leave it unset, and the test skips; it runs in Docker on Linux:
+//
+//	docker run --rm --tmpfs /mnt/small:size=4m -e BLOK_TEST_SMALL_FS=/mnt/small \
+//	  -v "$PWD":/src:ro -w /src golang:1.27.1 \
+//	  go test -count=1 -run TestRealDiskFullFailsClosedAndReopensIntact ./internal/journal
+const smallFilesystemEnv = "BLOK_TEST_SMALL_FS"
+
+const (
+	// diskFullPad is the size of each admission's input, so the room
+	// left to the journal fills within a few admissions.
+	diskFullPad = 32 << 10
+	// diskFullRoom is the space left for the journal: a ballast file
+	// fills the filesystem, then gives back this much.
+	diskFullRoom = 512 << 10
+	// diskFullLimit bounds the ballast before the test decides the
+	// directory is not on a small filesystem.
+	diskFullLimit = 64 << 20
+)
+
+// TestRealDiskFullFailsClosedAndReopensIntact (#44, #337) fills a real
+// filesystem with journal admissions until SQLite meets ENOSPC. The
+// admission that does not fit must fail, leave nothing of itself behind,
+// and leave every earlier admission whole; once space is freed the file
+// must reopen, pass PRAGMA integrity_check, and accept the refused
+// admission. TestWriteFailureDoesNotAcknowledgeAdmission covers the other
+// failure point, a store that refuses before any transaction starts.
+func TestRealDiskFullFailsClosedAndReopensIntact(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("needs a size-limited Linux filesystem (tmpfs) in %s; GOOS is %s", smallFilesystemEnv, runtime.GOOS)
+	}
+	small := os.Getenv(smallFilesystemEnv)
+	if small == "" {
+		t.Skipf("%s is unset; set it to a directory on a small tmpfs (e.g. docker run --tmpfs /mnt/small:size=4m)", smallFilesystemEnv)
+	}
+	ctx := context.Background()
+	directory, err := os.MkdirTemp(small, "disk-full-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	path := filepath.Join(directory, "journal.db")
+	database, journal := newJournalAtPath(t, path, Config{})
+	closed := false
+	defer func() {
+		if !closed {
+			_ = database.Close()
+		}
+	}()
+	// A ballast file takes all the free space and gives diskFullRoom back,
+	// so the journal fills only that room; removing the ballast afterwards
+	// frees far more than the journal wrote, enough for SQLite to
+	// checkpoint the whole log into the file on reopen.
+	ballast := filepath.Join(directory, "ballast")
+	if err := fillFilesystem(ballast); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(ballast)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() < 2*diskFullRoom {
+		t.Fatalf("%s had %d KiB free; the test needs at least %d KiB (e.g. a 4m tmpfs)", smallFilesystemEnv, info.Size()>>10, 2*diskFullRoom>>10)
+	}
+	if err := os.Truncate(ballast, info.Size()-diskFullRoom); err != nil {
+		t.Fatal(err)
+	}
+
+	type admitted struct{ runID, input string }
+	acknowledged := map[string]admitted{}
+	request := func(index int) AdmissionRequest {
+		input := fmt.Sprintf(`{"index":%d,"pad":%q}`, index, strings.Repeat(string(rune('a'+index%26)), diskFullPad))
+		return AdmissionRequest{RequestKey: fmt.Sprintf("disk-full-%04d", index), Workflow: "orders/quote", ArtifactDigest: "sha256:artifact", Input: []byte(input)}
+	}
+	var refused AdmissionRequest
+	var admitErr error
+	for index := 0; index*diskFullPad < 4*diskFullRoom; index++ {
+		next := request(index)
+		admission, err := journal.Admit(ctx, next)
+		if err != nil {
+			refused, admitErr = next, err
+			break
+		}
+		if !admission.Accepted || admission.RunID == "" {
+			t.Fatalf("admission %d=%+v", index, admission)
+		}
+		// An acknowledged admission must be in the journal: a store that
+		// lost a failed commit's error would acknowledge one that is not.
+		if run, err := journal.Run(ctx, admission.RunID); err != nil || run.RequestKey != next.RequestKey {
+			t.Fatalf("admission %d was acknowledged but is not in the journal: run=%q err=%v", index, run.RunID, err)
+		}
+		acknowledged[next.RequestKey] = admitted{runID: admission.RunID, input: string(next.Input)}
+	}
+	if admitErr == nil {
+		t.Fatalf("%d admissions fit in %d KiB of free space without filling it", len(acknowledged), diskFullRoom>>10)
+	}
+	t.Logf("admission %d (%d KiB input) failed: %v", len(acknowledged), diskFullPad>>10, admitErr)
+	if !strings.Contains(admitErr.Error(), "disk is full") {
+		t.Fatalf("the failing admission's error is not SQLite's disk-full error: %v", admitErr)
+	}
+	if len(acknowledged) == 0 {
+		t.Fatal("the filesystem was full before the first admission; it must hold some committed admissions to show they survive")
+	}
+	// The filesystem itself must be out of space, so the failure above was
+	// a real ENOSPC and not some other limit.
+	if err := os.WriteFile(filepath.Join(directory, "probe"), make([]byte, diskFullPad), 0o600); !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("writing beside the journal after the failure: err=%v, want ENOSPC", err)
+	}
+	_ = os.Remove(filepath.Join(directory, "probe"))
+
+	// Exactly the acknowledged admissions are visible, each whole, and
+	// nothing of the refused one: through the same handle while the disk
+	// is still full, and through a fresh handle after space is freed.
+	requireExactly := func(stage string, database store.Database) {
+		t.Helper()
+		seen := map[string]admitted{}
+		if err := database.WithTx(ctx, func(tx *sql.Tx) error {
+			rows, err := tx.QueryContext(ctx, `SELECT request_key, run_id, input_json, input_digest FROM journal_runs`)
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var key, runID, digest string
+				var input []byte
+				if err := rows.Scan(&key, &runID, &input, &digest); err != nil {
+					return err
+				}
+				if digest != digestBytes(input) {
+					return fmt.Errorf("%s: input of %s does not match its digest (%d bytes)", key, runID, len(input))
+				}
+				seen[key] = admitted{runID: runID, input: string(input)}
+			}
+			return rows.Err()
+		}); err != nil {
+			t.Fatalf("%s: read admissions: %v", stage, err)
+		}
+		if _, ok := seen[refused.RequestKey]; ok {
+			t.Fatalf("%s: the refused admission %s is visible", stage, refused.RequestKey)
+		}
+		if len(seen) != len(acknowledged) {
+			t.Fatalf("%s: %d admissions visible, want the %d acknowledged", stage, len(seen), len(acknowledged))
+		}
+		for key, want := range acknowledged {
+			if got, ok := seen[key]; !ok || got != want {
+				t.Fatalf("%s: acknowledged admission %s missing or changed (found=%v)", stage, key, ok)
+			}
+		}
+	}
+	requireExactly("disk full", database)
+
+	// The process gives up with the disk still full. Closing may fail to
+	// checkpoint; what matters is the file it leaves behind.
+	if err := database.Close(); err != nil {
+		t.Logf("close with the disk full: %v", err)
+	}
+	closed = true
+	if err := os.Remove(ballast); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := (sqlite.Backend{}).Open(ctx, path)
+	if err != nil {
+		t.Fatalf("reopen after freeing space: %v", err)
+	}
+	defer reopened.Close()
+	if err := reopened.Integrity(ctx); err != nil {
+		t.Fatalf("PRAGMA integrity_check after freeing space: %v", err)
+	}
+	requireExactly("reopened", reopened)
+	journal, err = New(ctx, reopened, Config{})
+	if err != nil {
+		t.Fatalf("journal over the reopened store: %v", err)
+	}
+	admission, err := journal.Admit(ctx, refused)
+	if err != nil || !admission.Accepted {
+		t.Fatalf("the refused admission after freeing space=%+v err=%v", admission, err)
+	}
+}
+
+// fillFilesystem writes path until its filesystem has no space left, and
+// fails unless that happens, with ENOSPC, within diskFullLimit.
+func fillFilesystem(path string) error {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	chunk := make([]byte, 64<<10)
+	for written := 0; written < diskFullLimit; {
+		n, err := file.Write(chunk)
+		written += n
+		if errors.Is(err, syscall.ENOSPC) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("fill %s: %w", path, err)
+		}
+	}
+	return fmt.Errorf("%s is not on a small filesystem: %d MiB written without ENOSPC", path, diskFullLimit>>20)
 }
 
 type failingDatabase struct {

@@ -19,7 +19,7 @@ func TestWaitAndSignalSurviveRestartAndDuplicateSignalsAreStable(t *testing.T) {
 		t.Fatal(err)
 	}
 	due := time.Unix(100, 0)
-	if _, err := journal.ScheduleWait(context.Background(), WaitRequest{RunID: admission.RunID, WaitID: "wait-1", Name: "approval", DueAt: due}); err != nil {
+	if _, err := journal.ScheduleWait(context.Background(), WaitRequest{RunID: admission.RunID, WaitID: "wait-1", Name: "approval", InvocationPath: "approve", IterationPath: "root", DueAt: due}); err != nil {
 		t.Fatal(err)
 	}
 	if err := database.Close(); err != nil {
@@ -57,14 +57,16 @@ func TestUnauthorizedLateAndCancelSignalOutcomes(t *testing.T) {
 	if _, err := journal.Signal(context.Background(), envelope, false); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("unauthorized=%v", err)
 	}
-	if _, err := journal.ScheduleWait(context.Background(), WaitRequest{RunID: admission.RunID, WaitID: "wait-2", Name: "approval", DueAt: time.Unix(200, 0)}); err != nil {
+	if _, err := journal.ScheduleWait(context.Background(), WaitRequest{RunID: admission.RunID, WaitID: "wait-2", Name: "approval", InvocationPath: "approve", IterationPath: "root", DueAt: time.Unix(200, 0)}); err != nil {
 		t.Fatal(err)
 	}
 	if err := journal.CancelWait(context.Background(), "wait-2"); err != nil {
 		t.Fatal(err)
 	}
+	// A signal for the canceled wait is late (#332: one addressed by name
+	// alone would be held for the run's next wait of the name).
 	envelope.SignalID = "late"
-	result, err := journal.Signal(context.Background(), envelope, true)
+	result, err := journal.SignalWait(context.Background(), envelope, WaitTarget{WaitID: "wait-2"}, true)
 	if err != nil || !result.Late {
 		t.Fatalf("late=%+v err=%v", result, err)
 	}
@@ -86,7 +88,7 @@ func TestSignalArrivingBeforeWaitIsConsumedAtomically(t *testing.T) {
 	if err != nil || !result.Accepted || result.Resumed {
 		t.Fatalf("pre-wait signal=%+v err=%v", result, err)
 	}
-	record, err := journal.ScheduleWait(context.Background(), WaitRequest{RunID: admission.RunID, WaitID: "prewait-wait", Name: "approval", DueAt: time.Unix(300, 0)})
+	record, err := journal.ScheduleWait(context.Background(), WaitRequest{RunID: admission.RunID, WaitID: "prewait-wait", Name: "approval", InvocationPath: "approve", IterationPath: "root", DueAt: time.Unix(300, 0)})
 	if err != nil {
 		t.Fatal(err)
 	}

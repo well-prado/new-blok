@@ -181,8 +181,8 @@ func New(ctx context.Context, database store.Database, config Config) (*Journal,
 	// while it loses (#235).
 	if err := migration.Retry(ctx, func() error {
 		return j.withTx(ctx, "schema", func(tx *sql.Tx) error {
-			return migration.Apply(ctx, tx, migration.Schema{Component: "journal", Supported: schemaVersion, Infer: inferSchemaVersion}, func(int) error {
-				return j.migrate(ctx, tx)
+			return migration.Apply(ctx, tx, migration.Schema{Component: "journal", Supported: schemaVersion, Infer: inferSchemaVersion}, func(from int) error {
+				return j.migrate(ctx, tx, from)
 			})
 		})
 	}); err != nil {
@@ -194,25 +194,27 @@ func New(ctx context.Context, database store.Database, config Config) (*Journal,
 // schemaVersion is the highest journal schema version this binary
 // understands (#291): 1 before #281, 2 with #281's erasure tables
 // (journal_compacted, journal_meta, and journal_reconciliations rebuilt
-// with digests and erased_at), 3 with #286's reconciliation tenant. New
-// refuses a journal stamped with a newer one. Raise it with every change
-// an older binary would misread, together with the migration step that
-// makes it. It is a variable only so tests can stand in for an older
+// with digests and erased_at), 3 with #286's reconciliation tenant, 4 with
+// #332's wait identity (journal_waits keyed by step and iteration instead
+// of by name). New refuses a journal stamped with a newer one. Raise it
+// with every change an older binary would misread, together with the
+// migration step that makes it. It is a variable only so tests can stand in for an older
 // binary.
-var schemaVersion = 3
+var schemaVersion = 4
 
 // inferSchemaVersion classifies a journal written before the stamp existed
-// by its shape: 0 when it has no tables yet, 3 when its reconciliations
-// carry a tenant (#286), 2 when they carry erased_at (#281), else 1.
+// by its shape: 0 when it has no tables yet, 4 when its waits carry an
+// iteration path (#332), 3 when its reconciliations carry a tenant (#286),
+// 2 when they carry erased_at (#281), else 1.
 func inferSchemaVersion(ctx context.Context, tx *sql.Tx) (int, error) {
 	if found, err := migration.TableExists(ctx, tx, "journal_runs"); err != nil || !found {
 		return 0, err
 	}
 	for _, shape := range []struct {
-		column  string
-		version int
-	}{{"tenant", 3}, {"erased_at", 2}} {
-		found, err := migration.ColumnExists(ctx, tx, "journal_reconciliations", shape.column)
+		table, column string
+		version       int
+	}{{"journal_waits", "iteration_path", 4}, {"journal_reconciliations", "tenant", 3}, {"journal_reconciliations", "erased_at", 2}} {
+		found, err := migration.ColumnExists(ctx, tx, shape.table, shape.column)
 		if err != nil {
 			return 0, err
 		}
@@ -228,8 +230,9 @@ func inferSchemaVersion(ctx context.Context, tx *sql.Tx) (int, error) {
 // stamp is older: a binary from before #291 cannot see the stamp, and a
 // pre-#281 one recreates journal_audit, or a pre-#286 one inserts a
 // reconciliation without a tenant, in a journal already stamped current.
-// The next open repairs both.
-func (j *Journal) migrate(ctx context.Context, tx *sql.Tx) error {
+// The next open repairs both. Steps from #332 on run only when the version
+// found is older than their own.
+func (j *Journal) migrate(ctx context.Context, tx *sql.Tx, from int) error {
 	for _, statement := range schemaStatements {
 		if _, err := tx.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("schema: %w", err)
@@ -281,7 +284,37 @@ func (j *Journal) migrate(ctx context.Context, tx *sql.Tx) error {
 	if err := ensureColumn(ctx, tx, "journal_reconciliations", "tenant", `TEXT`); err != nil {
 		return err
 	}
-	return backfillReconciliationTenants(ctx, tx)
+	if err := backfillReconciliationTenants(ctx, tx); err != nil {
+		return err
+	}
+	if from < 4 {
+		return migrateWaitIdentity(ctx, tx)
+	}
+	return nil
+}
+
+// migrateWaitIdentity rebuilds journal_waits keyed by step and iteration
+// instead of UNIQUE (run_id, name) (#332). SQLite cannot drop a table
+// constraint, so the table is copied whole. A wait written before #332 has
+// no step identity: its paths stay NULL, which no new wait can collide
+// with, and it keeps its ID, name, due time, state, signal and timestamps.
+func migrateWaitIdentity(ctx context.Context, tx *sql.Tx) error {
+	current, err := hasColumn(ctx, tx, "journal_waits", "iteration_path")
+	if err != nil || current {
+		return err
+	}
+	const columns = `wait_id, run_id, name, due_at, state, signal_id, payload_json, created_at, updated_at`
+	for _, statement := range append([]string{
+		waitsTable("journal_waits_332"),
+		`INSERT INTO journal_waits_332 (` + columns + `) SELECT ` + columns + ` FROM journal_waits`,
+		`DROP TABLE journal_waits`,
+		`ALTER TABLE journal_waits_332 RENAME TO journal_waits`,
+	}, waitIndexes...) {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("migrate wait identity: %w", err)
+		}
+	}
+	return nil
 }
 
 func ensureColumn(ctx context.Context, tx *sql.Tx, table, column, declaration string) error {
@@ -341,19 +374,9 @@ var schemaStatements = []string{
 	)`,
 	`CREATE INDEX IF NOT EXISTS journal_operations_run ON journal_operations(run_id)`,
 	`CREATE INDEX IF NOT EXISTS journal_attempts_operation ON journal_attempts(operation_key, attempt_number)`,
-	`CREATE TABLE IF NOT EXISTS journal_waits (
-		wait_id TEXT PRIMARY KEY,
-		run_id TEXT NOT NULL,
-		name TEXT NOT NULL,
-		due_at INTEGER NOT NULL,
-		state TEXT NOT NULL,
-		signal_id TEXT NOT NULL DEFAULT '',
-		payload_json BLOB,
-		created_at INTEGER NOT NULL,
-		updated_at INTEGER NOT NULL,
-		FOREIGN KEY (run_id) REFERENCES journal_runs(run_id),
-		UNIQUE (run_id, name)
-	)`,
+	waitsTable("journal_waits"),
+	waitIndexes[0],
+	waitIndexes[1],
 	`CREATE TABLE IF NOT EXISTS journal_signals (
 		run_id TEXT NOT NULL,
 		signal_id TEXT NOT NULL,
@@ -364,7 +387,6 @@ var schemaStatements = []string{
 		created_at INTEGER NOT NULL,
 		PRIMARY KEY (run_id, signal_id)
 	)`,
-	`CREATE INDEX IF NOT EXISTS journal_waits_due ON journal_waits(state, due_at)`,
 	`CREATE TABLE IF NOT EXISTS journal_checkpoints (
 		run_id TEXT PRIMARY KEY,
 		artifact_digest TEXT NOT NULL,
@@ -434,6 +456,37 @@ var schemaStatements = []string{
 		completed_at INTEGER NOT NULL,
 		compacted_at INTEGER NOT NULL
 	)`,
+}
+
+// waitsTable is journal_waits since #332: a wait is identified by the step
+// that waits and its iteration, as an effect is (OperationIdentity), so one
+// run can wait on the same name in successive iterations or steps. Waits
+// written before #332 have NULL paths (see migrateWaitIdentity).
+func waitsTable(name string) string {
+	return `CREATE TABLE IF NOT EXISTS ` + name + ` (
+		wait_id TEXT PRIMARY KEY,
+		run_id TEXT NOT NULL,
+		name TEXT NOT NULL,
+		due_at INTEGER NOT NULL,
+		state TEXT NOT NULL,
+		signal_id TEXT NOT NULL DEFAULT '',
+		payload_json BLOB,
+		created_at INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL,
+		invocation_path TEXT,
+		iteration_path TEXT,
+		FOREIGN KEY (run_id) REFERENCES journal_runs(run_id),
+		UNIQUE (run_id, invocation_path, iteration_path),
+		CHECK ((invocation_path IS NULL) = (iteration_path IS NULL))
+	)`
+}
+
+// waitIndexes serve the timer claim (state, due_at) and signal routing to
+// a run's open wait of a name, which UNIQUE (run_id, name) served before
+// #332.
+var waitIndexes = []string{
+	`CREATE INDEX IF NOT EXISTS journal_waits_due ON journal_waits(state, due_at)`,
+	`CREATE INDEX IF NOT EXISTS journal_waits_signal ON journal_waits(run_id, name, state)`,
 }
 
 func reconciliationsTable(name string) string {
