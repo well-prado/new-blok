@@ -39,7 +39,11 @@ func TestRecoveryReusesCompletedNestedPathsAndRejectsChangedArtifact(t *testing.
 	if err := j.CompleteScope(context.Background(), run.RunID, "parallel/0/each/0", started.AttemptID, []byte(`{"value":1}`)); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.RecordChild(context.Background(), ChildRecord{RunID: run.RunID, Path: "child/0", ChildRunID: "child-run", State: childCompleted, Result: []byte(`{"ok":true}`)}); err != nil {
+	child, err := j.Admit(context.Background(), AdmissionRequest{RequestKey: "recovery-child", Workflow: "nested", ArtifactDigest: "sha256:artifact", Input: []byte(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := j.RecordChild(context.Background(), ChildRecord{RunID: run.RunID, Path: "child/0", ChildRunID: child.RunID, State: childCompleted, Result: []byte(`{"ok":true}`)}); err != nil {
 		t.Fatal(err)
 	}
 	if err := j.RecordJoin(context.Background(), JoinRecord{RunID: run.RunID, Path: "parallel/0", Expected: 2, Completed: 2, Results: []json.RawMessage{[]byte(`1`), []byte(`2`)}}); err != nil {
@@ -146,6 +150,142 @@ func recovered(t *testing.T, j *Journal, runID string) Recovery {
 		t.Fatal(err)
 	}
 	return recovery
+}
+
+// P2 (#334, D6): a completed join is final. Re-recording a completed 2-of-2
+// join as 1 of 3 used to store expected=2 completed=1 state=running.
+func TestCompletedJoinCannotRegress(t *testing.T) {
+	ctx := context.Background()
+	j, runID := fencingRun(t, "join-final")
+	done := JoinRecord{RunID: runID, Path: "parallel/0", Expected: 2, Completed: 2, Results: []json.RawMessage{[]byte(`1`), []byte(`2`)}}
+	if err := j.RecordJoin(ctx, done); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.RecordJoin(ctx, JoinRecord{RunID: runID, Path: "parallel/0", Expected: 3, Completed: 1, Results: []json.RawMessage{[]byte(`9`)}}); !errors.Is(err, ErrRecordFinal) {
+		t.Errorf("regressing a completed join: err=%v, want ErrRecordFinal", err)
+	}
+	unchanged := func(when string) {
+		t.Helper()
+		joins := recovered(t, j, runID).Joins
+		if len(joins) != 1 || joins[0].Expected != 2 || joins[0].Completed != 2 || joins[0].State != joinCompleted || len(joins[0].Results) != 2 || string(joins[0].Results[1]) != "2" {
+			t.Fatalf("completed join changed %s: %+v", when, joins)
+		}
+	}
+	unchanged("by the regressing write")
+	if err := j.RecordJoin(ctx, done); err != nil {
+		t.Fatalf("identical retry of the completing join: %v", err)
+	}
+	unchanged("by the identical retry")
+}
+
+// A running join only moves forward: expected is fixed at creation and
+// completed never decreases (#334, D6).
+func TestRunningJoinIsMonotonic(t *testing.T) {
+	ctx := context.Background()
+	j, runID := fencingRun(t, "join-monotonic")
+	// The state is derived from the counts: a caller calling 1 of 2 completed
+	// is refused and nothing is stored.
+	if err := j.RecordJoin(ctx, JoinRecord{RunID: runID, Path: "parallel/bad", Expected: 2, Completed: 1, State: joinCompleted}); err == nil {
+		t.Errorf("1 of 2 recorded as completed")
+	}
+	if joins := recovered(t, j, runID).Joins; len(joins) != 0 {
+		t.Errorf("inconsistent join stored: %+v", joins)
+	}
+	two := JoinRecord{RunID: runID, Path: "parallel/0", Expected: 3, Completed: 2, Results: []json.RawMessage{[]byte(`1`), []byte(`2`)}}
+	if err := j.RecordJoin(ctx, two); err != nil {
+		t.Fatal(err)
+	}
+	for name, stale := range map[string]JoinRecord{
+		"fewer completed":           {RunID: runID, Path: "parallel/0", Expected: 3, Completed: 1, Results: []json.RawMessage{[]byte(`1`)}},
+		"expected changed":          {RunID: runID, Path: "parallel/0", Expected: 4, Completed: 3, Results: []json.RawMessage{[]byte(`1`), []byte(`2`), []byte(`3`)}},
+		"same count, other results": {RunID: runID, Path: "parallel/0", Expected: 3, Completed: 2, Results: []json.RawMessage{[]byte(`7`), []byte(`8`)}},
+	} {
+		if err := j.RecordJoin(ctx, stale); !errors.Is(err, ErrRecordConflict) {
+			t.Errorf("%s: err=%v, want ErrRecordConflict", name, err)
+		}
+	}
+	joins := recovered(t, j, runID).Joins
+	if len(joins) != 1 || joins[0].Expected != 3 || joins[0].Completed != 2 || joins[0].State != joinRunning || string(joins[0].Results[0]) != "1" {
+		t.Fatalf("running join changed: %+v", joins)
+	}
+	if err := j.RecordJoin(ctx, two); err != nil {
+		t.Fatalf("identical retry: %v", err)
+	}
+	if err := j.RecordJoin(ctx, JoinRecord{RunID: runID, Path: "parallel/0", Expected: 3, Completed: 3, Results: []json.RawMessage{[]byte(`1`), []byte(`2`), []byte(`3`)}}); err != nil {
+		t.Fatalf("moving forward: %v", err)
+	}
+	if joins := recovered(t, j, runID).Joins; joins[0].Completed != 3 || joins[0].State != joinCompleted {
+		t.Fatalf("join did not complete: %+v", joins)
+	}
+	if err := j.RecordJoin(ctx, JoinRecord{RunID: "run:missing", Path: "parallel/0", Expected: 1}); !errors.Is(err, ErrNotFound) {
+		t.Errorf("join of an unknown run: err=%v, want ErrNotFound", err)
+	}
+}
+
+// P3 and P3b (#334, D6): a child record keeps the child run it was created
+// with, never leaves completed, and must name a run that exists.
+func TestChildRecordIsBoundToItsChildRun(t *testing.T) {
+	ctx := context.Background()
+	j, runID := fencingRun(t, "child-bound")
+	var children []string
+	for _, key := range []string{"child-a", "child-b"} {
+		child, err := j.Admit(ctx, AdmissionRequest{RequestKey: key, Workflow: "nested", ArtifactDigest: "sha256:admitted", Input: []byte(`{}`)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		children = append(children, child.RunID)
+	}
+	if err := j.RecordChild(ctx, ChildRecord{RunID: runID, Path: "child/missing", ChildRunID: "run:does-not-exist"}); !errors.Is(err, ErrChildRunNotFound) {
+		t.Errorf("child pointing at a missing run: err=%v, want ErrChildRunNotFound", err)
+	}
+	if got := recovered(t, j, runID).Children; len(got) != 0 {
+		t.Errorf("missing child was recorded: %+v", got)
+	}
+	if err := j.RecordChild(ctx, ChildRecord{RunID: runID, Path: "child/0", ChildRunID: children[1], State: childRunning}); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.RecordChild(ctx, ChildRecord{RunID: runID, Path: "child/0", ChildRunID: children[0], State: childRunning}); !errors.Is(err, ErrRecordConflict) {
+		t.Errorf("running child re-pointed: err=%v, want ErrRecordConflict", err)
+	}
+	// A running child written as running again with a result neither
+	// completes it nor changes it.
+	if err := j.RecordChild(ctx, ChildRecord{RunID: runID, Path: "child/0", ChildRunID: children[1], State: childRunning, Result: []byte(`{"early":true}`)}); !errors.Is(err, ErrRecordConflict) {
+		t.Errorf("running child given a result: err=%v, want ErrRecordConflict", err)
+	}
+	if got := recovered(t, j, runID).Children; len(got) != 1 || got[0].State != childRunning || len(got[0].Result) != 0 {
+		t.Errorf("running child changed: %+v", got)
+	}
+	done := ChildRecord{RunID: runID, Path: "child/0", ChildRunID: children[1], State: childCompleted, Result: []byte(`{"ok":true}`)}
+	if err := j.RecordChild(ctx, done); err != nil {
+		t.Fatal(err)
+	}
+	for name, stale := range map[string]struct {
+		record ChildRecord
+		want   error
+	}{
+		"other child":     {ChildRecord{RunID: runID, Path: "child/0", ChildRunID: children[0], State: childCompleted, Result: []byte(`{"ok":true}`)}, ErrRecordConflict},
+		"back to running": {ChildRecord{RunID: runID, Path: "child/0", ChildRunID: children[1], State: childRunning}, ErrRecordFinal},
+		"other result":    {ChildRecord{RunID: runID, Path: "child/0", ChildRunID: children[1], State: childCompleted, Result: []byte(`{"ok":false}`)}, ErrRecordFinal},
+	} {
+		if err := j.RecordChild(ctx, stale.record); !errors.Is(err, stale.want) {
+			t.Errorf("%s: err=%v, want %v", name, err, stale.want)
+		}
+	}
+	unchanged := func(when string) {
+		t.Helper()
+		got := recovered(t, j, runID).Children
+		if len(got) != 1 || got[0].Path != "child/0" || got[0].ChildRunID != children[1] || got[0].State != childCompleted || string(got[0].Result) != `{"ok":true}` {
+			t.Fatalf("completed child changed %s: %+v", when, got)
+		}
+	}
+	unchanged("by the refused writes")
+	if err := j.RecordChild(ctx, done); err != nil {
+		t.Fatalf("identical retry: %v", err)
+	}
+	unchanged("by the identical retry")
+	if err := j.RecordChild(ctx, ChildRecord{RunID: "run:missing", Path: "child/0", ChildRunID: children[0]}); !errors.Is(err, ErrNotFound) {
+		t.Errorf("child of an unknown parent: err=%v, want ErrNotFound", err)
+	}
 }
 
 // P4 (#334, D7): a checkpoint names the artifact its run was admitted

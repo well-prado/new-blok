@@ -23,16 +23,27 @@ const (
 var ErrArtifactMismatch = errors.New("journal: checkpoint artifact does not match")
 
 // Refusals of the recovery records (#334). A recovery record is a run's
-// receipt: once written it does not change, except to move forward to one
-// of its two terminal states (completed or canceled). Each refusal below
-// leaves the stored record exactly as it was.
+// receipt: once written it does not change, except to move forward to a
+// terminal state (a scope's completed or canceled, a join's or a child's
+// completed). Each refusal below leaves the stored record exactly as it
+// was.
 var (
 	// ErrRecordFinal: the record has reached a terminal state and the
 	// write would change it: a completed scope given another output or by
-	// another attempt, or a canceled scope started again. Repeating the
-	// write that completed a scope, byte for byte and from the attempt that
-	// completed it, succeeds instead.
+	// another attempt, a canceled scope started again, or a completed join
+	// or child written differently. Repeating the write that completed it,
+	// byte for byte (for a scope, from the attempt that completed it),
+	// succeeds instead.
 	ErrRecordFinal = errors.New("journal: recovery record is final")
+	// ErrRecordConflict: the write contradicts what the record fixed when it
+	// was created (a join's expected count, a child's run id) or does not
+	// move it forward (a join's completed count going down, or staying the
+	// same with other results; a running child written as running with
+	// another result).
+	ErrRecordConflict = errors.New("journal: recovery record conflicts with the recorded one")
+	// ErrChildRunNotFound: a new child record names a run the journal does
+	// not hold.
+	ErrChildRunNotFound = errors.New("journal: child run does not exist")
 )
 
 type Checkpoint struct {
@@ -262,6 +273,12 @@ func (j *Journal) CancelScope(ctx context.Context, runID, path, reason string) e
 	})
 }
 
+// RecordChild records the child run a parent step started, and later its
+// result. The child run id is fixed when the record is created and must name
+// a run the journal holds (ErrChildRunNotFound); another id is
+// ErrRecordConflict. A record moves from running to completed only: a
+// completed record is ErrRecordFinal unless the write repeats it byte for
+// byte. The parent run must exist (ErrNotFound).
 func (j *Journal) RecordChild(ctx context.Context, record ChildRecord) error {
 	if record.RunID == "" || record.Path == "" || record.ChildRunID == "" {
 		return errors.New("journal: child run, path and child identity are required")
@@ -269,12 +286,51 @@ func (j *Journal) RecordChild(ctx context.Context, record ChildRecord) error {
 	if record.State == "" {
 		record.State = childRunning
 	}
+	if record.State != childRunning && record.State != childCompleted {
+		return errors.New("journal: child state must be running or completed")
+	}
 	return j.withTx(ctx, "child", func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `INSERT INTO journal_children (run_id, path, child_run_id, state, result_json) VALUES (?, ?, ?, ?, ?) ON CONFLICT(run_id, path) DO UPDATE SET state = excluded.state, result_json = excluded.result_json`, record.RunID, record.Path, record.ChildRunID, record.State, []byte(record.Result))
-		return err
+		if _, _, err := runStateAndArtifact(ctx, tx, record.RunID); err != nil {
+			return err
+		}
+		var childRunID, state string
+		var result []byte
+		err := tx.QueryRowContext(ctx, `SELECT child_run_id, state, result_json FROM journal_children WHERE run_id = ? AND path = ?`, record.RunID, record.Path).Scan(&childRunID, &state, &result)
+		if errors.Is(err, sql.ErrNoRows) {
+			if _, _, err := runStateAndArtifact(ctx, tx, record.ChildRunID); errors.Is(err, ErrNotFound) {
+				return ErrChildRunNotFound
+			} else if err != nil {
+				return err
+			}
+			_, err = tx.ExecContext(ctx, `INSERT INTO journal_children (run_id, path, child_run_id, state, result_json) VALUES (?, ?, ?, ?, ?)`, record.RunID, record.Path, record.ChildRunID, record.State, []byte(record.Result))
+			return err
+		}
+		if err != nil {
+			return err
+		}
+		if childRunID != record.ChildRunID {
+			return ErrRecordConflict
+		}
+		if state == record.State && bytes.Equal(result, record.Result) {
+			return nil
+		}
+		if state == childCompleted {
+			return ErrRecordFinal
+		}
+		if record.State != childCompleted {
+			return ErrRecordConflict
+		}
+		updated, err := tx.ExecContext(ctx, `UPDATE journal_children SET state = ?, result_json = ? WHERE run_id = ? AND path = ? AND state = ? AND child_run_id = ?`, childCompleted, []byte(record.Result), record.RunID, record.Path, childRunning, record.ChildRunID)
+		return requireOneRow(updated, err)
 	})
 }
 
+// RecordJoin records how many of a join's branches have come back. It only
+// moves forward: Expected is fixed when the record is created, Completed
+// never decreases, and the same count with other results is
+// ErrRecordConflict. The join completes when Completed reaches Expected;
+// a completed join is ErrRecordFinal unless the write repeats it byte for
+// byte. State is derived from the counts. The run must exist (ErrNotFound).
 func (j *Journal) RecordJoin(ctx context.Context, record JoinRecord) error {
 	if record.RunID == "" || record.Path == "" || record.Expected < 1 || record.Completed < 0 || record.Completed > record.Expected {
 		return errors.New("journal: invalid join record")
@@ -283,16 +339,57 @@ func (j *Journal) RecordJoin(ctx context.Context, record JoinRecord) error {
 	if err != nil {
 		return err
 	}
-	if record.State == "" {
-		record.State = joinRunning
-	}
+	state := joinRunning
 	if record.Completed == record.Expected {
-		record.State = joinCompleted
+		state = joinCompleted
+	}
+	if record.State != "" && record.State != state {
+		return errors.New("journal: invalid join record")
 	}
 	return j.withTx(ctx, "join", func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `INSERT INTO journal_joins (run_id, path, expected, completed, results_json, state) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(run_id, path) DO UPDATE SET completed = excluded.completed, results_json = excluded.results_json, state = excluded.state`, record.RunID, record.Path, record.Expected, record.Completed, encoded, record.State)
-		return err
+		if _, _, err := runStateAndArtifact(ctx, tx, record.RunID); err != nil {
+			return err
+		}
+		var expected, completed int
+		var results []byte
+		var stored string
+		err := tx.QueryRowContext(ctx, `SELECT expected, completed, results_json, state FROM journal_joins WHERE run_id = ? AND path = ?`, record.RunID, record.Path).Scan(&expected, &completed, &results, &stored)
+		if errors.Is(err, sql.ErrNoRows) {
+			_, err = tx.ExecContext(ctx, `INSERT INTO journal_joins (run_id, path, expected, completed, results_json, state) VALUES (?, ?, ?, ?, ?, ?)`, record.RunID, record.Path, record.Expected, record.Completed, encoded, state)
+			return err
+		}
+		if err != nil {
+			return err
+		}
+		if expected == record.Expected && completed == record.Completed && bytes.Equal(results, encoded) {
+			return nil
+		}
+		if stored == joinCompleted {
+			return ErrRecordFinal
+		}
+		if expected != record.Expected || record.Completed <= completed {
+			return ErrRecordConflict
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE journal_joins SET completed = ?, results_json = ?, state = ? WHERE run_id = ? AND path = ? AND state = ? AND expected = ? AND completed < ?`, record.Completed, encoded, state, record.RunID, record.Path, joinRunning, record.Expected, record.Completed)
+		return requireOneRow(result, err)
 	})
+}
+
+// requireOneRow is a fenced UPDATE's outcome: it must have moved exactly
+// the one record its checks read in the same writer transaction, or the
+// write conflicts.
+func requireOneRow(result sql.Result, err error) error {
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return ErrRecordConflict
+	}
+	return nil
 }
 
 func (j *Journal) Recover(ctx context.Context, runID, artifactDigest, checkpointDigest string) (Recovery, error) {
