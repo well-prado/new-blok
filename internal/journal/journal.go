@@ -197,10 +197,10 @@ func New(ctx context.Context, database store.Database, config Config) (*Journal,
 // with digests and erased_at), 3 with #286's reconciliation tenant, 4 with
 // #332's wait identity (journal_waits keyed by step and iteration instead
 // of by name), 5 with #334's scope attempt (journal_scopes.attempt_id,
-// which fences scope completion). New refuses a journal stamped with a newer one. Raise it
-// with every change an older binary would misread, together with the
-// migration step that makes it. It is a variable only so tests can stand in for an older
-// binary.
+// which fences scope completion). New refuses a journal stamped with a
+// newer one. Raise it with every change an older binary would misread,
+// together with the migration step that makes it. It is a variable only so
+// tests can stand in for an older binary.
 var schemaVersion = 5
 
 // inferSchemaVersion classifies a journal written before the stamp existed

@@ -445,7 +445,9 @@ the fence nor the finality: the #334 review ran the aaf633c binary on one,
 and it restarted a fenced scope without touching `attempt_id` and
 overwrote a completed output this binary had refused. A rollback would
 silently void the guarantees above; with the raise, a version-4 or older
-binary refuses the database at open instead (`store.NewerSchemaError`).
+binary from #291 on refuses the database at open instead
+(`store.NewerSchemaError`; older binaries have no stamp check, see Limits
+under § Schema versions).
 The migration adds the column when the version found is older than 5; it
 uses `ensureColumn`, so a database a pre-release build of #334 already gave
 the column under an older stamp migrates too. Version 5 has no shape for
@@ -459,7 +461,7 @@ caller holds, so only a fresh `StartScope` can complete it.
 | `journal_scopes.attempt_id TEXT NOT NULL DEFAULT ''` (#334) | schema, additive | Added when the version found is older than 5; existing rows get `''`, which no attempt matches until the next `StartScope` |
 | `StartScope` returns `ScopeAttempt{AttemptID, AlreadyCompleted}` instead of a bool; `CompleteScope` takes the attempt id (#334) | breaking (internal API) | Callers keep the attempt id `StartScope` returned and pass it to `CompleteScope`. Outside `internal/journal` only `contract/audit`'s tests call them |
 | Completed and canceled scopes are final; scopes are fenced by attempt; checkpoints are bound to the admitted artifact and an accepted run; `StartScope` needs an accepted run; `Recover` checks the admitted artifact (#334) | behavioral (bug fix) | None for a caller that writes each record forward once. A write that used to overwrite, or a restart of a canceled scope, now returns one of the typed errors above. Nothing in the repository restarted a canceled scope |
-| Journal schema version 5 (#334) | behavioral (breaking for downgrades) | None for upgrades. A binary supporting journal 4 or older refuses a database this release opened, with `store.NewerSchemaError`; restore a backup taken before the upgrade, as for every raise above |
+| Journal schema version 5 (#334) | behavioral (breaking for downgrades) | None for upgrades. A binary supporting journal 4 or older refuses a database this release opened, with `store.NewerSchemaError` (from #291 on; see Limits under § Schema versions); restore a backup taken before the upgrade, as for every raise above |
 | `ErrRecordFinal`, `ScopeAttempt` (#334) | additive | None |
 
 ## Alternatives considered

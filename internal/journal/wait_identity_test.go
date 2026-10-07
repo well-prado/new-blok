@@ -200,6 +200,19 @@ func TestOriginMainWaitsMigrateToStepIdentity(t *testing.T) {
 	if got := waitRows(t, database, legacySignalsQuery); !reflect.DeepEqual(got, legacy.signals) {
 		t.Fatalf("migrated signals:\n got %q\nwant %q", got, legacy.signals)
 	}
+	// The same open also brings the journal to version 5 (#334): a scope on
+	// the migrated database starts and completes with its attempt.
+	scopeRun, err := j.Admit(ctx, AdmissionRequest{RequestKey: "scope-after-migration", Workflow: "orders", ArtifactDigest: "sha256:artifact", Input: []byte(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := j.StartScope(ctx, ScopeRecord{RunID: scopeRun.RunID, Path: "each/0", Kind: "each"})
+	if err != nil || started.AttemptID == "" {
+		t.Fatalf("scope on the migrated journal: start=%+v err=%v", started, err)
+	}
+	if err := j.CompleteScope(ctx, scopeRun.RunID, "each/0", started.AttemptID, []byte(`{"v":1}`)); err != nil {
+		t.Fatalf("scope on the migrated journal: complete: %v", err)
+	}
 
 	runs := map[string]string{}
 	for _, key := range []string{"open", "signaled", "early", "canceled", "due", "claimed"} {
@@ -307,13 +320,13 @@ func TestWaitIdentityMigrationSurvivesAKill(t *testing.T) {
 			if phase == "before" && !reflect.DeepEqual(killed, legacy) {
 				t.Fatalf("a migration killed before commit changed the database:\n got %+v\nwant %+v", killed, legacy)
 			}
-			if phase == "after" && (killed.stamp != "5|3" || strings.Contains(killed.schema, "UNIQUE (run_id, name)") || !reflect.DeepEqual(killed.waits, legacy.waits) || !reflect.DeepEqual(killed.signals, legacy.signals)) {
+			if phase == "after" && (killed.stamp != "5|3" || !strings.Contains(killed.scopes, "attempt_id") || strings.Contains(killed.schema, "UNIQUE (run_id, name)") || !reflect.DeepEqual(killed.waits, legacy.waits) || !reflect.DeepEqual(killed.signals, legacy.signals)) {
 				t.Fatalf("a migration killed after commit:\n got %+v\nwant migrated with %+v", killed, legacy)
 			}
 			database, _ := newJournalAtPath(t, path, Config{})
 			database.Close()
 			reopened := legacyWaitDump(t, path)
-			if reopened.stamp != "5|3" || !strings.Contains(reopened.schema, "iteration_path") || !reflect.DeepEqual(reopened.waits, legacy.waits) || !reflect.DeepEqual(reopened.signals, legacy.signals) {
+			if reopened.stamp != "5|3" || !strings.Contains(reopened.scopes, "attempt_id") || !strings.Contains(reopened.schema, "iteration_path") || !reflect.DeepEqual(reopened.waits, legacy.waits) || !reflect.DeepEqual(reopened.signals, legacy.signals) {
 				t.Fatalf("reopened after the kill:\n got %+v\nwant migrated with %+v", reopened, legacy)
 			}
 		})
@@ -343,8 +356,8 @@ const (
 )
 
 type waitDump struct {
-	stamp, schema  string
-	waits, signals []string
+	stamp, schema, scopes string
+	waits, signals        []string
 }
 
 // legacyWaitDump reads a database file without opening a journal on it.
@@ -358,6 +371,7 @@ func legacyWaitDump(t *testing.T, path string) waitDump {
 	return waitDump{
 		stamp:   oneRow(t, database, `SELECT version || '|' || upgraded_from FROM blok_schema_versions WHERE component = 'journal'`),
 		schema:  oneRow(t, database, `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'journal_waits'`),
+		scopes:  oneRow(t, database, `SELECT group_concat(name, ',') FROM pragma_table_info('journal_scopes')`),
 		waits:   waitRows(t, database, legacyWaitsQuery+` ORDER BY wait_id`),
 		signals: waitRows(t, database, legacySignalsQuery),
 	}
