@@ -167,7 +167,13 @@ write goes to the arm's frame only, so arm results never reach
   `node.Any.ConvertInput` just before the node is invoked, and only to a
   value the source exactly holds: a value of the type as is, a non-nil
   `*T` dereferenced, null only into a type that can be nil, a JSON value
-  decoded with unknown fields refused, a slice element by element. Anything
+  decoded with unknown fields refused, a slice element by element. That
+  decode is standard `encoding/json`: it matches field names
+  case-insensitively and decodes a base64 string into a `[]byte`, and it
+  leaves a field the value lacks at its zero value; the input schema is
+  checked first, on the value as resolved rather than the converted one,
+  so a required field the value lacks is refused before any decode
+  (Review R round 3). Anything
   else is passed unchanged, so the node refuses it with its own
   `input_type_mismatch: expected <type>, got <type>`, as outside control
   flow. Values are never re-encoded through their own `MarshalJSON`. The
