@@ -338,7 +338,11 @@ func (c *connection) queueWriter(ctx context.Context) (func(), error) {
 }
 
 // Backup writes a transaction-consistent copy of the database to
-// destination, which must not exist. VACUUM INTO writes the copy to a
+// destination, which must not exist nor have a -wal, -shm or -journal file
+// beside it: SQLite would read a leftover one into the backup when it is
+// opened, so it is refused, not removed (#343). The check is repeated just
+// before the rename, which replaces a file another process creates there in
+// that moment (see install). VACUUM INTO writes the copy to a
 // temporary file beside destination; the file is synced, renamed into place
 // and its directory synced, so destination never names a partial copy: a
 // crash or a failure (a full disk, a canceled ctx) leaves destination absent
@@ -349,7 +353,7 @@ func (c *connection) Backup(ctx context.Context, destination string) error {
 		return errors.New("sqlite: backup destination is required")
 	}
 	directory := filepath.Dir(destination)
-	if err := os.MkdirAll(directory, 0o755); err != nil {
+	if err := createDirectory(directory); err != nil {
 		return fmt.Errorf("sqlite: create backup parent: %w", err)
 	}
 	if err := requireAbsent(destination, "backup destination"); err != nil {

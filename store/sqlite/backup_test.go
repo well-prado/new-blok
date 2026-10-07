@@ -485,6 +485,53 @@ func TestProcessKillDuringRestore(t *testing.T) {
 	}
 }
 
+// TestBackupRefusesALeftoverBesideTheDestination (#343, Review R): a -wal,
+// -shm or -journal file left beside the backup destination would be read
+// into the backup whenever it is opened, so the backup is refused, and the
+// leftover left for the operator, rather than written beside it. Before,
+// with a stale 7-row log beside it, Backup returned nil and the backup then
+// opened holding the stale log's rows instead of the database's.
+func TestBackupRefusesALeftoverBesideTheDestination(t *testing.T) {
+	ctx := context.Background()
+	const rows, pad = 400, 200
+	database := seedDatabase(t, filepath.Join(t.TempDir(), "journal.db"), rows, pad)
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
+		t.Run(suffix, func(t *testing.T) {
+			parent := t.TempDir()
+			destination := filepath.Join(parent, "backup.db")
+			var leftover []byte
+			if suffix == "-wal" {
+				leftover = staleLog(t, destination, 7)
+			} else {
+				leftover = bytes.Repeat([]byte{0x5A}, 4096)
+				if err := os.WriteFile(destination+suffix, leftover, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err := database.Backup(ctx, destination)
+			if err == nil {
+				backedUp := -1
+				if db, openErr := (Backend{}).Open(ctx, destination); openErr == nil {
+					_ = db.WithTx(ctx, func(tx *sql.Tx) error {
+						return tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM entries`).Scan(&backedUp)
+					})
+					_ = db.Close()
+				}
+				t.Fatalf("Backup beside a leftover %s returned nil; the backup opens holding %d rows of the database's %d", suffix, backedUp, rows)
+			}
+			if !strings.Contains(err.Error(), suffix) {
+				t.Fatalf("Backup beside a leftover %s: err=%v; want it to name the leftover", suffix, err)
+			}
+			if left := entries(t, parent); !slices.Equal(left, []string{"backup.db" + suffix}) {
+				t.Fatalf("the refused Backup left %v; want only the leftover", left)
+			}
+			if got, err := os.ReadFile(destination + suffix); err != nil || !bytes.Equal(got, leftover) {
+				t.Fatalf("Backup changed the leftover %s (err=%v)", suffix, err)
+			}
+		})
+	}
+}
+
 // TestProcessKillDuringBackup (#343, D9d) kills a real child process with
 // SIGKILL while VACUUM INTO is part way through writing the backup, and
 // once it has written and synced it but not renamed it. Either way nothing
@@ -513,6 +560,9 @@ func TestProcessKillDuringBackup(t *testing.T) {
 			killErr := command.Process.Kill()
 			_ = command.Wait()
 			if command.ProcessState != nil && command.ProcessState.Exited() {
+				if _, err := os.Stat(marker + crashDoneSuffix); err != nil {
+					t.Fatalf("the child failed before the kill (%v):\n%s%s", command.ProcessState, command.Stdout, command.Stderr)
+				}
 				// The child ran Backup to the end before the kill.
 				if attempt == attempts {
 					t.Fatalf("Backup finished before the kill in %d attempts", attempt)

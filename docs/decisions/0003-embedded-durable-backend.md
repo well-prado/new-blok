@@ -413,7 +413,13 @@ way; and nothing synced a directory after a rename.
 `Backup` now runs `VACUUM INTO` to a temporary file (`.backup-<random>`)
 beside the destination, syncs it, renames it to the destination and syncs
 the directory. On failure it removes the temporary file; a crash can leave
-it (and its `-journal`) behind, but never at the destination.
+it (and its `-journal`) behind, but never at the destination. Like
+`Restore`, it refuses a destination that exists or has a `-wal`, `-shm` or
+`-journal` file beside it, at the start and just before the rename: SQLite
+would read a leftover one into the backup whenever it is opened. Refusing
+was chosen over removing it, since the leftover may belong to a database
+still in use; the operator removes it. A destination directory `Backup`
+creates has its parent synced.
 
 `Restore` checks the backup through a connection opened `mode=ro&immutable=1`,
 not through `Open`. Immutable means SQLite takes no lock and creates no
@@ -451,7 +457,7 @@ a crash after it leaves the whole, synced copy of the checked backup.
 | `Restore` removes the destination when the restored check fails (#343) | behavioral (bug fix) | None. A retry is no longer refused with `already exists` |
 | `Restore` refuses a destination with a `-wal`, `-shm` or `-journal` file beside it (#343) | behavioral (bug fix) | Remove the leftover if no database uses it. Before, a leftover log was replayed into the restored database |
 | `Restore` syncs the directory after the rename, and the parent of a directory it creates (#343) | durability (bug fix) | None. Not done on Windows (unsupported, #297). A crash can leave `.restore-*` files beside the destination; they never block a retry and may be deleted |
-| `Backup` writes to a temporary file, syncs it, renames it and syncs the directory; a failed or interrupted backup leaves nothing at the destination (#343) | behavioral (bug fix) | None. A crash can leave `.backup-*` files (and their `-journal`) beside the destination; they never block a retry and may be deleted. The rename replaces a file another process creates at the destination between `Backup`'s check and the rename; `VACUUM INTO` alone refused one |
+| `Backup` writes to a temporary file, syncs it, renames it and syncs the directory; a failed or interrupted backup leaves nothing at the destination; it refuses a destination with a `-wal`, `-shm` or `-journal` beside it (#343) | behavioral (bug fix) | None. A crash can leave `.backup-*` files (and their `-journal`) beside the destination; they never block a retry and may be deleted. The rename replaces a file another process creates at the destination between `Backup`'s check and the rename; `VACUUM INTO` alone refused one |
 
 ## Recovery records are write-once (#334)
 
