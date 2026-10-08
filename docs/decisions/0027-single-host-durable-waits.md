@@ -319,6 +319,16 @@ iteration is part of it, and nothing but the identity's values moves it.
   root spelled empty (`StepIdentity.Canonical`, `SameExecution`), so a
   record written before #382 is the same execution as the engine's root
   step.
+- **Grammar.** Both encodings are unique only over ids that follow the
+  grammar (`contract.IDPattern`, `^[a-z][a-z0-9_-]{0,63}$`): the cluster
+  wait ID joins with NUL bytes (step `b\x00a[1]` at the root would share
+  an ID with step `b` in iteration `a[1]`), and `json.Marshal` maps
+  invalid UTF-8 to U+FFFD (`x\xfe` and `x\xff` would share an operation
+  key). Lowering enforces the grammar, and the engine's program check now
+  refuses any other step id (`invalid_step_id`), at the top level or in an
+  arm, before running anything, whoever built the program (#382 Review R
+  round 1). Iteration paths are built by the engine from those ids
+  (ADR 0028).
 
 Pinned by `TestStepIdentityEncodingIsPinned` (`internal/engine`),
 `TestOperationKeyFormatIsPinned` and the existing `TestWaitIDFormatIsPinned`
@@ -349,6 +359,7 @@ ADR 0028 has a durable runner refuse control flow until then.
 | `engine.StepIdentity.IterationPath`, `RootIteration`, `NewStepIdentity`, `OperationKey`, `Iteration`, `Canonical`, `SameExecution`; JSON tags on `StepIdentity` and `journal.OperationIdentity` with the names already used (#382) | API, additive; stored bytes unchanged | None |
 | `cluster.WaitIDFor` takes the iteration path; root-iteration IDs unchanged (#382) | API, breaking for its callers (tests only) | Pass `""` (or `engine.RootIteration`) for a step outside every loop |
 | `RunJournal` keys steps and waits by the identity's iteration path; the cluster step journal refuses an identity whose operation key its fields do not derive (#382) | behavioral; the engine passes the root iteration until #333 | None |
+| The engine refuses a program whose step id does not match `contract.IDPattern` (`invalid_step_id`, class `configuration`) (#382) | behavioral, fail closed; every lowered program already matches it | Rename the step to an id of the grammar |
 
 ## Evidence
 
@@ -403,7 +414,10 @@ round 3, `TestEngineInputFixedAtAdmissionRuns`,
 `TestOperationKeyFormatIsPinned`, `TestLoopIterationsWaitIndependently`
 (`internal/journal`), `TestWaitIDFormatIsPinned`,
 `TestLoopIterationsWaitIndependently` (against a real three-voter etcd
-cluster), `TestStepKeyMustMatchItsIteration` (`internal/cluster`).
+cluster), `TestStepKeyMustMatchItsIteration` (`internal/cluster`); after
+Review R round 1, `TestStepIDsMustFollowTheGrammar` (`internal/engine`),
+and `TestEngineSuspendsAndResumesThroughTheJournal` with its siblings now
+pin the root iteration of the engine's waits and steps in the journal.
 
 ## Limits
 

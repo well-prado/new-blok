@@ -115,6 +115,13 @@ func checkProgram(program contract.InternalProgram, maxSteps int) error {
 			if count > maxSteps {
 				return &Error{Code: "step_budget_exceeded", Class: "admission"}
 			}
+			// Step ids are hashed into operation keys and wait ids, whose
+			// encodings are unique only over ids of the grammar (ADR 0027,
+			// "Identity encoding"): lowering enforces it, and so does the
+			// engine, whoever built the program.
+			if !contract.ValidID(instruction.ID) {
+				return &Error{Code: "invalid_step_id", Class: "configuration", Step: instruction.ID, Err: fmt.Errorf("step id %q does not match the id grammar %s", instruction.ID, contract.IDPattern)}
+			}
 			wanted, control := controlShapes[instruction.Kind]
 			if depth > 0 && (instruction.Kind == "output" || instruction.Kind == "wait") {
 				return invalidControl(instruction.ID, fmt.Errorf("an arm cannot hold a %s instruction", instruction.Kind))
