@@ -45,11 +45,37 @@ type renewalFaultClient struct {
 	slowestRenewal atomic.Int64
 	acquisitions   atomic.Int64
 	releaseBlocked atomic.Pointer[time.Time]
+
+	// events records every lease call and every failed transaction, so a
+	// failing run says why the worker gave its partition up.
+	eventsMu sync.Mutex
+	created  time.Time
+	events   []string
+}
+
+func (c *renewalFaultClient) record(format string, args ...any) {
+	c.eventsMu.Lock()
+	defer c.eventsMu.Unlock()
+	if c.created.IsZero() {
+		c.created = time.Now()
+	}
+	c.events = append(c.events, fmt.Sprintf("+%s ", time.Since(c.created).Round(time.Millisecond))+fmt.Sprintf(format, args...))
+}
+
+func (c *renewalFaultClient) timeline() string {
+	c.eventsMu.Lock()
+	defer c.eventsMu.Unlock()
+	return strings.Join(c.events, "\n")
 }
 
 func (c *renewalFaultClient) Grant(ctx context.Context, ttl int64) (*clientv3.LeaseGrantResponse, error) {
 	n := c.grants.Add(1)
 	response, err := c.Client.Grant(ctx, ttl)
+	if err == nil {
+		c.record("grant #%d lease=%x ttl=%ds", n, int64(response.ID), response.TTL)
+	} else {
+		c.record("grant #%d error: %v", n, err)
+	}
 	if err == nil && c.failFirstLease && n == 1 {
 		c.failedLease.Store(int64(response.ID))
 	}
@@ -59,10 +85,13 @@ func (c *renewalFaultClient) Grant(ctx context.Context, ttl int64) (*clientv3.Le
 func (c *renewalFaultClient) KeepAliveOnce(ctx context.Context, id clientv3.LeaseID) (*clientv3.LeaseKeepAliveResponse, error) {
 	c.keepAlives.Add(1)
 	if c.failFirstLease && int64(id) == c.failedLease.Load() {
+		c.record("keepalive lease=%x refused (injected)", int64(id))
 		return nil, errInjectedKeepAlive
 	}
 	started := time.Now()
+	var keepAliveErr error
 	defer func() {
+		c.record("keepalive lease=%x took %s err=%v", int64(id), time.Since(started).Round(time.Millisecond), keepAliveErr)
 		elapsed := int64(time.Since(started))
 		for {
 			current := c.slowestRenewal.Load()
@@ -76,11 +105,14 @@ func (c *renewalFaultClient) KeepAliveOnce(ctx context.Context, id clientv3.Leas
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return nil, ctx.Err()
+			keepAliveErr = ctx.Err()
+			return nil, keepAliveErr
 		case <-timer.C:
 		}
 	}
-	return c.Client.KeepAliveOnce(ctx, id)
+	response, err := c.Client.KeepAliveOnce(ctx, id)
+	keepAliveErr = err
+	return response, err
 }
 
 func (c *renewalFaultClient) Txn(ctx context.Context) clientv3.Txn {
@@ -122,10 +154,21 @@ func (t *renewalFaultTxn) Commit() (*clientv3.TxnResponse, error) {
 	if t.deletesOwners && t.client.failFirstLease {
 		now := time.Now()
 		if t.client.releaseBlocked.CompareAndSwap(nil, &now) {
+			t.client.record("release refused (injected)")
 			return nil, errInjectedRelease
 		}
 	}
 	response, err := t.Txn.Commit()
+	switch {
+	case err != nil:
+		t.client.record("txn error (owner put=%v delete=%v): %v", t.putsOwner, t.deletesOwners, err)
+	case t.deletesOwners:
+		t.client.record("release committed=%v", response.Succeeded)
+	case t.putsOwner:
+		t.client.record("acquire committed=%v", response.Succeeded)
+	case !response.Succeeded:
+		t.client.record("txn compare failed")
+	}
 	if err == nil && response.Succeeded && t.putsOwner {
 		t.client.acquisitions.Add(1)
 	}
@@ -255,16 +298,18 @@ func (h *renewalHarness) awaitTerminal(within time.Duration) map[string]RunRecor
 // well inside the lease must not make the worker give up its partition, and
 // the run in flight must complete with exactly one effect (#405 (a), (c)).
 func TestSlowLeaseRenewalKeepsPartition(t *testing.T) {
-	const ownerTTL = 4 * time.Second
-	// Above the old per-renewal timeout (OwnerTTL/4 = 1s), below the window a
-	// renewal has inside the proven lease (about 5/12 of OwnerTTL = 1.67s).
-	const delay = 1200 * time.Millisecond
+	const ownerTTL = 8 * time.Second
+	// Above the old per-renewal timeout (OwnerTTL/4 = 2s), and leaving more
+	// than a second of the window a renewal has inside the proven lease
+	// (about 5/12 of OwnerTTL = 3.33s) for the real keepalive and the
+	// ownership check under load.
+	const delay = 2200 * time.Millisecond
 	client := &renewalFaultClient{Client: integrationClient(t), keepAliveDelay: delay}
 	var invocations renewalInvocations
 	effect := node.MustDefine("fixture/renewal-effect", "1.0.0", func(ctx context.Context, input renewalInput) (renewalOutput, error) {
 		invocations.add(input.Key)
-		// The effect spans several renewals: OwnerTTL/3 = 1.33s each.
-		timer := time.NewTimer(5 * time.Second)
+		// The effect spans two renewals, due OwnerTTL/3 = 2.67s apart.
+		timer := time.NewTimer(7 * time.Second)
 		defer timer.Stop()
 		select {
 		case <-ctx.Done():
@@ -281,7 +326,7 @@ func TestSlowLeaseRenewalKeepsPartition(t *testing.T) {
 	run := records["slow-renewal-run"]
 	t.Logf("slow renewals: keepalives=%d slowest=%s acquisitions=%d run=%s errorCode=%q effects=%d", client.keepAlives.Load(), time.Duration(client.slowestRenewal.Load()).Round(time.Millisecond), client.acquisitions.Load(), run.State, run.ErrorCode, invocations.get("slow-renewal-run"))
 	if acquisitions := client.acquisitions.Load(); acquisitions != 1 {
-		t.Fatalf("worker acquired the partition %d times, want 1: a slow renewal dropped it", acquisitions)
+		t.Fatalf("worker acquired the partition %d times, want 1: a slow renewal dropped it; lease timeline:\n%s", acquisitions, client.timeline())
 	}
 	if run.State != "completed" || string(run.Output) != `{"key":"slow-renewal-run"}` {
 		t.Fatalf("run=%+v, want completed with its output", run)
