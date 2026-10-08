@@ -313,6 +313,8 @@ func verifyStarts(ctx context.Context, tx *sql.Tx) (map[Kind]Marker, map[Kind]ma
 		if err != nil {
 			return nil, nil, err
 		}
+		// The digest covers the list, not the count stored beside it, so
+		// the count is compared on its own.
 		if count != r.marker.Legacy || digest != r.marker.Digest {
 			return nil, nil, ErrCorrupt
 		}

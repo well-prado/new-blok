@@ -2,6 +2,8 @@ package audit_test
 
 import (
 	"compress/gzip"
+	"context"
+	"database/sql"
 	"errors"
 	"io"
 	"os"
@@ -10,6 +12,7 @@ import (
 	"time"
 
 	"github.com/well-prado/new-blok/contract/audit"
+	"github.com/well-prado/new-blok/store/sqlite"
 )
 
 // The audit start marker (#284) against databases the released code paths
@@ -117,6 +120,54 @@ func TestUpgradedPreAuditDatabaseReportsLegacyDecisions(t *testing.T) {
 	}
 }
 
+// TestRecordPrunedBeforeTheUpgradeIsNotLegacy: a decision whose record
+// v0.1.0-alpha pruned before this release first opened the database has a
+// prune tombstone, not a missing record: it had its record, so the marker
+// does not list it as legacy, and Verify matches it by the tombstone.
+func TestRecordPrunedBeforeTheUpgradeIsNotLegacy(t *testing.T) {
+	ctx := context.Background()
+	path := fixtureDatabase(t, alphaFixture)
+	// What alpha's Prune leaves (ADR 0021 §4): the record deleted, its id
+	// digest and kind as a tombstone, and the record count lowered, in one
+	// transaction, before any binary from #284 opens the database.
+	db, err := (sqlite.Backend{}).Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WithTx(ctx, func(tx *sql.Tx) error {
+		for _, statement := range []struct {
+			query string
+			args  []any
+		}{
+			{`DELETE FROM audit_records_v1 WHERE id = ?`, []any{"approval:alpha-approval-1"}},
+			{`INSERT INTO audit_pruned_v1 (id_digest, kind, pruned_at) VALUES (?, ?, ?)`, []any{audit.Digest([]byte("approval:alpha-approval-1")), string(audit.KindApproval), time.Date(2026, 10, 7, 0, 0, 0, 0, time.UTC).UnixNano()}},
+			{`UPDATE audit_meta_v1 SET value = value - 1 WHERE name = 'records'`, nil},
+		} {
+			result, err := tx.ExecContext(ctx, statement.query, statement.args...)
+			if err != nil {
+				return err
+			}
+			if n, err := result.RowsAffected(); err != nil || n != 1 {
+				return errors.New("fixture: expected one row changed by " + statement.query)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	r := openRig(t, path, rigOptions{})
+	report, err := verifyReport(r)
+	if err != nil {
+		t.Fatalf("verify after a pre-upgrade prune: %v", err)
+	}
+	if report.Records != 1 || report.Legacy[audit.KindApproval] != 3 || report.Markers[audit.KindApproval].Legacy != 3 || report.Legacy[audit.KindReconciliation] != 2 || report.Markers[audit.KindReconciliation].Legacy != 2 {
+		t.Fatalf("report=%+v, want 1 record and the pruned approval matched by its tombstone, not listed: 3 legacy approvals, 2 legacy reconciliations", report)
+	}
+}
+
 // TestPostMarkerDecisionWithoutRecordStillMismatches: the marker exempts
 // only the decisions it listed. A decision recorded after it, whose record
 // is then removed, is ErrMismatch, beside the legacy ones.
@@ -148,9 +199,12 @@ func TestPostMarkerDecisionWithoutRecordStillMismatches(t *testing.T) {
 // TestMovingTheStartMarkerForwardIsDetected: hiding a post-marker decision
 // whose record was removed by listing it as legacy, by rewriting the
 // marker, or by removing the marker so that a later open writes a new one
-// is refused. Rewriting the marker AND its digest consistently is not
-// detectable inside the database; the marker digests in the report are
-// what an operator keeps outside it to catch that (pinned last).
+// is refused. With write access and knowledge of the scheme it is not
+// detectable inside the database: reopening a marker by hand, or deleting
+// the markers and setting the audit stamp back to 1, needs no hashing, and
+// a consistent rewrite needs one sha256. The marker digests in the report
+// are what an operator keeps outside it to catch that (the last two
+// subtests pin it).
 func TestMovingTheStartMarkerForwardIsDetected(t *testing.T) {
 	hidden := audit.Digest([]byte("approval:post-marker"))
 	setup := func(t *testing.T) (*rig, audit.Report) {
@@ -178,6 +232,15 @@ func TestMovingTheStartMarkerForwardIsDetected(t *testing.T) {
 			`UPDATE audit_start_v1 SET legacy = legacy + 1 WHERE kind = 'approval.decision'`)
 		if _, err := verifyReport(r); !errors.Is(err, audit.ErrCorrupt) {
 			t.Fatalf("legacy list and count rewritten: %v, want ErrCorrupt", err)
+		}
+	})
+	// The count is not part of the list digest, so it is compared on its
+	// own: a marker whose count alone was edited is ErrCorrupt too.
+	t.Run("count edited alone", func(t *testing.T) {
+		r, _ := setup(t)
+		r.exec(`UPDATE audit_start_v1 SET legacy = legacy + 1 WHERE kind = 'approval.decision'`)
+		if _, err := verifyReport(r); !errors.Is(err, audit.ErrCorrupt) {
+			t.Fatalf("marker count edited alone: %v, want ErrCorrupt", err)
 		}
 	})
 	t.Run("marker row removed", func(t *testing.T) {
@@ -211,6 +274,17 @@ func TestMovingTheStartMarkerForwardIsDetected(t *testing.T) {
 		report, err := verifyReport(r.reopen())
 		if err != nil || report.Legacy[audit.KindApproval] != 4 {
 			t.Fatalf("hand-reopened marker report=%+v err=%v, want it recaptured with 4 legacy approvals", report, err)
+		}
+		if report.Markers[audit.KindApproval] == anchor.Markers[audit.KindApproval] {
+			t.Fatal("a recaptured marker must differ from the anchored one")
+		}
+	})
+	t.Run("limit: markers deleted and audit stamp set back to 1 is caught only by an outside anchor", func(t *testing.T) {
+		r, anchor := setup(t)
+		r.exec(`DELETE FROM audit_start_v1`, `DELETE FROM audit_legacy_v1`, `UPDATE blok_schema_versions SET version = 1 WHERE component = 'audit'`)
+		report, err := verifyReport(r.reopen())
+		if err != nil || report.Legacy[audit.KindApproval] != 4 {
+			t.Fatalf("stamp reset report=%+v err=%v, want the version-2 migration rerun and 4 legacy approvals", report, err)
 		}
 		if report.Markers[audit.KindApproval] == anchor.Markers[audit.KindApproval] {
 			t.Fatal("a recaptured marker must differ from the anchored one")

@@ -602,23 +602,35 @@ whatever decisions lack records by then: that kind has no marker, nothing
 is legacy, and every unrecorded decision is `ErrMismatch`.
 
 **Tamper evidence, and its limits.** `Verify` recomputes each closed
-marker's list size and digest: a decision added to the list (moving the
-line forward to hide a decision whose record was removed), a list or count
-edited on its own, or a list left behind without its marker is
-`ErrCorrupt`; removing a marker and its list turns its legacy decisions
-into `ErrMismatch`. This is the same evidence as the record digests (§6):
-it detects partial restores, accidental damage and a rewrite that does not
-know the scheme. Someone who can write the database and recompute a
-sha256 can rewrite a marker and its list consistently, or reopen a marker
-by hand (`started = 0`) so that the next open lists again; inside the
-database neither is detectable. The closed markers in the report never
-change once written, so an operator who keeps them outside the database
-detects both (`TestMovingTheStartMarkerForwardIsDetected` pins the hand-
-reopened marker: it verifies, with one more legacy decision and a
-different digest). A legacy decision is accepted on the strength of the
-marker alone: on a database that ran `v0.1.0-alpha`, a decision whose
-record was removed before this release first opened it is indistinguishable
-from a pre-audit decision and is listed as legacy.
+marker's list size and digest, and compares the stored count on its own
+(the digest covers the list, not the count): a decision added to the list
+(moving the line forward to hide a decision whose record was removed), a
+list or count edited on its own, or a list left behind without its marker
+is `ErrCorrupt`; removing a marker and its list turns its legacy decisions
+into `ErrMismatch`. A decision whose record was pruned before the upgrade
+has its tombstone, so it is matched by it and never listed. This is the
+same evidence as the record digests (§6): it detects partial restores,
+accidental damage and a rewrite that does not know the scheme. It does
+not hold against anyone who can write the database and knows the scheme,
+and most of the ways around it need no hashing at all:
+
+- reopening a marker by hand (`UPDATE audit_start_v1 SET started = 0`,
+  emptying its list) makes the owner's next open list again whatever
+  decisions lack a record by then;
+- deleting the markers and setting audit's row in `blok_schema_versions`
+  back to 1 makes the next open run the version-2 migration again, which
+  opens new markers that the owners then fill;
+- rewriting a marker and its list consistently needs one sha256 as well.
+
+Inside the database none of these is detectable. The only defence is to
+keep `Report.Markers` outside the database: a closed marker never changes
+once written, so any of them shows up as a changed count or digest
+(`TestMovingTheStartMarkerForwardIsDetected` pins the hand-reopened
+marker and the stamp set back to 1: each verifies, with one more legacy
+decision and a different digest). A legacy decision is accepted on the strength of the marker
+alone: on a database that ran `v0.1.0-alpha`, a decision whose record was
+removed (not pruned) before this release first opened it is
+indistinguishable from a pre-audit decision and is listed as legacy.
 
 ## Compatibility
 
@@ -861,9 +873,10 @@ The audit start marker (#284), classified separately:
   with three legacy approvals and two legacy reconciliations, reopen
   unchanged, and match a legacy reconciliation once compaction backfills
   its record; a decision recorded after the marker whose record is removed
-  is `ErrMismatch`, for both kinds; a decision added to the legacy list,
-  with or without the count raised, and a list without its marker are
-  `ErrCorrupt`; a marker removed with its list, or its tables dropped, is
+  is `ErrMismatch`, for both kinds; a decision whose record alpha pruned
+  before the upgrade is matched by its tombstone and not listed; a
+  decision added to the legacy list, with or without the count raised, a
+  count edited alone, and a list without its marker are `ErrCorrupt`; a marker removed with its list, or its tables dropped, is
   not written again on reopen and the legacy decisions mismatch; a fresh
   database closes both markers with nothing listed. Red on origin/main;
   mutations are in the PR.
@@ -876,9 +889,11 @@ The audit start marker (#284), classified separately:
   active, so such a record is kept until the application composes an
   activity port that can prove the run ended.
 - The audit start marker (§10) is evidence against a rewrite that does not
-  know the scheme, not against someone who can write the database and
-  recompute a sha256; keep the reported markers outside the database to
-  detect that. On a database that ran `v0.1.0-alpha`, a record removed
+  know the scheme only. With write access and knowledge of the scheme,
+  reopening a marker (`started = 0`) or deleting the markers and setting
+  the audit stamp back to 1 needs no hashing, and a consistent rewrite
+  needs one sha256; keeping `Report.Markers` outside the database is the
+  only defence. On a database that ran `v0.1.0-alpha`, a record removed
   before this release first opened it makes its decision legacy. A marker
   closes on the owner's first open composed with audit: a journal opened
   only without audit leaves the reconciliation marker open, and a
