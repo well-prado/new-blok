@@ -275,7 +275,7 @@ func TestClusterRunIsReconstructedThroughTheInspectionStream(t *testing.T) {
 	if stepStates(suspended) != "first=completed,approval=suspended" || string(suspended.Steps[0].Output) != `{"value":41}` {
 		t.Fatalf("suspended reconstruction=%+v", suspended)
 	}
-	waitID := WaitIDFor(admission.RunID, "approval")
+	waitID := WaitIDFor(admission.RunID, "approval", "")
 	if result, err := runtime.DeliverSignal(ctx, tenant, waitID, "inspect-signal", "inspect-approver", json.RawMessage(`{"ok":true}`), true); err != nil || !result.Accepted {
 		t.Fatalf("signal=%+v err=%v", result, err)
 	}

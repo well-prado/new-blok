@@ -300,7 +300,7 @@ func TestSignalAcrossOwnerChangeIsRetryableAndResumesOnce(t *testing.T) {
 	if _, err := owners.processOne(ctx, oldOwner); !errors.Is(err, ErrNoWork) {
 		t.Fatalf("initial process=%v, want suspended wait", err)
 	}
-	waitID := WaitIDFor(admission.RunID, "approval")
+	waitID := WaitIDFor(admission.RunID, "approval", "")
 	var newOwner distributed.Owner
 	// Between ingress reading the current owner and sending its fenced
 	// transaction, ownership moves to a new owner with a higher fence.
@@ -427,7 +427,7 @@ func TestStaleOwnerTimerIsFencedAndKeepsTimerIndex(t *testing.T) {
 	if staleResult != expected.StaleResult || len(fired) != 0 {
 		t.Fatalf("stale owner timer=%s fired=%d err=%v, fixture %s", staleResult, len(fired), err, expected.StaleResult)
 	}
-	wait, err := runtime.GetWait(ctx, tenant, WaitIDFor(admission.RunID, "approval"))
+	wait, err := runtime.GetWait(ctx, tenant, WaitIDFor(admission.RunID, "approval", ""))
 	if err != nil || wait.State != expected.WaitAfterStaleFire {
 		t.Fatalf("wait after stale timer=%+v err=%v, fixture %s", wait, err, expected.WaitAfterStaleFire)
 	}
@@ -487,7 +487,7 @@ func TestSignalTimerAndStaleOwnerRaceHasOneWinnerPerWait(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		waitID := WaitIDFor(admission.RunID, "approval")
+		waitID := WaitIDFor(admission.RunID, "approval", "")
 		due := time.Now().UTC().Add(time.Second)
 		start := make(chan struct{})
 		var group sync.WaitGroup
@@ -770,7 +770,7 @@ func TestQuorumLossAtEachRuntimeTransition(t *testing.T) {
 		if _, err := owners.processOne(ctx, owner); !errors.Is(err, ErrNoWork) {
 			t.Fatalf("initial process=%v, want suspended wait", err)
 		}
-		waitID := WaitIDFor(admission.RunID, "approval")
+		waitID := WaitIDFor(admission.RunID, "approval", "")
 		payload := json.RawMessage(`{"approved":true}`)
 		var restore func()
 		if inFlight {
@@ -894,7 +894,7 @@ func TestQuorumLossAtEachRuntimeTransition(t *testing.T) {
 		if fired, err := owners.FireDueWaits(ctx, owner, time.Now().UTC().Add(time.Second), 8); err != nil || len(fired) != 1 {
 			t.Fatalf("timer fired=%d err=%v", len(fired), err)
 		}
-		waitID := WaitIDFor(admission.RunID, "approval")
+		waitID := WaitIDFor(admission.RunID, "approval", "")
 		payload := json.RawMessage(`{"approved":true}`)
 		restore := clustertest.PauseQuorum(t)
 		// The wait is already closed; the outage surfaces at the first
@@ -941,7 +941,7 @@ func TestQuorumLossAtEachRuntimeTransition(t *testing.T) {
 		if fired, err := owners.FireDueWaits(ctx, owner, time.Now().UTC().Add(time.Second), 8); err != nil || len(fired) != 1 {
 			t.Fatalf("timer fired=%d err=%v", len(fired), err)
 		}
-		waitID := WaitIDFor(admission.RunID, "approval")
+		waitID := WaitIDFor(admission.RunID, "approval", "")
 		payload := json.RawMessage(`{"approved":true}`)
 		var restore func()
 		hooked.arm("/events/late-signal-", 0, false, func() { restore = clustertest.PauseQuorum(t) })

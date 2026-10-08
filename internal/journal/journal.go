@@ -133,11 +133,16 @@ type Run struct {
 	ErrorClass     string
 }
 
+// OperationIdentity is an operation's identity; Key is a digest of its
+// JSON form, stored as every operation's key. The tags spell the names
+// json.Marshal used before they existed (#382), so renaming a Go field
+// moves no key; never change a tag, and give a new field omitempty with a
+// zero value that means what every key stored before it meant.
 type OperationIdentity struct {
-	RunID          string
-	ArtifactDigest string
-	InvocationPath string
-	IterationPath  string
+	RunID          string `json:"RunID"`
+	ArtifactDigest string `json:"ArtifactDigest"`
+	InvocationPath string `json:"InvocationPath"`
+	IterationPath  string `json:"IterationPath"`
 }
 
 func (i OperationIdentity) Key() string {

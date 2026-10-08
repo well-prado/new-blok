@@ -552,7 +552,7 @@ func TestSignalResumesDistributedRunFromCommittedPrefix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("bounded continuation state: partition=%s tenant=%s run=%s wait=%s", partition, tenant, admission.RunID, WaitIDFor(admission.RunID, "approval"))
+	t.Logf("bounded continuation state: partition=%s tenant=%s run=%s wait=%s", partition, tenant, admission.RunID, WaitIDFor(admission.RunID, "approval", ""))
 	owner, err := store.Acquire(ctx, partition, "signal-continuation-owner", 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -561,7 +561,7 @@ func TestSignalResumesDistributedRunFromCommittedPrefix(t *testing.T) {
 	if _, err := runtime.processOne(ctx, owner); !errors.Is(err, ErrNoWork) {
 		t.Fatalf("initial process error=%v, want suspended work yield", err)
 	}
-	waitID := WaitIDFor(admission.RunID, "approval")
+	waitID := WaitIDFor(admission.RunID, "approval", "")
 	wait, err := runtime.GetWait(ctx, tenant, waitID)
 	if err != nil || wait.State != "waiting" {
 		t.Fatalf("persisted wait=%+v err=%v", wait, err)
@@ -615,7 +615,7 @@ func TestTimerResumesDistributedRunFromCommittedPrefix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("bounded continuation state: partition=%s tenant=%s run=%s wait=%s", partition, tenant, admission.RunID, WaitIDFor(admission.RunID, "delay"))
+	t.Logf("bounded continuation state: partition=%s tenant=%s run=%s wait=%s", partition, tenant, admission.RunID, WaitIDFor(admission.RunID, "delay", ""))
 	owner, err := store.Acquire(ctx, partition, "timer-continuation-owner", 5*time.Second)
 	if err != nil {
 		t.Fatal(err)

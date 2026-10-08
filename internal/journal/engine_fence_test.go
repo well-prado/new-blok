@@ -145,7 +145,7 @@ func TestStaleExecutionWritesNothing(t *testing.T) {
 	if err := current.Complete(ctx, attempt, json.RawMessage(`{"value":5}`)); err != nil {
 		t.Fatalf("the live dispatch commits: %v", err)
 	}
-	if got, want := engineRows(t, j, run), []string{"charge|committed", "run|accepted"}; !reflect.DeepEqual(got, want) {
+	if got, want := engineRows(t, j, run), []string{"charge@root|committed", "run|accepted"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("rows:\n got %q\nwant %q", got, want)
 	}
 }

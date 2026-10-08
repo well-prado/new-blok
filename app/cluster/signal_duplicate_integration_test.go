@@ -42,7 +42,7 @@ func TestDistributedSignalRetryWithHTMLCharactersIsDuplicate(t *testing.T) {
 	if state := f.awaitRun(admission.RunID, "waiting", 15*time.Second); state != "waiting" {
 		t.Fatalf("fixture run state=%q, want suspended at its wait", state)
 	}
-	waitID := cluster.WaitIDFor(admission.RunID, "approval")
+	waitID := cluster.WaitIDFor(admission.RunID, "approval", "")
 
 	// Waiting path: the first delivery closes the open wait; every retry of
 	// it is answered from the signalled wait record.
