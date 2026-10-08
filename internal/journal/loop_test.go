@@ -98,7 +98,7 @@ func TestDurableEachKilledMidLoop(t *testing.T) {
 			if err := rj.CompleteRun(context.Background(), []byte(want)); err != nil {
 				t.Fatal(err)
 			}
-			if got := oneRow(t, j.database, `SELECT state || '|' || CAST(output_json AS TEXT) FROM journal_scopes WHERE run_id = '`+run+`' AND path = 'loop@root'`); got != "completed|"+want {
+			if got := oneRow(t, j.database, `SELECT state || '|' || CAST(output_json AS TEXT) FROM journal_scopes WHERE run_id = '`+run+`' AND path = 'loop@root'`); got != `completed|{"items":5}` {
 				t.Fatalf("each scope %s", got)
 			}
 			slots := waitRows(t, j.database, `SELECT path || '=' || CAST(output_json AS TEXT) FROM journal_scopes WHERE run_id = '`+run+`' AND kind = 'item' ORDER BY path`)
@@ -143,7 +143,7 @@ func TestDurableParallelKilledMidArms(t *testing.T) {
 	if got := controlRows(t, j, run); !reflect.DeepEqual(got, want) {
 		t.Fatalf("rows after recovery:\n got %q\nwant %q", got, want)
 	}
-	if got := oneRow(t, j.database, `SELECT CAST(output_json AS TEXT) FROM journal_scopes WHERE run_id = '`+run+`' AND path = 'fan@root'`); got != "[null,null]" {
+	if got := oneRow(t, j.database, `SELECT CAST(output_json AS TEXT) FROM journal_scopes WHERE run_id = '`+run+`' AND path = 'fan@root'`); got != `{"items":2}` {
 		t.Fatalf("parallel scope output %s", got)
 	}
 }
@@ -208,7 +208,7 @@ func TestDurableEmptyEach(t *testing.T) {
 	if err != nil || encoded(t, result.Output) != "[]" {
 		t.Fatalf("output=%s err=%v", encoded(t, result.Output), err)
 	}
-	if got := waitRows(t, j.database, `SELECT path || '|' || state || '|' || CAST(input_json AS TEXT) || '|' || CAST(output_json AS TEXT) FROM journal_scopes WHERE run_id = '`+run+`'`); !reflect.DeepEqual(got, []string{`loop@root|completed|{"items":0}|[]`}) {
+	if got := waitRows(t, j.database, `SELECT path || '|' || state || '|' || CAST(input_json AS TEXT) || '|' || CAST(output_json AS TEXT) FROM journal_scopes WHERE run_id = '`+run+`'`); !reflect.DeepEqual(got, []string{`loop@root|completed|{"items":0}|{"items":0}`}) {
 		t.Fatalf("scopes %q", got)
 	}
 }

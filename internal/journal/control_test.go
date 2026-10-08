@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -37,6 +38,15 @@ type controlNodes struct {
 	held     atomic.Bool
 	released chan struct{}
 	flakyOK  atomic.Bool
+
+	blockOnce, blockedOnce sync.Once
+	blocked                chan struct{} // closed once block has started
+}
+
+// blockStarted is closed once a block call has started.
+func (c *controlNodes) blockStarted() chan struct{} {
+	c.blockOnce.Do(func() { c.blocked = make(chan struct{}) })
+	return c.blocked
 }
 
 func (c *controlNodes) record(name string) {
@@ -110,6 +120,28 @@ func (c *controlNodes) engine() *engine.Engine {
 				return engineValue{}, errors.New("flaky")
 			}
 			return in, nil
+		}),
+		// gate fails item 1 once item 2's block (an effect) is in flight.
+		define("gate", false, func(ctx context.Context, in engineValue) (engineValue, error) {
+			if in.Value != 1 {
+				return in, nil
+			}
+			select {
+			case <-c.blockStarted():
+			case <-time.After(10 * time.Second):
+			}
+			return engineValue{}, errors.New("gate")
+		}),
+		// block is an effect that runs until its context ends.
+		define("block", true, func(ctx context.Context, in engineValue) (engineValue, error) {
+			started := c.blockStarted()
+			c.blockedOnce.Do(func() { close(started) })
+			<-ctx.Done()
+			return engineValue{}, ctx.Err()
+		}),
+		// unsure is an effect whose outcome is unknown.
+		define("unsure", true, func(context.Context, engineValue) (engineValue, error) {
+			return engineValue{}, &node.DomainError{Code: "unsure", Class: "uncertain", Err: errors.New("the effect's outcome is unknown")}
 		}),
 		define("hold", false, func(ctx context.Context, in engineValue) (engineValue, error) {
 			if c.held.Swap(true) {
@@ -283,6 +315,16 @@ func runControlChild() {
 		case name == "scope-enter" && !entered.Swap(true) && commits == 0:
 			journalMarkerAndWait()
 		case name == os.Getenv("NEWBLOK_333_CONTROL_BARRIER") && entered.Load() && int(committed.Add(1)) == commits:
+			if os.Getenv("NEWBLOK_333_CONTROL_MODE") == "parallel" {
+				// Park only once arm 1 has started slow, as the parent
+				// expects (it counts that invocation), however late the
+				// scheduler starts it (#412 Review R round 1).
+				for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+					if data, _ := os.ReadFile(os.Getenv("NEWBLOK_333_CONTROL_LOG")); strings.Contains(string(data), "slow\n") {
+						break
+					}
+				}
+			}
 			journalMarkerAndWait()
 		}
 	}

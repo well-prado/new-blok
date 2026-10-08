@@ -179,6 +179,7 @@ func runEach(ctx context.Context, id string, plan *EachPlan) (any, error) {
 	results := make([]any, len(plan.Items))
 	jobs := make(chan int)
 	var first atomic.Pointer[Error]
+	var uncertain atomic.Bool
 	var group sync.WaitGroup
 	for worker := 0; worker < workers; worker++ {
 		group.Add(1)
@@ -191,6 +192,9 @@ func runEach(ctx context.Context, id string, plan *EachPlan) (any, error) {
 				output, err := plan.Run(derived, plan.Items[index], index)
 				if err != nil {
 					wrapped := classify(id, err).(*Error)
+					if wrapped.Uncertain {
+						uncertain.Store(true)
+					}
 					if first.CompareAndSwap(nil, wrapped) {
 						cancel()
 					}
@@ -209,7 +213,7 @@ func runEach(ctx context.Context, id string, plan *EachPlan) (any, error) {
 	close(jobs)
 	group.Wait()
 	if err := first.Load(); err != nil {
-		return nil, err
+		return nil, keepUncertain(err, uncertain.Load())
 	}
 	return results, nil
 }
@@ -222,6 +226,7 @@ func runParallel(ctx context.Context, id string, plan *ParallelPlan) (any, error
 	defer cancel()
 	results := make([]any, len(plan.Actions))
 	var first atomic.Pointer[Error]
+	var uncertain atomic.Bool
 	var group sync.WaitGroup
 	for index, action := range plan.Actions {
 		group.Add(1)
@@ -234,7 +239,11 @@ func runParallel(ctx context.Context, id string, plan *ParallelPlan) (any, error
 			}
 			output, err := action.Run(derived)
 			if err != nil {
-				if first.CompareAndSwap(nil, classify(action.ID, err).(*Error)) {
+				wrapped := classify(action.ID, err).(*Error)
+				if wrapped.Uncertain {
+					uncertain.Store(true)
+				}
+				if first.CompareAndSwap(nil, wrapped) {
 					cancel()
 				}
 				return
@@ -244,9 +253,22 @@ func runParallel(ctx context.Context, id string, plan *ParallelPlan) (any, error
 	}
 	group.Wait()
 	if err := first.Load(); err != nil {
-		return nil, err
+		return nil, keepUncertain(err, uncertain.Load())
 	}
 	return results, nil
+}
+
+// keepUncertain is err marked uncertain when an error it was reported
+// instead of was: a sibling the first failure canceled while its effect
+// was in flight, or a try failure finally's failure replaced. The run's
+// outcome is then unknown whichever error names it (#412 Review R).
+func keepUncertain(err *Error, uncertain bool) *Error {
+	if !uncertain || err.Uncertain {
+		return err
+	}
+	marked := *err
+	marked.Uncertain = true
+	return &marked
 }
 
 func runTry(ctx context.Context, id string, plan *TryPlan) (any, error) {
@@ -276,6 +298,10 @@ func runTry(ctx context.Context, id string, plan *TryPlan) (any, error) {
 		stop()
 		cancel()
 		if finallyErr != nil {
+			var tried, replaced *Error
+			if errors.As(finallyErr, &replaced) && errors.As(err, &tried) {
+				return nil, keepUncertain(replaced, tried.Uncertain)
+			}
 			return nil, finallyErr
 		} else if finallyOutput != nil && err == nil {
 			output = finallyOutput

@@ -539,17 +539,21 @@ func (r *RunJournal) Slots(ctx context.Context, loop engine.ScopeEntry, prefix s
 	return slots, nil
 }
 
+// MaxSlotBytes bounds a slot: any result a step may commit
+// (MaxStepResultBytes), wrapped as {"output": <result>}, so an item whose
+// result is a step's always fits its slot.
+const MaxSlotBytes = MaxStepResultBytes + len(`{"output":}`)
+
 // RecordSlot records an item's or arm's slot (engine.LoopJournal): the
 // slot scope, completed with output, under the loop's, in one transaction
 // under the run lease. A slot already recorded with the same output is a
 // no-op; with another, ErrRecordFinal; under another kind or parent,
-// ErrRequestConflict. An output over MaxStepResultBytes is
-// ErrStepResultLimit.
+// ErrRequestConflict. An output over MaxSlotBytes is ErrStepResultLimit.
 func (r *RunJournal) RecordSlot(ctx context.Context, loop engine.ScopeEntry, slot engine.ScopeIdentity, output json.RawMessage) error {
 	if err := r.checkScope(slot); err != nil || slot.ParentPath != loop.Scope.Path || slot.Path == loop.Scope.Path {
 		return errors.Join(ErrRequestConflict, err)
 	}
-	if len(output) > MaxStepResultBytes {
+	if len(output) > MaxSlotBytes {
 		return ErrStepResultLimit
 	}
 	if !json.Valid(output) {

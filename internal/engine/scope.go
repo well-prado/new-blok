@@ -90,8 +90,8 @@ type loopScope struct {
 	entry    ScopeEntry
 	recorded map[string]json.RawMessage
 
-	mu    sync.Mutex
-	slots []json.RawMessage // each slot's result, unwrapped, by index
+	mu   sync.Mutex
+	done []bool // which slots hold a result, by index
 }
 
 // begin enters the loop's scope for n slots and, when prefix is set (an
@@ -111,7 +111,7 @@ func (l *loopScope) begin(ctx context.Context, step string, n int, prefix string
 	if failed := recorded.Failed; failed != nil {
 		return &Error{Code: failed.Code, Class: failed.Class, Step: failed.Step, Uncertain: failed.Uncertain, Err: fmt.Errorf("%s failed in an earlier execution of this run (recorded in scope %s)", step, l.identity.Path)}
 	}
-	l.entry, l.slots = entry, make([]json.RawMessage, n)
+	l.entry, l.done = entry, make([]bool, n)
 	if prefix != "" {
 		if l.recorded, err = l.journal.Slots(ctx, entry, prefix); err != nil {
 			return journalFailure("journal_scope_slots", step, err, nil)
@@ -140,7 +140,7 @@ func (l *loopScope) filled(step string, index int, path string) (any, bool, erro
 		return nil, false, scopeConflict(step, path, wrapped)
 	}
 	l.mu.Lock()
-	l.slots[index] = output
+	l.done[index] = true
 	l.mu.Unlock()
 	return value, true, nil
 }
@@ -159,32 +159,33 @@ func (l *loopScope) record(ctx context.Context, step string, index int, path, ki
 		return nil, journalFailure("journal_scope_slot", step, err, nil)
 	}
 	l.mu.Lock()
-	l.slots[index] = encoded
+	l.done[index] = true
 	l.mu.Unlock()
 	return decodeLiteral(encoded)
 }
 
-// exit commits the loop's result to its scope: its slots' results in
-// index order, every slot filled.
+// exit completes the loop's scope once every slot is filled. Its output
+// is a summary, {"items":N}: the loop's result lives in its slots, from
+// which a run and inspection assemble it in index order; storing it again
+// in the scope would bound a whole loop's results by one result's limit
+// (#412 Review R round 1).
 func (l *loopScope) exit(ctx context.Context, step string) error {
 	if l.entry.Completed {
 		return nil
 	}
-	output := []byte{'['}
-	for index, slot := range l.slots {
-		if slot == nil {
+	for index, done := range l.done {
+		if !done {
 			return &Error{Code: "journal_scope_slots", Class: "persistence", Step: step, Err: fmt.Errorf("slot %d of %s has no result", index, l.identity.Path)}
 		}
-		if index > 0 {
-			output = append(output, ',')
-		}
-		output = append(output, slot...)
 	}
-	if err := l.journal.ExitScope(ctx, l.entry, append(output, ']')); err != nil {
+	summary, _ := json.Marshal(scopeDecision{Items: ptrTo(len(l.done))})
+	if err := l.journal.ExitScope(ctx, l.entry, summary); err != nil {
 		return journalFailure("journal_scope_exit", step, err, nil)
 	}
 	return nil
 }
+
+func ptrTo(n int) *int { return &n }
 
 // fail records the loop's failure as its decision when it is the run's
 // own (fail-fast): not a suspension, the caller's cancellation or a

@@ -228,7 +228,9 @@ write goes to the arm's frame only, so arm results never reach
   suspension. A finally failure replaces the try outcome, except in a
   sibling canceled by fail-fast, where the first error wins (the finally
   failure still appears in Steps); otherwise a try failure is the run's
-  failure, after finally ran. A finally fail-fast started is still
+  failure, after finally ran. A finally failure that replaces an
+  uncertain try failure is itself uncertain (#412 Review R round 1): the
+  try's effect still has an unknown outcome. A finally fail-fast started is still
   canceled when the caller then cancels the run (Review R round 2).
 - Each construct is itself a step in `Result.Steps`, after its arm's
   steps, carrying its result. It is never `Executed` (that reports a node
@@ -474,8 +476,15 @@ restart nobody redoes a stamped item; the card is read instead.
   replayed alike, so a run that crashed and one that did not produce the
   same value; a typed node reading it converts it as any construct value
   (`node.Any.ConvertInput`). In memory it stays the Go values the bodies
-  returned. The loop scope's output is assembled from its slots in index
-  order (`[s0,…,sN-1]`; a parallel's `[null,…]`), every slot filled.
+  returned. The result is assembled from the slots in index order, every
+  slot filled. The loop scope itself exits with a summary, `{"items":N}`,
+  not the results again: a scope output is bounded like a step result
+  (1 MiB), so storing every slot in it again bounded a whole loop by one
+  result's limit, and a loop failed permanently at its exit after all its
+  effects ran (#412 Review R round 1). Inspection reads the slots.
+- **Slot bound.** A slot holds any result a step may commit plus its
+  wrapping: `journal.MaxSlotBytes` = `MaxStepResultBytes` + 11 bytes of
+  `{"output":}`, so an item whose result is a full step result fits.
 - **Fail-fast is recorded.** When an item or arm fails and the loop fails
   fast, the loop's own failure (not a suspension, the caller's
   cancellation or a journal fault, which a later execution may get past)
@@ -485,7 +494,15 @@ restart nobody redoes a stamped item; the card is read instead.
   reports that failure at once, starting no item, so a run that crashed
   after failing fast cannot run items it would never have run. The record
   is written when the loop joins its in-flight items; a crash before it
-  lets a replay run the loop again.
+  lets a replay run the loop again. **Uncertainty is never lost** (#412
+  Review R round 1, BLOCKER): the first failure is reported, but if any
+  item or arm it canceled failed uncertain (an effect in flight, whose
+  outcome is now unknown), the reported and recorded failure is marked
+  uncertain, so the run ends uncertain instead of failing. Otherwise
+  `FailRun` refuses the run (`ErrUncertain`) and every replay reports the
+  same certain failure: the run would never settle. As a second line,
+  the resumer ends a run uncertain when `FailRun` refuses it with
+  `ErrUncertain`, whatever failure the execution reported.
 - **Waits** stay refused inside an each or parallel (`checkProgram`), so
   no item suspends alone; the loop scope's entry is the run's first
   commit after a wait before it, so concurrent items never share a
@@ -524,6 +541,7 @@ restart nobody redoes a stamped item; the card is read instead.
 | `engine.LoopJournal`; `RunJournal.Slots`, `.RecordSlot`, `.FailScope` (slice 3) | API, additive | None |
 | A durable runner whose journal is a `LoopJournal` runs each and parallel; item and arm slots are `journal_scopes` rows of kind `item`/`arm` | behavioral: programs it refused now run; no schema change | None |
 | A durable each's result is its slots' JSON values | behavioral (durable runs only, which refused each before) | None |
+| `journal.MaxSlotBytes`; a loop scope's output is `{"items":N}`; a failure reported over an uncertain sibling or try is uncertain; the resumer ends uncertain a run `FailRun` refuses with `ErrUncertain` (#412 Review R round 1) | API additive; behavioral | None |
 
 ## Evidence (slice 1a)
 
@@ -589,11 +607,25 @@ RED on origin/main d19cddc (the durable runner refused each and
 parallel). Mutations, RED: slots never skipped, a null result read as an
 empty slot, slots not wrapped, fail-fast not recorded, a recorded failure
 ignored, the item count unchecked, a recorded slot overwritten, `Slots`
-unbounded by prefix or parent, item frames not their slot, no loop exit,
+with neither its prefix range nor its parent bound (either bound alone
+reads exactly the loop's slots, so removing only one stays GREEN), item
+frames not their slot, no loop exit,
 slots out of order, M47a and a blank slot parent, any scope journal
 running loops. One mutation stays GREEN by construction: recording a
 caller's cancellation as the loop's failure, because the record itself
 is written under the canceled context and so never commits.
+
+Review R round 1 (#412) added, each RED under a mutation of its fix:
+fail-fast over a sibling's uncertain effect (journal and through the
+resumer: settled uncertain on the first execution, where it was left
+interrupted forever), the resumer's `ErrUncertain` fallback, the recorded
+and replayed uncertainty, finally replacing an uncertain try, four
+300 KiB items completing, an item of exactly `MaxStepResultBytes`
+fitting its slot, a journal fault not recorded as the loop's failure,
+`FailScope`'s attempt fence, and `RecordSlot`/`Slots` refused after the
+run ended or under a stale lease. The parallel kill test now parks only
+once its second arm has started (it counted that invocation; a delayed
+arm failed it 3/3).
 
 ## Limits
 

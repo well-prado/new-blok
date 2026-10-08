@@ -351,7 +351,17 @@ func (r *Resumer) execute(ctx context.Context, lease journal.RunLease) (outcome 
 	settle := context.WithoutCancel(ctx)
 	defer func() { _ = j.ReleaseRunLease(settle, lease.RunID, lease.Token) }()
 	fail := func(code, class string, cause error) (Outcome, error) {
-		if err := runJournal.FailRun(settle, code, class); err != nil {
+		err := runJournal.FailRun(settle, code, class)
+		if errors.Is(err, journal.ErrUncertain) {
+			// The run holds an effect of unknown outcome (a sibling
+			// fail-fast canceled, say): it cannot fail, only end
+			// uncertain. Retrying would report the same failure forever.
+			if err = runJournal.MarkRunUncertain(settle, code, class); err == nil {
+				r.forget(lease.RunID)
+				return Uncertain, cause
+			}
+		}
+		if err != nil {
 			r.report(err)
 			return Interrupted, errors.Join(cause, err)
 		}
