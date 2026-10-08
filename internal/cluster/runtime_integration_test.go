@@ -256,7 +256,8 @@ func TestTakeoverPersistsUncertaintyAndRejectsPausedOwnersResult(t *testing.T) {
 		}
 		return input, nil
 	}}
-	runtime, err := New(store, engine.New(map[string]node.Any{"fixture/paused-effect": definition}), map[string]Workflow{"paused-effect-fixture": workflow}, Limits{Partitions: 8, PartitionAdmissions: 64, TenantAdmissions: 8, OwnerTTL: time.Second})
+	limits := Limits{Partitions: 8, PartitionAdmissions: 64, TenantAdmissions: 8, OwnerTTL: time.Second}
+	runtime, err := New(store, engine.New(map[string]node.Any{"fixture/paused-effect": definition}), map[string]Workflow{"paused-effect-fixture": workflow}, limits)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,7 +294,7 @@ func TestTakeoverPersistsUncertaintyAndRejectsPausedOwnersResult(t *testing.T) {
 	}
 	var newOwner distributed.Owner
 	for newOwner.ID == "" {
-		newOwner, err = store.Acquire(ctx, partition, "takeover-owner", time.Second)
+		newOwner, err = store.Acquire(ctx, partition, "takeover-owner", limits.OwnerTTL)
 		if errors.Is(err, distributed.ErrOwnershipLost) {
 			if err := waitContext(ctx, 100*time.Millisecond); err != nil {
 				t.Fatal(err)
@@ -305,12 +306,16 @@ func TestTakeoverPersistsUncertaintyAndRejectsPausedOwnersResult(t *testing.T) {
 		}
 	}
 	releaseOwnerOnCleanup(t, store, newOwner)
+	// The successor stays a live owner until the stale owner's result is
+	// rejected; only the paused owner's lease is left to expire (#399).
+	stopRenewal := keepOwnerAlive(ctx, store, newOwner, limits.OwnerTTL)
+	t.Cleanup(func() { _ = stopRenewal() })
 	if newOwner.Token <= oldOwner.Token {
 		t.Fatalf("fence did not advance: old=%d new=%d", oldOwner.Token, newOwner.Token)
 	}
 	takenOver, err := runtime.processOne(ctx, newOwner)
 	if err != nil {
-		t.Fatalf("new owner recovery: %v", err)
+		t.Fatalf("new owner recovery: %v (successor lease renewal: %v)", err, stopRenewal())
 	}
 	if takenOver.State != "uncertain" || effects.Load() != 1 {
 		t.Fatalf("takeover state=%q effect count=%d, want uncertain/1", takenOver.State, effects.Load())
@@ -319,6 +324,9 @@ func TestTakeoverPersistsUncertaintyAndRejectsPausedOwnersResult(t *testing.T) {
 	old := <-oldDone
 	if !errors.Is(old.err, distributed.ErrOwnershipLost) {
 		t.Fatalf("stale owner result error=%v, want ownership lost", old.err)
+	}
+	if err := stopRenewal(); err != nil {
+		t.Fatalf("successor lost its partition lease during takeover: %v", err)
 	}
 	final, err := runtime.GetRun(ctx, tenant, admission.RunID)
 	if err != nil || final.State != "uncertain" || len(final.Output) != 0 || effects.Load() != 1 {
@@ -452,7 +460,7 @@ func TestFailoverUnderSustainedLoadPreservesFairnessAndEffectCounts(t *testing.T
 	}
 	var newOwner distributed.Owner
 	for newOwner.ID == "" {
-		newOwner, err = store.Acquire(ctx, partition, "load-owner-after", time.Second)
+		newOwner, err = store.Acquire(ctx, partition, "load-owner-after", limits.OwnerTTL)
 		if errors.Is(err, distributed.ErrOwnershipLost) {
 			if err := waitContext(ctx, 100*time.Millisecond); err != nil {
 				t.Fatal(err)
@@ -464,9 +472,14 @@ func TestFailoverUnderSustainedLoadPreservesFairnessAndEffectCounts(t *testing.T
 		}
 	}
 	releaseOwnerOnCleanup(t, store, newOwner)
+	// The successor is a live owner for the whole drain, as Run's worker is:
+	// it renews its lease while it works. The paused old owner does not, so
+	// only it loses the partition (#399).
+	stopRenewal := keepOwnerAlive(ctx, store, newOwner, limits.OwnerTTL)
+	t.Cleanup(func() { _ = stopRenewal() })
 	firstRecovered, err := newRuntime.processOne(ctx, newOwner)
 	if err != nil {
-		t.Fatalf("reconcile paused effect: %v", err)
+		t.Fatalf("reconcile paused effect: %v (successor lease renewal: %v)", err, stopRenewal())
 	}
 	completed, uncertain := 0, 0
 	processed := map[string]bool{firstRecovered.RunID: true}
@@ -484,7 +497,7 @@ func TestFailoverUnderSustainedLoadPreservesFairnessAndEffectCounts(t *testing.T
 			break
 		}
 		if processErr != nil {
-			t.Fatal(processErr)
+			t.Fatalf("drain after takeover: %v (successor lease renewal: %v)", processErr, stopRenewal())
 		}
 		processed[run.RunID] = true
 		processedTenants = append(processedTenants, run.Tenant)
@@ -495,6 +508,9 @@ func TestFailoverUnderSustainedLoadPreservesFairnessAndEffectCounts(t *testing.T
 		} else {
 			t.Fatalf("unexpected failover run state=%q", run.State)
 		}
+	}
+	if err := stopRenewal(); err != nil {
+		t.Fatalf("successor lost its partition lease while draining: %v", err)
 	}
 	if completed != fixture.ExpectedCompleted || uncertain != fixture.ExpectedUncertain || effects.Load() != fixture.ExpectedExternalEffects {
 		t.Fatalf("failover completed=%d uncertain=%d effects=%d, want %d/%d/%d", completed, uncertain, effects.Load(), fixture.ExpectedCompleted, fixture.ExpectedUncertain, fixture.ExpectedExternalEffects)
@@ -860,7 +876,8 @@ func TestStepJournalQuorumLossDefersAcceptedRun(t *testing.T) {
 		}
 		return input, nil
 	}}
-	runtime, err := New(store, engine.New(map[string]node.Any{"fixture/quorum-prefix": prefix, "fixture/quorum-effect": effect}), map[string]Workflow{"quorum-defer-fixture": workflow}, Limits{Partitions: 8, PartitionAdmissions: 64, TenantAdmissions: 8, OwnerTTL: time.Second})
+	limits := Limits{Partitions: 8, PartitionAdmissions: 64, TenantAdmissions: 8, OwnerTTL: time.Second}
+	runtime, err := New(store, engine.New(map[string]node.Any{"fixture/quorum-prefix": prefix, "fixture/quorum-effect": effect}), map[string]Workflow{"quorum-defer-fixture": workflow}, limits)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -921,7 +938,7 @@ func TestStepJournalQuorumLossDefersAcceptedRun(t *testing.T) {
 	}
 	var newOwner distributed.Owner
 	for newOwner.ID == "" {
-		newOwner, err = store.Acquire(ctx, partition, "quorum-defer-recovery-owner", time.Second)
+		newOwner, err = store.Acquire(ctx, partition, "quorum-defer-recovery-owner", limits.OwnerTTL)
 		if errors.Is(err, distributed.ErrOwnershipLost) {
 			if err := waitContext(ctx, 100*time.Millisecond); err != nil {
 				t.Fatal(err)
@@ -933,9 +950,15 @@ func TestStepJournalQuorumLossDefersAcceptedRun(t *testing.T) {
 		}
 	}
 	releaseOwnerOnCleanup(t, store, newOwner)
+	// The recovery owner is a live owner while it replays the run (#399).
+	stopRenewal := keepOwnerAlive(ctx, store, newOwner, limits.OwnerTTL)
+	t.Cleanup(func() { _ = stopRenewal() })
 	recovered, err := runtime.processOne(ctx, newOwner)
 	if err != nil || recovered.State != fixture.ExpectedFinalState || string(recovered.Output) != fixture.ExpectedOutput {
-		t.Fatalf("recovered=%+v err=%v; expected %s / %s", recovered, err, fixture.ExpectedFinalState, fixture.ExpectedOutput)
+		t.Fatalf("recovered=%+v err=%v (recovery owner lease renewal: %v); expected %s / %s", recovered, err, stopRenewal(), fixture.ExpectedFinalState, fixture.ExpectedOutput)
+	}
+	if err := stopRenewal(); err != nil {
+		t.Fatalf("recovery owner lost its partition lease while replaying: %v", err)
 	}
 	active, err := store.ListActiveRunIDs(ctx, partition, runtime.limits.PartitionAdmissions)
 	if err != nil || len(active) != fixture.ExpectedActiveRuns || prefixInvocations.Load() != fixture.ExpectedPrefixInvocations || effects.Load() != fixture.ExpectedExternalEffects {
@@ -1020,6 +1043,48 @@ func releaseOwnerOnCleanup(t *testing.T, store *distributed.Store, owner distrib
 			t.Logf("release integration owner %s/%s: %v", owner.Partition, owner.ID, err)
 		}
 	})
+}
+
+// keepOwnerAlive renews owner's lease every ttl/3 until stop is called, as
+// Runtime.runPartition does for a live worker. A test that drives processOne
+// directly holds its partition through a bare Acquire, and nothing else renews
+// that lease: a drain that outlasts the granted TTL (etcd raises a 1s request
+// to its minimum, 2s by default) then loses the partition to lease expiry with
+// no successor involved. Under -race on a loaded host a 12-run drain was
+// measured at 2.5s, which is #399. stop returns the first renewal error, so a
+// genuine loss of ownership still fails the caller.
+func keepOwnerAlive(ctx context.Context, store *distributed.Store, owner distributed.Owner, ttl time.Duration) (stop func() error) {
+	renewCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() {
+		ticker := time.NewTicker(ttl / 3)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-renewCtx.Done():
+				done <- ctx.Err()
+				return
+			case <-ticker.C:
+				if err := store.Renew(renewCtx, owner); err != nil {
+					if renewCtx.Err() != nil {
+						done <- ctx.Err()
+					} else {
+						done <- err
+					}
+					return
+				}
+			}
+		}
+	}()
+	var once sync.Once
+	var result error
+	return func() error {
+		once.Do(func() {
+			cancel()
+			result = <-done
+		})
+		return result
+	}
 }
 
 func tenantForEmptyPartition(t *testing.T, ctx context.Context, store *distributed.Store, runtime *Runtime, prefix string) (string, string) {
