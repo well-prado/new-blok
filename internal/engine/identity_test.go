@@ -88,3 +88,72 @@ func TestStepIDsMustFollowTheGrammar(t *testing.T) {
 		t.Fatalf("a 64-character id: %v", err)
 	}
 }
+
+// TestInvocationPathKeepsKeysAndRecords: a step inside an arm carries its
+// invocation path (#333 slice 2), which is not an input to OperationKey
+// (ids are unique across a program, so the id fixes the path). A
+// top-level step leaves it empty, so its stored identity is byte for byte
+// what it was, and spelling it as the step id is the same execution.
+func TestInvocationPathKeepsKeysAndRecords(t *testing.T) {
+	top := NewStepIdentity("run-1", "sha256:a", "vip", RootIteration, []byte(`{}`))
+	inArm := (&frame{prefix: "route/then", iteration: RootIteration}).stepIdentity("run-1", "sha256:a", "vip", []byte(`{}`))
+	atRoot := (&frame{iteration: RootIteration}).stepIdentity("run-1", "sha256:a", "vip", []byte(`{}`))
+	if inArm.InvocationPath != "route/then/vip" || inArm.Invocation() != "route/then/vip" || inArm.IterationPath != RootIteration {
+		t.Fatalf("arm identity %+v", inArm)
+	}
+	if atRoot != top || top.InvocationPath != "" || top.Invocation() != "vip" {
+		t.Fatalf("top-level identity %+v; want %+v", atRoot, top)
+	}
+	if inArm.OperationKey != top.OperationKey || OperationKey(inArm) != top.OperationKey {
+		t.Fatalf("the invocation path moved the operation key: %s vs %s", inArm.OperationKey, top.OperationKey)
+	}
+	encoded, _ := json.Marshal(top)
+	if strings.Contains(string(encoded), "InvocationPath") {
+		t.Fatalf("a top-level identity encodes its invocation path: %s", encoded)
+	}
+	spelled := top
+	spelled.InvocationPath = "vip"
+	if !spelled.SameExecution(top) || inArm.SameExecution(top) {
+		t.Fatalf("same-execution: spelled=%v arm=%v", spelled.SameExecution(top), inArm.SameExecution(top))
+	}
+}
+
+// TestStepIDsAreOneNamespaceAcrossArms (#404 Review R round 1): a durable
+// step's OperationKey hashes its id, not its invocation path, so two steps
+// sharing an id (in try and finally, in then and else, or twice at the top
+// level) would share a key, and a provider deduplicating on it would drop
+// one effect. The engine refuses such a program, in memory and durably,
+// before running anything; lowering already does.
+func TestStepIDsAreOneNamespaceAcrossArms(t *testing.T) {
+	same := compare("x", "eq", literal("1"), literal("1"))
+	tryFinally := controlProgram(contract.InternalInstruction{ID: "t", Kind: "try-finally", Control: &contract.Control{Arms: []contract.Arm{
+		{Name: "try", Instructions: []contract.InternalInstruction{same}, Output: ptr(literal("1"))},
+		{Name: "finally", Instructions: []contract.InternalInstruction{same}},
+	}}}, outputOf("t"))
+	branches := controlProgram(contract.InternalInstruction{ID: "r", Kind: "if", Control: &contract.Control{Operands: []contract.Operand{literal("true")}, Arms: []contract.Arm{
+		{Name: "then", Instructions: []contract.InternalInstruction{same}, Output: ptr(literal("1"))},
+		{Name: "else", Instructions: []contract.InternalInstruction{same}, Output: ptr(literal("2"))},
+	}}}, outputOf("r"))
+	shadow := controlProgram(same, contract.InternalInstruction{ID: "r", Kind: "if", Control: &contract.Control{Operands: []contract.Operand{literal("true")}, Arms: []contract.Arm{
+		{Name: "then", Instructions: []contract.InternalInstruction{same}, Output: ptr(literal("1"))},
+		{Name: "else", Output: ptr(literal("2"))},
+	}}}, outputOf("r"))
+	topLevel := contract.InternalProgram{Instructions: []contract.InternalInstruction{outputOf("x"), {ID: "output", Kind: "output", References: []contract.Reference{{Step: "x"}}}}}
+	for name, program := range map[string]contract.InternalProgram{"try and finally": tryFinally, "then and else": branches, "an arm and the top level": shadow, "twice at the top level": topLevel} {
+		t.Run(name, func(t *testing.T) {
+			result, err := New(nil).Run(context.Background(), program, nil)
+			var classified *Error
+			if !errors.As(err, &classified) || classified.Code != "duplicate_step_id" || classified.Class != "configuration" {
+				t.Fatalf("err=%v; want duplicate_step_id", err)
+			}
+			if len(result.Steps) != 0 {
+				t.Fatalf("ran %d steps before refusing", len(result.Steps))
+			}
+			program.Digest = "sha256:" + strings.Repeat("0", 64)
+			journal := &refusingJournal{}
+			if _, err := New(nil).RunJournaled(context.Background(), program, nil, "run-1", journal); !errors.As(err, &classified) || classified.Code != "duplicate_step_id" || journal.calls != 0 {
+				t.Fatalf("durably: err=%v journal calls=%d; want duplicate_step_id before the journal", err, journal.calls)
+			}
+		})
+	}
+}

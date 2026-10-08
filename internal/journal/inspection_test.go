@@ -211,8 +211,14 @@ func TestJournalRunFailureIsCanonicalAndSeparateFromAttemptRetry(t *testing.T) {
 	if _, err := j.StartScope(ctx, ScopeRecord{RunID: activeScopeRun.RunID, Path: "running-node", Kind: "node"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.FailRun(ctx, activeScopeRun.RunID, "execution_failed", "workflow"); !errors.Is(err, ErrRunActiveWork) {
-		t.Fatalf("terminal failure accepted while a scope was still running: %v", err)
+	// A running scope is a construct the run was inside when it failed,
+	// not active work: failing the run ends it as canceled (#333 slice 2,
+	// #404 Review R round 1), where it used to refuse the failure.
+	if err := j.FailRun(ctx, activeScopeRun.RunID, "execution_failed", "workflow"); err != nil {
+		t.Fatalf("terminal failure refused while a scope was still running: %v", err)
+	}
+	if got := oneRow(t, db, `SELECT state || '|' || error_text FROM journal_scopes WHERE run_id = '`+activeScopeRun.RunID+`'`); got != "canceled|execution_failed" {
+		t.Fatalf("the failed run's scope is %s; want canceled|execution_failed", got)
 	}
 	policy := inspection.Policy{Fields: map[inspection.Field]bool{inspection.FieldInput: true, inspection.FieldError: true}, MaxPageSize: 10, MaxPayloadBytes: 1024}
 	page, err := inspect.InspectSource(ctx, j, "alice", policy, inspection.Query{Version: inspection.Version, RunID: admission.RunID})
