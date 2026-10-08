@@ -23,7 +23,8 @@ func checkSchema(t *testing.T, database store.Database) error {
 
 // TestCheckSchema (#321): CheckSchema is the stamp check an owner without
 // a composed audit.Journal runs before it reads audit's tables. It accepts
-// the stamps this binary understands (none, or version 1), refuses a newer
+// the stamps this binary understands (none, version 1, or version 2 since
+// #284), refuses a newer
 // one exactly as NewJournal does, and refuses a stamp it cannot read
 // rather than treating it as absent.
 func TestCheckSchema(t *testing.T) {
@@ -85,29 +86,32 @@ func TestCheckSchema(t *testing.T) {
 			t.Fatalf("a store without an audit stamp was refused: %v", err)
 		}
 	})
-	t.Run("stamped 1", func(t *testing.T) {
+	for _, version := range []string{"1", "2"} {
+		t.Run("stamped "+version, func(t *testing.T) {
+			database := open(t)
+			if err := newAudit(database); err != nil {
+				t.Fatal(err)
+			}
+			exec(t, database, `UPDATE blok_schema_versions SET version = `+version+` WHERE component = 'audit'`)
+			if err := checkSchema(t, database); err != nil {
+				t.Fatalf("a store stamped with a supported audit version was refused: %v", err)
+			}
+		})
+	}
+	t.Run("stamped 3", func(t *testing.T) {
 		database := open(t)
 		if err := newAudit(database); err != nil {
 			t.Fatal(err)
 		}
-		if err := checkSchema(t, database); err != nil {
-			t.Fatalf("a store stamped with the supported audit version was refused: %v", err)
-		}
-	})
-	t.Run("stamped 2", func(t *testing.T) {
-		database := open(t)
-		if err := newAudit(database); err != nil {
-			t.Fatal(err)
-		}
-		exec(t, database, `UPDATE blok_schema_versions SET version = 2 WHERE component = 'audit'`)
+		exec(t, database, `UPDATE blok_schema_versions SET version = 3 WHERE component = 'audit'`)
 		err := checkSchema(t, database)
 		var newer *store.NewerSchemaError
-		if !errors.As(err, &newer) || *newer != (store.NewerSchemaError{Component: "audit", Version: 2, Supported: 1}) {
-			t.Fatalf("audit stamped 2: %v, want NewerSchemaError{audit 2, supported 1}", err)
+		if !errors.As(err, &newer) || *newer != (store.NewerSchemaError{Component: "audit", Version: 3, Supported: 2}) {
+			t.Fatalf("audit stamped 3: %v, want NewerSchemaError{audit 3, supported 2}", err)
 		}
 		var fromConstructor *store.NewerSchemaError
 		if err := newAudit(database); !errors.As(err, &fromConstructor) || *fromConstructor != *newer {
-			t.Fatalf("NewJournal refused audit 2 with %v, CheckSchema with %v: want the same refusal", err, newer)
+			t.Fatalf("NewJournal refused audit 3 with %v, CheckSchema with %v: want the same refusal", err, newer)
 		}
 	})
 	t.Run("unreadable stamp", func(t *testing.T) {

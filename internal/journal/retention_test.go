@@ -394,8 +394,10 @@ func snapshotRun(tb testing.TB, j *Journal, run recoveryRun) runRows {
 // notRunOwnedTables are the tables that hold no row of any one run. Every
 // table in the store must be either here or in compactionFates.
 var notRunOwnedTables = map[string]bool{
+	"audit_legacy_v1":      true,
 	"audit_meta_v1":        true,
 	"audit_pruned_v1":      true,
+	"audit_start_v1":       true,
 	"blok_schema_versions": true,
 	"journal_artifacts":    true,
 	"journal_meta":         true,

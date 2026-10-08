@@ -50,6 +50,16 @@ var (
 	// ErrChildRunNotFound: a new child record names a run the journal does
 	// not hold.
 	ErrChildRunNotFound = errors.New("journal: child run does not exist")
+	// ErrChildPrincipalMismatch: a new child record names a run admitted
+	// for another principal than its parent (#372). A child's result is
+	// read by its parent, so binding another principal's run would hand
+	// the parent that principal's output. Runs admitted with no principal
+	// (the system principal) bind only to each other.
+	ErrChildPrincipalMismatch = errors.New("journal: child run belongs to another principal than its parent")
+	// ErrChildCycle: a new child record names its own parent run, or a run
+	// the parent descends from through recorded children (#372): the
+	// parent would wait for itself.
+	ErrChildCycle = errors.New("journal: child run is its parent or one of the parent's ancestors")
 )
 
 type Checkpoint struct {
@@ -281,12 +291,20 @@ func (j *Journal) CancelScope(ctx context.Context, runID, path, reason string) e
 
 // RecordChild records the child run a parent step started, and later its
 // result. The child run id is fixed when the record is created and must name
-// a run the journal holds (ErrChildRunNotFound); another id is
+// a run the journal holds (ErrChildRunNotFound), admitted for the parent's
+// principal (ErrChildPrincipalMismatch), that is neither the parent nor one
+// of its ancestors through recorded children (ErrChildCycle); another id is
 // ErrRecordConflict. A record moves from running to completed only: a
 // completed record is ErrRecordFinal unless the write repeats it byte for
-// byte. A running record has no result: a running write with one is an
-// invalid record, whether it would create the record or update it. The
-// parent run must exist (ErrNotFound).
+// byte. A running record has no result, and a completed one has a JSON
+// result: a write that breaks either is an invalid record, whether it would
+// create the record or update it. The parent run must exist (ErrNotFound).
+//
+// The child's binding (its existence, principal and ancestry) is checked
+// when the record is created, inside the writer transaction, and not on
+// later writes: a run's principal never changes and neither does the
+// record's child run id, so a record that passed once stays valid, and a
+// child run compacted afterwards does not strand its parent's record.
 func (j *Journal) RecordChild(ctx context.Context, record ChildRecord) error {
 	if record.RunID == "" || record.Path == "" || record.ChildRunID == "" {
 		return errors.New("journal: child run, path and child identity are required")
@@ -300,6 +318,9 @@ func (j *Journal) RecordChild(ctx context.Context, record ChildRecord) error {
 	if record.State == childRunning && len(record.Result) > 0 {
 		return errors.New("journal: a running child has no result")
 	}
+	if record.State == childCompleted && !json.Valid(record.Result) {
+		return errors.New("journal: a completed child's result must be valid JSON")
+	}
 	return j.withTx(ctx, "child", func(tx *sql.Tx) error {
 		if _, _, err := runStateAndArtifact(ctx, tx, record.RunID); err != nil {
 			return err
@@ -308,9 +329,7 @@ func (j *Journal) RecordChild(ctx context.Context, record ChildRecord) error {
 		var result []byte
 		err := tx.QueryRowContext(ctx, `SELECT child_run_id, state, result_json FROM journal_children WHERE run_id = ? AND path = ?`, record.RunID, record.Path).Scan(&childRunID, &state, &result)
 		if errors.Is(err, sql.ErrNoRows) {
-			if _, _, err := runStateAndArtifact(ctx, tx, record.ChildRunID); errors.Is(err, ErrNotFound) {
-				return ErrChildRunNotFound
-			} else if err != nil {
+			if err := childBindable(ctx, tx, record.RunID, record.ChildRunID); err != nil {
 				return err
 			}
 			_, err = tx.ExecContext(ctx, `INSERT INTO journal_children (run_id, path, child_run_id, state, result_json) VALUES (?, ?, ?, ?, ?)`, record.RunID, record.Path, record.ChildRunID, record.State, []byte(record.Result))
@@ -334,6 +353,51 @@ func (j *Journal) RecordChild(ctx context.Context, record ChildRecord) error {
 		updated, err := tx.ExecContext(ctx, `UPDATE journal_children SET state = ?, result_json = ? WHERE run_id = ? AND path = ? AND state = ? AND child_run_id = ?`, childCompleted, []byte(record.Result), record.RunID, record.Path, childRunning, record.ChildRunID)
 		return requireOneRow(updated, err)
 	})
+}
+
+// childBindable reports whether childRunID may be recorded as a child of
+// parentRunID (#372): the child run exists (ErrChildRunNotFound), was
+// admitted for the parent's principal (ErrChildPrincipalMismatch), and is
+// not the parent or an ancestor of it through recorded children
+// (ErrChildCycle). It runs in the writer transaction that inserts the
+// record, so no concurrent write can close a cycle between the check and
+// the insert.
+func childBindable(ctx context.Context, tx *sql.Tx, parentRunID, childRunID string) error {
+	var parentPrincipal, childPrincipal string
+	if err := tx.QueryRowContext(ctx, `SELECT principal FROM journal_runs WHERE run_id = ?`, parentRunID).Scan(&parentPrincipal); err != nil {
+		return err
+	}
+	err := tx.QueryRowContext(ctx, `SELECT principal FROM journal_runs WHERE run_id = ?`, childRunID).Scan(&childPrincipal)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrChildRunNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if childPrincipal != parentPrincipal {
+		return ErrChildPrincipalMismatch
+	}
+	// The child is the parent or an ancestor of it exactly when the parent
+	// is the child or one of its descendants. Walk down from the child,
+	// itself included, through its recorded children: each step reads
+	// journal_children by run_id, its primary key's prefix, so the walk
+	// costs the child's own subtree (nothing yet, for a run just
+	// started), not the table. UNION (not UNION ALL) visits each run once,
+	// so the walk ends even on a cycle a pre-#372 journal may hold.
+	var found int
+	err = tx.QueryRowContext(ctx, `WITH RECURSIVE descendants(run_id) AS (
+			SELECT ?
+			UNION
+			SELECT c.child_run_id FROM journal_children c JOIN descendants d ON c.run_id = d.run_id
+		)
+		SELECT 1 FROM descendants WHERE run_id = ? LIMIT 1`, childRunID, parentRunID).Scan(&found)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return ErrChildCycle
 }
 
 // RecordJoin records which of a join's branches have come back. Results

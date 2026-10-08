@@ -68,7 +68,7 @@ var components = []component{
 		_, err := journal.New(ctx, db, journal.Config{})
 		return err
 	}},
-	{"audit", 1, func(ctx context.Context, db store.Database) error {
+	{"audit", 2, func(ctx context.Context, db store.Database) error {
 		_, err := openAudit(ctx, db)
 		return err
 	}},
@@ -318,10 +318,14 @@ func TestOriginMainDatabaseIsClassifiedAndStamped(t *testing.T) {
 			t.Fatalf("%s: %v", c.name, err)
 		}
 		// ef330a3 wrote every other component at the version this binary
-		// supports, so each is classified as that version.
+		// supports, so each is classified as that version, except audit,
+		// which predates #284's start marker (audit 2).
 		from := c.version
-		if c.name == "journal" {
+		switch c.name {
+		case "journal":
 			from = 3
+		case "audit":
+			from = 1
 		}
 		if s, found := stampOf(t, db, c.name); !found || s != (stamp{version: c.version, from: from}) {
 			t.Fatalf("%s stamp=%+v found=%v; want %d upgraded from %d, classified from its shape", c.name, s, found, c.version, from)
