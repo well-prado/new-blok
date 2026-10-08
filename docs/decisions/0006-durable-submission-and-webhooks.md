@@ -402,9 +402,9 @@ lone `Enqueue` (#374): `TestSlowHoldNeverBlocksWriters` enqueues from
 another goroutine during every call of the hold, which succeeds because
 no write turn is held then, and fails busy every time if the hold runs
 inside the transaction; `TestCompactionWriteTransactionsAreTimeBounded`
-makes each erased row take at least 10 ms and asserts that no write
-transaction erases more rows than a tenth of a 200 ms busy timeout
-allows (two).
+makes each erased row take at least 25 ms, then 10 ms, and asserts that
+no write transaction erases more rows than a tenth of a 200 ms busy
+timeout allows (one, then two).
 Unfinished jobs are not in the index, so claims do not maintain it; every
 job that finishes adds one entry. Twelve interleaved runs of 2,000 trivial
 jobs on the same host gave median enqueue rates of about 13.6 k/s on

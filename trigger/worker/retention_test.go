@@ -862,55 +862,65 @@ func TestSlowHoldNeverBlocksWriters(t *testing.T) {
 // batch still holds (#313 review), so the write lock is released and the
 // writers queued for it get their turn (store/sqlite's arrival-order writer
 // queue, #214) after at most that long plus one row and the commit. With a
-// 200 ms busy timeout the budget is 20 ms; every erased row is made to take
-// at least 10 ms, so no transaction can erase more than two rows before it
-// commits, whatever the load. One transaction for the whole batch would
-// erase all 40.
+// 200 ms busy timeout the budget is 20 ms. Every erased row is made to take
+// at least rowTime, so no transaction can erase more than budget/rowTime
+// rows (at least one) before it commits, whatever the load; one
+// transaction for the whole batch would erase all 40. Two row times:
+//   - 25 ms, longer than the budget: every transaction erases exactly one
+//     row, so a fixed row cap in place of the time budget fails it (#402
+//     review);
+//   - 10 ms: two rows fit, so a budget measured per row instead of per
+//     transaction fails it (each row alone stays under 20 ms).
 //
 // The bound is asserted on rows per transaction, not on how long another
 // writer waited: on a loaded -race machine a two-statement Enqueue alone
 // has held the write lock for over 300 ms, so a wall-clock budget on the
 // writer beside the compaction failed for reasons that were not the
-// compaction's (#374). A row's 10 ms is a lower bound (time.Sleep), so load
+// compaction's (#374). A row's time is a lower bound (time.Sleep), so load
 // can only make a transaction erase fewer rows, never more. The measured
 // holds are logged.
 func TestCompactionWriteTransactionsAreTimeBounded(t *testing.T) {
-	const busy, rowTime, jobs = 200 * time.Millisecond, 10 * time.Millisecond, 40
-	// The promise under test: a tenth of the busy timeout, at least one row.
-	maxRows := max(1, int(busy/10/rowTime))
-	r := newWaitingRig(t, busy)
-	for i := range jobs {
-		r.finish(t, marked(fmt.Sprintf("timed-%02d", i)), StateCompleted)
+	const busy, jobs = 200 * time.Millisecond, 40
+	for _, rowTime := range []time.Duration{25 * time.Millisecond, 10 * time.Millisecond} {
+		t.Run(rowTime.String()+" per row", func(t *testing.T) {
+			// The promise under test: a tenth of the busy timeout, at least one row.
+			maxRows := max(1, int(busy/10/rowTime))
+			r := newWaitingRig(t, busy)
+			for i := range jobs {
+				r.finish(t, marked(fmt.Sprintf("timed-%02d", i)), StateCompleted)
+			}
+			r.clock.Set(retentionStart.Add(48 * time.Hour))
+			purger, _ := store.PurgerOf(r.database)
+			recorder := &batchDatabase{Database: r.database, purger: purger}
+			queue, err := New(context.Background(), recorder, r.clock.Now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if queue.busyTimeout != busy {
+				t.Fatalf("fixture: the queue budgets for a %v busy timeout, want %v", queue.busyTimeout, busy)
+			}
+			queue.compactRowHook = func() { time.Sleep(rowTime) }
+			recorder.jobs, recorder.deltas, recorder.holds = jobs, nil, nil
+			report, err := queue.Compact(context.Background(), Retention{Completed: r.clock.Now()})
+			if err != nil || report.Compacted != jobs {
+				t.Fatalf("report %+v err=%v; want %d jobs erased", report, err, jobs)
+			}
+			erased, transactions := 0, 0
+			for i, delta := range recorder.deltas {
+				if delta[0] == 0 {
+					continue // the purge's bookkeeping, not an erasure
+				}
+				transactions++
+				if delta[0] > maxRows {
+					t.Fatalf("write transaction %d erased %d jobs at %v each; a %v budget allows %d (holds %v, batches %v)", i, delta[0], rowTime, busy/10, maxRows, recorder.holds, recorder.deltas)
+				}
+				erased += delta[0]
+			}
+			least := (jobs + maxRows - 1) / maxRows
+			if erased != jobs || transactions != report.Batches || transactions < least {
+				t.Fatalf("%d jobs in %d write transactions (report %+v, batches %v); want %d jobs in at least %d", erased, transactions, report, recorder.deltas, jobs, least)
+			}
+			t.Logf("%d write transactions of at most %d rows; write-lock holds %v", transactions, maxRows, recorder.holds)
+		})
 	}
-	r.clock.Set(retentionStart.Add(48 * time.Hour))
-	purger, _ := store.PurgerOf(r.database)
-	recorder := &batchDatabase{Database: r.database, purger: purger}
-	queue, err := New(context.Background(), recorder, r.clock.Now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if queue.busyTimeout != busy {
-		t.Fatalf("fixture: the queue budgets for a %v busy timeout, want %v", queue.busyTimeout, busy)
-	}
-	queue.compactRowHook = func() { time.Sleep(rowTime) }
-	recorder.jobs, recorder.deltas, recorder.holds = jobs, nil, nil
-	report, err := queue.Compact(context.Background(), Retention{Completed: r.clock.Now()})
-	if err != nil || report.Compacted != jobs {
-		t.Fatalf("report %+v err=%v; want %d jobs erased", report, err, jobs)
-	}
-	erased, transactions := 0, 0
-	for i, delta := range recorder.deltas {
-		if delta[0] == 0 {
-			continue // the purge's bookkeeping, not an erasure
-		}
-		transactions++
-		if delta[0] > maxRows {
-			t.Fatalf("write transaction %d erased %d jobs at %v each; a %v budget allows %d (holds %v, batches %v)", i, delta[0], rowTime, busy/10, maxRows, recorder.holds, recorder.deltas)
-		}
-		erased += delta[0]
-	}
-	if erased != jobs || transactions != report.Batches || transactions < jobs/maxRows {
-		t.Fatalf("%d jobs in %d write transactions (report %+v, batches %v); want %d jobs in at least %d", erased, transactions, report, recorder.deltas, jobs, jobs/maxRows)
-	}
-	t.Logf("%d write transactions of at most %d rows; write-lock holds %v", transactions, maxRows, recorder.holds)
 }
