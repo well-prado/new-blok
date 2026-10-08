@@ -230,7 +230,9 @@ both; a top-level step's invocation path is its ID).
   never run).
 - **Permanent conflicts.** `Permanent(err)` reports the errors no retry
   can fix: `ErrRequestConflict` (another engine input, step input or wait
-  plan), `ErrWaitCanceled`, `ErrStepResultLimit`. A runner settles such a
+  plan), `ErrWaitCanceled`, `ErrStepResultLimit`, and (#372, #333 slice
+  2) `ErrChildPrincipalMismatch`, `ErrChildCycle` and `ErrRecordFinal` (a
+  canceled scope the run reached again). A runner settles such a
   run as failed with a diagnostic; a lost lease and storage faults are not
   permanent. The engine still labels them `persistence`; the journal's
   sentinel is what classifies them (#333 is reworking the engine's run

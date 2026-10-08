@@ -17,9 +17,9 @@ import (
 )
 
 // rootIteration is the iteration path of a step outside every loop. A
-// step's iteration path is the engine's (engine.StepIdentity.Iteration);
-// until #333 gives the engine iteration paths every step of a run is at
-// the root, and a step's invocation path is its instruction ID (ADR 0028).
+// step's iteration path is the engine's (engine.StepIdentity.Iteration),
+// and its invocation path too: its instruction ID at the top level, its
+// path through the constructs' arms inside one (ADR 0028).
 const rootIteration = engine.RootIteration
 
 // neverDue is the due time of a wait without a timeout: no timer claim
@@ -54,8 +54,9 @@ func (j *Journal) ForRun(runID string, token int64) *RunJournal {
 }
 
 var (
-	_ engine.StepJournal = (*RunJournal)(nil)
-	_ engine.WaitJournal = (*RunJournal)(nil)
+	_ engine.StepJournal  = (*RunJournal)(nil)
+	_ engine.WaitJournal  = (*RunJournal)(nil)
+	_ engine.ScopeJournal = (*RunJournal)(nil)
 )
 
 // Permanent reports an error no retry of the run can fix: a conflict with
@@ -63,12 +64,13 @@ var (
 // step input or wait plan), a canceled wait the run reached
 // (ErrWaitCanceled), a step result over the bound (ErrStepResultLimit), a
 // child run of another principal or one that would close a cycle
-// (ErrChildPrincipalMismatch, ErrChildCycle; #372). A runner settles such
-// a run as failed. A lost lease (another holder runs it) and storage
-// faults are not permanent.
+// (ErrChildPrincipalMismatch, ErrChildCycle; #372), a final recovery
+// record the run would change, such as a canceled scope it reached again
+// (ErrRecordFinal). A runner settles such a run as failed. A lost lease
+// (another holder runs it) and storage faults are not permanent.
 func Permanent(err error) bool {
 	return errors.Is(err, ErrRequestConflict) || errors.Is(err, ErrWaitCanceled) || errors.Is(err, ErrStepResultLimit) ||
-		errors.Is(err, ErrChildPrincipalMismatch) || errors.Is(err, ErrChildCycle)
+		errors.Is(err, ErrChildPrincipalMismatch) || errors.Is(err, ErrChildCycle) || errors.Is(err, ErrRecordFinal)
 }
 
 // uncertainStep marks an effect whose outcome is unknown; the engine fails
@@ -145,7 +147,11 @@ func (r *RunJournal) operation(identity engine.StepIdentity) (OperationIdentity,
 	if identity.RunID != r.runID || artifact == "" || identity.ArtifactDigest != artifact || identity.StepID == "" || identity.OperationKey == "" {
 		return OperationIdentity{}, ErrRequestConflict
 	}
-	return OperationIdentity{RunID: r.runID, ArtifactDigest: artifact, InvocationPath: identity.StepID, IterationPath: identity.Iteration()}, nil
+	invocation := identity.Invocation()
+	if invocation != identity.StepID && !strings.HasSuffix(invocation, "/"+identity.StepID) {
+		return OperationIdentity{}, ErrRequestConflict
+	}
+	return OperationIdentity{RunID: r.runID, ArtifactDigest: artifact, InvocationPath: invocation, IterationPath: identity.Iteration()}, nil
 }
 
 // fence checks, inside a write transaction, that this execution still
@@ -404,14 +410,107 @@ func (r *RunJournal) CompleteRun(ctx context.Context, output json.RawMessage) er
 	})
 }
 
-// FailRun fails the run as CompleteRun completes it.
+// FailRun fails the run as CompleteRun completes it. The scopes the
+// failure unwound through (the constructs it failed in, which never exit)
+// end canceled, with errorCode as their error, in the same transaction.
 func (r *RunJournal) FailRun(ctx context.Context, errorCode, errorClass string) error {
 	if !validDiagnosticLabel(errorCode) || !validDiagnosticLabel(errorClass) {
 		return errors.New("journal: safe failure code/class are required")
 	}
 	return r.settle(ctx, "run-fail", false, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `UPDATE journal_scopes SET state = ?, error_text = ?, updated_at = ? WHERE run_id = ? AND state = ?`, checkpointCanceled, errorCode, r.journal.now(), r.runID, checkpointRunning); err != nil {
+			return err
+		}
 		return r.journal.failRun(ctx, tx, r.runID, errorCode, errorClass)
 	})
+}
+
+// EnterScope enters a construct's scope under the run lease (see
+// engine.ScopeJournal): the first entry writes it, running, with decision
+// as its input; a later one (a replay) starts a new attempt of a running
+// scope and returns the decision recorded first, whatever decision it
+// brings. A completed scope comes back Completed. A canceled scope is
+// ErrRecordFinal, and a scope recorded with another kind or parent is
+// ErrRequestConflict.
+func (r *RunJournal) EnterScope(ctx context.Context, scope engine.ScopeIdentity, decision json.RawMessage) (engine.ScopeEntry, error) {
+	if err := r.checkScope(scope); err != nil {
+		return engine.ScopeEntry{}, err
+	}
+	if len(decision) > MaxInspectionInputBytes {
+		return engine.ScopeEntry{}, ErrObservationLimit
+	}
+	if len(decision) > 0 && !json.Valid(decision) {
+		return engine.ScopeEntry{}, errors.New("journal: a scope decision must be valid JSON")
+	}
+	attemptID, err := randomID("scope-attempt")
+	if err != nil {
+		return engine.ScopeEntry{}, err
+	}
+	entry := engine.ScopeEntry{Scope: scope}
+	err = r.settle(ctx, "scope-enter", true, func(tx *sql.Tx) error {
+		var kind, parent, state string
+		var input []byte
+		queryErr := tx.QueryRowContext(ctx, `SELECT kind, parent_path, state, input_json FROM journal_scopes WHERE run_id = ? AND path = ?`, r.runID, scope.Path).Scan(&kind, &parent, &state, &input)
+		if errors.Is(queryErr, sql.ErrNoRows) {
+			entry.AttemptID, entry.Decision = attemptID, append(json.RawMessage(nil), decision...)
+			return r.journal.insertScope(ctx, tx, ScopeRecord{RunID: r.runID, Path: scope.Path, Kind: scope.Kind, ParentPath: scope.ParentPath, Input: decision}, attemptID)
+		}
+		if queryErr != nil {
+			return queryErr
+		}
+		if kind != scope.Kind || parent != scope.ParentPath {
+			return fmt.Errorf("%w: scope %s was recorded as a %s in %q, not a %s in %q", ErrRequestConflict, scope.Path, kind, parent, scope.Kind, scope.ParentPath)
+		}
+		entry.Decision = append(json.RawMessage(nil), input...)
+		switch state {
+		case checkpointCompleted:
+			entry.Completed = true
+			return nil
+		case checkpointRunning:
+			entry.AttemptID = attemptID
+			_, err := tx.ExecContext(ctx, `UPDATE journal_scopes SET attempt_id = ?, updated_at = ? WHERE run_id = ? AND path = ?`, attemptID, r.journal.now(), r.runID, scope.Path)
+			return err
+		default:
+			return fmt.Errorf("%w: scope %s is %s", ErrRecordFinal, scope.Path, state)
+		}
+	})
+	if err != nil {
+		return engine.ScopeEntry{}, err
+	}
+	return entry, nil
+}
+
+// ExitScope commits a construct's result to the scope entry entered,
+// under the run lease; only the attempt that entered it last may (see
+// CompleteScope). A result over MaxStepResultBytes is ErrStepResultLimit.
+func (r *RunJournal) ExitScope(ctx context.Context, entry engine.ScopeEntry, output json.RawMessage) error {
+	if err := r.checkScope(entry.Scope); err != nil {
+		return err
+	}
+	if len(output) > MaxStepResultBytes {
+		return ErrStepResultLimit
+	}
+	if !json.Valid(output) {
+		return errors.New("journal: valid scope output is required")
+	}
+	if entry.AttemptID == "" {
+		return ErrStaleAttempt
+	}
+	return r.settle(ctx, "scope-exit", true, func(tx *sql.Tx) error {
+		return r.journal.completeScope(ctx, tx, r.runID, entry.Scope.Path, entry.AttemptID, output)
+	})
+}
+
+// checkScope refuses a scope of another run or artifact than this
+// execution verified, or without a path or kind.
+func (r *RunJournal) checkScope(scope engine.ScopeIdentity) error {
+	r.mu.Lock()
+	artifact := r.artifact
+	r.mu.Unlock()
+	if scope.RunID != r.runID || artifact == "" || scope.ArtifactDigest != artifact || scope.Path == "" || scope.Kind == "" {
+		return ErrRequestConflict
+	}
+	return nil
 }
 
 // settle runs commit in a transaction that first fences it (see fence)

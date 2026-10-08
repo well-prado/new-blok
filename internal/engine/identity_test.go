@@ -88,3 +88,32 @@ func TestStepIDsMustFollowTheGrammar(t *testing.T) {
 		t.Fatalf("a 64-character id: %v", err)
 	}
 }
+
+// TestInvocationPathKeepsKeysAndRecords: a step inside an arm carries its
+// invocation path (#333 slice 2), which is not an input to OperationKey
+// (ids are unique across a program, so the id fixes the path). A
+// top-level step leaves it empty, so its stored identity is byte for byte
+// what it was, and spelling it as the step id is the same execution.
+func TestInvocationPathKeepsKeysAndRecords(t *testing.T) {
+	top := NewStepIdentity("run-1", "sha256:a", "vip", RootIteration, []byte(`{}`))
+	inArm := (&frame{prefix: "route/then", iteration: RootIteration}).stepIdentity("run-1", "sha256:a", "vip", []byte(`{}`))
+	atRoot := (&frame{iteration: RootIteration}).stepIdentity("run-1", "sha256:a", "vip", []byte(`{}`))
+	if inArm.InvocationPath != "route/then/vip" || inArm.Invocation() != "route/then/vip" || inArm.IterationPath != RootIteration {
+		t.Fatalf("arm identity %+v", inArm)
+	}
+	if atRoot != top || top.InvocationPath != "" || top.Invocation() != "vip" {
+		t.Fatalf("top-level identity %+v; want %+v", atRoot, top)
+	}
+	if inArm.OperationKey != top.OperationKey || OperationKey(inArm) != top.OperationKey {
+		t.Fatalf("the invocation path moved the operation key: %s vs %s", inArm.OperationKey, top.OperationKey)
+	}
+	encoded, _ := json.Marshal(top)
+	if strings.Contains(string(encoded), "InvocationPath") {
+		t.Fatalf("a top-level identity encodes its invocation path: %s", encoded)
+	}
+	spelled := top
+	spelled.InvocationPath = "vip"
+	if !spelled.SameExecution(top) || inArm.SameExecution(top) {
+		t.Fatalf("same-execution: spelled=%v arm=%v", spelled.SameExecution(top), inArm.SameExecution(top))
+	}
+}

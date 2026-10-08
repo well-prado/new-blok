@@ -139,6 +139,51 @@ type StepIdentity struct {
 	// IterationPath is the loop iteration the step runs in (ADR 0028);
 	// empty, or RootIteration, outside every loop.
 	IterationPath string `json:"IterationPath,omitempty"`
+	// InvocationPath is the step's invocation path inside an arm of a
+	// control construct ("<construct path>/<arm>/<id>", ADR 0028); empty,
+	// or StepID, at the top level. It is not an input to OperationKey: a
+	// step id is unique across a program's tree, so with the artifact
+	// digest the id already determines the path (#333 slice 2).
+	InvocationPath string `json:"InvocationPath,omitempty"`
+}
+
+// ScopeJournal journals the scope of each control construct with arms
+// (if, choose, try-finally; ADR 0028, #333). A durable runner whose
+// journal does not implement it refuses a control program
+// (durable_control_unsupported) before touching the journal.
+//
+// EnterScope records the construct's decision (the arm it selected, empty
+// for a try-finally) the first time the run reaches it, and from then on
+// returns the recorded decision, which the engine follows: like a
+// committed step result, a recorded decision is never re-evaluated. A
+// completed scope comes back with Completed set; the engine replays its
+// arm from the journal and does not exit it again. ExitScope commits the
+// construct's result. A construct that fails leaves its scope running;
+// the run's failure ends it.
+type ScopeJournal interface {
+	EnterScope(context.Context, ScopeIdentity, json.RawMessage) (ScopeEntry, error)
+	ExitScope(context.Context, ScopeEntry, json.RawMessage) error
+}
+
+// ScopeIdentity names one execution of a construct: Path is
+// "<invocation path>@<iteration path>", ParentPath the path of the
+// construct whose arm it runs in (empty at the top level), Kind the
+// instruction kind (ADR 0028, "Joins and scopes").
+type ScopeIdentity struct {
+	RunID          string
+	ArtifactDigest string
+	Path           string
+	ParentPath     string
+	Kind           string
+}
+
+// ScopeEntry is an entered scope: the attempt that may exit it, and the
+// decision recorded for it.
+type ScopeEntry struct {
+	Scope     ScopeIdentity
+	AttemptID string
+	Decision  json.RawMessage
+	Completed bool
 }
 
 type StepAttempt struct {
@@ -262,10 +307,19 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 		return Result{}, err
 	}
 	controls := controlIDs(program.Instructions, nil)
+	var scopes ScopeJournal
 	if journal != nil && program.Format == contract.ControlFormat {
-		// Durable control flow journals scopes, joins and children (#333,
-		// later slices); until then a durable runner refuses it.
-		return Result{}, &Error{Code: "durable_control_unsupported", Class: "configuration", Err: fmt.Errorf("control instructions run only in memory until #333 journals them")}
+		// A durable runner journals if, choose and try-finally through
+		// the journal's scopes (#333 slice 2); each and parallel need
+		// joins (a later slice), and a journal without scopes (the
+		// cluster's) runs none of them.
+		var ok bool
+		if scopes, ok = journal.(ScopeJournal); !ok {
+			return Result{}, &Error{Code: "durable_control_unsupported", Class: "configuration", Err: fmt.Errorf("this durable runner's journal does not journal control constructs")}
+		}
+		if kind := unjournaledControl(program.Instructions); kind != "" {
+			return Result{}, &Error{Code: "durable_control_unsupported", Class: "configuration", Err: fmt.Errorf("%s runs only in memory until #333 journals its join", kind)}
+		}
 	}
 	if journal != nil {
 		inputDigest, err := InputDigest(input)
@@ -457,10 +511,7 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 					appendStep(step)
 					return step.Error
 				}
-				// A durable runner refuses control flow (durable_control_unsupported
-				// above), so a journaled step is always at the root iteration;
-				// #333 slice 2 passes f.iteration and the invocation path.
-				identity := NewStepIdentity(runID, program.Digest, instruction.ID, RootIteration, plan)
+				identity := f.stepIdentity(runID, program.Digest, instruction.ID, plan)
 				waitResult, ready, waitErr := waitJournal.Await(ctx, WaitIdentity{Step: identity, Name: instruction.Wait.Name, TimeoutMillis: instruction.Wait.TimeoutMillis})
 				if waitErr != nil {
 					step.Error = journalFailure("journal_wait", instruction.ID, waitErr, nil)
@@ -519,7 +570,7 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 						appendStep(step)
 						return step.Error
 					}
-					identity = NewStepIdentity(runID, program.Digest, instruction.ID, RootIteration, persistedInput)
+					identity = f.stepIdentity(runID, program.Digest, instruction.ID, persistedInput)
 					persistedOutput, completed, loadErr := journal.Load(ctx, identity)
 					if loadErr != nil {
 						step.Error = journalFailure("journal_step_load", instruction.ID, loadErr, definition.Descriptor().Effects)
@@ -692,11 +743,30 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 				if observing {
 					emit(inspection.Event{Kind: inspection.StepProcessing, StepID: step.ID, Attempt: step.Attempt, AttemptID: invocation.AttemptID, Trace: stepSpan})
 				}
+				// enter records the construct's decision in its scope and
+				// returns the decision to follow: the recorded one once
+				// there is one (ScopeJournal). In memory it is the one
+				// just made.
+				var entered *ScopeEntry
+				enter := func(decision string) (string, error) {
+					if scopes == nil {
+						return decision, nil
+					}
+					entry, arm, err := enterScope(ctx, scopes, ScopeIdentity{RunID: runID, ArtifactDigest: program.Digest, Path: f.scopePath(instruction.ID), ParentPath: f.scope, Kind: instruction.Kind}, instruction, decision)
+					if err != nil {
+						return "", err
+					}
+					entered = &entry
+					return arm, nil
+				}
 				output, err := runControl(ctx, f, instruction, e.maxSteps, func(ctx context.Context, armFrame *frame, arm contract.Arm) (any, error) {
 					// The arm's steps are children of the construct's span.
 					armFrame.span = stepSpan
 					return runArm(ctx, armFrame, instruction.ID, arm)
-				})
+				}, enter)
+				if err == nil && entered != nil && !entered.Completed {
+					err = exitScope(ctx, scopes, *entered, instruction.ID, output)
+				}
 				if err != nil {
 					// An arm's failure was classified when it failed, but a
 					// concurrent sibling may have committed an effect since,

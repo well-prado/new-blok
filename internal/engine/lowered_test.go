@@ -163,9 +163,8 @@ func (j *refusingJournal) Fail(context.Context, StepAttempt, []string, error) er
 	return nil
 }
 
-// Durable control flow is a later #333 slice: until scopes and joins are
-// journaled, a durable runner refuses a control program before touching
-// its journal, instead of replaying arm steps by id alone.
+// A durable runner whose journal journals no scopes (ScopeJournal; the
+// cluster's) refuses a control program before touching its journal.
 func TestDurableRunnerRefusesControlPrograms(t *testing.T) {
 	program := controlProgram(compare("big", "eq", literal("1"), literal("1")), outputOf("big"))
 	program.Digest = "sha256:" + strings.Repeat("0", 64)

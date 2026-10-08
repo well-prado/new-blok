@@ -2,10 +2,11 @@
 
 - Status: in progress for E07-T10 (#333), delivered as stacked PRs. Slice 1a
   lowers and runs compare, default, if, choose and try-finally in memory;
-  slice 1b (this revision) adds each and parallel, and lets control operands
-  read the workflow input. Slices 2+ make every construct durable on a
-  single host.
-- Date: 2026-10-07
+  slice 1b adds each and parallel, and lets control operands read the
+  workflow input. Slice 2 (this revision) runs compare, default, if, choose
+  and try-finally durably on a single host. Slice 3 makes each and
+  parallel durable, slice 4 child runs, slice 5 resumes at startup.
+- Date: 2026-10-07 (slice 2: 2026-10-08)
 - Roadmap: E07-T10 ([#333](https://github.com/well-prado/new-blok/issues/333)),
   closing gaps in E07-T05 (#47) and E07-T07 (#49)
 - Owners: `internal/lowering` (lowering), `internal/engine` (`lowered.go`,
@@ -264,10 +265,10 @@ write goes to the arm's frame only, so arm results never reach
   `<run attempt>/<step id>/<n>`. The inspection recorder keeps one attempt
   per id, so each iteration is its own attempt of the step.
 
-A durable runner (`RunJournaled`) refuses a format-2 program with
-`durable_control_unsupported` before touching its journal: replaying arm
-steps by step id alone would be wrong once a step can run more than once
-per run (#333 slices 2+).
+A durable runner (`RunJournaled`) runs a format-2 program only through a
+journal that journals scopes (slice 2, below), and refuses each and
+parallel with `durable_control_unsupported` before touching its journal
+until slice 3 journals their joins.
 
 ### Paths
 
@@ -324,6 +325,84 @@ Recorded here so slices 2 and 3 key their journal records consistently:
   so slice 3 records the empty each's scope as completed with output `[]`
   and writes no join row.
 
+### Durable if, choose and try-finally on a single host (slice 2)
+
+Like a hiker who marks the fork she took on the map before walking on: if
+she has to start the walk again, she does not look at the signpost a
+second time, she follows the mark.
+
+- **Who journals.** `engine.ScopeJournal` (`EnterScope`, `ExitScope`)
+  is implemented by `journal.RunJournal`, the SQLite journal under the
+  run lease (ADR 0027). A durable runner whose journal does not implement
+  it refuses every control program with `durable_control_unsupported`
+  before touching the journal: `internal/cluster`'s step journal does not
+  (#396 must land first; `TestClusterRefusesControlPrograms` pins it). Each
+  and parallel are refused at any depth until slice 3.
+- **Scopes.** If, choose and try-finally each enter a scope
+  (`journal_scopes`) when they start: path
+  `<invocation path>@<iteration path>` (`route@root`,
+  `route/then/pay@root`), parent path the scope of the construct whose
+  arm it runs in (empty at the top), kind the instruction kind. The scope's
+  input is the decision: `{"arm":"then"}` for an if, the selected arm's
+  name for a choose, none for a try-finally. A successful construct exits
+  its scope with its result (bounded by `MaxStepResultBytes`). Compare and
+  default have no arms and no scope: they are pure values recomputed on
+  replay from journaled step results, the admitted input and literals.
+- **The recorded decision wins.** The first entry records the decision; a
+  replay re-enters the scope (a new scope attempt, fencing the earlier
+  one, #351) and gets the recorded decision back, which the engine
+  follows whatever its condition now reads. A committed step result is
+  never recomputed and a recorded decision is never re-evaluated: an arm
+  that committed an effect is the arm the run continues
+  (`TestDurableBranchNeverReevaluatesItsDecision` changes the journaled
+  value the condition reads and the recorded arm still runs). A scope
+  recorded under another kind or parent is `ErrRequestConflict`, a
+  decision naming no arm `journal_scope_conflict`, a canceled scope
+  `ErrRecordFinal`; `journal.Permanent` reports all three. A completed
+  scope's arm is still replayed from the journal (its steps load, nothing
+  runs again), so values keep the Go types a live run gives them; it is
+  not exited again.
+- **Steps in arms.** A step inside an arm is journaled under its real
+  identity: `engine.StepIdentity.InvocationPath` is its invocation path
+  (`route/then/vip`) and `IterationPath` the frame's iteration (`root`
+  until slice 3). The journal keys its operation and its wait by that
+  path. A top-level step leaves `InvocationPath` empty, so its stored
+  identity, operation key and wait id are byte for byte what they were
+  (ADR 0027 rules). `InvocationPath` is not an input to
+  `engine.OperationKey` (no new key encoding): lowering keeps ids unique
+  across a program's tree, so with the artifact digest the id determines
+  the path; the SQLite journal's own key (`OperationIdentity`) already
+  hashes the invocation path.
+- **Try-finally.** `finally` runs once per run across crashes: every step
+  in it is journaled, so a replay loads what committed and runs only the
+  rest. A wait suspending inside try is not the end of try: finally does
+  not run at the suspension, only when the resumed try ends
+  (`runTry`; this lifts the recording's
+  `finally-not-guaranteed-after-suspension` caveat for single-host durable
+  runs). Caller cancellation still skips finally and internal fail-fast
+  still runs it (#383); a run canceled by its caller inside try runs
+  finally once when it is next executed. A pure call that failed was
+  never committed, so a replay runs it again (as at the top level) and
+  the try may now succeed.
+- **Waits in arms.** A wait may appear in an arm of an if, choose or
+  try-finally (`checkProgram`), not inside an each or parallel body. It
+  suspends the run inside the constructs; their scopes stay running; a
+  signal and `PendingResumptions` resume it through the same lease path
+  as a top-level wait.
+- **Failure.** A construct that fails leaves its scope running (it may be
+  retried: a transient fault, a lost lease, the caller's cancellation).
+  `RunJournal.FailRun` cancels the run's running scopes, with the failure
+  code as their error, in the transaction that fails the run;
+  `Journal.FailRun` keeps refusing a run with a running scope.
+  `MarkRunUncertain` leaves them running: the uncertain effect is inside
+  them.
+- **Transactions.** Entering and exiting a scope are their own
+  transactions (each fenced by the lease and acknowledging the waits read
+  since the last commit, as a step commit does), not the step's: the
+  decision commits before any step of the arm runs, and a crash between
+  the arm's last step and the exit re-enters and re-exits the scope on
+  replay. That is two extra synchronous commits per construct.
+
 ## Compatibility (ADR 0001)
 
 | Change | Class | Migration |
@@ -344,6 +423,11 @@ Recorded here so slices 2 and 3 key their journal records consistently:
 | A control operand or arm result may read `$input[.<field>…]` | behavioral: refused before | None |
 | Step attempt ids inside an each carry `@<iteration path>` | behavioral (new steps only); outside every each unchanged | None |
 | Engine refuses unknown formats, misshapen control instructions, control in format 0, control under a durable runner | behavioral, fail closed | None |
+| `engine.ScopeJournal`, `ScopeIdentity`, `ScopeEntry`, `StepIdentity.InvocationPath`, `.Invocation()`; `RunJournal.EnterScope`, `.ExitScope` (slice 2) | API, additive; `InvocationPath` omitted when empty, so top-level identities encode as before | None |
+| A durable runner whose journal journals scopes runs if, choose, try-finally, compare and default; others still refuse control | behavioral: programs it refused now run | None |
+| A wait may appear in an if, choose or try-finally arm | behavioral: refused before | None |
+| A suspension inside try does not run finally | behavioral (only reachable durably) | None |
+| `RunJournal.FailRun` cancels the run's running scopes; `journal.Permanent` reports `ErrRecordFinal` | behavioral | None |
 
 ## Evidence (slice 1a)
 
@@ -381,6 +465,23 @@ posted lines). Tests that use new API (`each_parallel_nested_test.go`,
 RED under named mutations in the 1b PR, including the race detector for the
 serialised step list and events.
 
+## Evidence (slice 2)
+
+`internal/journal/control_test.go` runs real engine programs through the
+SQLite journal and SIGKILLs a child process at journal commit barriers
+(after the decision commits, after an arm's effect commits, inside try,
+inside finally, inside finally after try failed), then resumes in the
+parent under a fresh lease; every node invocation is logged to a file, so
+counts span both processes. All are RED on origin/main f3ffd4d (the
+durable runner refused the program, or an arm could not hold a wait).
+Mutations of the fix, each RED: following the recomputed decision,
+running finally at a suspension, `FailRun` leaving scopes running, arm
+steps keyed by id, M47a (blank `parent_path` in the scope insert; GREEN
+on origin/main across `internal/journal` and `inspect`), no scope exit,
+no each/parallel refusal, any journal running control (cluster), no
+kind/parent check, a non-root iteration, the new decision replacing the
+recorded one.
+
 ## Limits
 
 - Child and template still do not lower (child needs a child-run path;
@@ -390,7 +491,15 @@ serialised step list and events.
 - `internal/program`'s artifact format (version 1) refuses control
   programs; a version-2 artifact for them is decided with the durable
   slices.
-- In memory only; nothing here is journaled or resumable.
+- Each and parallel run in memory only (slice 3 journals their joins);
+  child runs are slice 4; resuming accepted runs at startup is slice 5.
+  The cluster runs no control program durably (#396).
+- Slice 2's crash tests drive `engine.RunJournaled` over `RunJournal`
+  with the leases `TakeRunLease` and `PendingResumptions` hand out, the
+  calls the single-host resumer (#384) makes; they do not go through the
+  resumer itself, which is not on main yet.
+- `flow` cannot record a wait, so a wait in an arm comes only from a
+  program built otherwise; flow keeps its suspension note.
 - An each runs at most as many items as the step budget; there is no
   separate bound on the total steps its bodies run.
 - Inspection still shows one step per id: an each body's step is one step
