@@ -530,6 +530,7 @@ completed refuses completion.
 - `ErrChildRunNotFound`: a new child record names a run the journal does
   not hold. It is checked when the record is created, not on later writes,
   so a child run compacted afterwards does not strand its parent's record.
+  So are `ErrChildPrincipalMismatch` and `ErrChildCycle` (#372, below).
 - `ErrStaleAttempt`: `CompleteScope` from an attempt that a later
   `StartScope` superseded, or with no attempt id.
 - `ErrNotFound`: `CompleteScope` on a canceled scope, as before #334; and
@@ -577,6 +578,56 @@ caller holds, so only a fresh `StartScope` can complete it.
 | `ErrRecordFinal`, `ScopeAttempt` (#334) | additive | None |
 | Join results are positional slots (one per expected branch, filled once, merged per write); joins are final once every slot is filled; a child record keeps the child run it was created with, must name an existing run when created, and moves only from running to completed; `RecordJoin` and `RecordChild` refuse an unknown run with `ErrNotFound`; a join's `Completed` and `State` must agree with its slots, and a running child has no result (#334, part 2) | behavioral (bug fix) | None for a caller that records each join and child forward. A write that used to overwrite or regress one now returns one of the typed errors above; a child record naming a run the journal does not hold is refused; a join written with results that are not `Expected` slots is refused (the repository's callers already wrote one result per branch). Existing rows are read as before. No schema change, so no version raise: nothing on disk changes shape, and a version-5 binary reads every row this one writes |
 | `ErrRecordConflict`, `ErrChildRunNotFound` (#334, part 2) | additive | None |
+
+### A child record binds a run of the parent's principal, and no cycle (#372)
+
+A parent run reads its child's result through its child record, and the
+`Child` construct of nested control flow (#333) will hand that result to
+the parent's next step. So the record decides whose output a run may read.
+Before #372, `RecordChild` only checked that the child run existed: a run
+admitted for one principal could record another principal's run as its
+child, and a run could be recorded as its own child.
+
+A new child record is now refused unless the child run was admitted for
+the parent's principal, compared exactly as inspection compares owners (a
+run admitted with no principal, the system principal, binds only runs
+that have none either): `ErrChildPrincipalMismatch`. The journal tracks
+no tenant on a run apart from its principal, so the principal is the
+whole check. A record is also refused when the child is the parent or one
+of the parent's ancestors through recorded children, at any depth (A → A,
+A → B → A, A → B → C → A): `ErrChildCycle`. A parent would otherwise wait
+for its own result, and anything walking the tree would walk forever. A
+run may still be the child of several parents (a diamond is not a cycle).
+
+The cycle check walks down from the child through its recorded children,
+looking for the parent. Each step reads `journal_children` by `run_id`,
+its primary key's prefix, so the cost is the child's own subtree, which
+is empty for a run just started, and not the size of the table: measured
+at about 0.15 ms per refused depth-4 record with 0, 10,000 and 100,000
+unrelated child rows (walking up instead, by `child_run_id`, has no index
+and cost 26 ms at 10,000 rows and 290 ms at 100,000, inside the writer
+transaction). The walk visits each run once, so it ends on a cycle a
+journal written before #372 may already hold. It runs in the writer
+transaction that inserts the record, so two writers cannot close a cycle
+between them.
+
+Like `ErrChildRunNotFound`, both are checked when the record is created,
+not on later writes: a run's principal and a record's child run id never
+change, so a record that passed once stays valid. Rows written before
+#372 are not re-checked; there were no production callers of
+`RecordChild` before #333. `journal.Permanent` reports both errors: no
+retry of the run can make another principal's run its child, or remove
+the cycle.
+
+A completed child's result must now be valid JSON, as a scope's output
+must (`CompleteScope`); a completed record with no result, or with bytes
+that are not JSON, is an invalid record and nothing is stored. JSON
+`null` is a result.
+
+| Change | Class | Migration |
+| --- | --- | --- |
+| A new child record must name a run of the parent's principal (`ErrChildPrincipalMismatch`) that is not the parent or one of its ancestors (`ErrChildCycle`); a completed child's result must be valid JSON (#372) | behavioral (bug fix) | None for a parent that records its own principal's child runs with JSON results; nothing in the repository did otherwise. Existing rows are read as before and not re-checked. No schema change, so no version raise |
+| `ErrChildPrincipalMismatch`, `ErrChildCycle`; `journal.Permanent` reports both (#372) | additive | None |
 
 ## Alternatives considered
 

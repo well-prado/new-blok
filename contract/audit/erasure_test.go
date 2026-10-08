@@ -31,7 +31,9 @@ func marker(run, field string) string { return erasureMarker + run + "-" + field
 // uncertainty evidence, scope input and output, checkpoint state, signal
 // payload, child result, join results and run output. reconciled also
 // leaves its effect uncertain and reconciles it with marked evidence and a
-// marked provider result.
+// marked provider result. It completes two runs, the run and its child: a
+// child run shares its parent's principal (#372), so compaction erases
+// the principal only once both are gone.
 type contentRun struct {
 	RunID     string
 	Operation journal.Operation
@@ -100,10 +102,15 @@ func (r *rig) contentRun(label string, reconciled bool) contentRun {
 	if err != nil {
 		r.t.Fatal(err)
 	}
-	// The child record must name a run the journal holds (#334). The child
-	// carries no marker and stays accepted, so compaction leaves it alone.
-	child, err := r.journal.Admit(ctx, journal.AdmissionRequest{RequestKey: "child-of-" + label, Workflow: "orders", ArtifactDigest: digest("artifact"), Input: []byte(`{}`)})
+	// The child record must name a run the journal holds (#334), admitted
+	// for the parent's principal (#372). The child carries the parent's
+	// principal marker and no other, and completes with the parent, so
+	// compaction erases that marker from both runs.
+	child, err := r.journal.Admit(ctx, journal.AdmissionRequest{RequestKey: "child-of-" + label, Principal: "principal-" + m("PRINCIPAL"), Workflow: "orders", ArtifactDigest: digest("artifact"), Input: []byte(`{}`)})
 	if err != nil {
+		r.t.Fatal(err)
+	}
+	if err := r.journal.CompleteRun(ctx, child.RunID, []byte(`{}`)); err != nil {
 		r.t.Fatal(err)
 	}
 	if err := r.journal.RecordChild(ctx, journal.ChildRecord{RunID: run.RunID, Path: "child", ChildRunID: child.RunID, State: "completed", Result: quoted("CHILD")}); err != nil {
@@ -292,7 +299,7 @@ func TestReconciledRunPastRetentionCompacts(t *testing.T) {
 	r.mustVerify(1)
 	r.clock = r.clock.Add(48 * time.Hour)
 	report, err := r.journal.Compact(r.ctx, r.clock.Add(-24*time.Hour))
-	if err != nil || report.RemovedRuns != 1 {
+	if err != nil || report.RemovedRuns != 2 {
 		t.Fatalf("compact=%+v err=%v", report, err)
 	}
 	if found := r.rowMarkers(); len(found) != 0 {
@@ -325,7 +332,7 @@ func TestLegalHoldKeepsRunContent(t *testing.T) {
 	erased := r.contentRun("ERASED", true)
 	r.clock = r.clock.Add(48 * time.Hour)
 	report, err := r.journal.Compact(r.ctx, r.clock.Add(-24*time.Hour))
-	if err != nil || report.RemovedRuns != 1 || report.HeldRuns != 1 {
+	if err != nil || report.RemovedRuns != 2 || report.HeldRuns != 2 {
 		t.Fatalf("compact=%+v err=%v", report, err)
 	}
 	if found := fileMarkers(t, r.path, erased.Markers); len(found) != 0 {
@@ -367,7 +374,7 @@ func TestRestoreAfterErasure(t *testing.T) {
 	}
 	r.clock = r.clock.Add(48 * time.Hour)
 	cutoff := r.clock.Add(-24 * time.Hour)
-	if report, err := r.journal.Compact(r.ctx, cutoff); err != nil || report.RemovedRuns != 1 {
+	if report, err := r.journal.Compact(r.ctx, cutoff); err != nil || report.RemovedRuns != 2 {
 		t.Fatalf("compact=%+v err=%v", report, err)
 	}
 	after := filepath.Join(directory, "after.db")
@@ -396,7 +403,7 @@ func TestRestoreAfterErasure(t *testing.T) {
 		if found := restored.rowMarkers(); len(found) == 0 {
 			t.Fatal("restore of a pre-erasure backup was expected to hold the content")
 		}
-		if report, err := restored.journal.Compact(restored.ctx, cutoff); err != nil || report.RemovedRuns != 1 {
+		if report, err := restored.journal.Compact(restored.ctx, cutoff); err != nil || report.RemovedRuns != 2 {
 			t.Fatalf("re-compact after restore=%+v err=%v", report, err)
 		}
 		if found := fileMarkers(t, restoredPath, run.Markers); len(found) != 0 {
