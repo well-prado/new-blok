@@ -66,11 +66,14 @@ var (
 // child run of another principal or one that would close a cycle
 // (ErrChildPrincipalMismatch, ErrChildCycle; #372), a final recovery
 // record the run would change, such as a canceled scope it reached again
-// (ErrRecordFinal). A runner settles such a run as failed. A lost lease
-// (another holder runs it) and storage faults are not permanent.
+// (ErrRecordFinal), a recorded scope decision its construct cannot follow
+// (engine.ErrScopeConflict, the engine's journal_scope_conflict). A runner
+// settles such a run as failed. A lost lease (another holder runs it) and
+// storage faults are not permanent.
 func Permanent(err error) bool {
 	return errors.Is(err, ErrRequestConflict) || errors.Is(err, ErrWaitCanceled) || errors.Is(err, ErrStepResultLimit) ||
-		errors.Is(err, ErrChildPrincipalMismatch) || errors.Is(err, ErrChildCycle) || errors.Is(err, ErrRecordFinal)
+		errors.Is(err, ErrChildPrincipalMismatch) || errors.Is(err, ErrChildCycle) || errors.Is(err, ErrRecordFinal) ||
+		errors.Is(err, engine.ErrScopeConflict)
 }
 
 // uncertainStep marks an effect whose outcome is unknown; the engine fails
@@ -412,15 +415,13 @@ func (r *RunJournal) CompleteRun(ctx context.Context, output json.RawMessage) er
 
 // FailRun fails the run as CompleteRun completes it. The scopes the
 // failure unwound through (the constructs it failed in, which never exit)
-// end canceled, with errorCode as their error, in the same transaction.
+// end canceled, with errorCode as their error, in the same transaction
+// (see Journal.FailRun).
 func (r *RunJournal) FailRun(ctx context.Context, errorCode, errorClass string) error {
 	if !validDiagnosticLabel(errorCode) || !validDiagnosticLabel(errorClass) {
 		return errors.New("journal: safe failure code/class are required")
 	}
 	return r.settle(ctx, "run-fail", false, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, `UPDATE journal_scopes SET state = ?, error_text = ?, updated_at = ? WHERE run_id = ? AND state = ?`, checkpointCanceled, errorCode, r.journal.now(), r.runID, checkpointRunning); err != nil {
-			return err
-		}
 		return r.journal.failRun(ctx, tx, r.runID, errorCode, errorClass)
 	})
 }

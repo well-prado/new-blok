@@ -3,10 +3,17 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/well-prado/new-blok/contract"
 )
+
+// ErrScopeConflict: a scope's recorded decision is one its construct
+// cannot follow (it names no arm, or a try-finally recorded one). No retry
+// can fix it; journal.Permanent reports it, so a runner settles the run
+// as failed (journal_scope_conflict).
+var ErrScopeConflict = errors.New("engine: a scope's recorded decision conflicts with its construct")
 
 // scopeDecision is the decision a scope records (ScopeJournal): the arm an
 // if or a choose selected. A try-finally records none.
@@ -46,7 +53,7 @@ func enterScope(ctx context.Context, scopes ScopeJournal, identity ScopeIdentity
 }
 
 func scopeConflict(step, path string, recorded json.RawMessage) error {
-	return &Error{Code: "journal_scope_conflict", Class: "conflict", Step: step, Err: fmt.Errorf("scope %s recorded the decision %q, which this construct cannot follow", path, recorded)}
+	return &Error{Code: "journal_scope_conflict", Class: "conflict", Step: step, Err: fmt.Errorf("%w: scope %s recorded the decision %q, which this construct cannot follow", ErrScopeConflict, path, recorded)}
 }
 
 // exitScope commits the result of the construct step to its scope.

@@ -1002,7 +1002,10 @@ func (j *Journal) completeRun(ctx context.Context, tx *sql.Tx, runID string, out
 
 // FailRun records the canonical terminal workflow outcome. Attempt failures
 // never imply that the whole run stopped: callers invoke this only after the
-// engine has ended all active dispatches and waits.
+// engine has ended all active dispatches and waits. The run's running
+// scopes (constructs it was inside when it failed or crashed; #333) end
+// canceled, with errorCode as their error, in the same transaction; a
+// dispatched effect or a waiting wait still refuses it (ErrRunActiveWork).
 func (j *Journal) FailRun(ctx context.Context, runID, errorCode, errorClass string) error {
 	if runID == "" || !validDiagnosticLabel(errorCode) || !validDiagnosticLabel(errorClass) {
 		return errors.New("journal: run and safe failure code/class are required")
@@ -1035,6 +1038,9 @@ func (j *Journal) failRun(ctx context.Context, tx *sql.Tx, runID, errorCode, err
 	}
 	if state != runAccepted {
 		return ErrStaleAttempt
+	}
+	if err := j.cancelOpenScopes(ctx, tx, runID, errorCode); err != nil {
+		return err
 	}
 	if err := requireQuiescentRun(ctx, tx, runID); err != nil {
 		return err
@@ -1090,6 +1096,14 @@ func (j *Journal) markRunUncertain(ctx context.Context, tx *sql.Tx, runID, error
 		}
 		return ErrStaleAttempt
 	}()
+}
+
+// cancelOpenScopes ends the run's running scopes as canceled with reason
+// as their error, in tx: a run that fails or is canceled is inside them
+// no longer. The caller's transaction rolls it back if the run cannot end.
+func (j *Journal) cancelOpenScopes(ctx context.Context, tx *sql.Tx, runID, reason string) error {
+	_, err := tx.ExecContext(ctx, `UPDATE journal_scopes SET state = ?, error_text = ?, updated_at = ? WHERE run_id = ? AND state = ?`, checkpointCanceled, reason, j.now(), runID, checkpointRunning)
+	return err
 }
 
 func requireQuiescentRun(ctx context.Context, tx *sql.Tx, runID string) error {

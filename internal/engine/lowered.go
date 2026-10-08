@@ -121,7 +121,11 @@ func decodeLiteral(literal json.RawMessage) (any, error) {
 // checkProgram rejects a program the interpreter cannot run before any
 // instruction runs: an unknown format, control instructions outside the
 // control format or shaped other than lowering shapes them, and more
-// instructions, counted through every arm, than the step budget.
+// instructions, counted through every arm, than the step budget. Step ids
+// are one flat namespace across every arm (ADR 0028), as lowering records
+// them: a durable run keys a step's operation by its id (OperationKey does
+// not hash the invocation path), so two steps sharing an id would share
+// one key, and a provider deduplicating on it would drop one of them.
 func checkProgram(program contract.InternalProgram, maxSteps int) error {
 	switch program.Format {
 	case 0, contract.ControlFormat:
@@ -129,6 +133,7 @@ func checkProgram(program contract.InternalProgram, maxSteps int) error {
 		return &Error{Code: "unsupported_program_format", Class: "configuration", Err: fmt.Errorf("program format %d is not supported", program.Format)}
 	}
 	count := 0
+	seen := map[string]bool{}
 	// loop is set inside an each or parallel arm, where a wait cannot
 	// suspend one iteration or arm alone.
 	var check func([]contract.InternalInstruction, int, bool) error
@@ -145,6 +150,10 @@ func checkProgram(program contract.InternalProgram, maxSteps int) error {
 			if !contract.ValidID(instruction.ID) {
 				return &Error{Code: "invalid_step_id", Class: "configuration", Step: instruction.ID, Err: fmt.Errorf("step id %q does not match the id grammar %s", instruction.ID, contract.IDPattern)}
 			}
+			if seen[instruction.ID] {
+				return &Error{Code: "duplicate_step_id", Class: "configuration", Step: instruction.ID, Err: fmt.Errorf("step id %q appears more than once; ids are one namespace across every arm", instruction.ID)}
+			}
+			seen[instruction.ID] = true
 			wanted, control := controlShapes[instruction.Kind]
 			if (depth > 0 && instruction.Kind == "output") || (loop && instruction.Kind == "wait") {
 				return invalidControl(instruction.ID, fmt.Errorf("an arm cannot hold a %s instruction", instruction.Kind))

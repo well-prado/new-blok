@@ -357,8 +357,12 @@ second time, she follows the mark.
   (`TestDurableBranchNeverReevaluatesItsDecision` changes the journaled
   value the condition reads and the recorded arm still runs). A scope
   recorded under another kind or parent is `ErrRequestConflict`, a
-  decision naming no arm `journal_scope_conflict`, a canceled scope
-  `ErrRecordFinal`; `journal.Permanent` reports all three. A completed
+  decision naming no arm (or any decision on a try-finally)
+  `journal_scope_conflict` wrapping `engine.ErrScopeConflict`, a canceled
+  scope `ErrRecordFinal`; `journal.Permanent` reports all three, so a
+  runner settles the run failed with that diagnostic instead of retrying
+  it (`TestDurableUnfollowableDecisionSettlesFailed`, #404 Review R round
+  1). A completed
   scope's arm is still replayed from the journal (its steps load, nothing
   runs again), so values keep the Go types a live run gives them; it is
   not exited again.
@@ -369,10 +373,15 @@ second time, she follows the mark.
   path. A top-level step leaves `InvocationPath` empty, so its stored
   identity, operation key and wait id are byte for byte what they were
   (ADR 0027 rules). `InvocationPath` is not an input to
-  `engine.OperationKey` (no new key encoding): lowering keeps ids unique
-  across a program's tree, so with the artifact digest the id determines
-  the path; the SQLite journal's own key (`OperationIdentity`) already
-  hashes the invocation path.
+  `engine.OperationKey` (no new key encoding): step ids are unique across
+  a program's tree, so with the artifact digest the id determines the
+  path; the SQLite journal's own key (`OperationIdentity`) already hashes
+  the invocation path. Lowering records ids that way, and the engine's
+  `checkProgram` refuses any program, in memory or durable, whose id
+  appears twice anywhere in the tree (`duplicate_step_id`, configuration;
+  #404 Review R round 1): two steps sharing an id would share an
+  operation key, and a provider deduplicating on it would drop one
+  effect.
 - **Try-finally.** `finally` runs once per run across crashes: every step
   in it is journaled, so a replay loads what committed and runs only the
   rest. A wait suspending inside try is not the end of try: finally does
@@ -380,8 +389,9 @@ second time, she follows the mark.
   (`runTry`; this lifts the recording's
   `finally-not-guaranteed-after-suspension` caveat for single-host durable
   runs). Caller cancellation still skips finally and internal fail-fast
-  still runs it (#383); a run canceled by its caller inside try runs
-  finally once when it is next executed. A pure call that failed was
+  still runs it (#383); an execution canceled by its caller inside try
+  (the run itself is not canceled) runs no finally, and finally runs
+  once on the next execution. A pure call that failed was
   never committed, so a replay runs it again (as at the top level) and
   the try may now succeed.
 - **Waits in arms.** A wait may appear in an arm of an if, choose or
@@ -391,11 +401,15 @@ second time, she follows the mark.
   as a top-level wait.
 - **Failure.** A construct that fails leaves its scope running (it may be
   retried: a transient fault, a lost lease, the caller's cancellation).
-  `RunJournal.FailRun` cancels the run's running scopes, with the failure
-  code as their error, in the transaction that fails the run;
-  `Journal.FailRun` keeps refusing a run with a running scope.
-  `MarkRunUncertain` leaves them running: the uncertain effect is inside
-  them.
+  Failing or canceling the run ends them: `Journal.FailRun` (and so
+  `RunJournal.FailRun`) and `Journal.CancelRun` cancel the run's running
+  scopes, with the failure code or the cancellation reason as their
+  error, in the transaction that ends the run, so an operator can still
+  cancel or fail a run that crashed inside an arm, as before control flow
+  was durable (`TestOperatorCanEndARunKilledMidArm`, #404 Review R round
+  1). A dispatched effect, a waiting wait or an uncertain operation still
+  refuses both. `MarkRunUncertain` leaves the scopes running on purpose:
+  it rewrites no facts, and the uncertain effect is inside them.
 - **Transactions.** Entering and exiting a scope are their own
   transactions (each fenced by the lease and acknowledging the waits read
   since the last commit, as a step commit does), not the step's: the
@@ -427,7 +441,8 @@ second time, she follows the mark.
 | A durable runner whose journal journals scopes runs if, choose, try-finally, compare and default; others still refuse control | behavioral: programs it refused now run | None |
 | A wait may appear in an if, choose or try-finally arm | behavioral: refused before | None |
 | A suspension inside try does not run finally | behavioral (only reachable durably) | None |
-| `RunJournal.FailRun` cancels the run's running scopes; `journal.Permanent` reports `ErrRecordFinal` | behavioral | None |
+| `Journal.FailRun`, `RunJournal.FailRun` and `Journal.CancelRun` cancel the run's running scopes (they used to refuse a run with one); `journal.Permanent` reports `ErrRecordFinal` and `engine.ErrScopeConflict` | behavioral | None |
+| The engine refuses a program whose step id appears twice anywhere in its tree (`duplicate_step_id`), any format | behavioral, fail closed; lowering and v1 artifacts already refused it | None |
 
 ## Evidence (slice 1a)
 
@@ -500,6 +515,11 @@ recorded one.
   resumer itself, which is not on main yet.
 - `flow` cannot record a wait, so a wait in an arm comes only from a
   program built otherwise; flow keeps its suspension note.
+- A construct's result over `journal.MaxStepResultBytes` (1 MiB) fails a
+  durable run (`ErrStepResultLimit`, permanent) but not an in-memory one,
+  exactly as a call's result already does: the bound is the journal's
+  storage bound, and memory runs keep none (#404 Review R round 1 chose
+  documenting over a new in-memory bound, for parity with calls).
 - An each runs at most as many items as the step budget; there is no
   separate bound on the total steps its bodies run.
 - Inspection still shows one step per id: an each body's step is one step

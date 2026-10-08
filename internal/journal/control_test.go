@@ -612,3 +612,77 @@ func TestRunJournalScopes(t *testing.T) {
 		t.Fatalf("entry after the lease was released: err=%v; want ErrLeaseLost", err)
 	}
 }
+
+// TestDurableUnfollowableDecisionSettlesFailed (#404 Review R round 1): a
+// recorded decision its construct cannot follow (planted here after the
+// kill: an arm the if does not have) is permanent, so a runner settles
+// the run failed with journal_scope_conflict instead of retrying it
+// forever; no arm runs.
+func TestDurableUnfollowableDecisionSettlesFailed(t *testing.T) {
+	if os.Getenv("NEWBLOK_333_CONTROL_CHILD") == "1" {
+		runControlChild()
+		return
+	}
+	path, log := killControlChild(t, "branch", 0)
+	plant := func(j *Journal, run string) {
+		if err := j.database.WithTx(context.Background(), func(tx *sql.Tx) error {
+			_, err := tx.Exec(`UPDATE journal_scopes SET input_json = CAST('{"arm":"nowhere"}' AS BLOB) WHERE run_id = ? AND path = 'route@root'`, run)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	j, run, _, rj, err := resumeControl(t, path, log, "branch", plant)
+	var classified *engine.Error
+	if !errors.As(err, &classified) || classified.Code != "journal_scope_conflict" || !errors.Is(err, engine.ErrScopeConflict) || !Permanent(err) {
+		t.Fatalf("err=%v permanent=%v; want a permanent journal_scope_conflict", err, Permanent(err))
+	}
+	// What a runner does with a permanent error (internal/resumer, #384).
+	if err := rj.FailRun(context.Background(), classified.Code, "conflict"); err != nil {
+		t.Fatal(err)
+	}
+	if got := oneRow(t, j.database, `SELECT state || '|' || error_code || '|' || error_class FROM journal_runs WHERE run_id = '`+run+`'`); got != "failed|journal_scope_conflict|conflict" {
+		t.Fatalf("run %s; want failed|journal_scope_conflict|conflict", got)
+	}
+	if got := oneRow(t, j.database, `SELECT state || '|' || error_text FROM journal_scopes WHERE run_id = '`+run+`'`); got != "canceled|journal_scope_conflict" {
+		t.Fatalf("scope %s", got)
+	}
+	if got, want := invocations(t, log), map[string]int{"charge": 1}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("invocations %v; want %v (no arm)", got, want)
+	}
+}
+
+// TestOperatorCanEndARunKilledMidArm (#404 Review R round 1): a run
+// killed inside an arm is left inside its construct's scope. An operator
+// can still cancel it or fail it (Journal.CancelRun, Journal.FailRun, as
+// before control flow was durable), and its scopes end canceled with it.
+func TestOperatorCanEndARunKilledMidArm(t *testing.T) {
+	if os.Getenv("NEWBLOK_333_CONTROL_CHILD") == "1" {
+		runControlChild()
+		return
+	}
+	for _, c := range []struct {
+		name string
+		end  func(*Journal, string) error
+		want []string
+	}{
+		{"cancel", func(j *Journal, run string) error { return j.CancelRun(context.Background(), run, "operator") },
+			[]string{`route@root|if||canceled|{"arm":"then"}`, "charge@root|committed", "route/then/vip@root|committed", "run|canceled"}},
+		{"fail", func(j *Journal, run string) error {
+			return j.FailRun(context.Background(), run, "operator_failed", "operator")
+		}, []string{`route@root|if||canceled|{"arm":"then"}`, "charge@root|committed", "route/then/vip@root|committed", "run|failed"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			path, _ := killControlChild(t, "branch", 1)
+			database, j := newJournalAtPath(t, path, Config{Holder: "operator", Clock: ticking(fixtureBase.Add(time.Hour))})
+			defer database.Close()
+			run := oneRow(t, database, `SELECT run_id FROM journal_runs WHERE request_key = 'crash'`)
+			if err := c.end(j, run); err != nil {
+				t.Fatalf("ending a run killed mid-arm: %v", err)
+			}
+			if got := controlRows(t, j, run); !reflect.DeepEqual(got, c.want) {
+				t.Fatalf("rows:\n got %q\nwant %q", got, c.want)
+			}
+		})
+	}
+}
