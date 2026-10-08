@@ -395,8 +395,16 @@ write transaction (including its wait for the writer turn and its durable
 commit) took 13–15 ms, the longest 35–91 ms. With a 30 ms hold, and with a
 300 ms hold (longer than the busy timeout on its own), an `Enqueue` loop
 beside the compaction on a store with a 200 ms busy timeout never failed
-and waited at most about 15 ms (`TestSlowHoldNeverBlocksWriters`); with the
-hold inside the transaction the same test fails `admission_saturated`.
+and waited at most about 15 ms; with the hold inside the transaction it
+failed `admission_saturated`. The tests pin both bounds without a
+wall-clock budget, which a loaded `-race` machine cannot meet even for a
+lone `Enqueue` (#374): `TestSlowHoldNeverBlocksWriters` enqueues from
+another goroutine during every call of the hold, which succeeds because
+no write turn is held then, and fails busy every time if the hold runs
+inside the transaction; `TestCompactionWriteTransactionsAreTimeBounded`
+makes each erased row take at least 25 ms, then 10 ms, and asserts that
+no write transaction erases more rows than a tenth of a 200 ms busy
+timeout allows (one, then two).
 Unfinished jobs are not in the index, so claims do not maintain it; every
 job that finishes adds one entry. Twelve interleaved runs of 2,000 trivial
 jobs on the same host gave median enqueue rates of about 13.6 k/s on
