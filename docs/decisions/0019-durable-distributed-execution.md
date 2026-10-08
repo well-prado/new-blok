@@ -93,6 +93,30 @@ of 16 s and the owner TTL. Such a run still blocks a partition for as long as
 every worker that acquires it fails the same way; mismatched artifacts are an
 operator error the runtime reports but does not repair.
 
+A worker keeps its partition for as long as its lease is provably alive,
+not for as long as one renewal round-trip takes (#405). etcd restarts a
+lease's TTL when it processes a grant or keepalive, which is after the client
+sent it, grants at least the requested TTL (rounded up to whole seconds), and
+a leader change only extends a lease. So a lease last proven alive by a
+request sent at local time S cannot expire before S + OwnerTTL. The worker
+treats it as valid until `validUntil = S + OwnerTTL - OwnerTTL/4`. The
+OwnerTTL/4 safety margin covers the time the worker takes to notice its
+cancellation and any rate drift between the local and etcd clocks. It renews
+OwnerTTL/3 after the send time of the last proof (at once if a slow
+acquisition already used that up). A failed or slow renewal is retried every
+OwnerTTL/10, and each attempt is bounded by `validUntil`. A renewal that succeeds moves
+`validUntil` to its own send time + OwnerTTL - OwnerTTL/4. A timer cancels the
+worker's execution context at `validUntil` even when a renewal call is stuck,
+so the worker dispatches no further step once its lease could be gone. A
+renewal that proves ownership is lost (lease expired, owner key deleted, or
+fence or incarnation changed) ends ownership at once. With renewals every
+OwnerTTL/3, a renewal therefore has about 5/12 of OwnerTTL to succeed
+(417 ms at the 1 s minimum, 1.67 s at 4 s) before the worker gives up. The
+previous rule (a single attempt with an OwnerTTL/4 timeout, and give up on
+the first failure) dropped partitions on ordinary latency spikes and turned
+the run in flight into an uncertain one. Durable writes stay fenced by etcd
+exactly as before; this bound governs only local execution.
+
 Fencing rejects a stale owner's durable writes, not its external calls. A
 paused or partitioned owner that resumes after a takeover may still perform
 the effect of a step it had already dispatched; its result is rejected and the
