@@ -1,6 +1,7 @@
 package journal
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -57,6 +58,7 @@ var (
 	_ engine.StepJournal  = (*RunJournal)(nil)
 	_ engine.WaitJournal  = (*RunJournal)(nil)
 	_ engine.ScopeJournal = (*RunJournal)(nil)
+	_ engine.LoopJournal  = (*RunJournal)(nil)
 )
 
 // Permanent reports an error no retry of the run can fix: a conflict with
@@ -499,6 +501,97 @@ func (r *RunJournal) ExitScope(ctx context.Context, entry engine.ScopeEntry, out
 	}
 	return r.settle(ctx, "scope-exit", true, func(tx *sql.Tx) error {
 		return r.journal.completeScope(ctx, tx, r.runID, entry.Scope.Path, entry.AttemptID, output)
+	})
+}
+
+// Slots returns the slots recorded under the loop scope entered (its
+// completed child scopes) whose paths begin with prefix, by path: one
+// range read of the scope key, however many scopes the run has.
+func (r *RunJournal) Slots(ctx context.Context, loop engine.ScopeEntry, prefix string) (map[string]json.RawMessage, error) {
+	if err := r.checkScope(loop.Scope); err != nil || prefix == "" {
+		return nil, errors.Join(ErrRequestConflict, err)
+	}
+	slots := map[string]json.RawMessage{}
+	err := r.journal.withRead(ctx, func(tx *sql.Tx) error {
+		if err := r.journal.checkRunLease(ctx, tx, r.runID, r.token, false); err != nil {
+			return err
+		}
+		// Paths are ASCII: every path beginning with prefix sorts below
+		// prefix followed by the last code point.
+		rows, err := tx.QueryContext(ctx, `SELECT path, output_json FROM journal_scopes WHERE run_id = ? AND path >= ? AND path < ? AND parent_path = ? AND state = ?`, r.runID, prefix, prefix+"\U0010FFFF", loop.Scope.Path, checkpointCompleted)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var path string
+			var output []byte
+			if err := rows.Scan(&path, &output); err != nil {
+				return err
+			}
+			slots[path] = append(json.RawMessage(nil), output...)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return slots, nil
+}
+
+// RecordSlot records an item's or arm's slot (engine.LoopJournal): the
+// slot scope, completed with output, under the loop's, in one transaction
+// under the run lease. A slot already recorded with the same output is a
+// no-op; with another, ErrRecordFinal; under another kind or parent,
+// ErrRequestConflict. An output over MaxStepResultBytes is
+// ErrStepResultLimit.
+func (r *RunJournal) RecordSlot(ctx context.Context, loop engine.ScopeEntry, slot engine.ScopeIdentity, output json.RawMessage) error {
+	if err := r.checkScope(slot); err != nil || slot.ParentPath != loop.Scope.Path || slot.Path == loop.Scope.Path {
+		return errors.Join(ErrRequestConflict, err)
+	}
+	if len(output) > MaxStepResultBytes {
+		return ErrStepResultLimit
+	}
+	if !json.Valid(output) {
+		return errors.New("journal: valid slot output is required")
+	}
+	return r.settle(ctx, "scope-slot", true, func(tx *sql.Tx) error {
+		var kind, parent, state string
+		var stored []byte
+		err := tx.QueryRowContext(ctx, `SELECT kind, parent_path, state, output_json FROM journal_scopes WHERE run_id = ? AND path = ?`, r.runID, slot.Path).Scan(&kind, &parent, &state, &stored)
+		if errors.Is(err, sql.ErrNoRows) {
+			_, err = tx.ExecContext(ctx, `INSERT INTO journal_scopes (run_id, path, kind, parent_path, state, output_json, attempt_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, '', ?)`, r.runID, slot.Path, slot.Kind, slot.ParentPath, checkpointCompleted, []byte(output), r.journal.now())
+			return err
+		}
+		switch {
+		case err != nil:
+			return err
+		case kind != slot.Kind || parent != slot.ParentPath:
+			return fmt.Errorf("%w: slot %s was recorded as a %s in %q", ErrRequestConflict, slot.Path, kind, parent)
+		case state == checkpointCompleted && bytes.Equal(stored, output):
+			return nil
+		default:
+			return fmt.Errorf("%w: slot %s is %s with another result", ErrRecordFinal, slot.Path, state)
+		}
+	})
+}
+
+// FailScope replaces the decision of the running loop scope entry entered
+// with decision, which records its failure (engine.LoopJournal); only the
+// attempt that entered it last may (ErrStaleAttempt).
+func (r *RunJournal) FailScope(ctx context.Context, loop engine.ScopeEntry, decision json.RawMessage) error {
+	if err := r.checkScope(loop.Scope); err != nil {
+		return err
+	}
+	if len(decision) > MaxInspectionInputBytes || !json.Valid(decision) || loop.AttemptID == "" {
+		return ErrRequestConflict
+	}
+	return r.settle(ctx, "scope-fail", true, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ctx, `UPDATE journal_scopes SET input_json = ?, updated_at = ? WHERE run_id = ? AND path = ? AND state = ? AND attempt_id = ?`, []byte(decision), r.journal.now(), r.runID, loop.Scope.Path, checkpointRunning, loop.AttemptID)
+		if err := requireOneRow(result, err); err != nil {
+			return ErrStaleAttempt
+		}
+		return nil
 	})
 }
 

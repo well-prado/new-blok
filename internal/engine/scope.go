@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/well-prado/new-blok/contract"
 )
@@ -16,9 +17,21 @@ import (
 var ErrScopeConflict = errors.New("engine: a scope's recorded decision conflicts with its construct")
 
 // scopeDecision is the decision a scope records (ScopeJournal): the arm an
-// if or a choose selected. A try-finally records none.
+// if or a choose selected; for an each or a parallel, its number of slots
+// and, once it failed fast, that failure (LoopJournal.FailScope). A
+// try-finally records none.
 type scopeDecision struct {
-	Arm string `json:"arm"`
+	Arm    string           `json:"arm,omitempty"`
+	Items  *int             `json:"items,omitempty"`
+	Failed *recordedFailure `json:"failed,omitempty"`
+}
+
+// recordedFailure is the failure a loop recorded: what a replay reports.
+type recordedFailure struct {
+	Code      string `json:"code"`
+	Class     string `json:"class"`
+	Step      string `json:"step,omitempty"`
+	Uncertain bool   `json:"uncertain,omitempty"`
 }
 
 // enterScope enters instruction's scope with decision (an arm name, empty
@@ -68,9 +81,131 @@ func exitScope(ctx context.Context, scopes ScopeJournal, entry ScopeEntry, step 
 	return nil
 }
 
-// unjournaledControl is the kind of the first construct in instructions,
-// at any depth, that a durable runner cannot journal yet (each and
-// parallel need joins, #333 slice 3), or "".
+// loopScope journals one execution of an each or a parallel (ADR 0028,
+// slice 3): its scope, whose decision is its number of slots, and one slot
+// per item or arm. Items run concurrently, so slots is guarded.
+type loopScope struct {
+	journal  LoopJournal
+	identity ScopeIdentity
+	entry    ScopeEntry
+	recorded map[string]json.RawMessage
+
+	mu    sync.Mutex
+	slots []json.RawMessage // each slot's result, unwrapped, by index
+}
+
+// begin enters the loop's scope for n slots and, when prefix is set (an
+// each), reads the slots already recorded. A loop recorded for another
+// number of slots is journal_scope_conflict; one whose failure was
+// recorded fails again with it at once, starting no item.
+func (l *loopScope) begin(ctx context.Context, step string, n int, prefix string) error {
+	encoded, _ := json.Marshal(scopeDecision{Items: &n})
+	entry, err := l.journal.EnterScope(ctx, l.identity, encoded)
+	if err != nil {
+		return journalFailure("journal_scope_enter", step, err, nil)
+	}
+	var recorded scopeDecision
+	if json.Unmarshal(entry.Decision, &recorded) != nil || recorded.Items == nil || *recorded.Items != n || recorded.Arm != "" {
+		return scopeConflict(step, l.identity.Path, entry.Decision)
+	}
+	if failed := recorded.Failed; failed != nil {
+		return &Error{Code: failed.Code, Class: failed.Class, Step: failed.Step, Uncertain: failed.Uncertain, Err: fmt.Errorf("%s failed in an earlier execution of this run (recorded in scope %s)", step, l.identity.Path)}
+	}
+	l.entry, l.slots = entry, make([]json.RawMessage, n)
+	if prefix != "" {
+		if l.recorded, err = l.journal.Slots(ctx, entry, prefix); err != nil {
+			return journalFailure("journal_scope_slots", step, err, nil)
+		}
+	}
+	return nil
+}
+
+// filled returns the result recorded in the slot at path, as the JSON value
+// a replay continues with, if the slot is recorded.
+func (l *loopScope) filled(step string, index int, path string) (any, bool, error) {
+	wrapped, ok := l.recorded[path]
+	if !ok {
+		return nil, false, nil
+	}
+	var slot map[string]json.RawMessage
+	output, present := json.RawMessage(nil), false
+	if json.Unmarshal(wrapped, &slot) == nil && len(slot) == 1 {
+		output, present = slot["output"]
+	}
+	if !present {
+		return nil, false, scopeConflict(step, path, wrapped)
+	}
+	value, err := decodeLiteral(output)
+	if err != nil {
+		return nil, false, scopeConflict(step, path, wrapped)
+	}
+	l.mu.Lock()
+	l.slots[index] = output
+	l.mu.Unlock()
+	return value, true, nil
+}
+
+// record writes the slot at path with output, the item's or arm's result,
+// and returns the result as the JSON value it recorded, so a replay that
+// reads the slot continues with the same value.
+func (l *loopScope) record(ctx context.Context, step string, index int, path, kind string, output any) (any, error) {
+	encoded, err := json.Marshal(output)
+	if err != nil {
+		return nil, &Error{Code: "journal_scope_encode", Class: "persistence", Step: step, Err: err}
+	}
+	wrapped := append(append([]byte(`{"output":`), encoded...), '}')
+	slot := ScopeIdentity{RunID: l.identity.RunID, ArtifactDigest: l.identity.ArtifactDigest, Path: path, ParentPath: l.identity.Path, Kind: kind}
+	if err := l.journal.RecordSlot(ctx, l.entry, slot, wrapped); err != nil {
+		return nil, journalFailure("journal_scope_slot", step, err, nil)
+	}
+	l.mu.Lock()
+	l.slots[index] = encoded
+	l.mu.Unlock()
+	return decodeLiteral(encoded)
+}
+
+// exit commits the loop's result to its scope: its slots' results in
+// index order, every slot filled.
+func (l *loopScope) exit(ctx context.Context, step string) error {
+	if l.entry.Completed {
+		return nil
+	}
+	output := []byte{'['}
+	for index, slot := range l.slots {
+		if slot == nil {
+			return &Error{Code: "journal_scope_slots", Class: "persistence", Step: step, Err: fmt.Errorf("slot %d of %s has no result", index, l.identity.Path)}
+		}
+		if index > 0 {
+			output = append(output, ',')
+		}
+		output = append(output, slot...)
+	}
+	if err := l.journal.ExitScope(ctx, l.entry, append(output, ']')); err != nil {
+		return journalFailure("journal_scope_exit", step, err, nil)
+	}
+	return nil
+}
+
+// fail records the loop's failure as its decision when it is the run's
+// own (fail-fast): not a suspension, the caller's cancellation or a
+// journal fault, which a later execution may get past. If recording it
+// fails, a replay runs the loop again.
+func (l *loopScope) fail(ctx context.Context, failure error) {
+	var classified *Error
+	if !errors.As(failure, &classified) || classified.Suspended || classified.Class == "cancellation" || classified.Class == "persistence" ||
+		errors.Is(failure, context.Canceled) || errors.Is(failure, context.DeadlineExceeded) || l.entry.AttemptID == "" {
+		return
+	}
+	var recorded scopeDecision
+	_ = json.Unmarshal(l.entry.Decision, &recorded)
+	recorded.Failed = &recordedFailure{Code: classified.Code, Class: classified.Class, Step: classified.Step, Uncertain: classified.Uncertain}
+	encoded, _ := json.Marshal(recorded)
+	_ = l.journal.FailScope(ctx, l.entry, encoded)
+}
+
+// unjournaledControl is the kind of the first each or parallel in
+// instructions, at any depth: a durable runner journals them only through
+// a LoopJournal (#333 slice 3), or "".
 func unjournaledControl(instructions []contract.InternalInstruction) string {
 	for _, instruction := range instructions {
 		if instruction.Kind == "each" || instruction.Kind == "parallel" {
