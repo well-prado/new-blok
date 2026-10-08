@@ -563,6 +563,45 @@ func TestBusyWorkersTakeNoMoreRuns(t *testing.T) {
 	}
 }
 
+// TestStartWaitsForAWorkerBeforeLeasing: Start with every worker busy
+// waits for one without leasing the run, so the run's lease cannot lapse
+// while it queues and be taken again; once the worker frees, the run is
+// leased and executed.
+func TestStartWaitsForAWorkerBeforeLeasing(t *testing.T) {
+	r := newRigWith(t, program(0, "test/hold"), "a", "", rigOptions{config: func(c *Config) { c.Workers = 1; c.RenewEvery = 10 * time.Millisecond }})
+	first, second := r.admit("first"), r.admit("second")
+	for _, run := range []string{first, second} {
+		r.signal(run, "early-"+run)
+	}
+	if err := r.resumer.Start(r.ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return r.holding.Load() == 1 })
+	started := make(chan error, 1)
+	go func() { started <- r.resumer.Start(r.ctx, second) }()
+	// Start is queued for the worker; give a lease taken first the time to
+	// show (it is one write transaction).
+	time.Sleep(200 * time.Millisecond)
+	select {
+	case err := <-started:
+		t.Fatalf("Start returned with the only worker busy: %v", err)
+	default:
+	}
+	if got := r.runRow(second); got != "accepted|-|" {
+		t.Fatalf("the queued run: %s; want not leased while it waits for a worker", got)
+	}
+	close(r.hold)
+	if err := <-started; err != nil {
+		t.Fatal(err)
+	}
+	r.await(2)
+	for _, run := range []string{first, second} {
+		if got := fmt.Sprint(r.outcomesOf(run)); got != "[completed]" {
+			t.Fatalf("run %s outcomes %s", run, got)
+		}
+	}
+}
+
 // TestCloseReturnsAtItsDeadline: an execution stuck in a node that ignores
 // cancellation does not hold Close past its deadline; Start after Close is
 // refused.
