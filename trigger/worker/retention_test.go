@@ -522,23 +522,35 @@ func TestCensusIsCorrectAfterCompaction(t *testing.T) {
 }
 
 // batchDatabase records, for each marked write transaction, how many job
-// rows and tombstones it removed or added.
+// rows and tombstones it removed or added, and how long it held the write
+// lock (from its callback's start to its commit). It reports the busy
+// timeout of the store it wraps, so a queue on it budgets as one on the
+// store would.
 type batchDatabase struct {
 	store.Database
 	purger      store.Purger
 	mu          sync.Mutex
 	jobs, tombs int
 	deltas      [][2]int
+	holds       []time.Duration
 }
 
 func (d *batchDatabase) PurgeLog(ctx context.Context) error  { return d.purger.PurgeLog(ctx) }
 func (d *batchDatabase) PurgeFree(ctx context.Context) error { return d.purger.PurgeFree(ctx) }
 
+func (d *batchDatabase) BusyTimeout() time.Duration {
+	timeout, _ := store.BusyTimeoutOf(d.Database)
+	return timeout
+}
+
 func (d *batchDatabase) WithTx(ctx context.Context, fn func(*sql.Tx) error) error {
 	if !store.IsWriter(ctx) {
 		return d.Database.WithTx(ctx, fn)
 	}
-	return d.Database.WithTx(ctx, func(tx *sql.Tx) error {
+	var started time.Time
+	recorded := false
+	err := d.Database.WithTx(ctx, func(tx *sql.Tx) error {
+		started = time.Now()
 		if err := fn(tx); err != nil {
 			return err
 		}
@@ -550,8 +562,15 @@ func (d *batchDatabase) WithTx(ctx context.Context, fn func(*sql.Tx) error) erro
 		defer d.mu.Unlock()
 		d.deltas = append(d.deltas, [2]int{d.jobs - jobs, d.tombs - tombs})
 		d.jobs, d.tombs = jobs, tombs
+		recorded = true
 		return nil
 	})
+	if recorded {
+		d.mu.Lock()
+		d.holds = append(d.holds, time.Since(started))
+		d.mu.Unlock()
+	}
+	return err
 }
 
 // TestCompactionIsBatched: no write transaction erases more than
@@ -741,44 +760,6 @@ func TestRetentionMigratesAQueueFromBeforeIt(t *testing.T) {
 	}
 }
 
-// compactAlongsideEnqueues runs Compact while another goroutine enqueues
-// new jobs without pause, and returns the report and every enqueue failure
-// with the longest enqueue wait.
-func compactAlongsideEnqueues(t *testing.T, r *retentionRig, retention Retention) (CompactionReport, []error, time.Duration) {
-	t.Helper()
-	stop := make(chan struct{})
-	var failures []error
-	var longest time.Duration
-	enqueued := make(chan int, 1)
-	go func() {
-		n := 0
-		defer func() { enqueued <- n }()
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			start := time.Now()
-			_, err := r.queue.Enqueue(context.Background(), EnqueueRequest{RequestKey: fmt.Sprintf("concurrent-%d", n), Kind: "retention.test", Payload: []byte(`{}`)})
-			longest = max(longest, time.Since(start))
-			if err != nil {
-				failures = append(failures, err)
-			}
-			n++
-		}
-	}()
-	report, err := r.queue.Compact(context.Background(), retention)
-	close(stop)
-	if n := <-enqueued; n == 0 {
-		t.Fatal("fixture: no enqueue ran alongside the compaction")
-	}
-	if err != nil {
-		t.Fatalf("compact: %v", err)
-	}
-	return report, failures, longest
-}
-
 // newWaitingRig opens the rig's store with a short busy timeout, so a
 // writer kept waiting by compaction fails within the test instead of after
 // the default five seconds.
@@ -795,12 +776,22 @@ func newWaitingRig(t *testing.T, busy time.Duration, opts ...Option) *retentionR
 }
 
 // TestSlowHoldNeverBlocksWriters: the legal hold is asked outside the write
-// lock (#313 review), so an enqueue running beside a compaction never waits
-// out the store's 200 ms busy timeout and fails saturated, and the hold
-// still keeps its jobs. Two holds: 30 ms per job, about one lookup in a
-// legal-hold service, over 20 jobs (600 ms in all); and 300 ms per job,
-// longer than the busy timeout on its own, which no time bound on the write
-// transaction could cover if the hold ran inside it.
+// lock (#313 review), so a writer that arrives while the hold is deciding
+// gets its write turn at once instead of waiting out the store's 200 ms busy
+// timeout and failing saturated, and the hold still keeps its jobs. Two
+// holds: 30 ms per job, about one lookup in a legal-hold service, over 20
+// jobs (600 ms in all); and 300 ms per job, longer than the busy timeout on
+// its own, which no time bound on the write transaction could cover if the
+// hold ran inside it.
+//
+// The writer is an Enqueue from another goroutine, started inside every
+// call of the hold after its delay, and the hold waits for it to finish.
+// While the hold runs, Compact holds no write turn, so the enqueue meets no
+// other writer and never waits for one; no wall-clock budget is asserted,
+// and a loaded -race machine cannot fail it (#374). If the hold ran inside a
+// write transaction, the enqueue would queue behind that transaction, which
+// cannot end before the hold returns, which waits for the enqueue: it fails
+// busy after 200 ms, every time.
 func TestSlowHoldNeverBlocksWriters(t *testing.T) {
 	for _, slow := range []struct {
 		name  string
@@ -808,10 +799,29 @@ func TestSlowHoldNeverBlocksWriters(t *testing.T) {
 		jobs  int
 	}{{"30ms per job", 30 * time.Millisecond, 20}, {"300ms per job", 300 * time.Millisecond, 4}} {
 		t.Run(slow.name, func(t *testing.T) {
+			var queue *Queue
+			var mu sync.Mutex
+			var asked int
+			var failures []error
 			r := newWaitingRig(t, 200*time.Millisecond, WithRetentionHold(func(job RetainedJob) bool {
 				time.Sleep(slow.delay)
+				mu.Lock()
+				asked++
+				n := asked
+				mu.Unlock()
+				done := make(chan error, 1)
+				go func() {
+					_, err := queue.Enqueue(context.Background(), EnqueueRequest{RequestKey: fmt.Sprintf("beside-hold-%d", n), Kind: "retention.test", Payload: []byte(`{}`)})
+					done <- err
+				}()
+				if err := <-done; err != nil {
+					mu.Lock()
+					failures = append(failures, err)
+					mu.Unlock()
+				}
 				return strings.Contains(job.Principal.ID, "HELD")
 			}))
+			queue = r.queue
 			var heldJobs []markedJob
 			for i := range slow.jobs {
 				name := fmt.Sprintf("free-%02d", i)
@@ -825,9 +835,15 @@ func TestSlowHoldNeverBlocksWriters(t *testing.T) {
 				}
 			}
 			r.clock.Set(retentionStart.Add(48 * time.Hour))
-			report, failures, longest := compactAlongsideEnqueues(t, r, Retention{Completed: r.clock.Now()})
+			report, err := r.queue.Compact(context.Background(), Retention{Completed: r.clock.Now()})
+			if err != nil {
+				t.Fatalf("compact: %v", err)
+			}
+			if asked != slow.jobs {
+				t.Fatalf("fixture: the hold was asked %d times, want %d, one enqueue beside each", asked, slow.jobs)
+			}
 			if len(failures) > 0 {
-				t.Fatalf("an enqueue beside the compaction failed (longest wait %v): %v", longest, failures[0])
+				t.Fatalf("%d of %d enqueues made while the hold was deciding failed: %v", len(failures), asked, failures[0])
 			}
 			if report.Compacted != slow.jobs/2 || report.Held != slow.jobs/2 {
 				t.Fatalf("report %+v; want half the jobs erased and half held", report)
@@ -837,29 +853,64 @@ func TestSlowHoldNeverBlocksWriters(t *testing.T) {
 					t.Fatalf("held job %s lost its content: %q", job.name, dump)
 				}
 			}
-			t.Logf("longest enqueue wait beside the compaction: %v", longest)
 		})
 	}
 }
 
 // TestCompactionWriteTransactionsAreTimeBounded: a write transaction ends
 // once it has run for a tenth of the busy timeout, however many jobs its
-// batch still holds (#313 review). With every erased row made to take
-// 10 ms and a 200 ms busy timeout, one transaction for the whole batch
-// would hold the lock for 400 ms and fail the enqueue beside it.
+// batch still holds (#313 review), so the write lock is released and the
+// writers queued for it get their turn (store/sqlite's arrival-order writer
+// queue, #214) after at most that long plus one row and the commit. With a
+// 200 ms busy timeout the budget is 20 ms; every erased row is made to take
+// at least 10 ms, so no transaction can erase more than two rows before it
+// commits, whatever the load. One transaction for the whole batch would
+// erase all 40.
+//
+// The bound is asserted on rows per transaction, not on how long another
+// writer waited: on a loaded -race machine a two-statement Enqueue alone
+// has held the write lock for over 300 ms, so a wall-clock budget on the
+// writer beside the compaction failed for reasons that were not the
+// compaction's (#374). A row's 10 ms is a lower bound (time.Sleep), so load
+// can only make a transaction erase fewer rows, never more. The measured
+// holds are logged.
 func TestCompactionWriteTransactionsAreTimeBounded(t *testing.T) {
-	r := newWaitingRig(t, 200*time.Millisecond)
-	for i := range 40 {
+	const busy, rowTime, jobs = 200 * time.Millisecond, 10 * time.Millisecond, 40
+	// The promise under test: a tenth of the busy timeout, at least one row.
+	maxRows := max(1, int(busy/10/rowTime))
+	r := newWaitingRig(t, busy)
+	for i := range jobs {
 		r.finish(t, marked(fmt.Sprintf("timed-%02d", i)), StateCompleted)
 	}
 	r.clock.Set(retentionStart.Add(48 * time.Hour))
-	r.queue.compactRowHook = func() { time.Sleep(10 * time.Millisecond) }
-	report, failures, longest := compactAlongsideEnqueues(t, r, Retention{Completed: r.clock.Now()})
-	if len(failures) > 0 {
-		t.Fatalf("an enqueue beside the compaction failed (longest wait %v): %v", longest, failures[0])
+	purger, _ := store.PurgerOf(r.database)
+	recorder := &batchDatabase{Database: r.database, purger: purger}
+	queue, err := New(context.Background(), recorder, r.clock.Now)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if report.Compacted != 40 || report.Batches < 4 {
-		t.Fatalf("report %+v; want 40 jobs erased in transactions of about 20 ms", report)
+	if queue.busyTimeout != busy {
+		t.Fatalf("fixture: the queue budgets for a %v busy timeout, want %v", queue.busyTimeout, busy)
 	}
-	t.Logf("%d write transactions; longest enqueue wait %v", report.Batches, longest)
+	queue.compactRowHook = func() { time.Sleep(rowTime) }
+	recorder.jobs, recorder.deltas, recorder.holds = jobs, nil, nil
+	report, err := queue.Compact(context.Background(), Retention{Completed: r.clock.Now()})
+	if err != nil || report.Compacted != jobs {
+		t.Fatalf("report %+v err=%v; want %d jobs erased", report, err, jobs)
+	}
+	erased, transactions := 0, 0
+	for i, delta := range recorder.deltas {
+		if delta[0] == 0 {
+			continue // the purge's bookkeeping, not an erasure
+		}
+		transactions++
+		if delta[0] > maxRows {
+			t.Fatalf("write transaction %d erased %d jobs at %v each; a %v budget allows %d (holds %v, batches %v)", i, delta[0], rowTime, busy/10, maxRows, recorder.holds, recorder.deltas)
+		}
+		erased += delta[0]
+	}
+	if erased != jobs || transactions != report.Batches || transactions < jobs/maxRows {
+		t.Fatalf("%d jobs in %d write transactions (report %+v, batches %v); want %d jobs in at least %d", erased, transactions, report, recorder.deltas, jobs, jobs/maxRows)
+	}
+	t.Logf("%d write transactions of at most %d rows; write-lock holds %v", transactions, maxRows, recorder.holds)
 }
