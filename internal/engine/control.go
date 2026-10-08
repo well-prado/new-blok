@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -253,6 +254,11 @@ func runTry(ctx context.Context, id string, plan *TryPlan) (any, error) {
 		return nil, fmt.Errorf("try %s is missing", id)
 	}
 	output, err := runActions(ctx, plan.Try)
+	if suspended(err) {
+		// The try suspended at a durable wait: it has not ended, so
+		// finally runs once it does, in the execution that resumes it.
+		return nil, err
+	}
 	if err != nil && ctx.Err() == nil && plan.Catch != nil {
 		output, err = plan.Catch(ctx, err)
 	}
@@ -279,4 +285,10 @@ func runTry(ctx context.Context, id string, plan *TryPlan) (any, error) {
 		return nil, classify(id, err)
 	}
 	return output, nil
+}
+
+// suspended reports a run suspended at a durable wait (run_suspended).
+func suspended(err error) bool {
+	var classified *Error
+	return errors.As(err, &classified) && classified.Suspended
 }

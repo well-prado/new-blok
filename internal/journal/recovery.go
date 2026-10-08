@@ -210,14 +210,19 @@ func (j *Journal) StartScope(ctx context.Context, record ScopeRecord) (ScopeAtte
 		if !errors.Is(queryErr, sql.ErrNoRows) {
 			return queryErr
 		}
-		_, queryErr = tx.ExecContext(ctx, `INSERT INTO journal_scopes (run_id, path, kind, parent_path, state, input_json, attempt_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, record.RunID, record.Path, record.Kind, record.ParentPath, checkpointRunning, nullableJSON(record.Input), attemptID, j.now())
 		started.AttemptID = attemptID
-		return queryErr
+		return j.insertScope(ctx, tx, record, attemptID)
 	})
 	if err != nil {
 		return ScopeAttempt{}, err
 	}
 	return started, nil
+}
+
+// insertScope writes a new running scope, started by attemptID.
+func (j *Journal) insertScope(ctx context.Context, tx *sql.Tx, record ScopeRecord, attemptID string) error {
+	_, err := tx.ExecContext(ctx, `INSERT INTO journal_scopes (run_id, path, kind, parent_path, state, input_json, attempt_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, record.RunID, record.Path, record.Kind, record.ParentPath, checkpointRunning, nullableJSON(record.Input), attemptID, j.now())
+	return err
 }
 
 // CompleteScope commits a scope's output, once. attemptID is the one
@@ -237,39 +242,44 @@ func (j *Journal) CompleteScope(ctx context.Context, runID, path, attemptID stri
 		return ErrStaleAttempt
 	}
 	return j.withTx(ctx, "scope-complete", func(tx *sql.Tx) error {
-		var state, current string
-		var stored []byte
-		err := tx.QueryRowContext(ctx, `SELECT state, attempt_id, output_json FROM journal_scopes WHERE run_id = ? AND path = ?`, runID, path).Scan(&state, &current, &stored)
-		if errors.Is(err, sql.ErrNoRows) {
-			return ErrNotFound
-		}
-		if err != nil {
-			return err
-		}
-		switch {
-		case state == checkpointCompleted:
-			if current == attemptID && bytes.Equal(stored, output) {
-				return nil
-			}
-			return ErrRecordFinal
-		case state != checkpointRunning:
-			return ErrNotFound
-		case current != attemptID:
-			return ErrStaleAttempt
-		}
-		result, err := tx.ExecContext(ctx, `UPDATE journal_scopes SET state = ?, output_json = ?, updated_at = ? WHERE run_id = ? AND path = ? AND state = ? AND attempt_id = ?`, checkpointCompleted, []byte(output), j.now(), runID, path, checkpointRunning, attemptID)
-		if err != nil {
-			return err
-		}
-		changed, err := result.RowsAffected()
-		if err != nil {
-			return err
-		}
-		if changed != 1 {
-			return ErrStaleAttempt
-		}
-		return nil
+		return j.completeScope(ctx, tx, runID, path, attemptID, output)
 	})
+}
+
+// completeScope is CompleteScope in tx.
+func (j *Journal) completeScope(ctx context.Context, tx *sql.Tx, runID, path, attemptID string, output json.RawMessage) error {
+	var state, current string
+	var stored []byte
+	err := tx.QueryRowContext(ctx, `SELECT state, attempt_id, output_json FROM journal_scopes WHERE run_id = ? AND path = ?`, runID, path).Scan(&state, &current, &stored)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	switch {
+	case state == checkpointCompleted:
+		if current == attemptID && bytes.Equal(stored, output) {
+			return nil
+		}
+		return ErrRecordFinal
+	case state != checkpointRunning:
+		return ErrNotFound
+	case current != attemptID:
+		return ErrStaleAttempt
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE journal_scopes SET state = ?, output_json = ?, updated_at = ? WHERE run_id = ? AND path = ? AND state = ? AND attempt_id = ?`, checkpointCompleted, []byte(output), j.now(), runID, path, checkpointRunning, attemptID)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return ErrStaleAttempt
+	}
+	return nil
 }
 
 func (j *Journal) CancelScope(ctx context.Context, runID, path, reason string) error {
