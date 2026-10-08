@@ -62,7 +62,7 @@ func TestSignalRaceReconcilesAnHTMLDuplicate(t *testing.T) {
 		if _, err := runtime.processOne(ctx, owner); !errors.Is(err, ErrNoWork) {
 			t.Fatalf("%s: initial process error=%v, want suspended work yield", race.name, err)
 		}
-		waitID := WaitIDFor(admission.RunID, "approval")
+		waitID := WaitIDFor(admission.RunID, "approval", "")
 		barrier.eventID = waitTransition("signal", tenant+"\x00"+waitID+"\x00html-signal")
 		// The winner: the same signal ID and principal, committed through
 		// an unwrapped client exactly as DeliverSignal commits it.

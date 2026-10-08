@@ -79,11 +79,14 @@ func suspended(err error) bool {
 }
 
 // engineRows lists the run's waits as name|state|signal_id and its steps'
-// operations as invocation_path|state, each in order.
+// operations as invocation_path@iteration_path|state, each in order. The
+// iteration is pinned: the engine's top-level steps are at the root, as
+// operations written before #382 are (a step keyed by another iteration
+// would never be found again by a run suspended before it).
 func engineRows(t *testing.T, j *Journal, runID string) []string {
 	t.Helper()
 	rows := waitRows(t, j.database, `SELECT name || '|' || state || '|' || signal_id FROM journal_waits WHERE run_id = '`+runID+`' ORDER BY rowid`)
-	rows = append(rows, waitRows(t, j.database, `SELECT invocation_path || '|' || state FROM journal_operations WHERE run_id = '`+runID+`' ORDER BY rowid`)...)
+	rows = append(rows, waitRows(t, j.database, `SELECT invocation_path || '@' || iteration_path || '|' || state FROM journal_operations WHERE run_id = '`+runID+`' ORDER BY rowid`)...)
 	return append(rows, waitRows(t, j.database, `SELECT 'run|' || state FROM journal_runs WHERE run_id = '`+runID+`'`)...)
 }
 
@@ -110,6 +113,12 @@ func TestEngineSuspendsAndResumesThroughTheJournal(t *testing.T) {
 	if err := j.ReleaseRunLease(ctx, run, first); err != nil {
 		t.Fatal(err)
 	}
+	// The engine waits at the root iteration, where a run suspended before
+	// #382 waits: a wait keyed by another iteration would never be found
+	// again by such a run, which would re-suspend on a new wait forever.
+	if wait, err := j.WaitAt(ctx, run, "approval", engine.RootIteration); err != nil || wait.State != "waiting" {
+		t.Fatalf("wait at the root iteration: %+v err=%v", wait, err)
+	}
 	if result, err := j.Signal(ctx, signal.Envelope{RunID: run, SignalID: "s1", Name: "approval", Principal: "operator", Payload: []byte(`{"approved":true}`)}, true); err != nil || result != delivered {
 		t.Fatalf("signal=%+v err=%v", result, err)
 	}
@@ -131,7 +140,7 @@ func TestEngineSuspendsAndResumesThroughTheJournal(t *testing.T) {
 	if err := rj.CompleteRun(ctx, []byte(`{"approved":true}`)); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"approval|acknowledged|s1", "charge|committed", "notify|committed", "run|completed"}
+	want := []string{"approval|acknowledged|s1", "charge@root|committed", "notify@root|committed", "run|completed"}
 	if got := engineRows(t, j, run); !reflect.DeepEqual(got, want) {
 		t.Fatalf("rows:\n got %q\nwant %q", got, want)
 	}
@@ -176,7 +185,7 @@ func TestEngineWaitTimesOutThroughTheJournal(t *testing.T) {
 	if err := rj.CompleteRun(ctx, []byte(`{"timedOut":true}`)); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"approval|acknowledged|", "charge|committed", "notify|committed", "run|completed"}
+	want := []string{"approval|acknowledged|", "charge@root|committed", "notify@root|committed", "run|completed"}
 	if got := engineRows(t, j, run); !reflect.DeepEqual(got, want) {
 		t.Fatalf("rows:\n got %q\nwant %q", got, want)
 	}
@@ -214,7 +223,7 @@ func TestEngineReplaysAfterACrashMidResumption(t *testing.T) {
 	database, j := newJournalAtPath(t, path, Config{Holder: "parent", Clock: ticking(fixtureBase.Add(time.Hour))})
 	defer database.Close()
 	run := oneRow(t, database, `SELECT run_id FROM journal_runs WHERE request_key = 'crash'`)
-	if got, want := engineRows(t, j, run), []string{"approval|fired|s1", "charge|committed", "run|accepted"}; !reflect.DeepEqual(got, want) {
+	if got, want := engineRows(t, j, run), []string{"approval|fired|s1", "charge@root|committed", "run|accepted"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("rows the kill left:\n got %q\nwant %q", got, want)
 	}
 	if listed, err := j.PendingResumptions(ctx, fixtureBase.Add(2*time.Second), 10); err != nil || len(listed) != 0 {
@@ -232,7 +241,7 @@ func TestEngineReplaysAfterACrashMidResumption(t *testing.T) {
 	if err := rj.CompleteRun(ctx, []byte(`{}`)); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := engineRows(t, j, run), []string{"approval|acknowledged|s1", "charge|committed", "notify|committed", "run|completed"}; !reflect.DeepEqual(got, want) {
+	if got, want := engineRows(t, j, run), []string{"approval|acknowledged|s1", "charge@root|committed", "notify@root|committed", "run|completed"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("rows after recovery:\n got %q\nwant %q", got, want)
 	}
 }
@@ -250,7 +259,7 @@ func TestEngineEffectInterruptedByACrashIsUncertain(t *testing.T) {
 	database, j := newJournalAtPath(t, path, Config{Holder: "parent", Clock: ticking(fixtureBase.Add(time.Hour))})
 	defer database.Close()
 	run := oneRow(t, database, `SELECT run_id FROM journal_runs WHERE request_key = 'crash'`)
-	if got, want := engineRows(t, j, run), []string{"charge|dispatched", "run|accepted"}; !reflect.DeepEqual(got, want) {
+	if got, want := engineRows(t, j, run), []string{"charge@root|dispatched", "run|accepted"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("rows the kill left:\n got %q\nwant %q", got, want)
 	}
 	token, err := j.TakeRunLease(context.Background(), run, fixtureBase.Add(time.Minute))
@@ -263,7 +272,7 @@ func TestEngineEffectInterruptedByACrashIsUncertain(t *testing.T) {
 	if !errors.As(err, &uncertain) || !uncertain.IsUncertain() || flow.charges.Load() != 0 {
 		t.Fatalf("err=%v charges=%d; want an uncertain outcome and no second charge", err, flow.charges.Load())
 	}
-	if got, want := engineRows(t, j, run), []string{"charge|uncertain", "run|accepted"}; !reflect.DeepEqual(got, want) {
+	if got, want := engineRows(t, j, run), []string{"charge@root|uncertain", "run|accepted"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("rows after the replay:\n got %q\nwant %q", got, want)
 	}
 }

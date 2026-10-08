@@ -205,7 +205,7 @@ was renumbered from 5 to 6.
 `StepJournal` and `WaitJournal` for one run executed under that lease
 token. A run's steps are identified as the journal identifies effects and
 waits: the invocation path is the engine's step ID, and the iteration path
-is `root` until #333 gives the engine iteration paths (ADR 0031 defines
+is `root` until #333 gives the engine iteration paths (ADR 0028 defines
 both; a top-level step's invocation path is its ID).
 
 - **Lease and input.** `VerifyRun` refuses a run that is not live, whose
@@ -281,12 +281,63 @@ wakeup is consumed with the step after it rather than with the wait step;
 the effect is the same, since the wait step's output is the stored
 outcome and replays identically.
 
-`internal/cluster`'s `WaitIDFor(runID, stepID)` addresses a wait by run
-and step only. Once #333 runs a wait in a loop durably, every iteration
-would map to one cluster wait, and the second iteration would read the
-first one's outcome: it needs the iteration path (and the invocation path
-inside an arm) before durable loops reach the cluster runtime. ADR 0031
-(#333, in progress) has a durable runner refuse control flow until then.
+## Identity encoding (#382)
+
+A suspended run finds its step results and its waits again, after a
+restart or an upgrade, by IDs derived from its identity. Like a locker
+number, an ID must name one locker, the same one every time: the
+iteration is part of it, and nothing but the identity's values moves it.
+
+- **Iteration.** `engine.StepIdentity.IterationPath` is the iteration a
+  step runs in (ADR 0028's iteration path); empty and `root`
+  (`engine.RootIteration`) are the same root iteration. The SQLite
+  journal's `RunJournal` keys a step's operation and its wait by it (it
+  put every step at `root` before). `internal/cluster`'s
+  `WaitIDFor(runID, stepID, iterationPath)` includes it, and so does the
+  operation key that addresses the cluster's step records, so one wait or
+  call step reached in two iterations of a loop is two records with
+  independent outcomes. The cluster step journal refuses an identity
+  whose operation key is not the one its fields derive.
+- **Root is unchanged.** A root-iteration wait ID is the digest of
+  `runID \x00 stepID`, as before #382; another iteration appends
+  `\x00 iterationPath`. A root-iteration operation key is the digest of the
+  bytes `json.Marshal` produced for the untagged `StepIdentity` before
+  #382; another iteration adds `"IterationPath"`. Every wait, step record
+  and operation already stored keeps its ID: no migration, and no journal
+  schema change.
+- **Explicit encodings.** What is hashed or stored never follows a Go
+  field name. `engine.OperationKey` hashes its own versioned encoding
+  (`operationKeyV1`), not `StepIdentity`; `StepIdentity` (stored in every
+  cluster step record) and `journal.OperationIdentity` (hashed into every
+  journal operation key) carry JSON tags spelling the names `json.Marshal`
+  used before. Rules: never change a tag; a field added to a stored
+  identity is `omitempty`, and its zero value means what every record
+  written before it meant; a new input to a key or wait ID needs a new,
+  explicitly versioned encoding, never an edit of an existing one. The
+  journal's wait ID (`wait/v1`, above) already followed this.
+- **Comparison.** Stored identities are written and compared with the
+  root spelled empty (`StepIdentity.Canonical`, `SameExecution`), so a
+  record written before #382 is the same execution as the engine's root
+  step.
+- **Grammar.** Both encodings are unique only over ids that follow the
+  grammar (`contract.IDPattern`, `^[a-z][a-z0-9_-]{0,63}$`): the cluster
+  wait ID joins with NUL bytes (step `b\x00a[1]` at the root would share
+  an ID with step `b` in iteration `a[1]`), and `json.Marshal` maps
+  invalid UTF-8 to U+FFFD (`x\xfe` and `x\xff` would share an operation
+  key). Lowering enforces the grammar, and the engine's program check now
+  refuses any other step id (`invalid_step_id`), at the top level or in an
+  arm, before running anything, whoever built the program (#382 Review R
+  round 1). Iteration paths are built by the engine from those ids
+  (ADR 0028).
+
+Pinned by `TestStepIdentityEncodingIsPinned` (`internal/engine`),
+`TestOperationKeyFormatIsPinned` and the existing `TestWaitIDFormatIsPinned`
+(`internal/journal`), and `TestWaitIDFormatIsPinned` (`internal/cluster`),
+each with vectors taken from origin/main a3d90d2. The engine and journal
+vectors failed on a3d90d2 when a Go field of the identity was renamed
+(`ArtifactDigest`, `InvocationPath`) and pass with the same rename after
+#382. The engine does not pass iteration paths yet (#333 slice 2 does);
+ADR 0028 has a durable runner refuse control flow until then.
 
 ## Compatibility
 
@@ -305,6 +356,10 @@ inside an arm) before durable loops reach the cluster runtime. ADR 0031
 | Journal schema 5 → 6 (slice B) | schema, one-way | On open; `resumed` waits remapped on every open |
 | Journal schema 6 → 7: `journal_operations.input_digest`, `journal_runs.engine_input_digest` (slice C1) | schema, one-way | On open, `from < 7`; operations recorded before it have no digest and are not compared; a run's engine input is fixed by its next execution |
 | `RunJournal.MarkRunUncertain`, `AdmissionRequest.EngineInput`, `Permanent`, `MaxStepResultBytes`, `ErrStepResultLimit` (slice C1) | API, additive | None |
+| `engine.StepIdentity.IterationPath`, `RootIteration`, `NewStepIdentity`, `OperationKey`, `Iteration`, `Canonical`, `SameExecution`; JSON tags on `StepIdentity` and `journal.OperationIdentity` with the names already used (#382) | API, additive; stored bytes unchanged | None |
+| `cluster.WaitIDFor` takes the iteration path; root-iteration IDs unchanged (#382) | API, breaking for its callers (tests only) | Pass `""` (or `engine.RootIteration`) for a step outside every loop |
+| `RunJournal` keys steps and waits by the identity's iteration path; the cluster step journal refuses an identity whose operation key its fields do not derive (#382) | behavioral; the engine passes the root iteration until #333 | None |
+| The engine refuses a program whose step id does not match `contract.IDPattern` (`invalid_step_id`, class `configuration`) (#382) | behavioral, fail closed; every lowered program already matches it | Rename the step to an id of the grammar |
 
 ## Evidence
 
@@ -355,6 +410,15 @@ round 2, `TestEveryValidInputRuns`, `TestEngineInputIsFixedOnce`,
 round 3, `TestEngineInputFixedAtAdmissionRuns`,
 `TestEngineInputMustEncode`, `TestRepeatAdmissionComparesEngineInput`.
 
+#382: `TestStepIdentityEncodingIsPinned` (`internal/engine`),
+`TestOperationKeyFormatIsPinned`, `TestLoopIterationsWaitIndependently`
+(`internal/journal`), `TestWaitIDFormatIsPinned`,
+`TestLoopIterationsWaitIndependently` (against a real three-voter etcd
+cluster), `TestStepKeyMustMatchItsIteration` (`internal/cluster`); after
+Review R round 1, `TestStepIDsMustFollowTheGrammar` (`internal/engine`),
+and `TestEngineSuspendsAndResumesThroughTheJournal` with its siblings now
+pin the root iteration of the engine's waits and steps in the journal.
+
 ## Limits
 
 - Nothing calls `PendingResumptions` or `AcknowledgeWait` yet: slice C's
@@ -384,8 +448,18 @@ round 3, `TestEngineInputFixedAtAdmissionRuns`,
 - No single-host runner resumes runs through `RunJournal` yet: slice C2
   lists resumptions on start, executes them, renews and releases leases.
 - Every step is at the `root` iteration until #333 passes iteration paths
-  to the engine (ADR 0031, in progress, refuses durable control flow until
-  then).
+  to the engine (ADR 0028 refuses durable control flow until then). The
+  journals key by the iteration path the engine passes (#382), but no
+  engine execution has exercised a non-root path yet: the two-iteration
+  tests drive the step and wait journals directly.
+- A cluster wait inside a parallel arm or other construct is still told
+  apart by step ID only; ADR 0028's invocation paths are unique per step,
+  so this holds while step IDs are unique per workflow.
+- `internal/cluster`'s run suspension (`Runtime.suspend`) commits an event
+  identified by run, step and owner token: a second suspension at the same
+  step under the same owner (a loop's next iteration) is refused as
+  already written and the run stays `running` (a probe in #382's PR).
+  Durable loops on the cluster must identify it by iteration too.
 - Effect inputs over `MaxInspectionInputBytes` are refused at dispatch, as
   `BeginEffect` refuses them.
 - Pending signals of a run that ends stay pending (never late

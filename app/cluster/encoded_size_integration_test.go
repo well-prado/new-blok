@@ -111,7 +111,7 @@ func TestDistributedEncodedOversizeIsDefiniteNotUnavailable(t *testing.T) {
 	if waiting.Code != http.StatusAccepted || json.Unmarshal(waiting.Body.Bytes(), &waitingRun) != nil || late.Code != http.StatusAccepted || json.Unmarshal(late.Body.Bytes(), &lateRun) != nil {
 		t.Fatalf("fixture admissions: waiting=%d %s late=%d %s", waiting.Code, waiting.Body.String(), late.Code, late.Body.String())
 	}
-	waitingID, lateID := cluster.WaitIDFor(waitingRun.RunID, "approval"), cluster.WaitIDFor(lateRun.RunID, "approval")
+	waitingID, lateID := cluster.WaitIDFor(waitingRun.RunID, "approval", ""), cluster.WaitIDFor(lateRun.RunID, "approval", "")
 	awaitWait := func(waitID, state string) {
 		for ctx.Err() == nil {
 			if wait, err := runtime.GetWait(ctx, tenant, waitID); err == nil && wait.State == state {
@@ -341,7 +341,7 @@ func TestDistributedNearLimitAdmissionStaysClaimableAndSignalable(t *testing.T) 
 		stopShort()
 		// Registered on the parent: the next subtest runs under this owner.
 		f.startWorker(parent, strings.Repeat("<", 180))
-		waitID := cluster.WaitIDFor(largest, "approval")
+		waitID := cluster.WaitIDFor(largest, "approval", "")
 		var response *httptest.ResponseRecorder
 		for attempt := 0; attempt < 100; attempt++ {
 			// 503 is expected only while the new owner acquires the partition.
@@ -383,7 +383,7 @@ func TestDistributedNearLimitAdmissionStaysClaimableAndSignalable(t *testing.T) 
 		if state := f.awaitRun(admission.RunID, "waiting", 15*time.Second); state != "waiting" {
 			t.Fatalf("fixture run state=%q, want waiting", state)
 		}
-		waitID := cluster.WaitIDFor(admission.RunID, "approval")
+		waitID := cluster.WaitIDFor(admission.RunID, "approval", "")
 		// Walk the signal down from the record bound one '<' at a time. Each
 		// one is under the edge bound; near the top the wait record itself is
 		// over, then the three-record transaction is, then it fits.
@@ -470,7 +470,7 @@ func TestDistributedRunMetadataOverflowIsNotTheCallersFault(t *testing.T) {
 	}
 	long := acquire(strings.Repeat("<", 180))
 	t.Cleanup(func() { _ = f.store.Release(context.Background(), long) })
-	waitID := cluster.WaitIDFor(admission.RunID, "approval")
+	waitID := cluster.WaitIDFor(admission.RunID, "approval", "")
 	_, err = f.runtime.DeliverSignal(f.ctx, f.tenant, waitID, "tiny", "synthetic-principal", json.RawMessage(`{"approved":true}`), true)
 	if !errors.Is(err, cluster.ErrRecordOverflow) || errors.Is(err, cluster.ErrInvalid) || errors.Is(err, cluster.ErrUnavailable) {
 		t.Fatalf("tiny signal to a run whose own metadata overflows: err=%v, want ErrRecordOverflow, neither ErrInvalid nor ErrUnavailable", err)

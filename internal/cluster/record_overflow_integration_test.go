@@ -388,7 +388,7 @@ func TestRunStoredWithoutHeadroomFailsAtTimerReadmission(t *testing.T) {
 		t.Fatalf("failed run input=%.32q digest=%s; want the input dropped and digest %s kept", run.Input, run.InputDigest, stored.InputDigest)
 	}
 	h.assertFollowUpAndRelease(followUp)
-	wait, err := h.runtime.GetWait(h.ctx, h.tenant, WaitIDFor(headroomless, "delay"))
+	wait, err := h.runtime.GetWait(h.ctx, h.tenant, WaitIDFor(headroomless, "delay", ""))
 	if err != nil || wait.State != h.fixture.Expected.WaitStateAfterTimer {
 		t.Fatalf("wait of the failed run=%+v err=%v; want %q", wait, err, h.fixture.Expected.WaitStateAfterTimer)
 	}
@@ -441,7 +441,7 @@ func TestDueTimerOfATerminalRunClosesItsWait(t *testing.T) {
 	if _, err := h.runtime.FireDueWaits(h.ctx, owner, time.Now().UTC().Add(time.Duration(h.fixture.TimerTimeoutMillis)*time.Millisecond+time.Second), 8); err != nil {
 		t.Fatal(err)
 	}
-	wait, err := h.runtime.GetWait(h.ctx, h.tenant, WaitIDFor(runID, "delay"))
+	wait, err := h.runtime.GetWait(h.ctx, h.tenant, WaitIDFor(runID, "delay", ""))
 	if err != nil || wait.State != h.fixture.Expected.WaitStateAfterTimer {
 		t.Fatalf("wait of a terminal run after its timer was due=%+v err=%v; want %q", wait, err, h.fixture.Expected.WaitStateAfterTimer)
 	}
