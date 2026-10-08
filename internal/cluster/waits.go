@@ -358,9 +358,18 @@ func waitTransition(kind, identity string) string {
 	return kind + "-" + hex.EncodeToString(hash[:16])
 }
 
-// WaitIDFor returns the stable external signal address for a durable wait step.
-// Callers must still authenticate and authorize every signal independently.
-func WaitIDFor(runID, stepID string) string {
-	hash := sha256.Sum256([]byte(runID + "\x00" + stepID))
+// WaitIDFor returns the stable external signal address for a durable wait
+// step in one loop iteration (engine.StepIdentity.IterationPath; empty or
+// engine.RootIteration outside every loop). A root-iteration wait keeps
+// the ID it had before iterations existed (#382), so a run suspended by an
+// older binary finds its wait again; any other iteration adds its path,
+// so each iteration of a loop waits on its own record. Callers must still
+// authenticate and authorize every signal independently.
+func WaitIDFor(runID, stepID, iterationPath string) string {
+	key := runID + "\x00" + stepID
+	if iterationPath != "" && iterationPath != engine.RootIteration {
+		key += "\x00" + iterationPath
+	}
+	hash := sha256.Sum256([]byte(key))
 	return "wait-" + hex.EncodeToString(hash[:])
 }

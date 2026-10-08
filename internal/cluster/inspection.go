@@ -276,7 +276,7 @@ func (j *inspectionJournal) Load(ctx context.Context, identity engine.StepIdenti
 		return nil, false, errInspectionStop
 	}
 	var persisted stepRecord
-	if err := json.Unmarshal(data, &persisted); err != nil || persisted.Identity != identity {
+	if err := json.Unmarshal(data, &persisted); err != nil || !persisted.Identity.SameExecution(identity) {
 		return nil, false, j.fail(fmt.Errorf("cluster: malformed step record at %s", identity.StepID))
 	}
 	step := inspection.Step{ID: identity.StepID, Status: j.stepStatus(persisted), Attempt: persisted.AttemptNumber}
@@ -321,7 +321,7 @@ func (j *inspectionJournal) Await(ctx context.Context, identity engine.WaitIdent
 	if !sameStepIdentity(identity.Step, j.record, identity.Step.StepID) {
 		return engine.WaitResult{}, false, j.fail(fmt.Errorf("cluster: inspection replay wait identity mismatch at %s", identity.Step.StepID))
 	}
-	data, found, err := j.read(ctx, waitStateID(j.record.Tenant, WaitIDFor(j.record.RunID, identity.Step.StepID)))
+	data, found, err := j.read(ctx, waitStateID(j.record.Tenant, WaitIDFor(j.record.RunID, identity.Step.StepID, identity.Step.IterationPath)))
 	if err != nil || !found {
 		return engine.WaitResult{}, false, errInspectionStop
 	}
