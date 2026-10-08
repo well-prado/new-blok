@@ -501,7 +501,15 @@ Slice C2: `internal/resumer` (`TestResumerSuspendsAndResumesRuns`,
 `TestBusyWorkersTakeNoMoreRuns`, `TestCloseReturnsAtItsDeadline`,
 `TestRenewalKeepsAndLosesTheLease`, `TestLeaseComesFromTheJournal`,
 `TestSweepSurfacesErrors`, `TestPanicsAreContained`,
-`TestInterruptedRunsAreNotCrowdedOut`), the fixtures in
+`TestInterruptedRunsAreNotCrowdedOut`; after Review R round 2 on #384,
+`TestStartWaitsForAWorkerBeforeLeasing`, `TestRenewalFaultsAreReported`,
+`TestUncertainSettlementFaultIsReported`,
+`TestCloseCancelsEveryExecutionOfARun`,
+`TestFaultCountsStartAgainAfterProgress`,
+`TestLeaseLostAtCompletionIsNotAFault`, `TestLostLeaseForgetsTheFaultCount`,
+`TestFaultCountsOfRunsEndedElsewhereAreDropped`,
+`TestSaturatedSweepDoesNotDelayTheScan`; round 3's delta, the merge of
+#382's iteration-aware identity, added none), the fixtures in
 `testdata/waits/fixtures.json` (`TestWaitFixtures`, nine cases, five of
 them negative) and `benchmarks/waits`
 (`TestSuspendedRunsCostStorageNotGoroutines`, always run at 1,000 runs, and
