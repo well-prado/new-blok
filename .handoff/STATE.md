@@ -1,4 +1,4 @@
-# Orchestrator state — 2026-10-07 late (laptop session 2 → next session)
+# Orchestrator state — 2026-10-08 (session 3 → next session)
 
 THIS BRANCH (`wip/orchestrator-handoff`) IS NOTES ONLY. NEVER MERGE IT.
 Read in this order: STATE.md (this) → RULES.md → WORKER-BRIEF.md → ISSUES.md. `waiver-merge.sh` merges; `gate.sh` is the full local gate.
@@ -22,34 +22,38 @@ Finish epic #7 [E07] "Durable state, recovery and version retention".
 - #383: `finally` runs on internal fail-fast cancellation; only a caller cancellation skips it. Retry-safety (#190) re-evaluated after the join.
 - Stacked PRs: merge in stack order; a stacked child can be merged INTO its parent branch so one gate + one main merge covers both (done for #369→#368).
 
-## Merged so far (main = a6984cb at handoff 2026-10-07 late; re-check `git log origin/main`)
-Earlier session: #327 #326 #322 #352 #350 #358 #349 #351 #363 #367 #370 #366 #369(via #368) #368 #376 #378.
-This session (2026-10-07 late), each with Review R + full gate recorded as a PR comment, then waiver-merge (PROTECTION IDENTICAL):
-- #380 T09 C1 (journal v7) at 5dff4f8 (round-3 fix: `EngineInput any`, digested by the shared `engine.InputDigest`).
-- #383 → folded into #379 (00e905f), then #379 merged = T10 slice 1 (#333 stays open for slices 2–5).
-- #387 (closes #294) at 089cc51. #388 (T16, closes #339) at 97aae21; evidence comments on #43/#44.
-Closed E07 tasks: T08 #331, T11 #334, T14 #337, T16 #339, T17 #340, T20 #343. Also #294 #320 #321 #66 #359.
+## Merged so far (main = f3ffd4d at handoff 2026-10-08; re-check `git log origin/main`)
+Session 1: #327 #326 #322 #352 #350 #358 #349 #351 #363 #367 #370 #366 #369 #368 #376 #378.
+Session 2 (10-07): #380 (T09 C1), #379+#383 (T10 slice 1), #387 (#294), #388 (T16 #339).
+Session 3 (10-08): #393 (#372 child principal + cycles), #394 (#284 audit start marker; AUDIT schema 1->2, v0.1.0-alpha refuses upgraded DBs -> release note), #401 (#400 engine saturation test: test bug, forced ordering), #395 (#382 stable wait/step identity + iteration; engine refuses step ids outside the grammar).
+Every merge: Review R + full gate on the tree that lands, recorded as a PR comment; waiver-merge PROTECTION IDENTICAL.
+Closed E07 tasks: T08 #331, T11 #334, T14 #337, T16 #339, T17 #340, T20 #343. Prereqs closed: #372 #382 #284 #294.
 
-## OPEN PRs at handoff — exact next action for each (verify heads with `gh pr view <n> --json headRefOid`)
+## OPEN PRs / WIP at handoff — exact next action (verify heads with `gh pr view <n> --json headRefOid`)
 
-| PR | Task | Head | Status | Next |
+| PR / branch | Task | Head | Status | Next |
 |---|---|---|---|---|
-| #384 | T09 C2a resumer (`internal/resumer`), base **main** | `6654aa5f5f04c64885e45aa9f0d6ea6ef51b6825` | All R1 findings fixed; contains main a6984cb. The -race failures were 3 test races, now fixed (`56fc68d`, 280/280 at `-race -count=20`). Crowd-out test rewritten and RED without the live-lease filter; J-M11 RED. Targeted validation passes. Mutation matrix re-run is partial: S1/S2/S4/Settled-panic/M7 not re-run. **The PR BODY IS STALE** (still mentions WithInput, old Config, C2-M10 GREEN). | (1) rewrite the #384 body (What/Why/How + proofs) via gh api PATCH; (2) delta Review R `1fd524a..6654aa5` (+ remerge-diffs), including the missing mutations; (3) full gate → merge |
-| #385 | T09 C2b benchmarks + wait fixtures, `Fixes #332`, base codex/332-local-resumer | `ce9550769d8e78b5564e683098420c7ff9ff92d1` (unchanged) | NOT reviewed; worktree `~/Projects/Personal/new-blok-332d` exists (clean) | merge 6654aa5 in (expect ADR 0027 conflicts; drop stale WithInput / TestTypedInputIsVerifiedAsTheSameJSONValue refs); re-measure the benchmarks at low load on the new resumer and update the README+JSON; full Review R1 → retarget to main after #384 merges → gate → merge → tick #46 boxes (AC5, V1, V2, V4, V5; V3 → T13) |
-| #393 | #372 RecordChild principal binding + cycle refusal (any depth), base main | `8e78d7f93c9fe260b217f8ce88d2cba886c68ae4` | Review R1 INCOMPLETE (stopped at handoff): no blockers, leaning APPROVE; merges clean with a6984cb; tests and -race on importers pass on the merged tree. NOT done: mutation table, EXPLAIN/timing check. Nits: PR body wrongly claims ADR 0028 has a slice-4 note (reword or add one line to 0028 Limits pointing to ADR 0003 #372); ADR 0003 "not re-checked" vs a byte-identical repeat of an old invalid-JSON record now fails. Follow-up to file: ErrChildPrincipalMismatch vs ErrChildRunNotFound is an existence oracle once Child surfaces it — map to not-found at the API boundary in #333 slice 4. | finish Review R1 (mutations) → fix nits → gate → merge |
-| #395 | #382 stable wait/step identity + iteration in cluster wait IDs, base main (a3d90d2) | `4e660dad36e9fe48b9f4a66357fa45a002840a82` | NOT reviewed. Existing IDs byte-identical (vectors pinned from a3d90d2); RED proofs on real 3-voter etcd; mutations M1–M6 RED; no schema change. Found #396. | full Review R1 (needs isolated etcd for internal/cluster, app/cluster) → merge main in → gate → merge. Unblocks T10 slice 2 |
-| #394 | #284 audit start marker, base main a6984cb | `cc754b69914b50213742d972199ed1a5cef75077` | NOT reviewed. **Audit store schema 1→2 (journal v8 NOT used, still free).** Real fixtures from pre-#280 code and v0.1.0-alpha. 8/9 mutations RED. **USER-VISIBLE: v0.1.0-alpha binaries refuse an upgraded DB (NewerSchemaError); rollback = restore a backup.** Tell the user about this in the release notes. | full Review R1 → gate → merge |
+| #384 | T09 C2a resumer | `e16b85254e1b4bb4bfd68e26bc9770edf184d50c` | Review R2 (delta 1fd524a..6654aa5) = REQUEST CHANGES; ALL findings 1–4f fixed + extra (saturated sweep no longer counts as a scan, closes #398's substance) — RED proofs in body; 4-pkg -race x10 at load 32–117 pass; contains main 69a1adf. Gate on 6654aa5 was green. | delta Review R3 `6654aa5..e16b852` → merge main → gate → merge; then close #398 if covered |
+| #385 | T09 C2b benchmarks, `Fixes #332` | PR head `ce95507` (stale); progress on **`wip/332-evidence-r1` @ bab127c** (merges of #384 6654aa5 + e16b852, ADR conflicts resolved) | benchmarks NOT re-measured (load too high) | worktree `-332d`: fast-forward `codex/332-wait-evidence` to wip, merge latest #384/main; at load < ~6 re-measure old ce95507 vs new interleaved + 3-rep report; update README/JSON/ADR "Measured"; full Review R1 → retarget main after #384 → gate → merge → tick #46 boxes |
+| #402 | #374 trigger/worker timing tests (test budget, not product) | `9af76ca56accb71ff0594caf01ec2b2f23f87f78` | Review R1 → 1 should-fix (row cap indistinguishable from time budget) FIXED (25ms+10ms cases; M12 RED); orchestrator approved delta. Reviewer's prod analysis: default busy timeout 5s, worst wait 0.57s under load → no action. Gate: all PASS except `go test` FAIL in **internal/tooling/devtool** (untouched; new flake → filed #406); race step not completed (gate stopped at shutdown) | re-run gate (or prove #406 unrelated on main + same tree) → merge |
+| #403 | #399 cluster failover test (test bug: unrenewed hand-played owner lease) | `924ac8a4bd19f298e3bad0e1ef40d04c032085a8` | test-only; main failed 16/20 under load, PR 20/20; siblings hardened; NOT independently reviewed yet | Review R1 (orchestrator may review: test-only, it wrote none) → gate (+ cluster tests vs isolated etcd) → merge |
+| #404 | T10 slice 2: durable If/Choose/Default/Compare/TryFinally (single host) | `bacad1c0bb6fdb1ab1a933fb4c3ecaf54c25e5ff` | Review R1 INCOMPLETE (stopped). Found so far: **SHOULD-FIX 1** engine.checkProgram doesn't enforce step-id uniqueness across arms (OperationKey omits InvocationPath → try/finally same id = same key); **SHOULD-FIX 2** `scopeConflict` (internal/engine/scope.go) not wrapped → `journal.Permanent` false, contradicts ADR 0028 (retries forever instead of FAILED); NIT ADR wording "execution canceled by caller (run not canceled)"; FOLLOW-UP open scopes after MarkRunUncertain block requireQuiescentRun (CancelRun/FailRun refuse runs mid-construct); NIT construct output >1MiB fails durably. Not run: mutations (PR's M1–M10, M47a, reviewer's), -race on crash tests | send findings to implementer (worktree `-333c`) → finish Review R1 (mutations) → gate → merge. Then slice 3 (plan in PR body / below) |
+| wip/396-cluster-suspend-iteration | #396 | `9f5a5552a1b0196a300456522f59b1bc2312efc1` (worktree `-396`, local branch codex/396-cluster-suspend-iteration) | suspension keyed by run revision (`suspendTransitionID`); 2 acceptance tests RED on main / GREEN; other collision sites audited (safe) | add pinned vector test; upgrade-in-place probe on etcd; ADR 0027 (drop Limits entry); mutation (step back in id) RED; validate; open PR `Fixes #396` |
+| #405 (issue) | cluster worker drops partition on first slow renewal (TTL/4, no retry) — PRODUCT bug | worktree `-405` (clean, at f3ffd4d) | design settled (validUntil = send time + TTL − TTL/4; AfterFunc cancel; retry renewals within validUntil; ADR 0019 + 0017 row) — see #399 agent's plan in this session; tests (a) slow keepalive keeps partition (RED on main), (b) lease really expires → give up before expiry, no effect after, (c) exact effect counts | implement |
+
+## New issues filed 2026-10-08
+#397 (child mismatch = existence oracle; + cycle-walk cost note), #398 (resumer saturated sweep; likely fixed in #384 e16b852), #399 (→ #403), #400 (→ #401, closed), #405 (partition renewal, product), #406 (devtool crash-loop fixture flake under load).
 
 ## Next work after those (E07 queue)
-1. T10 slice 2+ (durable control flow) — needs #382 (= PR #395) merged first, and #396 before durable CLUSTER loops (cluster wait IDs need the iteration; stable identity encoding). Plan in ADR 0028 on the #379/#383 branches: slice 2 durable If/Choose/TryFinally (StepJournal paths, scopes `<invocation>@<iteration>`, M47a RED), slice 3 durable Each/Parallel (RecordJoin slots; see #386 for join-row cost), slice 4 Child (#372 first: child principal binding), slice 5 resume at startup.
+1. T10: slice 2 = #404 (open). Slice 3 durable Each/Parallel (plan: per-item scopes, RecordSlot join slots wrapped {"output":…}, skip filled slots on replay, fail-fast recorded in scope, measure #386 join-row cost at 1k/10k items; per-slot table would need journal v8 — ask first). Slice 4 Child (#372 done; see #397). Slice 5 resume at startup. #396 before durable CLUSTER loops (cluster wait IDs need the iteration; stable identity encoding). Plan in ADR 0028 on the #379/#383 branches: slice 2 durable If/Choose/TryFinally (StepJournal paths, scopes `<invocation>@<iteration>`, M47a RED), slice 3 durable Each/Parallel (RecordJoin slots; see #386 for join-row cost), slice 4 Child (#372 first: child principal binding), slice 5 resume at startup.
 2. T12 #335 nested crash matrix (after T10).
-3. #284 → PR #394 (open, see table).
+3. Flaky-test class: #406 (devtool). The user wants every recurring failure root-caused and fixed, not re-proven each gate.
 4. T13 #336 fake-clock/time-jump tests (#46 V3), T15 #338 signal.Authorizer, T18 #341 provider result lookup, T19 #342 slices B–D (B #289 failed/canceled compaction; C #316 worker Compact re-check; D growth — **needs a user decision**: document+assert per-run tombstone cost vs tombstone retention; interacts with #364).
 5. T21 #344 docs + ROADMAP M3 alignment (last), then close #7 only after: every task merged with Review R, #43–#49 boxes ticked with evidence links, and an independent specialist Review R of the whole epic recorded on #7.
 6. Non-E07 follow-ups filed this session: see ISSUES.md.
 
 ## Known flaky tests (proven unrelated each time)
-- #374 trigger/worker `TestCompactionWriteTransactionsAreTimeBounded`, `TestSlowHoldNeverBlocksWriters` (200ms budget under load). Re-run at lower load / on main to prove unrelated.
+- #374 → fixed by #402 (open). #400 fixed (#401). #399 → #403 (open). #406 devtool crash-loop fixture (open). Until fixed, prove unrelated (untouched pkg + rerun on main) and record it.
 - #359 is FIXED (#376).
 
 ## Environment

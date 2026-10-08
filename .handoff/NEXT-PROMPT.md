@@ -11,12 +11,12 @@ Hard rules (summary; RULES.md is authoritative):
 - One issue per PR. What/Why/How bodies. Every new test shown RED first. Max 4 agents (Opus subagents, never nested). Commits by Wellington Prado <wellington@deskree.com> with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 - After each merge: move the board item to Done (Project 15 ids in STATE.md), tick E07 child boxes with evidence links, and file non-blocking findings as issues.
 
-Start with the open PRs (details in STATE.md), running in parallel:
-1. #384 (T09 C2a, head 6654aa5): rewrite its stale body → delta Review R 1fd524a..6654aa5 including the mutations not re-run → gate → merge.
-2. #385 (T09 C2b, Fixes #332): merge #384's head, re-measure the benchmarks at low load, full Review R → retarget to main → gate → merge → tick the #46 boxes.
-3. #395 (#382, stable wait identity): full Review R1 (needs isolated etcd) → gate → merge. Unblocks T10 slice 2.
-4. #393 (#372): finish Review R1 (mutation table), fix the nits → gate → merge.
-5. #394 (#284, audit schema 1→2): full Review R1 → gate → merge. Tell the user that v0.1.0-alpha binaries will refuse an upgraded DB.
-Then T10 slices 2–5 (#396 before durable cluster loops; slice 4 Child after #393), T12 #335, T13, T15, T18, T19 B–D (ask the user about tombstone growth: document+assert vs retention; interacts with #364), and T21 #344 last. Close #7 only after every task is merged with Review R, every child box (#43–#49) is ticked with evidence links, and an independent specialist Review R of the whole epic is recorded on #7.
+Start with the open PRs/WIP (details in STATE.md), running in parallel:
+1. #384 (T09 C2a, head e16b852): delta Review R3 6654aa5..e16b852 → gate → merge.
+2. #385 (Fixes #332): fast-forward from wip/332-evidence-r1, re-measure the benchmarks at low load, full Review R1 → gate → merge → tick the #46 boxes.
+3. #404 (T10 slice 2): relay the 2 should-fixes from the incomplete review → finish Review R1 (mutations) → gate → merge. Then T10 slice 3.
+4. #402 (#374) and #403 (#399), both test-only: finish the gates → merge. #406 (devtool flake): root-cause and fix.
+5. wip/396 (#396): finish it (vector, upgrade probe, ADR) → PR → review → merge. #405 (partition renewal, a PRODUCT bug): implement the settled design.
+Then T10 slices 3–5 (#396 before durable cluster loops; slice 4 Child, see #397), T12 #335, T13, T15, T18, T19 B–D (ask the user about tombstone growth: document+assert vs retention; interacts with #364), and T21 #344 last. Close #7 only after every task is merged with Review R, every child box (#43–#49) is ticked with evidence links, and an independent specialist Review R of the whole epic is recorded on #7.
 
 Report back after each merge.

@@ -73,3 +73,6 @@ Reason: #322 (~7,000 lines) cost one to three hours per review round because eve
   mocks/file presence), and file every non-blocking later-round finding as an issue (What/Why/How).
 - **Never** run fixture/RED work in the shared checkout; never `git checkout -- <file>` to revert a mutation (it wipes
   other edits) — apply/revert mutations with exact string replacement or `go test -overlay`.
+
+## User direction (2026-10-08)
+"Focus on making the core of Blok work; tackle problems, don't avoid them." So: when a review or gate surfaces a real problem (flaky test, product risk, untested promise), FIX it (in the PR if on its lines, else a focused issue+PR started right away), with root cause + evidence. Cheap nits on changed lines are fixed, not filed. Re-proving a known flake "unrelated" is a stopgap only; its fix must be in flight.
