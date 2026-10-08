@@ -45,7 +45,6 @@ type devCase struct {
 		Builds             int     `json:"builds"`
 		FailedBuilds       int     `json:"failedBuilds"`
 		Starts             *int    `json:"starts"`
-		MaxStarts          int     `json:"maxStarts"`
 		Stops              int     `json:"stops"`
 		RacingStopBuilds   []int   `json:"racingStopBuilds"`
 		Exits              *int    `json:"exits"`
@@ -198,7 +197,10 @@ func (s *devSession) dump() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out bytes.Buffer
+	// Each event carries when the harness received it, from the first
+	// event, so a failure shows the timeline it happened in (#406).
 	for _, event := range s.events {
+		fmt.Fprintf(&out, "+%dms ", event.at.Sub(s.events[0].at).Milliseconds())
 		_ = WriteDevJSON(&out, event.DevEvent)
 	}
 	fmt.Fprintf(&out, "--- application output ---\n%s", s.output.String())
@@ -304,10 +306,14 @@ func runDevCase(t *testing.T, item devCase, layout string) {
 	for index, step := range item.Steps {
 		switch {
 		case step.Await != "":
-			what := fmt.Sprintf("step %d: %s of build %d", index, step.Await, step.Build)
-			session.await(func(event DevEvent) bool {
-				return event.Event == step.Await && event.Build == step.Build && (step.Running == nil || event.Running == *step.Running)
-			}, what)
+			// An await with a repeat waits for that many matching events,
+			// however long the machine takes to produce them (#406).
+			for occurrence := range max(step.Repeat, 1) {
+				what := fmt.Sprintf("step %d: %s of build %d (occurrence %d of %d)", index, step.Await, step.Build, occurrence+1, max(step.Repeat, 1))
+				session.await(func(event DevEvent) bool {
+					return event.Event == step.Await && event.Build == step.Build && (step.Running == nil || event.Running == *step.Running)
+				}, what)
+			}
 		case step.Post > 0:
 			status, body := postQuote(t, address, step.Post)
 			if total, _ := body["totalCents"].(float64); status != step.Status || int64(total) != step.TotalCents {
@@ -361,14 +367,43 @@ func checkDevExpectations(t *testing.T, item devCase, events []timedEvent, names
 	var delays []int64
 	var diagnostics []string
 	var buildDone time.Time
+	// A restart is never faster than its delay: the application started
+	// for a scheduled restart must start at least that delay after the exit
+	// that scheduled it, and no build's application starts again without a
+	// scheduled restart. Both times are taken as blok dev emits the events,
+	// the exit before its timer is set and the start after it fired, so
+	// load can only lengthen the gap, never shorten it (#406).
+	type scheduled struct {
+		build int
+		exit  time.Time
+		delay time.Duration
+	}
+	var pending *scheduled
+	var lastExit time.Time
+	started := map[int]bool{}
+	restarts := 0
 	for _, event := range events {
 		count[event.Event]++
 		regenerated += len(event.Regenerated)
 		switch event.Event {
 		case EventBuildSucceeded:
 			buildDone = event.at
+			pending = nil // a new build cancels a pending restart
 		case EventRestartScheduled:
 			delays = append(delays, event.DelayMS)
+			pending = &scheduled{build: event.Build, exit: lastExit, delay: millis(event.DelayMS)}
+		case EventAppStarted:
+			switch {
+			case pending != nil && pending.build == event.Build:
+				restarts++
+				if gap := event.at.Sub(pending.exit); gap < pending.delay {
+					t.Errorf("build %d restarted %s after it exited, sooner than its %s restart delay", event.Build, gap, pending.delay)
+				}
+				pending = nil
+			case started[event.Build]:
+				t.Errorf("build %d started again (generation %d) without a scheduled restart", event.Build, event.Generation)
+			}
+			started[event.Build] = true
 		case EventBuildFailed, EventWatchFailed:
 			for _, problem := range event.Diagnostics {
 				diagnostics = append(diagnostics, problem.Code+" "+problem.Source)
@@ -395,6 +430,7 @@ func checkDevExpectations(t *testing.T, item devCase, events []timedEvent, names
 				}
 			}
 		case EventAppExited:
+			lastExit = event.at
 			if want.ExitOutputContains != "" && !strings.Contains(strings.Join(event.Output, "\n"), want.ExitOutputContains) {
 				t.Errorf("app-exited output %q lacks %q", event.Output, want.ExitOutputContains)
 			}
@@ -416,9 +452,6 @@ func checkDevExpectations(t *testing.T, item devCase, events []timedEvent, names
 	if want.Starts != nil {
 		check("starts", count[EventAppStarted], *want.Starts)
 	}
-	if want.MaxStarts > 0 && count[EventAppStarted] > want.MaxStarts {
-		t.Errorf("starts: %d, want at most %d", count[EventAppStarted], want.MaxStarts)
-	}
 	if want.Exits != nil {
 		check("exits", count[EventAppExited], *want.Exits)
 	}
@@ -427,6 +460,11 @@ func checkDevExpectations(t *testing.T, item devCase, events []timedEvent, names
 	}
 	if len(delays) < len(want.RestartDelaysMS) || fmt.Sprint(delays[:len(want.RestartDelaysMS)]) != fmt.Sprint(want.RestartDelaysMS) {
 		t.Errorf("restart delays %v, want prefix %v", delays, want.RestartDelaysMS)
+	}
+	// Every scheduled restart but the last, which a new build may cancel,
+	// must have been seen to start, so the delay check above is not vacuous.
+	if len(want.RestartDelaysMS) > 0 && restarts < len(want.RestartDelaysMS)-1 {
+		t.Errorf("restarts observed: %d, want at least %d", restarts, len(want.RestartDelaysMS)-1)
 	}
 	for _, delay := range delays {
 		if item.Options.MaxBackoffMS > 0 && delay > item.Options.MaxBackoffMS {

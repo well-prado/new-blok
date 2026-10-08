@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "roadmap": "E11-T03",
-  "description": "blok dev runs against real scaffolded applications (module example.com/shop) and these edits, applied while it runs. Placeholders: {module}, {node} (the quote node's directory in the layout), {nodes} (the directory of the layout's Go nodes). Steps run in order: await waits for the next event of that name and build; post sends {sku: coffee, quantity} to POST /quotes; edits change the project (and a shadow copy); repeat/everyMs repeat edits, substituting {n}; outside writes the sibling file ../outside.go; link makes a symbolic link to it; observeMs waits. Expected counts cover the whole session, which the harness ends with a cancellation (exit 130): builds and failedBuilds count build-started and build-failed, starts app-started, stops app-stopped (the final stop included) except those of racingStopBuilds, builds whose replacement may or may not find them alive (a crash loop): each such stop must be a stop of a running application (status signal: terminated or exit status 0), never a crash reported as a stop; exits app-exited, regenerated the files blok dev rewrote, stopTimeouts dev_app_stop_timeout diagnostics, effectRecords the project files whose content differs from the shadow copy (blok dev's own writes), diagnostics every build-failed diagnostic. Every case also requires zero processes left in any application's process group.",
+  "description": "blok dev runs against real scaffolded applications (module example.com/shop) and these edits, applied while it runs. Placeholders: {module}, {node} (the quote node's directory in the layout), {nodes} (the directory of the layout's Go nodes). Steps run in order: await waits for the next event of that name and build (with repeat, for that many of them, however long they take: no step counts events inside a fixed window); post sends {sku: coffee, quantity} to POST /quotes; edits change the project (and a shadow copy); repeat/everyMs repeat edits, substituting {n}; outside writes the sibling file ../outside.go; link makes a symbolic link to it; observeMs waits, and is used only to give an event that must not happen time to appear (a slow machine can hide such an event, never invent one). Expected counts cover the whole session, which the harness ends with a cancellation (exit 130): builds and failedBuilds count build-started and build-failed, starts app-started, stops app-stopped (the final stop included) except those of racingStopBuilds, builds whose replacement may or may not find them alive (a crash loop): each such stop must be a stop of a running application (status signal: terminated or exit status 0), never a crash reported as a stop; exits app-exited, regenerated the files blok dev rewrote, stopTimeouts dev_app_stop_timeout diagnostics, effectRecords the project files whose content differs from the shadow copy (blok dev's own writes), diagnostics every build-failed diagnostic; restartDelaysMs is the required prefix of the restart-scheduled delays, every application started for a scheduled restart must start at least that delay after the exit that scheduled it, no build's application may start again without one, and every scheduled restart but the last must be seen to start. Every case also requires zero processes left in any application's process group.",
   "cases": [
     {
       "id": "dev-edit-rebuilds-and-restarts",
@@ -415,7 +415,7 @@
       "layouts": [
         "classic"
       ],
-      "description": "An application that dies at start is restarted 100, 200, 400, 400\u2026 ms later, never faster; the repair rebuilds and serves. Build 1 is stopped by build 2 and build 3 by the end of the session; when build 3 replaces the crash-looping build 2 it is pending a restart, has crashed during the build (reported as app-exited, never app-stopped), or, rarely, is alive and stopped.",
+      "description": "An application that dies at start is restarted 100, 200, 400, 400\u2026 ms after each exit, never sooner; the harness waits for five scheduled restarts however long the machine takes, then repairs it, and the repair rebuilds and serves. Build 1 is stopped by build 2 and build 3 by the end of the session; when build 3 replaces the crash-looping build 2 it is pending a restart, has crashed during the build (reported as app-exited, never app-stopped), or, rarely, is alive and stopped.",
       "options": {
         "backoffMs": 100,
         "maxBackoffMs": 400,
@@ -442,7 +442,9 @@
           "build": 2
         },
         {
-          "observeMs": 2500
+          "await": "restart-scheduled",
+          "build": 2,
+          "repeat": 5
         },
         {
           "edits": [
@@ -469,7 +471,6 @@
         "builds": 3,
         "failedBuilds": 0,
         "minExits": 5,
-        "maxStarts": 12,
         "stops": 2,
         "racingStopBuilds": [2],
         "regenerated": 0,
