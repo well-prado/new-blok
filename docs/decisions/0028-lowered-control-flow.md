@@ -408,8 +408,13 @@ second time, she follows the mark.
   cancel or fail a run that crashed inside an arm, as before control flow
   was durable (`TestOperatorCanEndARunKilledMidArm`, #404 Review R round
   1). A dispatched effect, a waiting wait or an uncertain operation still
-  refuses both. `MarkRunUncertain` leaves the scopes running on purpose:
-  it rewrites no facts, and the uncertain effect is inside them.
+  refuses both. An operator's cancel or fail of a run inside a try skips
+  its `finally`, consistent with #383 (canceling the run skips it): the
+  run has ended, and an execution still holding the lease can neither
+  enter nor exit a scope (nor commit a step) afterwards, `ErrRunNotActive`
+  (#404 Review R round 1b). `MarkRunUncertain` leaves the scopes running
+  on purpose: it rewrites no facts, and the uncertain effect is inside
+  them.
 - **Transactions.** Entering and exiting a scope are their own
   transactions (each fenced by the lease and acknowledging the waits read
   since the last commit, as a step commit does), not the step's: the

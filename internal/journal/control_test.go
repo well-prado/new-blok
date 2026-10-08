@@ -605,6 +605,29 @@ func TestRunJournalScopes(t *testing.T) {
 	if _, err := rj.EnterScope(ctx, pay, nil); !errors.Is(err, ErrRecordFinal) || !Permanent(err) {
 		t.Fatalf("entry of a canceled scope: err=%v; want a permanent ErrRecordFinal", err)
 	}
+	// An operator ends the run (CancelRun takes no lease) while this
+	// execution still holds its lease and is inside a construct: from then
+	// on the execution can neither enter a construct nor exit the one it is
+	// in (#404 Review R round 1b).
+	open, err := rj.EnterScope(ctx, engine.ScopeIdentity{RunID: run, ArtifactDigest: controlArtifact, Path: "open@root", Kind: "if"}, json.RawMessage(`{"arm":"then"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := j.CancelRun(ctx, run, "operator"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rj.EnterScope(ctx, engine.ScopeIdentity{RunID: run, ArtifactDigest: controlArtifact, Path: "after@root", Kind: "if"}, json.RawMessage(`{"arm":"then"}`)); !errors.Is(err, ErrRunNotActive) {
+		t.Fatalf("entry after the run was canceled: err=%v; want ErrRunNotActive", err)
+	}
+	if err := rj.ExitScope(ctx, open, json.RawMessage(`1`)); !errors.Is(err, ErrRunNotActive) {
+		t.Fatalf("exit after the run was canceled: err=%v; want ErrRunNotActive", err)
+	}
+	if got := oneRow(t, database, `SELECT state || '|' || error_text FROM journal_scopes WHERE run_id = '`+run+`' AND path = 'open@root'`); got != "canceled|operator" {
+		t.Fatalf("the open scope is %s; want canceled|operator", got)
+	}
+	if n := oneRow(t, database, `SELECT COUNT(*) FROM journal_scopes WHERE run_id = '`+run+`' AND path = 'after@root'`); n != "0" {
+		t.Fatalf("an entry after the run ended wrote a scope")
+	}
 	if err := j.ReleaseRunLease(ctx, run, token); err != nil {
 		t.Fatal(err)
 	}
