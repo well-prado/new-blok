@@ -256,7 +256,8 @@ func TestTakeoverPersistsUncertaintyAndRejectsPausedOwnersResult(t *testing.T) {
 		}
 		return input, nil
 	}}
-	runtime, err := New(store, engine.New(map[string]node.Any{"fixture/paused-effect": definition}), map[string]Workflow{"paused-effect-fixture": workflow}, Limits{Partitions: 8, PartitionAdmissions: 64, TenantAdmissions: 8, OwnerTTL: time.Second})
+	limits := Limits{Partitions: 8, PartitionAdmissions: 64, TenantAdmissions: 8, OwnerTTL: time.Second}
+	runtime, err := New(store, engine.New(map[string]node.Any{"fixture/paused-effect": definition}), map[string]Workflow{"paused-effect-fixture": workflow}, limits)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,7 +294,7 @@ func TestTakeoverPersistsUncertaintyAndRejectsPausedOwnersResult(t *testing.T) {
 	}
 	var newOwner distributed.Owner
 	for newOwner.ID == "" {
-		newOwner, err = store.Acquire(ctx, partition, "takeover-owner", time.Second)
+		newOwner, err = store.Acquire(ctx, partition, "takeover-owner", limits.OwnerTTL)
 		if errors.Is(err, distributed.ErrOwnershipLost) {
 			if err := waitContext(ctx, 100*time.Millisecond); err != nil {
 				t.Fatal(err)
@@ -305,12 +306,16 @@ func TestTakeoverPersistsUncertaintyAndRejectsPausedOwnersResult(t *testing.T) {
 		}
 	}
 	releaseOwnerOnCleanup(t, store, newOwner)
+	// The successor stays a live owner until the stale owner's result is
+	// rejected; only the paused owner's lease is left to expire (#399).
+	stopRenewal := keepOwnerAlive(ctx, store, newOwner, limits.OwnerTTL)
+	t.Cleanup(func() { _ = stopRenewal() })
 	if newOwner.Token <= oldOwner.Token {
 		t.Fatalf("fence did not advance: old=%d new=%d", oldOwner.Token, newOwner.Token)
 	}
 	takenOver, err := runtime.processOne(ctx, newOwner)
 	if err != nil {
-		t.Fatalf("new owner recovery: %v", err)
+		t.Fatalf("new owner recovery: %v (successor lease renewal: %v)", err, stopRenewal())
 	}
 	if takenOver.State != "uncertain" || effects.Load() != 1 {
 		t.Fatalf("takeover state=%q effect count=%d, want uncertain/1", takenOver.State, effects.Load())
@@ -319,6 +324,9 @@ func TestTakeoverPersistsUncertaintyAndRejectsPausedOwnersResult(t *testing.T) {
 	old := <-oldDone
 	if !errors.Is(old.err, distributed.ErrOwnershipLost) {
 		t.Fatalf("stale owner result error=%v, want ownership lost", old.err)
+	}
+	if err := stopRenewal(); err != nil {
+		t.Fatalf("successor lost its partition lease during takeover: %v", err)
 	}
 	final, err := runtime.GetRun(ctx, tenant, admission.RunID)
 	if err != nil || final.State != "uncertain" || len(final.Output) != 0 || effects.Load() != 1 {
@@ -868,7 +876,8 @@ func TestStepJournalQuorumLossDefersAcceptedRun(t *testing.T) {
 		}
 		return input, nil
 	}}
-	runtime, err := New(store, engine.New(map[string]node.Any{"fixture/quorum-prefix": prefix, "fixture/quorum-effect": effect}), map[string]Workflow{"quorum-defer-fixture": workflow}, Limits{Partitions: 8, PartitionAdmissions: 64, TenantAdmissions: 8, OwnerTTL: time.Second})
+	limits := Limits{Partitions: 8, PartitionAdmissions: 64, TenantAdmissions: 8, OwnerTTL: time.Second}
+	runtime, err := New(store, engine.New(map[string]node.Any{"fixture/quorum-prefix": prefix, "fixture/quorum-effect": effect}), map[string]Workflow{"quorum-defer-fixture": workflow}, limits)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -929,7 +938,7 @@ func TestStepJournalQuorumLossDefersAcceptedRun(t *testing.T) {
 	}
 	var newOwner distributed.Owner
 	for newOwner.ID == "" {
-		newOwner, err = store.Acquire(ctx, partition, "quorum-defer-recovery-owner", time.Second)
+		newOwner, err = store.Acquire(ctx, partition, "quorum-defer-recovery-owner", limits.OwnerTTL)
 		if errors.Is(err, distributed.ErrOwnershipLost) {
 			if err := waitContext(ctx, 100*time.Millisecond); err != nil {
 				t.Fatal(err)
@@ -941,9 +950,15 @@ func TestStepJournalQuorumLossDefersAcceptedRun(t *testing.T) {
 		}
 	}
 	releaseOwnerOnCleanup(t, store, newOwner)
+	// The recovery owner is a live owner while it replays the run (#399).
+	stopRenewal := keepOwnerAlive(ctx, store, newOwner, limits.OwnerTTL)
+	t.Cleanup(func() { _ = stopRenewal() })
 	recovered, err := runtime.processOne(ctx, newOwner)
 	if err != nil || recovered.State != fixture.ExpectedFinalState || string(recovered.Output) != fixture.ExpectedOutput {
-		t.Fatalf("recovered=%+v err=%v; expected %s / %s", recovered, err, fixture.ExpectedFinalState, fixture.ExpectedOutput)
+		t.Fatalf("recovered=%+v err=%v (recovery owner lease renewal: %v); expected %s / %s", recovered, err, stopRenewal(), fixture.ExpectedFinalState, fixture.ExpectedOutput)
+	}
+	if err := stopRenewal(); err != nil {
+		t.Fatalf("recovery owner lost its partition lease while replaying: %v", err)
 	}
 	active, err := store.ListActiveRunIDs(ctx, partition, runtime.limits.PartitionAdmissions)
 	if err != nil || len(active) != fixture.ExpectedActiveRuns || prefixInvocations.Load() != fixture.ExpectedPrefixInvocations || effects.Load() != fixture.ExpectedExternalEffects {
