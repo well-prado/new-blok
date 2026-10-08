@@ -207,15 +207,33 @@ waits: the invocation path is the engine's step ID, and the iteration path
 is `root` until #333 gives the engine iteration paths (ADR 0031 defines
 both; a top-level step's invocation path is its ID).
 
-- **Lease.** `VerifyRun` refuses a run that is not live, whose artifact or
-  input differs, or whose lease is no longer the token's
-  (`ErrLeaseLost`). Every write a `RunJournal` makes runs in a transaction
-  that first checks the lease (and, except for the run's end, that the run
-  is live): recording a dispatch, marking one uncertain on replay or after
-  a node failure, committing a step, scheduling or acknowledging a wait,
-  and ending the run. A stale execution therefore changes nothing; only
-  its next node runs before it learns, since a pure node journals nothing
-  before it runs (Review R round 1 on #380).
+- **Lease and input.** `VerifyRun` refuses a run that is not live, whose
+  artifact differs, or whose lease is no longer the token's
+  (`ErrLeaseLost`). A run's engine input (the engine's digest of the input
+  its runner hands it, a typed decode of the admitted JSON re-encoded) is
+  fixed once: at admission when the admitter knows it
+  (`AdmissionRequest.EngineInput`, the decoded value itself, which `Admit`
+  digests with the engine's own `engine.InputDigest`, so no caller
+  encoding can differ from the engine's; a value `json.Marshal` refuses is
+  refused at admission), otherwise by the run's first execution
+  (`journal_runs.engine_input_digest`, schema 7). A later execution with
+  another engine input is refused, and so is a repeat admission of the
+  request key naming another engine input than the one fixed (Review R
+  round 3 on #380: caller bytes with other whitespace, HTML escaping, key
+  order or `\u` escapes than `json.Marshal`'s fixed an identity no
+  execution could match). The admitted bytes are
+  never compared with a re-encoding: a run admitted with valid input always
+  runs, whether its typed decode reorders fields, keeps an integer beyond
+  float64's exact range, drops an unknown field or zero-fills an optional
+  one (Review R round 2 on #380 and round 1 on #384: each of those could
+  never run).
+- **Permanent conflicts.** `Permanent(err)` reports the errors no retry
+  can fix: `ErrRequestConflict` (another engine input, step input or wait
+  plan), `ErrWaitCanceled`, `ErrStepResultLimit`. A runner settles such a
+  run as failed with a diagnostic; a lost lease and storage faults are not
+  permanent. The engine still labels them `persistence`; the journal's
+  sentinel is what classifies them (#333 is reworking the engine's run
+  loop).
 - **Calls.** A call with declared effects is recorded as dispatched before
   the node runs, in one transaction, and committed after; one found
   dispatched on replay is marked uncertain and the run fails as uncertain,
@@ -226,14 +244,22 @@ both; a top-level step's invocation path is its ID).
   that resolves a different input at the same step (a later loop
   iteration, or an upgrade that resolves inputs differently) is
   `ErrRequestConflict`, never served the recorded result. Step results are
-  bounded by `MaxStepResultBytes` (1 MiB, as a run's output).
+  bounded by `MaxStepResultBytes` (1 MiB, as a run's output). The engine
+  already refuses a node result over 1 MiB as `invalid_output`, except for
+  a node whose output schema is an open object; there the journal refuses
+  it with `ErrStepResultLimit`, which the engine reports as
+  `journal_step_complete` (class `persistence`); it is permanent (above).
 - **Waits.** `Await` looks the step's wait up by run, invocation path and
   iteration path, and schedules it the first time. Its ID is a digest of
   an explicit encoding of the run, artifact, step, the engine's digest of
   the wait plan (name and timeout) and the iteration path, owned by the
-  journal (not of the engine's identity struct, whose encoding could move
-  with a field rename), so every replay reads the same wait and a changed
-  plan at the same step is `ErrRequestConflict`. A wait without a timeout
+  journal (`wait/v1`, pinned by a test vector; not of the engine's
+  identity struct, whose encoding could move with a field rename), so
+  every replay reads the same wait and a changed plan at the same step is
+  `ErrRequestConflict`. The engine's digest of the wait plan is of
+  `contract.WaitInstruction`'s JSON encoding: a new field without
+  `omitempty` would change every suspended run's wait ID, which a test
+  also pins. A wait without a timeout
   is due at the end of time: only a signal fires it. Waiting suspends the
   run; fired or acknowledged returns the stored outcome (the signal, or a
   timeout when no signal fired it); canceled is `ErrWaitCanceled`.
@@ -270,8 +296,9 @@ storage, and only an application that runs durable workflows links the
 resumer (`internal/journal`'s other importers, such as `agent/policy`, do
 not gain a scheduler).
 
-- `New(Config{Journal, Engine, Workflows, Interval, Batch, Workers, Lease,
-  Clock})`: `Workflows` maps a workflow name to its program and an input
+- `New(Config{Journal, Engine, Workflows, Interval, Batch, Workers, Clock,
+  RenewEvery, MaxRetries, OnError, Settled})`; the lease length is the
+  journal's own (`WakeupLease`), never configured twice: `Workflows` maps a workflow name to its program and an input
   decoder, as `internal/cluster` does; a run executes only the program
   whose digest is its admitted artifact (another is left, not failed: a
   different build may know it).
@@ -281,7 +308,7 @@ not gain a scheduler).
   timers), `InterruptedRuns` (below), each up to `Batch`, executed by at
   most `Workers` at a time.
 - An execution decodes the run's input, runs `RunJournaled` through
-  `ForRun(run, token).WithInput(...)`, renews the lease every third of its
+  `ForRun(run, token)`, renews the lease every third of its
   length (an `ErrLeaseLost` renewal cancels it), and settles: a completed
   run through `RunJournal.CompleteRun`, a workflow failure through
   `FailRun`, an uncertain effect through `MarkRunUncertain`; a suspension
@@ -291,19 +318,30 @@ not gain a scheduler).
   goroutine ends; the run is a waiting row and a released lease
   (`TestSuspendedRunsHoldNoGoroutine`: 500 suspended runs, no goroutine
   growth; the benchmarks below measure 10,000).
-- **Interrupted runs.** `Journal.InterruptedRuns` leases live runs that
-  were leased before, hold no live lease and have neither an open nor a
-  fired wait: their execution stopped without suspending or ending (the
-  holder died, lost its lease, or was stopped), including after it
-  consumed a wakeup. A run admitted and never leased is its admitter's.
+- **Interrupted runs.** `Journal.InterruptedRuns` leases live runs of the
+  resumer's workflows that hold no live lease and have neither an open nor
+  a fired wait, and either were leased before (the holder died, lost its
+  lease, or was stopped, including after it consumed a wakeup) or were
+  admitted over a lease ago and never leased (the admitter crashed before
+  `Start`). The resumer scans for them once per third of a lease.
+- **Workers before leases.** A sweep takes at most as many runs as there
+  are free workers, and `Start` waits for a free worker before leasing:
+  a lease is never held by a run waiting for a worker, so it cannot lapse
+  and be taken again in the same process.
+- **Settlement.** Conflicts no retry can fix (`journal.Permanent`: another
+  engine input, a changed wait plan, a canceled wait, an oversize result)
+  and workflow errors fail the run with a diagnostic; a transient fault
+  leaves it to be retried at the scan's pace, `MaxRetries` times in a row,
+  then fails it (`retries_exhausted`). A panicking input decoder fails the
+  run; a panicking `Settled` is reported, not fatal. Sweep and settlement
+  errors go to `OnError` and are returned by `Sweep`.
 - **Shutdown.** `Close(ctx)` stops sweeping, waits for running executions
-  until `ctx` ends, then cancels the rest; every execution releases its
-  lease as it ends, so another resumer takes its run at once (as an
-  interrupted run, or a woken one if its wakeup was not yet consumed).
-- **Typed inputs.** A typed input encodes its fields in declaration order,
-  not the admitted JSON's; `RunJournal.WithInput` lets `VerifyRun` accept
-  it when it is the same JSON value as the admitted input (C1 compared the
-  sorted-key encoding only, so a two-field typed input could not run).
+  until `ctx` ends, then cancels the rest and returns at once; every
+  execution releases its lease as it returns (one stuck in a node that
+  ignores cancellation, when that node returns), so another resumer takes
+  its run. `Start` after `Close` is `ErrClosed`.
+- **Typed inputs** run whatever their decode reshapes: the run's engine
+  input is fixed at admission or first execution (slice C1).
 
 ## Measured footprint and wakeup bursts (slice C2)
 
@@ -342,9 +380,9 @@ These are local samples, not a capacity or fleet claim.
 | `Journal.ForRun`, `RunJournal` (engine `StepJournal` and `WaitJournal`), `Journal.WaitAt`, `ErrWaitCanceled` (slice C1) | API, additive | None |
 | `Journal.CompleteRun` refuses a run with a fired, unacknowledged wait (slice C1) | behavioral | Acknowledge the wait (`AcknowledgeWait`, or a `RunJournal` commit) before completing |
 | Journal schema 5 → 6 (slice B) | schema, one-way | On open; `resumed` waits remapped on every open |
-| Journal schema 6 → 7: `journal_operations.input_digest` (slice C1) | schema, one-way | On open, `from < 7`; operations recorded before it have no digest and are not compared |
-| `RunJournal.MarkRunUncertain`, `MaxStepResultBytes`, `ErrStepResultLimit` (slice C1) | API, additive | None |
-| `internal/resumer`; `Journal.InterruptedRuns`, `RunLease`; `RunJournal.WithInput` (slice C2) | API, additive | None |
+| Journal schema 6 → 7: `journal_operations.input_digest`, `journal_runs.engine_input_digest` (slice C1) | schema, one-way | On open, `from < 7`; operations recorded before it have no digest and are not compared; a run's engine input is fixed by its next execution |
+| `RunJournal.MarkRunUncertain`, `AdmissionRequest.EngineInput`, `Permanent`, `MaxStepResultBytes`, `ErrStepResultLimit` (slice C1) | API, additive | None |
+| `internal/resumer`; `Journal.InterruptedRuns`, `RunLease` (slice C2) | API, additive | None |
 
 ## Evidence
 
@@ -388,11 +426,20 @@ probes), `TestTakeRunLeaseHoldsARunThatNeverSuspended`,
 `TestEngineEffectInterruptedByACrashIsUncertain` (the last two kill a real
 process); after Review R round 1, `TestWaitAfterWaitIsNotWokenAgain`,
 `TestStaleExecutionWritesNothing`, `TestStepResultIsBoundToItsInput`,
-`TestRunJournalMarksARunUncertain`, `TestStepResultIsBounded`. Slice C2:
-`internal/resumer` (`TestResumerSuspendsAndResumesRuns`,
+`TestRunJournalMarksARunUncertain`, `TestStepResultIsBounded`; after
+round 2, `TestEveryValidInputRuns`, `TestEngineInputIsFixedOnce`,
+`TestPermanentErrors`, `TestWritesAfterTheRunEndedAreRefused`,
+`TestWaitIDFormatIsPinned`, `TestOversizeStepResultIsRecognizable`; after
+round 3, `TestEngineInputFixedAtAdmissionRuns`,
+`TestEngineInputMustEncode`, `TestRepeatAdmissionComparesEngineInput`.
+Slice C2: `internal/resumer` (`TestResumerSuspendsAndResumesRuns`,
 `TestSuspendedRunsHoldNoGoroutine`, `TestTimerWakesARun`,
-`TestInterruptedRunIsTakenAgain`, `TestCloseDrainsThenCancelsAndReleases`),
-`TestTypedInputIsVerifiedAsTheSameJSONValue`, the fixtures in
+`TestInterruptedRunIsTakenAgain`, `TestCloseDrainsThenCancelsAndReleases`,
+`TestPermanentConflictsAreSettled`, `TestTransientFaultsAreRetriedThenFailed`,
+`TestBusyWorkersTakeNoMoreRuns`, `TestCloseReturnsAtItsDeadline`,
+`TestRenewalKeepsAndLosesTheLease`, `TestLeaseComesFromTheJournal`,
+`TestSweepSurfacesErrors`, `TestPanicsAreContained`,
+`TestInterruptedRunsAreNotCrowdedOut`), the fixtures in
 `testdata/waits/fixtures.json` (`TestWaitFixtures`, nine cases, five of
 them negative) and `benchmarks/waits`
 (`TestSuspendedRunsCostStorageNotGoroutines`, always run at 1,000 runs, and
@@ -424,9 +471,13 @@ the gated `TestWaitFootprintAndBurstSamples`).
   first open by this binary remaps that wait to `fired` and a holder may
   then list and execute the same run: a double-resume window that lasts
   until the old process stops. Upgrade by stopping old processes first.
-- `InterruptedRuns` scans live runs without an index on their state; a
-  run that keeps failing with a journal fault, or whose workflow is not
-  registered, is taken again every sweep (least recently leased first).
+- `InterruptedRuns` reads the live runs of the resumer's workflows once
+  per third of a lease, without an index on their state (a follow-up). A
+  woken run whose workflow is not registered here is re-leased by every
+  sweep and released (another build may know it).
+- Transient-retry counts are kept in memory; a restart starts them again.
+- An application that admits a resumer workflow's runs through another
+  executor must start them within a lease, or the resumer takes them.
 - The resumer settles what the engine reports; an application's admission
   path calls `Start` (no admission is wired to it in this slice).
 - Every step is at the `root` iteration until #333 passes iteration paths

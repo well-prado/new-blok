@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -42,22 +41,9 @@ type RunJournal struct {
 	runID   string
 	token   int64
 
-	input json.RawMessage
-
 	mu       sync.Mutex
 	artifact string
 	pending  []string
-}
-
-// WithInput gives VerifyRun the run's input as the runner hands it to the
-// engine, encoded with json.Marshal. It is accepted when it is the same
-// JSON value as the input the run was admitted with, whatever its key
-// order: a typed input encodes its fields in declaration order, not the
-// order of the admitted JSON. Without it, VerifyRun expects the admitted
-// input re-encoded with sorted keys.
-func (r *RunJournal) WithInput(encoded json.RawMessage) *RunJournal {
-	r.input = append(json.RawMessage(nil), encoded...)
-	return r
 }
 
 // ForRun returns the engine journal for runID under lease token, from
@@ -70,6 +56,16 @@ var (
 	_ engine.StepJournal = (*RunJournal)(nil)
 	_ engine.WaitJournal = (*RunJournal)(nil)
 )
+
+// Permanent reports an error no retry of the run can fix: a conflict with
+// what the run already recorded (ErrRequestConflict: another engine input,
+// step input or wait plan), a canceled wait the run reached
+// (ErrWaitCanceled), a step result over the bound (ErrStepResultLimit). A
+// runner settles such a run as failed. A lost lease (another holder runs
+// it) and storage faults are not permanent.
+func Permanent(err error) bool {
+	return errors.Is(err, ErrRequestConflict) || errors.Is(err, ErrWaitCanceled) || errors.Is(err, ErrStepResultLimit)
+}
 
 // uncertainStep marks an effect whose outcome is unknown; the engine fails
 // the run as uncertain instead of invoking the effect again.
@@ -90,29 +86,47 @@ func (r *RunJournal) VerifyRun(ctx context.Context, runID, artifact, inputDigest
 	if run.State != runAccepted {
 		return ErrRunNotActive
 	}
-	// The engine digests its input re-encoded; compare the same encoding.
-	var stored any
-	if err := json.Unmarshal(run.Input, &stored); err != nil {
-		return err
-	}
-	encoded, err := json.Marshal(stored)
-	if err != nil {
-		return err
-	}
-	if r.input != nil {
-		var given any
-		if err := json.Unmarshal(r.input, &given); err != nil || !reflect.DeepEqual(stored, given) {
-			return ErrRequestConflict
-		}
-		encoded = r.input
-	}
-	if run.ArtifactDigest != artifact || digestBytes(encoded) != inputDigest {
+	if run.ArtifactDigest != artifact {
 		return ErrRequestConflict
 	}
+	// The run's engine input was fixed at admission or by its first
+	// execution: the runner decodes the admitted input the same way every
+	// time, so a later execution hands the engine the same encoding, and a
+	// different one is a different input (a changed decoder, a wrong run).
+	// Read first: only the first execution of a run admitted without an
+	// engine input writes.
+	var bound sql.NullString
 	if err := r.journal.withRead(ctx, func(tx *sql.Tx) error {
-		return r.journal.checkRunLease(ctx, tx, runID, r.token, false)
+		if err := r.journal.checkRunLease(ctx, tx, runID, r.token, false); err != nil {
+			return err
+		}
+		return tx.QueryRowContext(ctx, `SELECT engine_input_digest FROM journal_runs WHERE run_id = ?`, runID).Scan(&bound)
 	}); err != nil {
 		return err
+	}
+	if bound.Valid && bound.String != inputDigest {
+		return ErrRequestConflict
+	}
+	if !bound.Valid {
+		if err := r.journal.withTx(ctx, "run-verify", func(tx *sql.Tx) error {
+			if err := r.fence(ctx, tx, true); err != nil {
+				return err
+			}
+			result, err := tx.ExecContext(ctx, `UPDATE journal_runs SET engine_input_digest = ? WHERE run_id = ? AND (engine_input_digest IS NULL OR engine_input_digest = ?)`, inputDigest, runID, inputDigest)
+			if err != nil {
+				return err
+			}
+			changed, err := result.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if changed != 1 {
+				return ErrRequestConflict
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
 	}
 	r.mu.Lock()
 	r.artifact = artifact

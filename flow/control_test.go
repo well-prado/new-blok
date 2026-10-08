@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"reflect"
 	"testing"
 
 	"github.com/well-prado/new-blok/node"
@@ -34,14 +35,35 @@ func TestControlFlowRecordsScopedJoinsAndBounds(t *testing.T) {
 		Parallel(builder, "audit", func(arm *ArmBuilder) { ArmCall(arm, "audit-one", n, input) }, func(arm *ArmBuilder) { ArmCall(arm, "audit-two", n, input) })
 		return selected
 	}).Program()
-	if len(definition.Instructions) != 8 {
-		t.Fatalf("instructions=%d, want 8: %+v", len(definition.Instructions), definition.Instructions)
+	// Each construct holds its arms' instructions; none of them is in the
+	// workflow's own list (#333).
+	if len(definition.Instructions) != 3 {
+		t.Fatalf("instructions=%d, want 3: %+v", len(definition.Instructions), definition.Instructions)
 	}
-	if definition.Instructions[2].Kind != "if" || definition.Instructions[4].Kind != "each" || definition.Instructions[7].Kind != "parallel" {
+	if definition.Instructions[0].Kind != "if" || definition.Instructions[1].Kind != "each" || definition.Instructions[2].Kind != "parallel" {
 		t.Fatalf("instructions=%+v", definition.Instructions)
 	}
-	if definition.Instructions[4].Data["concurrency"] != 4 || definition.Instructions[4].Data["preserveOrder"] != true {
-		t.Fatalf("each data=%+v", definition.Instructions[4].Data)
+	arms := func(instruction Instruction) (names, steps []string) {
+		for _, arm := range instruction.Arms {
+			names = append(names, arm.Name)
+			for _, step := range arm.Instructions {
+				steps = append(steps, step.ID)
+			}
+		}
+		return names, steps
+	}
+	for index, want := range [][2][]string{
+		{{"then", "else"}, {"premium", "standard"}},
+		{{"body"}, {"line"}},
+		{{"0", "1"}, {"audit-one", "audit-two"}},
+	} {
+		names, steps := arms(definition.Instructions[index])
+		if !reflect.DeepEqual(names, want[0]) || !reflect.DeepEqual(steps, want[1]) {
+			t.Fatalf("%s arms=%v steps=%v; want %v %v", definition.Instructions[index].ID, names, steps, want[0], want[1])
+		}
+	}
+	if definition.Instructions[1].Data["concurrency"] != 4 || definition.Instructions[1].Data["preserveOrder"] != true {
+		t.Fatalf("each data=%+v", definition.Instructions[1].Data)
 	}
 }
 

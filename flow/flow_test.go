@@ -60,16 +60,13 @@ func TestLowerProducesEngineProgramWithoutExecutingNode(t *testing.T) {
 	}
 }
 
-func TestLowerRejectsNonCallInstruction(t *testing.T) {
+func TestLowerRejectsConstructWithoutAProgramForm(t *testing.T) {
 	definition := MustDefine(Spec{Name: "shop/quote", Version: "1.0.0"}, func(builder *Builder, input Ref[quoteInput]) Ref[quoteOutput] {
-		return If(builder, "route", Lit(true), func(arm *ArmBuilder) Ref[quoteOutput] {
-			return ArmCall(arm, "then", testQuoteNode(t), input)
-		}, func(arm *ArmBuilder) Ref[quoteOutput] {
-			return ArmCall(arm, "else", testQuoteNode(t), input)
-		})
+		Template(builder, "label", "quote {}", Lit("x"))
+		return Call(builder, "quote", testQuoteNode(t), input)
 	})
-	if _, err := definition.Lower(); err == nil {
-		t.Fatal("Lower accepted unsupported control flow")
+	if _, err := definition.Lower(); err == nil || err.Error() != `flow: instruction "label" of kind "template" cannot be lowered` {
+		t.Fatalf("Lower err=%v; want template rejected: it has no substitution semantics", err)
 	}
 }
 

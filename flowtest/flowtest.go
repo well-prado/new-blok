@@ -49,6 +49,9 @@ func (r Result) State(id string) (any, bool) { value, ok := r.result.State[id]; 
 func (r Result) Steps() []engine.StepResult {
 	return append([]engine.StepResult(nil), r.result.Steps...)
 }
+
+// Step returns the first execution of id, in completion order. A step inside
+// an Each runs once per item: read Steps and select by IterationPath.
 func (r Result) Step(id string) (engine.StepResult, bool) {
 	for _, step := range r.result.Steps {
 		if step.ID == id {
