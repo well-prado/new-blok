@@ -407,21 +407,31 @@ not gain a scheduler).
 
 `benchmarks/waits` runs the real journal, engine and resumer on a SQLite file:
 N runs admitted, started to suspension at one wait, then all signalled back
-to back and resumed to completion. The committed report
-(`waits-go1.27.1-darwin-arm64.json`, raw per-run latencies included) holds
-three repetitions of 10,000 runs on a shared Apple M4 developer host:
+to back and resumed to completion. Its README holds the tables.
 
-- **Goroutines.** 3 before, 3 with all 10,000 suspended, 3 after the burst,
-  in every repetition. A suspended run holds no goroutine.
-- **Memory.** Resident memory rose about 7 MiB with the first 10,000
-  suspended runs, SQLite's page cache included; heap in use rose under 1 MiB.
-- **Burst.** All 10,000 runs completed 4.8–5.0 s after the first signal
-  (2,000–2,083 runs/s), with p50 1.5 ms, p99 4.9–5.9 ms and a maximum of
-  40–48 ms from a run's signal commit to its completion. The burst was bound
-  by one goroutine committing the signals: the resumer kept pace with them.
+- **Report** (`waits-go1.27.1-darwin-arm64.json`, raw per-run latencies
+  included): three repetitions of 10,000 runs of `7d08ca9` (the resumer after
+  #384's Review R rounds 1–3) on a shared Apple M4 developer host at load
+  about 5. Goroutines 3 before, 3 with all 10,000 suspended, 3 after the
+  burst, in every repetition: a suspended run holds no goroutine. Resident
+  memory rose about 7 MiB with the first 10,000 suspended runs, SQLite's page
+  cache included; heap in use rose under 1 MiB. The burst drained at 562–1,037
+  runs/s (p50 2.8–3.7 ms), bound by one goroutine committing the signals: the
+  resumer kept pace with them.
+- **Old against new** (`ab-ce95507-darwin-arm64.json`): 16 interleaved pairs
+  of the first measured revision (`ce95507`) and the new one, at load 8–140.
+  Footprint unchanged; burst throughput unchanged within the noise (median
+  new ÷ old 0.95 and 0.99). Starting 10,000 runs to their wait was slower in
+  15 of 16 pairs (median 1.26× and 1.81×); the cause is not isolated (the
+  arms also differ in engine and journal changes merged since), and `Start`
+  taking a worker before its lease was tested and not confirmed as it.
 - **Scan cost.** Looking for interrupted runs on every sweep, inside a write
-  transaction over every live run, cut the same burst to about 464 runs/s
-  (p50 8.9 ms). It now reads first and runs once per third of a lease (#384).
+  transaction over every live run, cut the burst to about 464 runs/s
+  (p50 8.9 ms) against about 2,000 without it, on 2026-10-07. It now reads
+  first and runs once per third of a lease (#384).
+- Times on this host vary with its load more than with the code (the same
+  old resumer ran 2,000–2,083 runs/s on 2026-10-07 and 400–680 on 2026-10-08):
+  compare within one pair, not across reports.
 
 These are local samples, not a capacity or fleet claim.
 
