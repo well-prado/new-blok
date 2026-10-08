@@ -42,17 +42,37 @@ func format2(instructions ...contract.InternalInstruction) contract.InternalProg
 // write before the parallel joins. Retrying the run would write twice, so
 // the run's failure must no longer read as saturation (Review R round 1 on
 // #383).
+//
+// The order is forced, not timed (#400): busy fails only once write has
+// started, and write commits only after busy's failure has canceled it
+// (fail-fast). With sleeps alone, a loaded machine could fail busy before
+// arm 0 reached its node; the run was then canceled before anything was
+// written, and a retryable saturated failure was the right answer.
 func TestSaturationAfterAConcurrentEffectIsNotRetryable(t *testing.T) {
 	for attempt := 0; attempt < 3; attempt++ {
 		var wrote atomic.Int32
-		write := node.MustDefine("write", "1.0.0", func(context.Context, effectIn) (effectIn, error) {
-			time.Sleep(30 * time.Millisecond)
+		var canceledFirst atomic.Bool
+		started := make(chan struct{})
+		write := node.MustDefine("write", "1.0.0", func(ctx context.Context, _ effectIn) (effectIn, error) {
+			close(started)
+			select {
+			case <-ctx.Done():
+				canceledFirst.Store(true)
+			case <-time.After(10 * time.Second):
+			}
+			// The write is still in flight when the run fails: the join
+			// must wait for it.
+			time.Sleep(20 * time.Millisecond)
 			wrote.Add(1)
 			return effectIn{}, nil
 		}, node.Description("writes"), effectSchema, node.Effects("store:write"))
 		busy := node.MustDefine("busy", "1.0.0", func(context.Context, effectIn) (effectIn, error) {
-			time.Sleep(5 * time.Millisecond)
-			return effectIn{}, capacity.ErrSaturated
+			select {
+			case <-started:
+				return effectIn{}, capacity.ErrSaturated
+			case <-time.After(10 * time.Second):
+				return effectIn{}, errors.New("write never started")
+			}
 		}, node.Description("saturated"), effectSchema)
 		program := format2(
 			control("fan", "parallel", &contract.Control{Arms: []contract.Arm{
@@ -64,6 +84,9 @@ func TestSaturationAfterAConcurrentEffectIsNotRetryable(t *testing.T) {
 		_, err := engine.New(map[string]node.Any{"write": write.Any(), "busy": busy.Any()}).Run(context.Background(), program, effectIn{})
 		if err == nil || wrote.Load() != 1 {
 			t.Fatalf("err=%v wrote=%d", err, wrote.Load())
+		}
+		if !canceledFirst.Load() {
+			t.Fatalf("attempt %d: busy's failure never canceled write, so write did not commit after it", attempt)
 		}
 		if errors.Is(err, capacity.ErrSaturated) {
 			t.Fatalf("attempt %d: %v still reads as saturated after the write committed", attempt, err)

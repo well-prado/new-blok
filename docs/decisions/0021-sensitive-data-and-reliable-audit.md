@@ -7,7 +7,8 @@
   ADR 0020 (optional observability, #79) and the #49 journal retention,
   compaction, backup and restore
 - Amended by: #281 (§7, erasure of run data), #286 (§8, the tenant of a
-  reconciliation), #291 (§9, schema versions)
+  reconciliation), #291 (§9, schema versions), #284 (§10, the audit start
+  marker)
 - Amends: [ADR 0008](0008-durable-tool-policy.md) (approval decisions now
   require audit), [ADR 0016](0016-versioned-inspection.md) (projection
   redaction and error labels), [ADR 0020](0020-optional-observability-export.md)
@@ -155,8 +156,9 @@ it erases is described in §7.
 
 ### 5. Backup and restore
 
-Audit tables (`audit_records_v1`, `audit_meta_v1`, `audit_pruned_v1`) live
-in the journal's database, so `journal.Backup` and `sqlite.Backend.Restore`
+Audit tables (`audit_records_v1`, `audit_meta_v1`, `audit_pruned_v1`, and
+since #284 `audit_start_v1` and `audit_legacy_v1`) live in the journal's
+database, so `journal.Backup` and `sqlite.Backend.Restore`
 carry audit and durable state together, from the same point in time.
 
 After a restore, `audit.Journal.Verify(ctx, owners...)` proves two things:
@@ -169,10 +171,13 @@ After a restore, `audit.Journal.Verify(ctx, owners...)` proves two things:
    record on re-delivery, or by hand. The error names that record's id,
    and a tombstone of any kind counts, as `Append` refuses another kind
    under a pruned id too. The ids are checked in batches of 256, one
-   indexed lookup per batch (Limits gives the cost).
+   indexed lookup per batch (Limits gives the cost). Every audit start
+   marker matches its legacy list (§10).
 2. **Agreement** (`ErrMismatch`), for each `audit.Owner` passed (the
    approval store and the journal implement it): every durable decision
-   has its record or a prune tombstone of the same id digest and kind, and
+   has its record, a prune tombstone of the same id digest and kind, or a
+   place on its kind's legacy list (§10: recorded before audit existed on
+   the database, reported as legacy, not as a mismatch), and
    every record of the owner's
    kind names a decision the owner still has. This catches an audit table
    that was dropped and recreated empty, a deleted row whose counter was
@@ -308,8 +313,8 @@ transaction:
    predates audit) gets that record first, since the actor it needs is
    about to be erased. It takes the tenant stored with the reconciliation,
    or the system tenant `""` for a row from before #286 (§8). Without an audit
-   journal composed nothing is written, and `Verify` reports the decision as
-   it reports any pre-audit decision (#284).
+   journal composed nothing is written, and `Verify` accepts the decision
+   only if the start marker listed it as legacy (§10).
 2. Each reconciliation keeps its operation key, run id, tenant, state,
    creation time, `evidence_digest` and `result_digest` (the digests its audit
    record carries) and gains `erased_at`; actor, evidence and result are
@@ -527,7 +532,7 @@ their history are in ADR 0003 ("Schema versions"). For this decision it
 means:
 
 - A journal migrated by #281 or #286 (stamp `journal` 3), an audit store
-  (`audit` 1), approvals (`approval` 1) and a queue with tombstones
+  (`audit` 1; 2 since #284, §10), approvals (`approval` 1) and a queue with tombstones
   (`worker` 2) are refused at open, with `store.NewerSchemaError` naming
   the component and both versions, by any binary from #291 on that
   supports an older version. Such a binary can therefore no longer insert
@@ -545,6 +550,88 @@ means:
   is still repaired after: the legacy tombstone table it recreates is
   rewritten, an untenanted row it inserts is given its record's tenant.
 
+### 10. The audit start marker (#284)
+
+Audit became mandatory with #80, and `v0.1.0-alpha` shipped it. A database
+that already held approval decisions or reconciliations then has decisions
+that never had a record, and before #284 `Verify` reported every one of
+them as `ErrMismatch`, forever: the only repair was to retry each old
+decision, which needs its original proposal and grant. An operator taught
+to ignore `ErrMismatch` would also ignore it when it means tampering. The
+start marker draws the line once: decisions recorded before audit existed
+on the database are **legacy**, counted and reported separately; every
+later decision must have its record.
+
+**The line is a list, not a time or a position.** Each owner kind
+(`approval.decision`, `reconciliation.decision`) has one marker row in
+`audit_start_v1`. Opening the audit store with a binary from #284 on, when
+it is created (audit schema 0) or upgraded from audit schema 1, opens a
+marker for each kind, in the schema transaction that stamps audit 2
+(ADR 0003). The owner's first open composed with audit
+(`approval.NewJournalStore`, `journal.New` with `Config.Audit`) calls
+`audit.Journal.Start`, which, in one write transaction, lists each of the
+owner's decisions that has neither a record nor a prune tombstone in
+`audit_legacy_v1` (the sha256 of its record id, as a prune tombstone keeps
+it, since ids may carry personal data) and closes the marker with the
+list's size and digest (sha256 of the kind and the sorted id digests, one
+per line). No decision can commit between the listing and the marker. A
+legacy list needs no ordering of decisions, so it cannot be confused by
+clock skew, by a clock that went backwards, or by owner tables whose row
+order changed (the #281 rebuild of `journal_reconciliations`).
+
+- A fresh database: the markers close when the owners first open, with
+  nothing listed. Every decision needs its record.
+- A database written before #280: the markers list every decision; `Verify`
+  passes and reports them as legacy.
+- A database that went through `v0.1.0-alpha` (audit 1, no marker): the
+  markers list the decisions without a record, which are the ones recorded
+  before audit; the alpha binary's own decisions have their records and
+  are matched.
+- A legacy decision whose record is written later (an idempotent retry, a
+  re-delivery, or compaction's backfill, §7) is matched by its record and
+  no longer counted as legacy; it stays on the list.
+
+`audit.Journal.VerifyReport` returns the record count, the legacy count
+per owner kind passed, and every closed marker (`Marker{Legacy, Digest}`);
+`Verify` keeps its signature and returns the record count.
+
+**Written once.** `Start` never rewrites a closed marker. A store already
+at audit 2 never opens a marker again, so removing the marker rows, or
+dropping and recreating the marker tables, does not let the next open list
+whatever decisions lack records by then: that kind has no marker, nothing
+is legacy, and every unrecorded decision is `ErrMismatch`.
+
+**Tamper evidence, and its limits.** `Verify` recomputes each closed
+marker's list size and digest, and compares the stored count on its own
+(the digest covers the list, not the count): a decision added to the list
+(moving the line forward to hide a decision whose record was removed), a
+list or count edited on its own, or a list left behind without its marker
+is `ErrCorrupt`; removing a marker and its list turns its legacy decisions
+into `ErrMismatch`. A decision whose record was pruned before the upgrade
+has its tombstone, so it is matched by it and never listed. This is the
+same evidence as the record digests (§6): it detects partial restores,
+accidental damage and a rewrite that does not know the scheme. It does
+not hold against anyone who can write the database and knows the scheme,
+and most of the ways around it need no hashing at all:
+
+- reopening a marker by hand (`UPDATE audit_start_v1 SET started = 0`,
+  emptying its list) makes the owner's next open list again whatever
+  decisions lack a record by then;
+- deleting the markers and setting audit's row in `blok_schema_versions`
+  back to 1 makes the next open run the version-2 migration again, which
+  opens new markers that the owners then fill;
+- rewriting a marker and its list consistently needs one sha256 as well.
+
+Inside the database none of these is detectable. The only defence is to
+keep `Report.Markers` outside the database: a closed marker never changes
+once written, so any of them shows up as a changed count or digest
+(`TestMovingTheStartMarkerForwardIsDetected` pins the hand-reopened
+marker and the stamp set back to 1: each verifies, with one more legacy
+decision and a different digest). A legacy decision is accepted on the strength of the marker
+alone: on a database that ran `v0.1.0-alpha`, a decision whose record was
+removed (not pruned) before this release first opened it is
+indistinguishable from a pre-audit decision and is listed as legacy.
+
 ## Compatibility
 
 Pre-alpha. Classified per surface:
@@ -556,7 +643,8 @@ Pre-alpha. Classified per surface:
   rewritten and receive no backfilled record; a decision recorded before
   this change still authorizes; an idempotent retry of it, or a
   re-delivery of a pre-audit reconciliation, writes its missing record.
-  Until then `Verify` with owners reports `ErrMismatch` for such a store.
+  Until #284 `Verify` with owners reported `ErrMismatch` for such a
+  store; since #284 it reports them as legacy (§10).
   `audit.Journal.Append` returns whether it inserted.
 - **Behaviour tightening**: more content is redacted in inspection, worker
   logs and telemetry (the widened shared pattern and the encoded layer);
@@ -647,6 +735,27 @@ Pruned records stay pruned (#294), classified separately:
   fails `Verify`, naming the record's id, until the next `Prune` removes
   it (Limits).
 - No schema change.
+
+The audit start marker (#284), classified separately:
+
+- **Behaviour change**: `Verify` accepts a decision without a record when
+  its kind's start marker lists it, and reports it as legacy
+  (`VerifyReport`), where it returned `ErrMismatch`. A decision recorded
+  after the marker without its record is still `ErrMismatch`. A marker
+  that disagrees with its list, or a list without a marker, is
+  `ErrCorrupt`.
+- **Schema change, additive, with a version raise**: `audit_start_v1` and
+  `audit_legacy_v1` are created on open; audit schema 2. A binary from #291
+  on that supports audit 1 (`v0.1.0-alpha` included) refuses a database
+  this release opened (`store.NewerSchemaError`): it would ignore the
+  marker and report every legacy decision as `ErrMismatch` again, and a
+  marker it never saw could not stay write-once. Downgrade by restoring a
+  pre-upgrade backup, as for every raise.
+- **Behaviour change**: `approval.NewJournalStore` and `journal.New` with
+  `Config.Audit` close their kind's marker on their first open, in one
+  extra write transaction; later opens read one row.
+- **Additive**: `audit.Journal.Start`, `audit.Journal.VerifyReport`,
+  `audit.Report`, `audit.Marker`.
 
 ## Evidence
 
@@ -753,6 +862,25 @@ Pruned records stay pruned (#294), classified separately:
   #294 head; mutations and a store written by the origin/main code are in
   the PR.
 
+- The audit start marker (#284), against real SQLite files:
+  `contract/audit/start_test.go`, with a database written by origin/main at
+  `71b8351`, before #280, by the pre-audit code path
+  (`testdata/restore/audit-start-284/legacy-main-71b8351.db.gz`: three
+  approvals, two reconciliations, no audit tables) and the same database
+  upgraded and used by `v0.1.0-alpha` (`alpha-79ee0a7.db.gz`: audit 1, one
+  more approval and reconciliation with records; the alpha binary's own
+  `Verify` of it is `ErrMismatch`, which its generator checks). Both verify
+  with three legacy approvals and two legacy reconciliations, reopen
+  unchanged, and match a legacy reconciliation once compaction backfills
+  its record; a decision recorded after the marker whose record is removed
+  is `ErrMismatch`, for both kinds; a decision whose record alpha pruned
+  before the upgrade is matched by its tombstone and not listed; a
+  decision added to the legacy list, with or without the count raised, a
+  count edited alone, and a list without its marker are `ErrCorrupt`; a marker removed with its list, or its tables dropped, is
+  not written again on reopen and the legacy decisions mismatch; a fresh
+  database closes both markers with nothing listed. Red on origin/main;
+  mutations are in the PR.
+
 ## Limits
 
 - Journaled and cluster runs on `store/distributed` (ADR 0019) have no audit
@@ -760,10 +888,17 @@ Pruned records stay pruned (#294), classified separately:
   them: the journal's activity port reports a run it does not hold as
   active, so such a record is kept until the application composes an
   activity port that can prove the run ended.
-- An upgraded database's decisions recorded before audit existed are
-  reported by `Verify` as `ErrMismatch`, not as legacy; an audit start
-  marker is
-  [#284](https://github.com/well-prado/new-blok/issues/284).
+- The audit start marker (§10) is evidence against a rewrite that does not
+  know the scheme only. With write access and knowledge of the scheme,
+  reopening a marker (`started = 0`) or deleting the markers and setting
+  the audit stamp back to 1 needs no hashing, and a consistent rewrite
+  needs one sha256; keeping `Report.Markers` outside the database is the
+  only defence. On a database that ran `v0.1.0-alpha`, a record removed
+  before this release first opened it makes its decision legacy. A marker
+  closes on the owner's first open composed with audit: a journal opened
+  only without audit leaves the reconciliation marker open, and a
+  reconciliation an old binary writes before it closes is listed as
+  legacy.
 - Erasure (§7) is retention-driven only: there is no API to erase one
   run or one subject's runs on request before their cutoff. Failed,
   canceled and uncertain runs are never compacted, and a parent's copy of a

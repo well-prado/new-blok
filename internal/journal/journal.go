@@ -219,6 +219,14 @@ func New(ctx context.Context, database store.Database, config Config) (*Journal,
 	}); err != nil {
 		return nil, err
 	}
+	// The first open composed with audit closes the reconciliation start
+	// marker: reconciliations recorded before audit existed become legacy,
+	// every later one needs its record (#284).
+	if config.Audit != nil {
+		if err := config.Audit.Start(ctx, j); err != nil {
+			return nil, err
+		}
+	}
 	return j, nil
 }
 
