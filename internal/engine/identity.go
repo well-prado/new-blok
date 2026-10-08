@@ -28,12 +28,25 @@ func (i StepIdentity) Iteration() string {
 	return i.IterationPath
 }
 
-// Canonical is i with the root iteration spelled as the empty string, the
-// form stored records compare in: a record written before IterationPath
-// existed decodes with it empty.
+// Invocation is i's invocation path: InvocationPath inside an arm, the
+// step id at the top level.
+func (i StepIdentity) Invocation() string {
+	if i.InvocationPath == "" {
+		return i.StepID
+	}
+	return i.InvocationPath
+}
+
+// Canonical is i with the root iteration, and a top-level invocation path,
+// spelled as the empty string, the form stored records compare in: a
+// record written before IterationPath or InvocationPath existed decodes
+// with them empty.
 func (i StepIdentity) Canonical() StepIdentity {
 	if i.IterationPath == RootIteration {
 		i.IterationPath = ""
+	}
+	if i.InvocationPath == i.StepID {
+		i.InvocationPath = ""
 	}
 	return i
 }

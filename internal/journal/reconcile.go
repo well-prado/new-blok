@@ -487,11 +487,19 @@ func (j *Journal) ActiveRuns(ctx context.Context, tx *sql.Tx, runIDs []string) (
 	return active, nil
 }
 
+// CancelRun cancels an accepted run that has no dispatched effect, waiting
+// wait or uncertain operation (ErrRunActiveWork, ErrUncertain otherwise).
+// Its running scopes end canceled, with reason as their error, in the same
+// transaction.
 func (j *Journal) CancelRun(ctx context.Context, runID, reason string) error {
 	if runID == "" || reason == "" {
 		return errors.New("journal: run and cancellation reason are required")
 	}
 	return j.withTx(ctx, "run-cancel", func(tx *sql.Tx) error {
+		// The constructs the run is inside end with it (see FailRun).
+		if err := j.cancelOpenScopes(ctx, tx, runID, reason); err != nil {
+			return err
+		}
 		if err := requireQuiescentRun(ctx, tx, runID); err != nil {
 			return err
 		}

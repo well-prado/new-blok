@@ -2,9 +2,9 @@
 
 - Status: in progress for E07-T09 (#332), delivered in slices. Slice A
   (merged, #350) records wait identity and signal routing; slice B (#366,
-  #378) makes wakeups crash-safe; slice C1 (this revision) makes
-  `internal/journal` the engine's step and wait journal; slice C2 (the
-  single-host resumer) completes it
+  #378) makes wakeups crash-safe; slice C1 (#380) makes
+  `internal/journal` the engine's step and wait journal; slice C2 (this
+  revision, with its benchmarks to follow) adds the single-host resumer
 - Date: 2026-10-07
 - Roadmap: E07-T09 ([#332](https://github.com/well-prado/new-blok/issues/332)),
   closing gaps in E07-T04 (#46); prerequisite of E07-T10 (#333, nested
@@ -230,7 +230,9 @@ both; a top-level step's invocation path is its ID).
   never run).
 - **Permanent conflicts.** `Permanent(err)` reports the errors no retry
   can fix: `ErrRequestConflict` (another engine input, step input or wait
-  plan), `ErrWaitCanceled`, `ErrStepResultLimit`. A runner settles such a
+  plan), `ErrWaitCanceled`, `ErrStepResultLimit`, and (#372, #333 slice
+  2) `ErrChildPrincipalMismatch`, `ErrChildCycle` and `ErrRecordFinal` (a
+  canceled scope the run reached again). A runner settles such a
   run as failed with a diagnostic; a lost lease and storage faults are not
   permanent. The engine still labels them `persistence`; the journal's
   sentinel is what classifies them (#333 is reworking the engine's run
@@ -339,6 +341,69 @@ vectors failed on a3d90d2 when a Go field of the identity was renamed
 #382. The engine does not pass iteration paths yet (#333 slice 2 does);
 ADR 0028 has a durable runner refuse control flow until then.
 
+## Single-host resumer (slice C2)
+
+`internal/resumer` executes durable runs on one host. It is a package of
+its own, not part of `internal/journal`: the journal stays storage (no
+goroutines, tickers or engine execution), the engine stays free of
+storage, and only an application that runs durable workflows links the
+resumer (`internal/journal`'s other importers, such as `agent/policy`, do
+not gain a scheduler).
+
+- `New(Config{Journal, Engine, Workflows, Interval, Batch, Workers, Clock,
+  RenewEvery, MaxRetries, OnError, Settled})`. The lease length is the
+  journal's own (`WakeupLease`), never configured twice. `Workflows` maps
+  a workflow name to its program and an input decoder, as
+  `internal/cluster` does. A run executes only the program whose digest is
+  its admitted artifact; another is left, not failed, since a different
+  build may know it.
+- `Start(runID)` takes a just-admitted run's lease (`TakeRunLease`) and
+  executes it. `Run(ctx)` sweeps at once and every interval (and on
+  `Wake`): `PendingResumptions` (woken runs), `ClaimDueWaits` (due
+  timers), `InterruptedRuns` (below), each up to `Batch`, executed by at
+  most `Workers` at a time.
+- An execution decodes the run's input, runs `RunJournaled` through
+  `ForRun(run, token)`, renews the lease every `RenewEvery` (default a
+  third of the lease; an `ErrLeaseLost` renewal cancels the execution,
+  any other renewal error goes to `OnError` and the execution carries
+  on), and settles: a completed
+  run through `RunJournal.CompleteRun`, a workflow failure through
+  `FailRun`, an uncertain effect through `MarkRunUncertain`; a suspension
+  just releases the lease. A lost lease, a stop, a journal fault or an
+  unknown workflow settles nothing and releases the lease.
+- **Suspended runs hold nothing.** An execution returns at a wait and its
+  goroutine ends; the run is a waiting row and a released lease
+  (`TestSuspendedRunsHoldNoGoroutine`: 500 suspended runs, no goroutine
+  growth; slice C2's benchmarks measure 10,000).
+- **Interrupted runs.** `Journal.InterruptedRuns` leases live runs of the
+  resumer's workflows that hold no live lease and have neither an open nor
+  a fired wait, and either were leased before (the holder died, lost its
+  lease, or was stopped, including after it consumed a wakeup) or were
+  admitted over a lease ago and never leased (the admitter crashed before
+  `Start`). The resumer scans for them once per third of a lease.
+- **Workers before leases.** A sweep takes at most as many runs as there
+  are free workers, and `Start` waits for a free worker before leasing:
+  a lease is never held by a run waiting for a worker, so it cannot lapse
+  and be taken again in the same process.
+- **Settlement.** Conflicts no retry can fix (`journal.Permanent`: another
+  engine input, a changed wait plan, a canceled wait, an oversize result)
+  and workflow errors fail the run with a diagnostic; a transient fault
+  leaves it to be retried at the scan's pace, `MaxRetries` times in a row,
+  then fails it (`retries_exhausted`). The count is of consecutive faults
+  here: it is forgotten when the run suspends or ends, when another
+  holder takes it (a lost lease, at renewal or at completion, is not a
+  fault), and, at each interrupted-run scan, for runs that ended
+  elsewhere. A panicking input decoder fails the
+  run; a panicking `Settled` is reported, not fatal. Sweep and settlement
+  errors go to `OnError` and are returned by `Sweep`.
+- **Shutdown.** `Close(ctx)` stops sweeping, waits for running executions
+  until `ctx` ends, then cancels the rest and returns at once; every
+  execution releases its lease as it returns (one stuck in a node that
+  ignores cancellation, when that node returns), so another resumer takes
+  its run. `Start` after `Close` is `ErrClosed`.
+- **Typed inputs** run whatever their decode reshapes: the run's engine
+  input is fixed at admission or first execution (slice C1).
+
 ## Compatibility
 
 | Change | Class | Migration |
@@ -360,6 +425,7 @@ ADR 0028 has a durable runner refuse control flow until then.
 | `cluster.WaitIDFor` takes the iteration path; root-iteration IDs unchanged (#382) | API, breaking for its callers (tests only) | Pass `""` (or `engine.RootIteration`) for a step outside every loop |
 | `RunJournal` keys steps and waits by the identity's iteration path; the cluster step journal refuses an identity whose operation key its fields do not derive (#382) | behavioral; the engine passes the root iteration until #333 | None |
 | The engine refuses a program whose step id does not match `contract.IDPattern` (`invalid_step_id`, class `configuration`) (#382) | behavioral, fail closed; every lowered program already matches it | Rename the step to an id of the grammar |
+| `internal/resumer`; `Journal.InterruptedRuns`, `RunLease` (slice C2) | API, additive | None |
 
 ## Evidence
 
@@ -445,8 +511,17 @@ pin the root iteration of the engine's waits and steps in the journal.
   first open by this binary remaps that wait to `fired` and a holder may
   then list and execute the same run: a double-resume window that lasts
   until the old process stops. Upgrade by stopping old processes first.
-- No single-host runner resumes runs through `RunJournal` yet: slice C2
-  lists resumptions on start, executes them, renews and releases leases.
+- `InterruptedRuns` reads the live runs of the resumer's workflows once
+  per third of a lease, without an index on their state (a follow-up). A
+  woken run whose workflow is not registered here is re-leased by every
+  sweep and released (another build may know it).
+- Transient-retry counts are kept in memory; a restart starts them again.
+  A run that faulted here and is then executed by another holder, which
+  this resumer does not see, keeps its count until it ends.
+- An application that admits a resumer workflow's runs through another
+  executor must start them within a lease, or the resumer takes them.
+- The resumer settles what the engine reports; an application's admission
+  path calls `Start` (no admission is wired to it in this slice).
 - Every step is at the `root` iteration until #333 passes iteration paths
   to the engine (ADR 0028 refuses durable control flow until then). The
   journals key by the iteration path the engine passes (#382), but no

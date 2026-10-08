@@ -16,8 +16,9 @@ import (
 )
 
 // Control instructions flow lowers (ADR 0028, #333). The interpreter runs
-// them in memory; a durable runner refuses them until their scopes, joins
-// and children are journaled.
+// them in memory and, through a ScopeJournal, if, choose and try-finally
+// durably (scope.go); a durable runner refuses each and parallel until
+// their joins are journaled.
 
 // maxNesting bounds how deeply control instructions nest, as lowering does.
 const maxNesting = 64
@@ -33,6 +34,9 @@ type frame struct {
 	// the root; iteration is the iteration path, "root" outside each.
 	prefix    string
 	iteration string
+	// scope is the scope path of the construct whose arm the frame runs,
+	// empty at the root (ScopeIdentity.ParentPath of a construct in it).
+	scope string
 	// input is the workflow input, which control operands may read
 	// (contract.InputStep).
 	input any
@@ -52,7 +56,24 @@ func (f *frame) invocation(id string) string {
 
 // arm returns the frame that runs arm of the construct id in this frame.
 func (f *frame) arm(id string, arm contract.Arm) *frame {
-	return &frame{values: map[string]any{}, parent: f, prefix: f.invocation(id) + "/" + arm.Name, iteration: f.iteration, input: f.input, span: f.span}
+	return &frame{values: map[string]any{}, parent: f, prefix: f.invocation(id) + "/" + arm.Name, iteration: f.iteration, scope: f.scopePath(id), input: f.input, span: f.span}
+}
+
+// scopePath is the scope path of the construct id in this frame,
+// "<invocation path>@<iteration path>" (ADR 0028).
+func (f *frame) scopePath(id string) string {
+	return f.invocation(id) + "@" + f.iteration
+}
+
+// stepIdentity is the journal identity of step id running in this frame:
+// its iteration and, inside an arm, its invocation path. A top-level step
+// keeps the identity it always had.
+func (f *frame) stepIdentity(runID, artifactDigest, id string, input []byte) StepIdentity {
+	identity := NewStepIdentity(runID, artifactDigest, id, f.iteration, input)
+	if f.prefix != "" {
+		identity.InvocationPath = f.invocation(id)
+	}
+	return identity
 }
 
 // item returns the frame that runs the body of the each id in this frame
@@ -100,7 +121,11 @@ func decodeLiteral(literal json.RawMessage) (any, error) {
 // checkProgram rejects a program the interpreter cannot run before any
 // instruction runs: an unknown format, control instructions outside the
 // control format or shaped other than lowering shapes them, and more
-// instructions, counted through every arm, than the step budget.
+// instructions, counted through every arm, than the step budget. Step ids
+// are one flat namespace across every arm (ADR 0028), as lowering records
+// them: a durable run keys a step's operation by its id (OperationKey does
+// not hash the invocation path), so two steps sharing an id would share
+// one key, and a provider deduplicating on it would drop one of them.
 func checkProgram(program contract.InternalProgram, maxSteps int) error {
 	switch program.Format {
 	case 0, contract.ControlFormat:
@@ -108,8 +133,11 @@ func checkProgram(program contract.InternalProgram, maxSteps int) error {
 		return &Error{Code: "unsupported_program_format", Class: "configuration", Err: fmt.Errorf("program format %d is not supported", program.Format)}
 	}
 	count := 0
-	var check func([]contract.InternalInstruction, int) error
-	check = func(instructions []contract.InternalInstruction, depth int) error {
+	seen := map[string]bool{}
+	// loop is set inside an each or parallel arm, where a wait cannot
+	// suspend one iteration or arm alone.
+	var check func([]contract.InternalInstruction, int, bool) error
+	check = func(instructions []contract.InternalInstruction, depth int, loop bool) error {
 		for _, instruction := range instructions {
 			count++
 			if count > maxSteps {
@@ -122,8 +150,12 @@ func checkProgram(program contract.InternalProgram, maxSteps int) error {
 			if !contract.ValidID(instruction.ID) {
 				return &Error{Code: "invalid_step_id", Class: "configuration", Step: instruction.ID, Err: fmt.Errorf("step id %q does not match the id grammar %s", instruction.ID, contract.IDPattern)}
 			}
+			if seen[instruction.ID] {
+				return &Error{Code: "duplicate_step_id", Class: "configuration", Step: instruction.ID, Err: fmt.Errorf("step id %q appears more than once; ids are one namespace across every arm", instruction.ID)}
+			}
+			seen[instruction.ID] = true
 			wanted, control := controlShapes[instruction.Kind]
-			if depth > 0 && (instruction.Kind == "output" || instruction.Kind == "wait") {
+			if (depth > 0 && instruction.Kind == "output") || (loop && instruction.Kind == "wait") {
 				return invalidControl(instruction.ID, fmt.Errorf("an arm cannot hold a %s instruction", instruction.Kind))
 			}
 			if !control {
@@ -142,14 +174,14 @@ func checkProgram(program contract.InternalProgram, maxSteps int) error {
 				return invalidControl(instruction.ID, err)
 			}
 			for _, arm := range instruction.Control.Arms {
-				if err := check(arm.Instructions, depth+1); err != nil {
+				if err := check(arm.Instructions, depth+1, loop || instruction.Kind == "each" || instruction.Kind == "parallel"); err != nil {
 					return err
 				}
 			}
 		}
 		return nil
 	}
-	return check(program.Instructions, 0)
+	return check(program.Instructions, 0, false)
 }
 
 func invalidControl(step string, err error) error {
@@ -255,7 +287,11 @@ func checkOperand(operand contract.Operand) error {
 // its arms in the frame given and returns the arm's result. Branches,
 // try-finally, each and parallel run through the engine's control path
 // (control.go); an each runs at most maxItems items.
-func runControl(ctx context.Context, f *frame, instruction contract.InternalInstruction, maxItems int, runArm func(context.Context, *frame, contract.Arm) (any, error)) (any, error) {
+//
+// enter is called once an if or choose has decided which arm to run, with
+// that arm's name, and when a try-finally starts, with none; the arm it
+// returns is the one that runs (the decision a durable run recorded).
+func runControl(ctx context.Context, f *frame, instruction contract.InternalInstruction, maxItems int, runArm func(context.Context, *frame, contract.Arm) (any, error), enter func(string) (string, error)) (any, error) {
 	control := instruction.Control
 	operands := make([]any, len(control.Operands))
 	for index, operand := range control.Operands {
@@ -293,6 +329,15 @@ func runControl(ctx context.Context, f *frame, instruction contract.InternalInst
 		if !ok {
 			return nil, &Error{Code: "invalid_condition", Class: "validation", Step: instruction.ID, Err: fmt.Errorf("if condition is %s, not a boolean", describe(operands[0]))}
 		}
+		decision := control.Arms[1].Name
+		if selected {
+			decision = control.Arms[0].Name
+		}
+		recorded, err := enter(decision)
+		if err != nil {
+			return nil, err
+		}
+		selected = recorded == control.Arms[0].Name
 		step.Kind = ControlBranch
 		step.Branch = &BranchPlan{When: func(context.Context) (bool, error) { return selected, nil }, Then: action(control.Arms[0]), Else: action(control.Arms[1])}
 	case "choose":
@@ -308,8 +353,20 @@ func runControl(ctx context.Context, f *frame, instruction contract.InternalInst
 				break
 			}
 		}
+		recorded, err := enter(selected.Name)
+		if err != nil {
+			return nil, err
+		}
+		for _, arm := range control.Arms {
+			if arm.Name == recorded {
+				selected = arm
+			}
+		}
 		step.Action = action(selected)[0].Run
 	case "try-finally":
+		if _, err := enter(""); err != nil {
+			return nil, err
+		}
 		finally := control.Arms[1]
 		step.Kind = ControlTry
 		step.Try = &TryPlan{Try: action(control.Arms[0]), Finally: []Action{{ID: instruction.ID, Run: func(ctx context.Context) (any, error) {
