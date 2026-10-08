@@ -355,6 +355,8 @@ func TestCatalogLowersAcceptedWorkflowsExactlyLikeFlowLower(t *testing.T) {
 
 // Every workflow flow.Lower rejects, the catalog rejects too, as not
 // agent-safe, and for the same reason: its error carries flow.Lower's.
+// Control flow flow.Lower now lowers (#333, ADR 0028) stays not agent-safe
+// in the catalog, which rejects its construct by kind.
 func TestCatalogRejectsWhatFlowLowerRejectsForTheSameReason(t *testing.T) {
 	n := newConfNodes(&recorder{})
 	// A reference recorded by a different definition names a step this
@@ -376,6 +378,9 @@ func TestCatalogRejectsWhatFlowLowerRejectsForTheSameReason(t *testing.T) {
 		name   string
 		define func() (confWorkflow, error)
 		want   string
+		// flowLowers marks control flow flow.Lower accepts and the catalog
+		// still rejects with want.
+		flowLowers bool
 	}{
 		{
 			name: "empty field segment inside a path",
@@ -472,7 +477,8 @@ func TestCatalogRejectsWhatFlowLowerRejectsForTheSameReason(t *testing.T) {
 					return flow.If(b, "construct", flow.Select[object, bool](reserved, "ok"), arm("yes", in), arm("no", in))
 				}))
 			},
-			want: `flow: instruction "construct" of kind "if" cannot be lowered`,
+			want:       `flow: instruction "construct" of kind "if" cannot be lowered`,
+			flowLowers: true,
 		},
 		{
 			name: "choose",
@@ -482,7 +488,8 @@ func TestCatalogRejectsWhatFlowLowerRejectsForTheSameReason(t *testing.T) {
 					return flow.Choose(b, "construct", flow.Select[object, string](reserved, "id"), map[string]func(*flow.ArmBuilder) flow.Ref[object]{"r-coffee": arm("coffee", in)}, arm("other", in))
 				}))
 			},
-			want: `flow: instruction "construct" of kind "choose" cannot be lowered`,
+			want:       `flow: instruction "construct" of kind "choose" cannot be lowered`,
+			flowLowers: true,
 		},
 		{
 			name: "each",
@@ -494,7 +501,8 @@ func TestCatalogRejectsWhatFlowLowerRejectsForTheSameReason(t *testing.T) {
 					})
 				}))
 			},
-			want: `flow: instruction "construct" of kind "each" cannot be lowered`,
+			want:       `flow: instruction "construct" of kind "each" cannot be lowered`,
+			flowLowers: true,
 		},
 		{
 			name: "parallel",
@@ -505,7 +513,8 @@ func TestCatalogRejectsWhatFlowLowerRejectsForTheSameReason(t *testing.T) {
 					return reserved
 				}))
 			},
-			want: `flow: instruction "construct" of kind "parallel" cannot be lowered`,
+			want:       `flow: instruction "construct" of kind "parallel" cannot be lowered`,
+			flowLowers: true,
 		},
 		{
 			name: "try-finally",
@@ -514,7 +523,8 @@ func TestCatalogRejectsWhatFlowLowerRejectsForTheSameReason(t *testing.T) {
 					return flow.TryFinally(b, "construct", arm("attempt", in), func(a *flow.ArmBuilder) { flow.ArmCall(a, "cleanup", n.reserve, in) })
 				}))
 			},
-			want: `flow: instruction "construct" of kind "try-finally" cannot be lowered`,
+			want:       `flow: instruction "construct" of kind "try-finally" cannot be lowered`,
+			flowLowers: true,
 		},
 		{
 			name: "compare",
@@ -524,17 +534,19 @@ func TestCatalogRejectsWhatFlowLowerRejectsForTheSameReason(t *testing.T) {
 					return flow.Compare(b, "construct", "eq", flow.Select[object, string](reserved, "id"), flow.Lit("r-coffee"))
 				}))
 			},
-			want: `flow: instruction "construct" of kind "compare" cannot be lowered`,
+			want:       `flow: instruction "construct" of kind "compare" cannot be lowered`,
+			flowLowers: true,
 		},
 		{
 			name: "default",
 			define: func() (confWorkflow, error) {
 				return wrap(flow.Define(confSpec, func(b *flow.Builder, in flow.Ref[object]) flow.Ref[object] {
 					reserved := flow.Call(b, "reserve", n.reserve, in)
-					return flow.Default(b, "construct", flow.Select[object, object](reserved, "body"), in)
+					return flow.Default(b, "construct", flow.Select[object, object](reserved, "body"), reserved)
 				}))
 			},
-			want: `flow: instruction "construct" of kind "default" cannot be lowered`,
+			want:       `flow: instruction "construct" of kind "default" cannot be lowered`,
+			flowLowers: true,
 		},
 		{
 			name: "template",
@@ -553,7 +565,9 @@ func TestCatalogRejectsWhatFlowLowerRejectsForTheSameReason(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Define: %v", err)
 			}
-			if _, err := workflow.lower(); err == nil || err.Error() != tc.want {
+			if _, err := workflow.lower(); tc.flowLowers && err != nil {
+				t.Fatalf("flow.Lower err=%v; want the construct lowered", err)
+			} else if !tc.flowLowers && (err == nil || err.Error() != tc.want) {
 				t.Fatalf("flow.Lower err=%v; want %q", err, tc.want)
 			}
 			err = workflow.register(confCatalog(t, n), []byte(confOrderSchema), []byte(confCommitSchema))

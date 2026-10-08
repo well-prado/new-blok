@@ -132,12 +132,22 @@ func (o OptionalString) MarshalJSON() ([]byte, error) {
 }
 
 type InternalProgram struct {
-	WorkflowID   string                `json:"workflowId"`
-	Version      string                `json:"version"`
-	Digest       string                `json:"digest"`
+	WorkflowID string `json:"workflowId"`
+	Version    string `json:"version"`
+	Digest     string `json:"digest"`
+	// Format is the instruction set the program uses. Zero, omitted from
+	// the encoding, is the original call set (call, wait, output), so every
+	// program that set describes encodes exactly as it did before #333.
+	// ControlFormat adds the control instructions flow lowers (ADR 0028).
+	Format       int                   `json:"format,omitempty"`
 	Instructions []InternalInstruction `json:"instructions"`
 	Bindings     []Binding             `json:"bindings,omitempty"`
 }
+
+// ControlFormat is the InternalProgram.Format of a program holding control
+// instructions: compare, default, if, choose, try-finally, each and
+// parallel (ADR 0028).
+const ControlFormat = 2
 
 type InternalInstruction struct {
 	Index      int              `json:"index"`
@@ -148,6 +158,46 @@ type InternalInstruction struct {
 	References []Reference      `json:"references,omitempty"`
 	Output     OptionalString   `json:"output,omitempty"`
 	Source     *SourceSpan      `json:"source,omitempty"`
+	// Control carries a control instruction's operands and arms. It is
+	// nil, and omitted from the encoding, for call, wait and output.
+	Control *Control `json:"control,omitempty"`
+}
+
+// Control is the body of a control instruction (ADR 0028). Operands are
+// positional: compare reads left and right, default value and fallback, if
+// and choose their condition, each its items. Arms hold the nested
+// instructions: if has "then" and "else", choose one "case-<n>" arm per
+// case (in case order) and "default", try-finally "try" and "finally",
+// each "body", parallel "0" to "<n-1>". Concurrency bounds an each's
+// iterations in flight.
+type Control struct {
+	Operator    string    `json:"operator,omitempty"`
+	Operands    []Operand `json:"operands,omitempty"`
+	Arms        []Arm     `json:"arms,omitempty"`
+	Concurrency int       `json:"concurrency,omitempty"`
+}
+
+// InputStep is the step a control operand's reference names to read the
+// workflow input. It is outside the id grammar, so no step can take it.
+const InputStep = "$input"
+
+// Operand is a value a control instruction reads: a reference to a value
+// in scope (InputStep for the workflow input), or a JSON literal. Exactly
+// one is set.
+type Operand struct {
+	Reference *Reference      `json:"reference,omitempty"`
+	Literal   json.RawMessage `json:"literal,omitempty"`
+}
+
+// Arm is one nested block of a control instruction. Name is the arm's
+// segment in the invocation paths of its instructions. Match is the JSON
+// value a choose case selects. Output is the arm's result; an arm without
+// one (finally) yields nothing.
+type Arm struct {
+	Name         string                `json:"name"`
+	Match        json.RawMessage       `json:"match,omitempty"`
+	Instructions []InternalInstruction `json:"instructions,omitempty"`
+	Output       *Operand              `json:"output,omitempty"`
 }
 
 var semver = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)

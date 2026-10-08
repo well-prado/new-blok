@@ -50,6 +50,9 @@ func Build(input contract.InternalProgram, limits Limits) (Program, error) {
 	if limits.MaxSteps < 1 || limits.MaxDepth < 1 {
 		return Program{}, fmt.Errorf("invalid program limits")
 	}
+	if input.Format != 0 {
+		return Program{}, fmt.Errorf("unsupported_program_format: format %d has no version %d artifact (ADR 0028)", input.Format, Version)
+	}
 	if len(input.Instructions) > limits.MaxSteps {
 		return Program{}, fmt.Errorf("program_limits: instruction count exceeds %d", limits.MaxSteps)
 	}
@@ -110,6 +113,9 @@ func validateInstructions(instructions []contract.InternalInstruction, maxDepth 
 	seen := map[string]bool{}
 	depths := map[string]int{}
 	for index, instruction := range instructions {
+		if instruction.Control != nil {
+			return fmt.Errorf("unsupported_program_format: %s is a control instruction, which a version %d artifact cannot hold (ADR 0028)", instruction.ID, Version)
+		}
 		if !known[instruction.Kind] {
 			return fmt.Errorf("unknown_opcode: %s", instruction.Kind)
 		}

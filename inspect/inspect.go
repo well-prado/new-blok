@@ -194,7 +194,10 @@ func (r *Recorder) Observe(event inspection.Event) {
 			step.Status = inspection.StatusFailed
 		}
 		for i := len(step.Attempts) - 1; i >= 0; i-- {
-			if step.Attempts[i].ID == event.AttemptID || event.AttemptID == "" && step.Attempts[i].Number == event.Attempt {
+			// Attempt ids are stored bounded; a completion is matched on
+			// the same bounded form, or an attempt with a long id would
+			// never complete.
+			if event.AttemptID != "" && step.Attempts[i].ID == boundedText(event.AttemptID, 160) || event.AttemptID == "" && step.Attempts[i].Number == event.Attempt {
 				attempt := &step.Attempts[i]
 				attempt.FinishedAt = event.At
 				attempt.Output = cloneRaw(event.Output)

@@ -205,7 +205,7 @@ was renumbered from 5 to 6.
 `StepJournal` and `WaitJournal` for one run executed under that lease
 token. A run's steps are identified as the journal identifies effects and
 waits: the invocation path is the engine's step ID, and the iteration path
-is `root` until #333 gives the engine iteration paths (ADR 0031 defines
+is `root` until #333 gives the engine iteration paths (ADR 0028 defines
 both; a top-level step's invocation path is its ID).
 
 - **Lease and input.** `VerifyRun` refuses a run that is not live, whose
