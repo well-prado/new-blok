@@ -271,6 +271,8 @@ func TestPermanentErrors(t *testing.T) {
 		{fmt.Errorf("journal_run_mismatch: %w", ErrRequestConflict), true},
 		{ErrWaitCanceled, true},
 		{ErrStepResultLimit, true},
+		{ErrChildPrincipalMismatch, true},
+		{ErrChildCycle, true},
 		{ErrLeaseLost, false},
 		{ErrRunNotActive, false},
 		{errors.New("database is locked"), false},

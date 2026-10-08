@@ -67,6 +67,12 @@ func NewJournalStore(ctx context.Context, database store.Database, cfg Config) (
 	if err != nil {
 		return nil, err
 	}
+	// The first open composed with audit closes the approval start marker:
+	// decisions recorded before audit existed become legacy, every later
+	// one needs its record (#284).
+	if err := cfg.Audit.Start(ctx, s); err != nil {
+		return nil, err
+	}
 	return s, nil
 }
 

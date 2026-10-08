@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -63,6 +65,7 @@ type rig struct {
 	errs     []error
 	hold     chan struct{} // test/hold blocks until it closes or its context ends
 	holding  atomic.Int32
+	faults   atomic.Int32 // the next executions to hit a transient fault
 }
 
 // rigOptions changes the rig's journal lease and resumer configuration.
@@ -130,16 +133,19 @@ func newRigWith(t *testing.T, p contract.InternalProgram, holder string, path st
 			return value{}, ctx.Err()
 		}
 	}, node.Description("hold"), node.Schemas([]byte(valueSchema), []byte(valueSchema))).Any()
+	unsure := node.MustDefine("test/unsure", "1.0.0", func(context.Context, value) (value, error) {
+		return value{}, &node.DomainError{Code: "unsure", Class: "uncertain", Err: errors.New("the effect's outcome is unknown")}
+	}, node.Description("unsure"), node.Schemas([]byte(valueSchema), []byte(valueSchema))).Any()
 	config := Config{
 		Journal: r.journal,
-		Engine:  engine.New(map[string]node.Any{"test/notify": notify, "test/reject": reject, "test/hold": hold}),
+		Engine:  engine.New(map[string]node.Any{"test/notify": notify, "test/reject": reject, "test/hold": hold, "test/unsure": unsure}),
 		Workflows: map[string]Workflow{"approval": {Program: p, DecodeInput: func(raw json.RawMessage) (any, error) {
 			var in value
 			err := json.Unmarshal(raw, &in)
 			if in.Kind == "panic" {
 				panic("decoder bug")
 			}
-			if in.Kind == "transient" {
+			if in.Kind == "transient" || r.takeFault() {
 				// The engine cannot encode this input: a persistence
 				// fault, not the workflow's, standing in for a transient
 				// one.
@@ -172,6 +178,44 @@ func newRigWith(t *testing.T, p contract.InternalProgram, holder string, path st
 		t.Fatal(err)
 	}
 	return r
+}
+
+// takeFault reports whether this execution hits one of the queued
+// transient faults.
+func (r *rig) takeFault() bool {
+	for {
+		n := r.faults.Load()
+		if n <= 0 {
+			return false
+		}
+		if r.faults.CompareAndSwap(n, n-1) {
+			return true
+		}
+	}
+}
+
+// exec runs SQL on the journal's database, to install a fault.
+func (r *rig) exec(query string) {
+	r.t.Helper()
+	if err := r.database.WithTx(r.ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(query)
+		return err
+	}); err != nil {
+		r.t.Fatal(err)
+	}
+}
+
+// reported is the errors OnError has received.
+func (r *rig) reported() []error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]error(nil), r.errs...)
+}
+
+func (r *rig) retryCounts() map[string]int {
+	r.resumer.mu.Lock()
+	defer r.resumer.mu.Unlock()
+	return maps.Clone(r.resumer.retries)
 }
 
 func (r *rig) admitInput(key, input string) string {
@@ -540,10 +584,15 @@ func TestBusyWorkersTakeNoMoreRuns(t *testing.T) {
 	if n := r.holding.Load(); n != 1 {
 		t.Fatalf("%d executions started with one worker busy", n)
 	}
-	// A second execution adds an execution and a renewal goroutine per
-	// sweep; allow for the database's own transient goroutines.
-	if got := runtime.NumGoroutine() - before; got > 4 {
-		t.Fatalf("goroutines grew by %d while the worker was busy", got)
+	// A second execution would add an execution and a renewal goroutine
+	// per sweep, for good. The database's own goroutines (a context
+	// watcher per statement) come and go: poll until they settle.
+	growth := runtime.NumGoroutine() - before
+	for deadline := time.Now().Add(5 * time.Second); growth > 4 && time.Now().Before(deadline); growth = runtime.NumGoroutine() - before {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if growth > 4 {
+		t.Fatalf("goroutines grew by %d while the worker was busy", growth)
 	}
 	if got := r.row(`SELECT COUNT(*) FROM journal_runs WHERE lease_owner IS NOT NULL`); got != "1" {
 		t.Fatalf("%s runs leased with one worker", got)
@@ -559,6 +608,45 @@ func TestBusyWorkersTakeNoMoreRuns(t *testing.T) {
 	for _, run := range runs {
 		if fmt.Sprint(r.outcomesOf(run)) != "[completed]" {
 			t.Fatalf("run %s outcomes %v", run, r.outcomesOf(run))
+		}
+	}
+}
+
+// TestStartWaitsForAWorkerBeforeLeasing: Start with every worker busy
+// waits for one without leasing the run, so the run's lease cannot lapse
+// while it queues and be taken again; once the worker frees, the run is
+// leased and executed.
+func TestStartWaitsForAWorkerBeforeLeasing(t *testing.T) {
+	r := newRigWith(t, program(0, "test/hold"), "a", "", rigOptions{config: func(c *Config) { c.Workers = 1; c.RenewEvery = 10 * time.Millisecond }})
+	first, second := r.admit("first"), r.admit("second")
+	for _, run := range []string{first, second} {
+		r.signal(run, "early-"+run)
+	}
+	if err := r.resumer.Start(r.ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return r.holding.Load() == 1 })
+	started := make(chan error, 1)
+	go func() { started <- r.resumer.Start(r.ctx, second) }()
+	// Start is queued for the worker; give a lease taken first the time to
+	// show (it is one write transaction).
+	time.Sleep(200 * time.Millisecond)
+	select {
+	case err := <-started:
+		t.Fatalf("Start returned with the only worker busy: %v", err)
+	default:
+	}
+	if got := r.runRow(second); got != "accepted|-|" {
+		t.Fatalf("the queued run: %s; want not leased while it waits for a worker", got)
+	}
+	close(r.hold)
+	if err := <-started; err != nil {
+		t.Fatal(err)
+	}
+	r.await(2)
+	for _, run := range []string{first, second} {
+		if got := fmt.Sprint(r.outcomesOf(run)); got != "[completed]" {
+			t.Fatalf("run %s outcomes %s", run, got)
 		}
 	}
 }
@@ -733,6 +821,279 @@ func TestInterruptedRunsAreNotCrowdedOut(t *testing.T) {
 	}
 	close(r.hold)
 	r.await(1)
+}
+
+// failRenewals makes every lease renewal fail with an injected database
+// fault (a renewal keeps the token and extends the lease; a take changes
+// the token, a release clears it).
+const failRenewals = `CREATE TRIGGER fail_renewals BEFORE UPDATE OF lease_until ON journal_runs
+	WHEN NEW.lease_token = OLD.lease_token AND NEW.lease_until > OLD.lease_until
+	BEGIN SELECT RAISE(ABORT, 'injected renewal fault'); END`
+
+func hasError(errs []error, text string) bool {
+	for _, err := range errs {
+		if strings.Contains(err.Error(), text) {
+			return true
+		}
+	}
+	return false
+}
+
+// awaitWithin waits up to d for one more execution to settle.
+func (r *rig) awaitWithin(d time.Duration) bool {
+	select {
+	case <-r.settled:
+		return true
+	case <-time.After(d):
+		return false
+	}
+}
+
+// TestRenewalFaultsAreReported is Review R round 2 on #384: a renewal that
+// fails with anything but a lost lease (a busy or full disk) reaches
+// OnError, and the execution carries on under its lease.
+func TestRenewalFaultsAreReported(t *testing.T) {
+	r := newRigWith(t, straight("test/hold"), "a", "", rigOptions{config: func(c *Config) { c.RenewEvery = 5 * time.Millisecond }})
+	run := r.admit("renewal-fault")
+	r.exec(failRenewals)
+	if err := r.resumer.Start(r.ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return r.holding.Load() == 1 })
+	r.clock.Advance(time.Second) // a renewal now extends the lease: it fails
+	waitFor(t, func() bool { return hasError(r.reported(), "injected renewal fault") })
+	r.exec(`DROP TRIGGER fail_renewals`)
+	close(r.hold)
+	r.await(1)
+	if got := fmt.Sprint(r.outcomesOf(run)); got != "[completed]" {
+		t.Fatalf("outcomes %s; want completed under the lease it still held", got)
+	}
+}
+
+// TestUncertainSettlementFaultIsReported is Review R round 2 on #384: when
+// marking a run uncertain fails, the fault reaches OnError and the run is
+// left to be taken again, which then marks it.
+func TestUncertainSettlementFaultIsReported(t *testing.T) {
+	r := newRig(t, straight("test/unsure"), "a", "")
+	run := r.admit("uncertain-fault")
+	r.exec(`CREATE TRIGGER fail_uncertain BEFORE UPDATE OF state ON journal_runs WHEN NEW.state = 'uncertain'
+		BEGIN SELECT RAISE(ABORT, 'injected settlement fault'); END`)
+	if err := r.resumer.Start(r.ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	r.await(1)
+	if got := fmt.Sprint(r.outcomesOf(run)); got != "[interrupted]" || !hasError(r.reported(), "injected settlement fault") {
+		t.Fatalf("outcomes %s, reported %v; want interrupted with the fault reported", got, r.reported())
+	}
+	r.exec(`DROP TRIGGER fail_uncertain`)
+	if err := r.resumer.Sweep(r.ctx); err != nil {
+		t.Fatal(err)
+	}
+	r.await(1)
+	if got := r.row(`SELECT state || '|' || error_code FROM journal_runs WHERE run_id = ?`, run); got != "uncertain|unsure" {
+		t.Fatalf("run %s; want uncertain once the fault cleared", got)
+	}
+}
+
+// TestCloseCancelsEveryExecutionOfARun is Review R round 2 on #384 (B2c):
+// one process can hold two executions of a run, one under a lease that
+// lapsed (its renewals failed) and one under the lease taken after it.
+// The first ending must not forget the second: Close cancels it, and it
+// releases its lease. With executions keyed by run, the first's exit
+// removed the second's cancel, and Close never stopped it.
+func TestCloseCancelsEveryExecutionOfARun(t *testing.T) {
+	r := newRigWith(t, straight("test/hold"), "a", "", rigOptions{config: func(c *Config) { c.Workers = 3; c.RenewEvery = time.Millisecond }})
+	run := r.admit("twice")
+	before := runtime.NumGoroutine()
+	r.exec(failRenewals)
+	if err := r.resumer.Start(r.ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return r.holding.Load() == 1 })
+	r.clock.Advance(31 * time.Second) // the first lease lapses unrenewed
+	if err := r.resumer.Sweep(r.ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return r.holding.Load() == 2 })
+	r.exec(`DROP TRIGGER fail_renewals`)
+	r.await(1) // the first execution's renewal finds its lease lost
+	deadline, cancel := context.WithTimeout(r.ctx, 100*time.Millisecond)
+	defer cancel()
+	if err := r.resumer.Close(deadline); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("close=%v; want the drain cut short", err)
+	}
+	if !r.awaitWithin(5 * time.Second) {
+		close(r.hold)
+		t.Fatal("Close did not cancel the second execution of the run")
+	}
+	if got := fmt.Sprint(r.outcomesOf(run)); got != "[interrupted interrupted]" {
+		t.Fatalf("outcomes %s", got)
+	}
+	if got := r.runRow(run); got != "accepted|-|" {
+		t.Fatalf("run %s; want its lease released", got)
+	}
+	growth := runtime.NumGoroutine() - before
+	for deadline := time.Now().Add(5 * time.Second); growth > 4 && time.Now().Before(deadline); growth = runtime.NumGoroutine() - before {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if growth > 4 {
+		t.Fatalf("goroutines grew by %d after Close", growth)
+	}
+}
+
+// TestFaultCountsStartAgainAfterProgress is Review R round 2 on #384
+// (B1d): MaxRetries bounds consecutive faults, so a run that suspends or
+// completes after a fault has its count forgotten.
+func TestFaultCountsStartAgainAfterProgress(t *testing.T) {
+	r := newRigWith(t, program(0, "test/notify"), "a", "", rigOptions{config: func(c *Config) { c.MaxRetries = 1 }})
+	run := r.admit("progress")
+	r.faults.Store(1)
+	if err := r.resumer.Start(r.ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	r.await(1)
+	r.resumer.Sweep(r.ctx) // taken again as interrupted: suspends
+	r.await(1)
+	if counts := r.retryCounts(); len(counts) != 0 {
+		t.Fatalf("after suspending: counts %v; want none", counts)
+	}
+	r.signal(run, "s1")
+	r.faults.Store(1)
+	r.resumer.Sweep(r.ctx) // woken: one fault, the first since it suspended
+	r.await(1)
+	r.clock.Advance(11 * time.Second)
+	r.resumer.Sweep(r.ctx)
+	r.await(1)
+	if got, want := fmt.Sprint(r.outcomesOf(run)), "[interrupted suspended interrupted completed]"; got != want {
+		t.Fatalf("outcomes %s; want %s", got, want)
+	}
+	if counts := r.retryCounts(); len(counts) != 0 {
+		t.Fatalf("after completing: counts %v; want none", counts)
+	}
+}
+
+// TestLeaseLostAtCompletionIsNotAFault is Review R round 2 on #384: a
+// completion fenced because another holder took the run is not the run's
+// fault: it is not counted towards MaxRetries, nor reported.
+func TestLeaseLostAtCompletionIsNotAFault(t *testing.T) {
+	r := newRig(t, straight("test/notify"), "a", "")
+	run := r.admit("fenced")
+	// Another holder takes the run right after its last step commits,
+	// before the execution completes it.
+	r.exec(`CREATE TRIGGER take_over AFTER INSERT ON journal_operations
+		BEGIN UPDATE journal_runs SET lease_owner = 'z', lease_token = lease_token + 1000 WHERE run_id = NEW.run_id; END`)
+	if err := r.resumer.Start(r.ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	r.await(1)
+	if got := fmt.Sprint(r.outcomesOf(run)); got != "[interrupted]" {
+		t.Fatalf("outcomes %s", got)
+	}
+	if got := r.runRow(run); got != "accepted|z|" {
+		t.Fatalf("run %s; want left to its new holder", got)
+	}
+	if counts, errs := r.retryCounts(), r.reported(); len(counts) != 0 || len(errs) != 0 {
+		t.Fatalf("counts %v, reported %v; want neither for a lost lease", counts, errs)
+	}
+}
+
+// TestLostLeaseForgetsTheFaultCount is Review R round 2 on #384: once
+// another holder takes a run from a running execution, this resumer's
+// count of its faults is dropped; the run is the other holder's now.
+func TestLostLeaseForgetsTheFaultCount(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "journal.db")
+	r := newRigWith(t, straight("test/hold"), "a", path, rigOptions{config: func(c *Config) { c.RenewEvery = 5 * time.Millisecond }})
+	run := r.admit("taken")
+	r.faults.Store(1)
+	if err := r.resumer.Start(r.ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	r.await(1)
+	r.resumer.Sweep(r.ctx) // taken again as interrupted: holds
+	waitFor(t, func() bool { return r.holding.Load() == 1 })
+	if counts := r.retryCounts(); counts[run] != 1 {
+		t.Fatalf("counts %v; want one fault", counts)
+	}
+	other := newRig(t, straight("test/hold"), "b", path)
+	if _, err := other.journal.TakeRunLease(r.ctx, run, r.clock.Now().Add(31*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	r.await(1)
+	if got := fmt.Sprint(r.outcomesOf(run)); got != "[interrupted interrupted]" {
+		t.Fatalf("outcomes %s", got)
+	}
+	if counts := r.retryCounts(); len(counts) != 0 {
+		t.Fatalf("counts %v after the lease was lost; want none", counts)
+	}
+}
+
+// TestSaturatedSweepDoesNotDelayTheScan: a sweep with every worker busy
+// takes no interrupted run and does not count as a scan, so the next
+// sweep with a free worker takes it at once instead of a third of a lease
+// later.
+func TestSaturatedSweepDoesNotDelayTheScan(t *testing.T) {
+	r := newRigWith(t, straight("test/hold"), "a", "", rigOptions{config: func(c *Config) { c.Workers = 1; c.RenewEvery = 10 * time.Millisecond }})
+	long, interrupted := r.admit("long"), r.admit("interrupted")
+	if err := r.resumer.Start(r.ctx, long); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return r.holding.Load() == 1 })
+	// interrupted: leased by a holder that died.
+	if _, err := r.journal.TakeRunLease(r.ctx, interrupted, r.clock.Now()); err != nil {
+		t.Fatal(err)
+	}
+	r.clock.Advance(31 * time.Second)
+	r.awaitRenewal(long, 30*time.Second)
+	if err := r.resumer.Sweep(r.ctx); err != nil { // saturated: takes nothing
+		t.Fatal(err)
+	}
+	if got := r.runRow(interrupted); got != "accepted|a|" || r.holding.Load() != 1 {
+		t.Fatalf("a saturated sweep: %s, %d executing", got, r.holding.Load())
+	}
+	close(r.hold)
+	r.await(1)
+	waitFor(t, func() bool { return len(r.resumer.slots) == 0 })
+	if err := r.resumer.Sweep(r.ctx); err != nil { // same time: a worker is free
+		t.Fatal(err)
+	}
+	if !r.awaitWithin(5 * time.Second) {
+		t.Fatal("the interrupted run was not taken by the first sweep with a free worker")
+	}
+	if got := fmt.Sprint(r.outcomesOf(interrupted)); got != "[completed]" {
+		t.Fatalf("the interrupted run: %s", got)
+	}
+}
+
+// TestFaultCountsOfRunsEndedElsewhereAreDropped is Review R round 2 on
+// #384: the count of a run that faulted here and then ended under another
+// holder is dropped at the next interrupted-run scan, so the counts do not
+// grow with every run that ever faulted.
+func TestFaultCountsOfRunsEndedElsewhereAreDropped(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "journal.db")
+	r := newRig(t, straight("test/notify"), "a", path)
+	run := r.admit("elsewhere")
+	r.faults.Store(1)
+	if err := r.resumer.Start(r.ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	r.await(1)
+	if counts := r.retryCounts(); counts[run] != 1 {
+		t.Fatalf("counts %v; want one fault", counts)
+	}
+	other := newRig(t, straight("test/notify"), "b", path)
+	if err := other.resumer.Sweep(other.ctx); err != nil {
+		t.Fatal(err)
+	}
+	other.await(1)
+	if got := r.runRow(run); got != "completed|-|" {
+		t.Fatalf("run %s; want completed by the other holder", got)
+	}
+	if err := r.resumer.Sweep(r.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if counts := r.retryCounts(); len(counts) != 0 {
+		t.Fatalf("counts %v after the run ended elsewhere; want none", counts)
+	}
 }
 
 func waitFor(t *testing.T, ready func() bool) {

@@ -204,7 +204,7 @@ was renumbered from 5 to 6.
 `StepJournal` and `WaitJournal` for one run executed under that lease
 token. A run's steps are identified as the journal identifies effects and
 waits: the invocation path is the engine's step ID, and the iteration path
-is `root` until #333 gives the engine iteration paths (ADR 0031 defines
+is `root` until #333 gives the engine iteration paths (ADR 0028 defines
 both; a top-level step's invocation path is its ID).
 
 - **Lease and input.** `VerifyRun` refuses a run that is not live, whose
@@ -284,7 +284,7 @@ outcome and replays identically.
 and step only. Once #333 runs a wait in a loop durably, every iteration
 would map to one cluster wait, and the second iteration would read the
 first one's outcome: it needs the iteration path (and the invocation path
-inside an arm) before durable loops reach the cluster runtime. ADR 0031
+inside an arm) before durable loops reach the cluster runtime. ADR 0028
 (#333, in progress) has a durable runner refuse control flow until then.
 
 ## Single-host resumer (slice C2)
@@ -297,19 +297,22 @@ resumer (`internal/journal`'s other importers, such as `agent/policy`, do
 not gain a scheduler).
 
 - `New(Config{Journal, Engine, Workflows, Interval, Batch, Workers, Clock,
-  RenewEvery, MaxRetries, OnError, Settled})`; the lease length is the
-  journal's own (`WakeupLease`), never configured twice: `Workflows` maps a workflow name to its program and an input
-  decoder, as `internal/cluster` does; a run executes only the program
-  whose digest is its admitted artifact (another is left, not failed: a
-  different build may know it).
+  RenewEvery, MaxRetries, OnError, Settled})`. The lease length is the
+  journal's own (`WakeupLease`), never configured twice. `Workflows` maps
+  a workflow name to its program and an input decoder, as
+  `internal/cluster` does. A run executes only the program whose digest is
+  its admitted artifact; another is left, not failed, since a different
+  build may know it.
 - `Start(runID)` takes a just-admitted run's lease (`TakeRunLease`) and
   executes it. `Run(ctx)` sweeps at once and every interval (and on
   `Wake`): `PendingResumptions` (woken runs), `ClaimDueWaits` (due
   timers), `InterruptedRuns` (below), each up to `Batch`, executed by at
   most `Workers` at a time.
 - An execution decodes the run's input, runs `RunJournaled` through
-  `ForRun(run, token)`, renews the lease every third of its
-  length (an `ErrLeaseLost` renewal cancels it), and settles: a completed
+  `ForRun(run, token)`, renews the lease every `RenewEvery` (default a
+  third of the lease; an `ErrLeaseLost` renewal cancels the execution,
+  any other renewal error goes to `OnError` and the execution carries
+  on), and settles: a completed
   run through `RunJournal.CompleteRun`, a workflow failure through
   `FailRun`, an uncertain effect through `MarkRunUncertain`; a suspension
   just releases the lease. A lost lease, a stop, a journal fault or an
@@ -332,7 +335,11 @@ not gain a scheduler).
   engine input, a changed wait plan, a canceled wait, an oversize result)
   and workflow errors fail the run with a diagnostic; a transient fault
   leaves it to be retried at the scan's pace, `MaxRetries` times in a row,
-  then fails it (`retries_exhausted`). A panicking input decoder fails the
+  then fails it (`retries_exhausted`). The count is of consecutive faults
+  here: it is forgotten when the run suspends or ends, when another
+  holder takes it (a lost lease, at renewal or at completion, is not a
+  fault), and, at each interrupted-run scan, for runs that ended
+  elsewhere. A panicking input decoder fails the
   run; a panicking `Settled` is reported, not fatal. Sweep and settlement
   errors go to `OnError` and are returned by `Sweep`.
 - **Shutdown.** `Close(ctx)` stops sweeping, waits for running executions
@@ -476,12 +483,14 @@ the gated `TestWaitFootprintAndBurstSamples`).
   woken run whose workflow is not registered here is re-leased by every
   sweep and released (another build may know it).
 - Transient-retry counts are kept in memory; a restart starts them again.
+  A run that faulted here and is then executed by another holder, which
+  this resumer does not see, keeps its count until it ends.
 - An application that admits a resumer workflow's runs through another
   executor must start them within a lease, or the resumer takes them.
 - The resumer settles what the engine reports; an application's admission
   path calls `Start` (no admission is wired to it in this slice).
 - Every step is at the `root` iteration until #333 passes iteration paths
-  to the engine (ADR 0031, in progress, refuses durable control flow until
+  to the engine (ADR 0028, in progress, refuses durable control flow until
   then).
 - Effect inputs over `MaxInspectionInputBytes` are refused at dispatch, as
   `BeginEffect` refuses them.

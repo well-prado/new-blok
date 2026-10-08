@@ -32,7 +32,7 @@ func TestMinimumRetentionKeepsYoungRunContent(t *testing.T) {
 	}
 	r.clock = r.clock.Add(21 * 24 * time.Hour)
 	report, err = r.journal.Compact(r.ctx, r.clock)
-	if err != nil || report.RemovedRuns != 1 || report.ErasedReconciliations != 1 || !report.LogPurged {
+	if err != nil || report.RemovedRuns != 2 || report.ErasedReconciliations != 1 || !report.LogPurged {
 		t.Fatalf("compact past the minimum=%+v err=%v", report, err)
 	}
 	if found := fileMarkers(t, r.path, young.Markers); len(found) != 0 {
@@ -133,7 +133,7 @@ func TestCompactionBackfillsAPreAuditReconciliationRecord(t *testing.T) {
 		t.Fatal("fixture: a reconciliation without its record must mismatch")
 	}
 	r.clock = r.clock.Add(48 * time.Hour)
-	if report, err := r.journal.Compact(r.ctx, r.clock); err != nil || report.RemovedRuns != 1 {
+	if report, err := r.journal.Compact(r.ctx, r.clock); err != nil || report.RemovedRuns != 2 {
 		t.Fatalf("compact=%+v err=%v", report, err)
 	}
 	r.mustVerify(1)
@@ -195,7 +195,7 @@ func TestBlockedLogPurgeIsRetriedWithoutStallingWriters(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	close(stop)
 	worst := <-slowest
-	if err != nil || report.RemovedRuns != 1 || report.LogPurged || !report.PurgePending {
+	if err != nil || report.RemovedRuns != 2 || report.LogPurged || !report.PurgePending {
 		t.Fatalf("compact beside a reader=%+v err=%v", report, err)
 	}
 	select {

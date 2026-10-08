@@ -83,7 +83,7 @@ type Resumer struct {
 	mu        sync.Mutex
 	scanned   time.Time                    // the last interrupted-run scan
 	running   map[int64]context.CancelFunc // by lease token
-	retries   map[string]int               // consecutive transient faults, by run
+	retries   map[string]int               // consecutive transient faults here, by live run
 	closing   bool
 	executing sync.WaitGroup
 }
@@ -187,19 +187,49 @@ func (r *Resumer) Sweep(ctx context.Context) error {
 	// A run is interrupted only once its lease lapses (or a lease after
 	// its admission), so looking a third of a lease apart finds every one
 	// within a lease and a third of becoming one; the scan reads every
-	// live run, which mostly wait, so it is not done every sweep.
+	// live run, which mostly wait, so it is not done every sweep. A sweep
+	// with no free worker does not scan, and does not count as a scan:
+	// the next sweep with a free worker does.
 	r.mu.Lock()
 	due := r.scanned.IsZero() || now.Sub(r.scanned) >= r.lease/3 || now.Before(r.scanned)
-	if due {
-		r.scanned = now
-	}
 	r.mu.Unlock()
 	if due {
 		list(func(limit int) ([]journal.RunLease, error) {
+			r.mu.Lock()
+			r.scanned = now
+			r.mu.Unlock()
+			if err := r.prune(ctx); err != nil {
+				errs = append(errs, err)
+				r.report(err)
+			}
 			return j.InterruptedRuns(ctx, now, limit, r.workflows)
 		})
 	}
 	return errors.Join(errs...)
+}
+
+// prune forgets the transient-fault counts of runs that have ended or no
+// longer exist: another holder executed them to the end, or they were
+// canceled. A run this resumer settles is forgotten as it settles.
+func (r *Resumer) prune(ctx context.Context) error {
+	r.mu.Lock()
+	runs := make([]string, 0, len(r.retries))
+	for runID := range r.retries {
+		runs = append(runs, runID)
+	}
+	r.mu.Unlock()
+	for _, runID := range runs {
+		run, err := r.config.Journal.Run(ctx, runID)
+		switch {
+		case errors.Is(err, journal.ErrNotFound):
+		case err != nil:
+			return err
+		case run.State == "accepted":
+			continue
+		}
+		r.forget(runID)
+	}
+	return nil
 }
 
 func leasesOf(waits []journal.WaitRecord) []journal.RunLease {
@@ -356,10 +386,16 @@ func (r *Resumer) execute(ctx context.Context, lease journal.RunLease) (outcome 
 			case <-execCtx.Done():
 				return
 			case <-ticker.C:
-				if err := j.RenewRunLease(execCtx, lease.RunID, lease.Token, r.config.Clock()); errors.Is(err, journal.ErrLeaseLost) {
+				err := j.RenewRunLease(execCtx, lease.RunID, lease.Token, r.config.Clock())
+				if errors.Is(err, journal.ErrLeaseLost) {
 					lost = true
 					cancel()
 					return
+				}
+				if err != nil && execCtx.Err() == nil {
+					// The lease may still lapse: report it, keep executing
+					// and renewing; the lease token fences a lapsed one.
+					r.report(fmt.Errorf("resumer: renewing the lease of run %s: %w", lease.RunID, err))
 				}
 			}
 		}
@@ -374,8 +410,19 @@ func (r *Resumer) execute(ctx context.Context, lease journal.RunLease) (outcome 
 		if err == nil {
 			err = runJournal.CompleteRun(settle, output)
 		}
+		// Defensive: the engine commits the output step under the same
+		// byte bound (MaxStepResultBytes is MaxRunOutputBytes) and the
+		// same fence before it returns, so today an oversize or
+		// conflicting output fails in RunJournaled (the Permanent case
+		// below) and never reaches this. Should the bounds part, it fails
+		// the run rather than retrying it.
 		if errors.Is(err, journal.ErrRunOutputLimit) || journal.Permanent(err) {
 			return fail("output_rejected", "validation", err)
+		}
+		if errors.Is(err, journal.ErrLeaseLost) {
+			// Another holder has the run: not its fault, not a retry.
+			r.forget(lease.RunID)
+			return Interrupted, err
 		}
 		if err != nil {
 			return r.transient(lease.RunID, runJournal, err)
@@ -387,10 +434,13 @@ func (r *Resumer) execute(ctx context.Context, lease journal.RunLease) (outcome 
 		return Suspended, nil
 	case lost, errors.Is(runErr, journal.ErrLeaseLost), ctx.Err() != nil:
 		// Not ours to settle: another holder has the run, or we are
-		// stopping. It is taken again once the lease is free.
+		// stopping. It is taken again once the lease is free; its fault
+		// count starts again.
+		r.forget(lease.RunID)
 		return Interrupted, runErr
 	case errors.As(runErr, &engineErr) && engineErr.Uncertain:
 		if err := runJournal.MarkRunUncertain(settle, engineErr.Code, engineErr.Class); err != nil {
+			r.report(err)
 			return Interrupted, errors.Join(runErr, err)
 		}
 		r.forget(lease.RunID)
