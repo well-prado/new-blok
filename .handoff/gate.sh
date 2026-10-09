@@ -1,7 +1,9 @@
 #!/bin/bash
 # gate.sh <worktree> <logdir> : full RULES.md gate, one line per step
 set -u
-cd "$1"; L=$2; mkdir -p "$L"
+cd "$1" || { echo "gate: cannot cd to $1" >&2; exit 2; }
+[ "$(git rev-parse --show-toplevel 2>/dev/null)" = "$(cd "$1" && pwd -P)" ] || { echo "gate: $1 is not a worktree root" >&2; exit 2; }
+L=$2; mkdir -p "$L"
 echo "head $(git rev-parse HEAD) go $(go version | awk '{print $3}')" > "$L/summary"
 step() { n=$1; shift; if "$@" > "$L/$n.log" 2>&1; then echo "PASS $n" >> "$L/summary"; else echo "FAIL $n" >> "$L/summary"; fi; }
 step gofmt bash -c 'out=$(gofmt -l .); echo "$out"; [ -z "$out" ]'

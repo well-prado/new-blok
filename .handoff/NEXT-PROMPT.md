@@ -12,11 +12,12 @@ Hard rules (summary; RULES.md is authoritative):
 - After each merge: move the board item to Done (Project 15 ids in STATE.md), tick E07 child boxes with evidence links, and file non-blocking findings as issues.
 
 Start with the open PRs/WIP (details in STATE.md), running in parallel:
-1. #384 (T09 C2a, head e16b852): delta Review R3 6654aa5..e16b852 → gate → merge.
-2. #385 (Fixes #332): fast-forward from wip/332-evidence-r1, re-measure the benchmarks at low load, full Review R1 → gate → merge → tick the #46 boxes.
-3. #404 (T10 slice 2): relay the 2 should-fixes from the incomplete review → finish Review R1 (mutations) → gate → merge. Then T10 slice 3.
-4. #402 (#374) and #403 (#399), both test-only: finish the gates → merge. #406 (devtool flake): root-cause and fix.
-5. wip/396 (#396): finish it (vector, upgrade probe, ADR) → PR → review → merge. #405 (partition renewal, a PRODUCT bug): implement the settled design.
-Then T10 slices 3–5 (#396 before durable cluster loops; slice 4 Child, see #397), T12 #335, T13, T15, T18, T19 B–D (ask the user about tombstone growth: document+assert vs retention; interacts with #364), and T21 #344 last. Close #7 only after every task is merged with Review R, every child box (#43–#49) is ticked with evidence links, and an independent specialist Review R of the whole epic is recorded on #7.
+1. #421 (resumer backlog drain): relay the Review R1 SHOULD-FIX (an "every worker busy" test plus a CPU-spin check) → delta review → gate → merge.
+2. #423 (T10 slice 4, durable Child): full Review R1 → gate → merge (after #421; expect a resumer.go merge).
+3. wip/333-durable-app (T10 slice 5, durable runtime in real apps): finish (P9 test, docs, validation) → PR → full Review R1 → gate → merge. Closes #333. Confirm its design decisions (listed in STATE.md) with the user if any look questionable.
+4. #385 (Fixes #332): delta Review R2 → after #421, re-measure the backlog arm → gate → merge → tick the #46 boxes.
+5. wip/411 (cluster suite reliability): rebase onto main, validate, PR → review → merge.
+Then: #422 (PendingResumptions cost), #410 (bisect the slowdown), #408 (sqlite arrival-order test), the T12 #335 crash matrix, T13, T15, T18, T19 B–D (ask the user about tombstone growth), and T21 last.
+T12 #335, T13, T15, T18, T19 B–D (ask the user about tombstone growth: document+assert vs retention; interacts with #364), and T21 #344 last. Close #7 only after every task is merged with Review R, every child box (#43–#49) is ticked with evidence links, and an independent specialist Review R of the whole epic is recorded on #7.
 
 Report back after each merge.
