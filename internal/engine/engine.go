@@ -165,6 +165,24 @@ type ScopeJournal interface {
 	ExitScope(context.Context, ScopeEntry, json.RawMessage) error
 }
 
+// LoopJournal journals each and parallel (ADR 0028, #333 slice 3) on top
+// of their scopes: every item of an each and every arm of a parallel is a
+// slot, a scope recorded completed with its result wrapped as
+// {"output": <result>}, in one transaction, once the item's or arm's last
+// step has committed. A recorded slot never changes: RecordSlot with other
+// bytes is refused, with the same bytes is a no-op. Slots returns the
+// slots recorded under a loop's scope whose paths begin with prefix, by
+// path. FailScope replaces a running loop scope's decision with one that
+// records the loop's failure (fail-fast), so a replay reports it without
+// starting an item. A durable runner whose journal does not implement it
+// refuses each and parallel.
+type LoopJournal interface {
+	ScopeJournal
+	Slots(ctx context.Context, loop ScopeEntry, prefix string) (map[string]json.RawMessage, error)
+	RecordSlot(ctx context.Context, loop ScopeEntry, slot ScopeIdentity, output json.RawMessage) error
+	FailScope(ctx context.Context, loop ScopeEntry, decision json.RawMessage) error
+}
+
 // ScopeIdentity names one execution of a construct: Path is
 // "<invocation path>@<iteration path>", ParentPath the path of the
 // construct whose arm it runs in (empty at the top level), Kind the
@@ -308,17 +326,19 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 	}
 	controls := controlIDs(program.Instructions, nil)
 	var scopes ScopeJournal
+	var loops LoopJournal
 	if journal != nil && program.Format == contract.ControlFormat {
 		// A durable runner journals if, choose and try-finally through
-		// the journal's scopes (#333 slice 2); each and parallel need
-		// joins (a later slice), and a journal without scopes (the
-		// cluster's) runs none of them.
+		// the journal's scopes (#333 slice 2), each and parallel through
+		// its slots (slice 3); a journal without scopes (the cluster's)
+		// runs none of them.
 		var ok bool
 		if scopes, ok = journal.(ScopeJournal); !ok {
 			return Result{}, &Error{Code: "durable_control_unsupported", Class: "configuration", Err: fmt.Errorf("this durable runner's journal does not journal control constructs")}
 		}
-		if kind := unjournaledControl(program.Instructions); kind != "" {
-			return Result{}, &Error{Code: "durable_control_unsupported", Class: "configuration", Err: fmt.Errorf("%s runs only in memory until #333 journals its join", kind)}
+		loops, _ = journal.(LoopJournal)
+		if kind := unjournaledControl(program.Instructions); kind != "" && loops == nil {
+			return Result{}, &Error{Code: "durable_control_unsupported", Class: "configuration", Err: fmt.Errorf("this durable runner's journal does not journal the slots %s needs", kind)}
 		}
 	}
 	if journal != nil {
@@ -759,11 +779,17 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 					entered = &entry
 					return arm, nil
 				}
+				// An each or a parallel journals its scope and slots itself
+				// (loopScope).
+				var loop *loopScope
+				if loops != nil && (instruction.Kind == "each" || instruction.Kind == "parallel") {
+					loop = &loopScope{journal: loops, identity: ScopeIdentity{RunID: runID, ArtifactDigest: program.Digest, Path: f.scopePath(instruction.ID), ParentPath: f.scope, Kind: instruction.Kind}}
+				}
 				output, err := runControl(ctx, f, instruction, e.maxSteps, func(ctx context.Context, armFrame *frame, arm contract.Arm) (any, error) {
 					// The arm's steps are children of the construct's span.
 					armFrame.span = stepSpan
 					return runArm(ctx, armFrame, instruction.ID, arm)
-				}, enter)
+				}, enter, loop)
 				if err == nil && entered != nil && !entered.Completed {
 					err = exitScope(ctx, scopes, *entered, instruction.ID, output)
 				}

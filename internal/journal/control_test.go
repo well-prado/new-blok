@@ -5,12 +5,14 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -35,6 +37,16 @@ type controlNodes struct {
 	log      string
 	held     atomic.Bool
 	released chan struct{}
+	flakyOK  atomic.Bool
+
+	blockOnce, blockedOnce sync.Once
+	blocked                chan struct{} // closed once block has started
+}
+
+// blockStarted is closed once a block call has started.
+func (c *controlNodes) blockStarted() chan struct{} {
+	c.blockOnce.Do(func() { c.blocked = make(chan struct{}) })
+	return c.blocked
 }
 
 func (c *controlNodes) record(name string) {
@@ -93,6 +105,52 @@ func (c *controlNodes) engine() *engine.Engine {
 		define("audit", true, same),
 		define("notify", false, same),
 		define("boom", false, func(context.Context, engineValue) (engineValue, error) { return engineValue{}, errors.New("boom") }),
+		// slow never returns in a killed child (it blocks until its
+		// context ends), and returns at once in the parent.
+		define("slow", false, func(ctx context.Context, in engineValue) (engineValue, error) {
+			if os.Getenv("NEWBLOK_333_CONTROL_CHILD") == "1" {
+				<-ctx.Done()
+				return engineValue{}, ctx.Err()
+			}
+			return in, nil
+		}),
+		// flaky fails for value 3 until flakyOK is set.
+		define("flaky", false, func(_ context.Context, in engineValue) (engineValue, error) {
+			if in.Value == 3 && !c.flakyOK.Load() {
+				return engineValue{}, errors.New("flaky")
+			}
+			return in, nil
+		}),
+		// gate fails item 1 once item 2's block (an effect) is in flight.
+		define("gate", false, func(ctx context.Context, in engineValue) (engineValue, error) {
+			if in.Value != 1 {
+				return in, nil
+			}
+			select {
+			case <-c.blockStarted():
+			case <-time.After(10 * time.Second):
+			}
+			return engineValue{}, errors.New("gate")
+		}),
+		// failafter fails once a block (an effect) is in flight.
+		define("failafter", false, func(context.Context, engineValue) (engineValue, error) {
+			select {
+			case <-c.blockStarted():
+			case <-time.After(10 * time.Second):
+			}
+			return engineValue{}, errors.New("failafter")
+		}),
+		// block is an effect that runs until its context ends.
+		define("block", true, func(ctx context.Context, in engineValue) (engineValue, error) {
+			started := c.blockStarted()
+			c.blockedOnce.Do(func() { close(started) })
+			<-ctx.Done()
+			return engineValue{}, ctx.Err()
+		}),
+		// unsure is an effect whose outcome is unknown.
+		define("unsure", true, func(context.Context, engineValue) (engineValue, error) {
+			return engineValue{}, &node.DomainError{Code: "unsure", Class: "uncertain", Err: errors.New("the effect's outcome is unknown")}
+		}),
 		define("hold", false, func(ctx context.Context, in engineValue) (engineValue, error) {
 			if c.held.Swap(true) {
 				return in, nil
@@ -164,8 +222,50 @@ func controlPrograms(mode string) contract.InternalProgram {
 		return tryProgram("second")
 	case "try-fail":
 		return tryProgram("boom")
+	case "each":
+		return controlProgramOf(eachOf("loop", 5, "charge"), output("loop"))
+	case "parallel":
+		return parallelProgram()
+	case "each-try":
+		return eachInTryProgram()
 	}
 	panic("unknown control program " + mode)
+}
+
+// eachOf runs body (a node) on each of n items {"value":1}…{"value":n},
+// one at a time; the each's result is the bodies' results.
+func eachOf(id string, n int, body string) contract.InternalInstruction {
+	items := make([]string, n)
+	for index := range items {
+		items[index] = fmt.Sprintf(`{"value":%d}`, index+1)
+	}
+	return contract.InternalInstruction{ID: id, Kind: "each", Control: &contract.Control{Concurrency: 1,
+		Operands: []contract.Operand{{Literal: json.RawMessage("[" + strings.Join(items, ",") + "]")}},
+		Arms:     []contract.Arm{{Name: "body", Instructions: []contract.InternalInstruction{call(0, body, body, id)}, Output: ref(body)}},
+	}}
+}
+
+// parallelProgram: arm 0 charges, arm 1 runs slow then vip; the output
+// reads vip, an arm's step, after the parallel.
+func parallelProgram() contract.InternalProgram {
+	return controlProgramOf(
+		contract.InternalInstruction{ID: "fan", Kind: "parallel", Control: &contract.Control{Arms: []contract.Arm{
+			{Name: "0", Instructions: []contract.InternalInstruction{call(0, "charge", "charge")}},
+			{Name: "1", Instructions: []contract.InternalInstruction{call(0, "slow", "slow"), call(1, "vip", "vip", "slow")}},
+		}}},
+		output("vip"),
+	)
+}
+
+// eachInTryProgram: try [each of 4 charges] finally [release].
+func eachInTryProgram() contract.InternalProgram {
+	return controlProgramOf(
+		contract.InternalInstruction{ID: "pay", Kind: "try-finally", Control: &contract.Control{Arms: []contract.Arm{
+			{Name: "try", Instructions: []contract.InternalInstruction{eachOf("loop", 4, "charge")}, Output: ref("loop")},
+			{Name: "finally", Instructions: []contract.InternalInstruction{call(0, "release", "release")}},
+		}}},
+		output("pay"),
+	)
 }
 
 // controlRows lists the run's scopes (path|kind|parent|state|input, in the
@@ -183,10 +283,17 @@ func controlRows(t *testing.T, j *Journal, runID string) []string {
 // for it, SIGKILLs it, and returns its database and node log.
 func killControlChild(t *testing.T, mode string, commits int) (string, string) {
 	t.Helper()
+	return killControlChildAt(t, mode, "step-commit", commits)
+}
+
+// killControlChildAt is killControlChild parking after the commits-th
+// commit named barrier that follows the first scope entry.
+func killControlChildAt(t *testing.T, mode, barrier string, commits int) (string, string) {
+	t.Helper()
 	directory := t.TempDir()
 	path, marker, log := filepath.Join(directory, "journal.db"), filepath.Join(directory, "marker"), filepath.Join(directory, "nodes.log")
 	command := exec.Command(os.Args[0], "-test.run=^"+t.Name()+"$")
-	command.Env = append(os.Environ(), "NEWBLOK_333_CONTROL_CHILD=1", "NEWBLOK_333_CONTROL_MODE="+mode, "NEWBLOK_333_CONTROL_COMMITS="+strconv.Itoa(commits),
+	command.Env = append(os.Environ(), "NEWBLOK_333_CONTROL_CHILD=1", "NEWBLOK_333_CONTROL_MODE="+mode, "NEWBLOK_333_CONTROL_COMMITS="+strconv.Itoa(commits), "NEWBLOK_333_CONTROL_BARRIER="+barrier,
 		"NEWBLOK_333_CONTROL_LOG="+log, "NEWBLOK_JOURNAL_PATH="+path, "NEWBLOK_JOURNAL_MARKER="+marker)
 	if err := command.Start(); err != nil {
 		t.Fatal(err)
@@ -202,7 +309,7 @@ func killControlChild(t *testing.T, mode string, commits int) (string, string) {
 // runControlChild admits a run of its program and executes it, parking
 // (for the parent's SIGKILL) right after the commit that enters the first
 // scope when NEWBLOK_333_CONTROL_COMMITS is 0, else right after that many
-// step commits following it.
+// commits named NEWBLOK_333_CONTROL_BARRIER following it.
 func runControlChild() {
 	ctx := context.Background()
 	commits, err := strconv.Atoi(os.Getenv("NEWBLOK_333_CONTROL_COMMITS"))
@@ -215,7 +322,17 @@ func runControlChild() {
 		switch {
 		case name == "scope-enter" && !entered.Swap(true) && commits == 0:
 			journalMarkerAndWait()
-		case name == "step-commit" && entered.Load() && int(committed.Add(1)) == commits:
+		case name == os.Getenv("NEWBLOK_333_CONTROL_BARRIER") && entered.Load() && int(committed.Add(1)) == commits:
+			if os.Getenv("NEWBLOK_333_CONTROL_MODE") == "parallel" {
+				// Park only once arm 1 has started slow, as the parent
+				// expects (it counts that invocation), however late the
+				// scheduler starts it (#412 Review R round 1).
+				for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+					if data, _ := os.ReadFile(os.Getenv("NEWBLOK_333_CONTROL_LOG")); strings.Contains(string(data), "slow\n") {
+						break
+					}
+				}
+			}
 			journalMarkerAndWait()
 		}
 	}
@@ -509,37 +626,6 @@ func TestDurableWaitInsideAnArmSuspendsAndResumes(t *testing.T) {
 	}
 	if got := oneRow(t, database, `SELECT state || '|' || invocation_path FROM journal_waits WHERE run_id = '`+run+`'`); got != "acknowledged|route/then/pay/try/approval" {
 		t.Fatalf("wait %s", got)
-	}
-}
-
-// TestDurableRunnerStillRefusesEachAndParallel: their joins are a later
-// slice, so a durable run refuses them, at any depth, before writing
-// anything.
-func TestDurableRunnerStillRefusesEachAndParallel(t *testing.T) {
-	ctx := context.Background()
-	database, j := newJournal(t, "refuse.db", Config{Holder: "a", Clock: ticking(fixtureBase)})
-	defer database.Close()
-	runner := (&controlNodes{log: filepath.Join(t.TempDir(), "nodes.log"), released: make(chan struct{})}).engine()
-	parallel := contract.InternalInstruction{ID: "fan", Kind: "parallel", Control: &contract.Control{Arms: []contract.Arm{{Name: "0", Instructions: []contract.InternalInstruction{call(0, "notify", "notify")}}}}}
-	nested := controlProgramOf(contract.InternalInstruction{ID: "pay", Kind: "try-finally", Control: &contract.Control{Arms: []contract.Arm{
-		{Name: "try", Instructions: []contract.InternalInstruction{parallel}, Output: &contract.Operand{Literal: json.RawMessage(`1`)}},
-		{Name: "finally"},
-	}}}, output("pay"))
-	admitted, err := j.Admit(ctx, AdmissionRequest{RequestKey: "refuse", Workflow: "control", ArtifactDigest: controlArtifact, Input: []byte(`{"value":4}`)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	token, err := j.TakeRunLease(ctx, admitted.RunID, fixtureBase)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = runner.RunJournaled(ctx, nested, engineValue{Value: 4}, admitted.RunID, j.ForRun(admitted.RunID, token))
-	var classified *engine.Error
-	if !errors.As(err, &classified) || classified.Code != "durable_control_unsupported" {
-		t.Fatalf("err=%v; want durable_control_unsupported", err)
-	}
-	if got := controlRows(t, j, admitted.RunID); !reflect.DeepEqual(got, []string{"run|accepted"}) {
-		t.Fatalf("rows %q; want nothing written", got)
 	}
 }
 
