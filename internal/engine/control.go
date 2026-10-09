@@ -261,9 +261,11 @@ func runParallel(ctx context.Context, id string, plan *ParallelPlan) (any, error
 // keepUncertain is err marked uncertain when an error it was reported
 // instead of was: a sibling the first failure canceled while its effect
 // was in flight, or a try failure finally's failure replaced. The run's
-// outcome is then unknown whichever error names it (#412 Review R).
+// outcome is then unknown whichever error names it (#412 Review R). A
+// suspension is not an outcome, so it is never marked: the run waits, and
+// reports the uncertainty when it ends.
 func keepUncertain(err *Error, uncertain bool) *Error {
-	if !uncertain || err.Uncertain {
+	if !uncertain || err.Uncertain || err.Suspended {
 		return err
 	}
 	marked := *err

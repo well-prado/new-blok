@@ -485,7 +485,9 @@ restart nobody redoes a stamped item; the card is read instead.
   effects ran (#412 Review R round 1). Inspection reads the slots.
 - **Slot bound.** A slot holds any result a step may commit plus its
   wrapping: `journal.MaxSlotBytes` = `MaxStepResultBytes` + 11 bytes of
-  `{"output":}`, so an item whose result is a full step result fits.
+  `{"output":}`, so an item whose result is one step's result fits. An
+  item whose result is larger than any step result, such as an inner
+  each's results, does not (see Limits).
 - **Fail-fast is recorded.** When an item or arm fails and the loop fails
   fast, the loop's own failure (not a suspension, the caller's
   cancellation or a journal fault, which a later execution may get past)
@@ -626,7 +628,9 @@ fitting its slot, a journal fault not recorded as the loop's failure,
 `FailScope`'s attempt fence, and `RecordSlot`/`Slots` refused after the
 run ended or under a stale lease. The parallel kill test now parks only
 once its second arm has started (it counted that invocation; a delayed
-arm failed it 3/3).
+arm failed it 3/3). Round 2 added the parallel half of the uncertainty
+rule and kept a suspension from being marked uncertain, each RED under
+a mutation of its fix.
 
 ## Limits
 
@@ -645,6 +649,12 @@ arm failed it 3/3).
   resumer (#384) makes; slice 3 adds one crash test through the resumer
   itself.
 - No bound on a run's total work across nested loops yet (#386 part 1).
+- A slot is bounded like a step result, so nested loops can exceed it: an
+  outer each item whose result is an inner each's results (four 300 KiB
+  inner items, 1.2 MB) fails permanently (`journal_scope_slot`,
+  `ErrStepResultLimit`) after the inner slots were written (#412 Review R
+  round 2). Return a smaller result from the outer body, or read the inner
+  results where they are used.
 - `flow` cannot record a wait, so a wait in an arm comes only from a
   program built otherwise; flow keeps its suspension note.
 - A construct's result over `journal.MaxStepResultBytes` (1 MiB) fails a

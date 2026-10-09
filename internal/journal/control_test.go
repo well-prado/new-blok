@@ -132,6 +132,14 @@ func (c *controlNodes) engine() *engine.Engine {
 			}
 			return engineValue{}, errors.New("gate")
 		}),
+		// failafter fails once a block (an effect) is in flight.
+		define("failafter", false, func(context.Context, engineValue) (engineValue, error) {
+			select {
+			case <-c.blockStarted():
+			case <-time.After(10 * time.Second):
+			}
+			return engineValue{}, errors.New("failafter")
+		}),
 		// block is an effect that runs until its context ends.
 		define("block", true, func(ctx context.Context, in engineValue) (engineValue, error) {
 			started := c.blockStarted()

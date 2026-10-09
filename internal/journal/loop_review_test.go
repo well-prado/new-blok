@@ -152,3 +152,42 @@ func TestDurableEachJournalFaultIsNotRecorded(t *testing.T) {
 		t.Fatalf("next execution output=%s err=%v", encoded(t, result.Output), err)
 	}
 }
+
+// TestDurableParallelFailFastKeepsASiblingsUncertainEffect (#412 Review R
+// round 2): the parallel half of BLOCKER 1. Arm 0's pure step fails once
+// arm 1's effect is in flight; fail-fast cancels that effect, so the
+// parallel reports and records its failure as uncertain.
+func TestDurableParallelFailFastKeepsASiblingsUncertainEffect(t *testing.T) {
+	ctx, j, run, token := loopRig(t, "uncertain-parallel")
+	nodes := &controlNodes{log: filepath.Join(t.TempDir(), "nodes.log"), released: make(chan struct{})}
+	program := controlProgramOf(contract.InternalInstruction{ID: "fan", Kind: "parallel", Control: &contract.Control{Arms: []contract.Arm{
+		{Name: "0", Instructions: []contract.InternalInstruction{call(0, "failafter", "failafter")}},
+		{Name: "1", Instructions: []contract.InternalInstruction{call(0, "block", "block")}},
+	}}}, contract.InternalInstruction{ID: "output", Kind: "output", References: []contract.Reference{{Step: contract.InputStep}}})
+	_, err := nodes.engine().RunJournaled(ctx, program, engineValue{Value: 4}, run, j.ForRun(run, token))
+	var classified *engine.Error
+	if !errors.As(err, &classified) || classified.Code != "node_error" || classified.Step != "failafter" || !classified.Uncertain {
+		t.Fatalf("err=%v (%+v); want failafter's node_error, uncertain", err, classified)
+	}
+	const recorded = `{"items":2,"failed":{"code":"node_error","class":"failure","step":"failafter","uncertain":true}}`
+	if got := oneRow(t, j.database, `SELECT CAST(input_json AS TEXT) FROM journal_scopes WHERE run_id = '`+run+`' AND path = 'fan@root'`); got != recorded {
+		t.Fatalf("parallel decision %s; want %s", got, recorded)
+	}
+}
+
+// TestDurableSuspensionIsNeverMarkedUncertain (#412 Review R round 2): an
+// uncertain try failure followed by a finally that waits suspends the run;
+// the suspension is not an outcome, so it is not marked uncertain.
+func TestDurableSuspensionIsNeverMarkedUncertain(t *testing.T) {
+	ctx, j, run, token := loopRig(t, "uncertain-suspension")
+	nodes := &controlNodes{log: filepath.Join(t.TempDir(), "nodes.log"), released: make(chan struct{})}
+	program := controlProgramOf(contract.InternalInstruction{ID: "pay", Kind: "try-finally", Control: &contract.Control{Arms: []contract.Arm{
+		{Name: "try", Instructions: []contract.InternalInstruction{call(0, "unsure", "unsure")}, Output: ref("unsure")},
+		{Name: "finally", Instructions: []contract.InternalInstruction{{ID: "approval", Kind: "wait", Wait: &contract.WaitInstruction{Name: "approval"}}}},
+	}}}, output("pay"))
+	_, err := nodes.engine().RunJournaled(ctx, program, engineValue{Value: 4}, run, j.ForRun(run, token))
+	var classified *engine.Error
+	if !errors.As(err, &classified) || !classified.Suspended || classified.Uncertain {
+		t.Fatalf("err=%v (%+v); want a suspension, not marked uncertain", err, classified)
+	}
+}
