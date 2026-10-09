@@ -347,7 +347,7 @@ func (r *Resumer) report(err error) {
 // meanwhile, settles the outcome under that lease, and releases it.
 func (r *Resumer) execute(ctx context.Context, lease journal.RunLease) (outcome Outcome, err error) {
 	j := r.config.Journal
-	runJournal := j.ForRun(lease.RunID, lease.Token)
+	runJournal := j.ForRun(lease.RunID, lease.Token).WithChildren(r.childWorkflow)
 	settle := context.WithoutCancel(ctx)
 	defer func() { _ = j.ReleaseRunLease(settle, lease.RunID, lease.Token) }()
 	fail := func(code, class string, cause error) (Outcome, error) {
@@ -374,6 +374,15 @@ func (r *Resumer) execute(ctx context.Context, lease journal.RunLease) (outcome 
 	run, err := j.Run(ctx, lease.RunID)
 	if err != nil {
 		return Interrupted, err
+	}
+	if journal.IsChildRun(run) {
+		// A child's end fires its parent's wait: resume the parent now,
+		// not at the next interval.
+		defer func() {
+			if outcome == Completed || outcome == Failed || outcome == Uncertain {
+				r.Wake()
+			}
+		}()
 	}
 	workflow, ok := r.config.Workflows[run.Workflow]
 	if !ok || workflow.Program.Digest != run.ArtifactDigest {
@@ -441,6 +450,7 @@ func (r *Resumer) execute(ctx context.Context, lease journal.RunLease) (outcome 
 		return Completed, nil
 	case errors.As(runErr, &engineErr) && engineErr.Suspended:
 		r.forget(lease.RunID)
+		r.startChildren(settle, lease.RunID)
 		return Suspended, nil
 	case lost, errors.Is(runErr, journal.ErrLeaseLost), ctx.Err() != nil:
 		// Not ours to settle: another holder has the run, or we are
@@ -488,6 +498,34 @@ func (r *Resumer) transient(runID string, runJournal *journal.RunJournal, cause 
 	}
 	r.forget(runID)
 	return Failed, cause
+}
+
+// childWorkflow resolves a child step's workflow from the registered
+// workflows (journal.RunJournal.WithChildren).
+func (r *Resumer) childWorkflow(name string) (journal.ChildWorkflow, bool) {
+	workflow, ok := r.config.Workflows[name]
+	if !ok {
+		return journal.ChildWorkflow{}, false
+	}
+	return journal.ChildWorkflow{ArtifactDigest: workflow.Program.Digest, DecodeInput: workflow.DecodeInput}, true
+}
+
+// startChildren starts, each once a worker is free, the children a run
+// that just suspended started and no holder has taken, instead of leaving
+// them for the interrupted-run scan a lease later.
+func (r *Resumer) startChildren(ctx context.Context, runID string) {
+	children, err := r.config.Journal.ChildrenToStart(ctx, runID)
+	if err != nil {
+		r.report(err)
+		return
+	}
+	for _, child := range children {
+		go func() {
+			if err := r.Start(ctx, child); err != nil && !errors.Is(err, journal.ErrLeaseLost) && !errors.Is(err, ErrClosed) && !errors.Is(err, journal.ErrRunNotActive) {
+				r.report(err)
+			}
+		}()
+	}
 }
 
 func (r *Resumer) forget(runID string) {

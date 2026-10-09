@@ -4,9 +4,10 @@
   lowers and runs compare, default, if, choose and try-finally in memory;
   slice 1b adds each and parallel, and lets control operands read the
   workflow input. Slice 2 runs compare, default, if, choose and
-  try-finally durably on a single host; slice 3 (this revision) each and
-  parallel. Slice 4 makes child runs durable, slice 5 resumes at startup.
-- Date: 2026-10-07 (slice 2: 2026-10-08; slice 3: 2026-10-08)
+  try-finally durably on a single host; slice 3 each and parallel; slice 4
+  (this revision) child runs. Slice 5 resumes at startup.
+- Date: 2026-10-07 (slice 2: 2026-10-08; slice 3: 2026-10-08; slice 4:
+  2026-10-09)
 - Roadmap: E07-T10 ([#333](https://github.com/well-prado/new-blok/issues/333)),
   closing gaps in E07-T05 (#47) and E07-T07 (#49)
 - Owners: `internal/lowering` (lowering), `internal/engine` (`lowered.go`,
@@ -117,8 +118,12 @@ compiler produces" applies to calls only.
 - `flow.Definition.Lower` sets `Control`; the agent catalog does not, so a
   composed workflow with control flow stays not agent-safe, rejected with
   the message it always had.
-- Kinds lowered: compare, default, if, choose, try-finally, each, parallel.
-  Child (in flow) and template are rejected by kind, wherever nested,
+- Kinds lowered: compare, default, if, choose, try-finally, each, parallel
+  and (slice 4) child, as contract kind `child` with the workflow it
+  names in `Node` and its input reference in `References` (call input
+  rules; `$child.<id>` reads its result later). The agent catalog's
+  `Children` option keeps lowering a child as a call of the child
+  workflow key instead. Template is rejected by kind, wherever nested,
   before anything else is checked.
 - References: `$step.<id>`, `$op.<id>` (compare, default), `$join.<id>`
   (if, choose, try-finally, each) and, inside an each's body,
@@ -515,6 +520,63 @@ restart nobody redoes a stamped item; the card is read instead.
   which inspection pages over and compaction removes with the run
   (`TestThousandItemLoopInspectsAndCompacts`).
 
+### Durable child runs on a single host (slice 4)
+
+Like a manager who hands a task to a colleague with a numbered ticket and
+goes home: the ticket's number is derived from her own desk and task, so
+if she comes back after a crash she finds the same ticket, never opens a
+second one, and picks up the colleague's answer once it is in.
+
+- **Who journals.** `engine.ChildJournal` (`StartChild`, plus scopes and
+  waits), implemented by `journal.RunJournal`. A durable runner whose
+  journal does not implement it refuses a program with a child
+  (`durable_control_unsupported`); in memory a child step fails
+  (`child_requires_durable_runner`). A child may appear in an if, choose
+  or try-finally arm, not inside an each or parallel (it suspends the run,
+  like a wait).
+- **Start, once.** The child step resolves its input like a call and calls
+  `StartChild`, which in one transaction under the parent's lease: admits
+  the child run, with an id and request key derived from the parent run
+  and the step's scope path (`run:` + 32 hex of a SHA-256; request key
+  `blok-child/<depth>/<parent run>/<digest>`), the parent's principal,
+  the step input as its admitted input and, through the child workflow's
+  input decoder, its engine-input identity fixed at admission (#380's
+  rule); records it as the parent's child (`journal_children`); enters
+  the step's scope (kind `child`, decision `{"child":"<run id>"}`); and
+  schedules the parent's wait for it (named `blok.child:<run id>`, keyed
+  by the step's identity). A replay finds the scope and returns the child
+  it records: no second child is ever admitted. The runner resolves
+  workflows for it (`RunJournal.WithChildren`; the resumer passes its
+  registry).
+- **Wait for the child.** The parent then waits at that wait and
+  suspends, holding nothing. The transaction that ends the child (complete,
+  fail, uncertain, cancel) settles the parent's record with the child's
+  outcome (`engine.ChildOutcome`) and fires the parent's wait with it, so
+  the parent is listed for resumption. A signal addressed to a child wait
+  is refused (`ErrReservedSignal`): only the child's end fires it.
+- **Outcome.** A completed child's output (as a JSON value) is the step's
+  result, and the step's scope exits with `{"child":"<run id>"}`. A failed
+  child fails the step (`child_failed`, class failure, the child's code and
+  class in the message), an uncertain one makes it uncertain
+  (`child_uncertain`), a canceled one fails it (`child_canceled`).
+- **Starting the child.** The resumer starts a run's unstarted children
+  as soon as the run suspends (`Journal.ChildrenToStart`), each once a
+  worker is free; should that resumer die first, the interrupted-run scan
+  takes them a lease after admission. It sweeps again when a child ends.
+- **Depth.** A run's depth is in its request key (0 for a run not started
+  as a child), so no walk is needed. `journal.Config.MaxChildDepth`
+  (default 8) bounds it: a child step of a run at that depth is refused
+  before anything is admitted (`child_depth_exceeded`, class admission,
+  permanent).
+- **No walk, no oracle (#397).** The child is always a run its own
+  transaction admits, so it has no children and binding it cannot close a
+  cycle: the subtree walk `RecordChild` does (181 ms at a 100,000-wide
+  subtree, ADR 0003) never runs. A run already holding the derived id or
+  request key that the step never recorded is refused with one
+  diagnostic, `child_unavailable` ("the child run is not available"),
+  whoever admitted it. Child refusals are `*engine.ChildError`;
+  `journal.Permanent` reports them, so a runner settles the run failed.
+
 ## Compatibility (ADR 0001)
 
 | Change | Class | Migration |
@@ -544,6 +606,8 @@ restart nobody redoes a stamped item; the card is read instead.
 | `engine.LoopJournal`; `RunJournal.Slots`, `.RecordSlot`, `.FailScope` (slice 3) | API, additive | None |
 | A durable runner whose journal is a `LoopJournal` runs each and parallel; item and arm slots are `journal_scopes` rows of kind `item`/`arm` | behavioral: programs it refused now run; no schema change | None |
 | A durable each's result is its slots' JSON values | behavioral (durable runs only, which refused each before) | None |
+| `flow.Definition.Lower` lowers child as contract kind `child`; `engine.ChildJournal`, `ChildRequest`, `ChildStart`, `ChildOutcome`, `ChildError`, `ChildWaitPrefix`; `journal.ChildWorkflow`, `RunJournal.WithChildren`, `.StartChild`, `Journal.ChildrenToStart`, `IsChildRun`, `Config.MaxChildDepth`, `ErrReservedSignal` (slice 4) | API additive; behavioral: programs it refused now lower and run under a durable runner | None |
+| Run end (complete, fail, uncertain, cancel) of a child settles its parent's record and fires its wait; signals named `blok.child:…` are refused | behavioral | None |
 | `journal.MaxSlotBytes`; a loop scope's output is `{"items":N}`; a failure reported over an uncertain sibling or try is uncertain; the resumer ends uncertain a run `FailRun` refuses with `ErrUncertain` (#412 Review R round 1) | API additive; behavioral | None |
 
 ## Evidence (slice 1a)
@@ -632,16 +696,38 @@ arm failed it 3/3). Round 2 added the parallel half of the uncertainty
 rule and kept a suspension from being marked uncertain, each RED under
 a mutation of its fix.
 
+## Evidence (slice 4)
+
+`internal/journal/child_run_test.go` drives a parent and its child as
+the resumer does (real SQLite) and SIGKILLs a child process just before
+and just after the commit that starts the child, while the child runs
+(after its effect committed), and after the child completed but before
+the parent resumed; driving on in another process admits exactly one
+child, runs every effect once and completes both.
+`internal/resumer/child_crash_test.go` kills a resumer while the child it
+started runs; a resumer in the parent process completes child and
+parent. Also: failure and uncertainty reach the parent, the depth bound,
+`child_unavailable` identical whoever holds the derived id, and child
+waits refusing signals. RED on origin/main 4eebd62 where they compile
+(the engine refused the kind, flow refused to lower it, the resumer test
+never saw the child's effect); the journal tests are RED under named
+mutations of the fix (no reuse of the recorded child, the binding error
+leaking, no depth check, signalable child waits, a child's end waking
+nobody, children not started by the resumer, refusals not permanent, the
+parent's principal not inherited).
+
 ## Limits
 
-- Child and template still do not lower (child needs a child-run path;
-  template has no defined substitution semantics).
+- Template still does not lower (no defined substitution semantics).
+- A child of another program format, or one run in memory, is not
+  supported: child runs need a durable runner. A child step's input is
+  the call input of one reference (or the workflow input), like a call.
 - A call cannot read a field of the workflow input (the canonical
   compiler's rule); a control operand can.
 - `internal/program`'s artifact format (version 1) refuses control
   programs; a version-2 artifact for them is decided with the durable
   slices.
-- Child runs are slice 4; resuming accepted runs at startup is slice 5.
+- Resuming accepted runs at startup is slice 5.
   The cluster runs no control program durably: its step journal journals
   no scopes yet (#333).
 - Slice 2's crash tests drive `engine.RunJournaled` over `RunJournal`

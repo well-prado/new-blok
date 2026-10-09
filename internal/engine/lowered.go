@@ -164,8 +164,19 @@ func checkProgram(program contract.InternalProgram, maxSteps int) error {
 			}
 			seen[instruction.ID] = true
 			wanted, control := controlShapes[instruction.Kind]
-			if (depth > 0 && instruction.Kind == "output") || (loop && instruction.Kind == "wait") {
+			if (depth > 0 && instruction.Kind == "output") || (loop && (instruction.Kind == "wait" || instruction.Kind == "child")) {
 				return invalidControl(instruction.ID, fmt.Errorf("an arm cannot hold a %s instruction", instruction.Kind))
+			}
+			if instruction.Kind == "child" {
+				// A child run of the workflow Node, its input the call
+				// input its reference resolves (ADR 0028, slice 4).
+				if program.Format != contract.ControlFormat {
+					return &Error{Code: "unsupported_instruction", Class: "configuration", Step: instruction.ID, Err: fmt.Errorf("child needs program format %d", contract.ControlFormat)}
+				}
+				if instruction.Node == "" || instruction.Control != nil || len(instruction.References) > 1 {
+					return invalidControl(instruction.ID, fmt.Errorf("a child names its workflow, has no control body and at most one input reference"))
+				}
+				continue
 			}
 			if !control {
 				if instruction.Control != nil {
@@ -536,6 +547,10 @@ func controlIDs(instructions []contract.InternalInstruction, ids map[string]bool
 		ids = map[string]bool{}
 	}
 	for _, instruction := range instructions {
+		if instruction.Kind == "child" {
+			// A child's result is its outcome's JSON value.
+			ids[instruction.ID] = true
+		}
 		if instruction.Control == nil {
 			continue
 		}

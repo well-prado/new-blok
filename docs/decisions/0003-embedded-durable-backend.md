@@ -622,7 +622,22 @@ the cycle.
 A completed child's result must now be valid JSON, as a scope's output
 must (`CompleteScope`); a completed record with no result, or with bytes
 that are not JSON, is an invalid record and nothing is stored. JSON
-`null` is a result.
+`null` is a result. One consequence: a byte-identical repeat of a
+completed child record stored before #372 with a result that is not
+valid JSON, which used to succeed and change nothing, is now refused.
+
+The walk's worst case (#397, from the final Review R of #393): a fresh
+child costs about 0.28 ms; a child with a 100,000-wide subtree about
+181 ms, and a 50,000-deep chain about 116 ms, during which a concurrent
+checkpoint write waited about 119 ms for the writer. #333's child step
+therefore never walks: `RunJournal.StartChild` binds only a child run it
+admits in the same transaction, which has no children and so cannot
+close a cycle, under the parent's own principal. A run already holding
+the child's derived id or request key is refused with one diagnostic,
+`child_unavailable` ("the child run is not available"), whoever admitted
+it, so a workflow cannot tell another principal's existing run from a
+missing one (#397). `RecordChild` keeps its distinct errors for its
+direct callers (tests and tooling; no runner calls it).
 
 | Change | Class | Migration |
 | --- | --- | --- |

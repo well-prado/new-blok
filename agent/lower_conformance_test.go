@@ -663,9 +663,10 @@ func TestCatalogLiteralIsTheOnlyDifferenceFromFlowLower(t *testing.T) {
 	}
 }
 
-// A child workflow call is the catalog's other extension: flow.Lower rejects
-// Child, and the catalog lowers it as a call under the same reference rules,
-// with a nil path for the child's whole result.
+// A child workflow call is the catalog's other extension: flow.Lower lowers
+// Child as a durable child run (#333 slice 4), and the catalog lowers it as
+// a call under the same reference rules, with a nil path for the child's
+// whole result.
 func TestCatalogChildWorkflowLowersUnderFlowReferenceRules(t *testing.T) {
 	r := &recorder{}
 	n := newConfNodes(r)
@@ -682,8 +683,8 @@ func TestCatalogChildWorkflowLowersUnderFlowReferenceRules(t *testing.T) {
 		committed := flow.Child[object, object](b, "nested", "conf/child@1.0.0", flow.Select[object, object](reserved, "body"))
 		return committed
 	})
-	if _, err := parent.Lower(); err == nil || err.Error() != `flow: instruction "nested" of kind "child" cannot be lowered` {
-		t.Fatalf("flow.Lower must keep rejecting Child: %v", err)
+	if lowered, err := parent.Lower(); err != nil || lowered.Instructions[1].Kind != "child" || lowered.Instructions[1].Node != "conf/child@1.0.0" {
+		t.Fatalf("flow.Lower must lower Child as a durable child run: %+v %v", lowered, err)
 	}
 	if err := RegisterWorkflow(c, parent, []byte(confOrderSchema), []byte(confCommitSchema), confManifest(), metadata()); err != nil {
 		t.Fatalf("parent: %v", err)

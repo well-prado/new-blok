@@ -86,6 +86,8 @@ type Options struct {
 	Literals bool
 	// Children lowers a "child" instruction as a call of the child workflow
 	// key in Node, referenced by later instructions as "$child.<id>".
+	// Without it, Control lowers a child as a durable child run instead
+	// (contract kind "child", the workflow in Node).
 	Children bool
 	// Control lowers compare, default, if, choose, try-finally, each and
 	// parallel into control instructions (ADR 0028). flow.Definition.Lower sets it; the
@@ -144,7 +146,7 @@ func Lower(workflowID, version string, instructions []Instruction, output string
 // whose kind the options do not lower, wherever it is nested.
 func checkKinds(instructions []Instruction, options Options) error {
 	for _, instruction := range instructions {
-		supported := instruction.Kind == "call" || options.Children && instruction.Kind == "child"
+		supported := instruction.Kind == "call" || (options.Children || options.Control) && instruction.Kind == "child"
 		switch instruction.Kind {
 		case "compare", "default", "if", "choose", "try-finally", "each", "parallel":
 			supported = options.Control
@@ -215,6 +217,20 @@ func (l *lowerer) block(instructions []Instruction, current *scope, depth int) (
 			next.References = references
 			if instruction.Kind == "child" {
 				prefix = childPrefix
+				if !l.options.Children {
+					// With control flow (and not the catalog's child
+					// calls), a child is a durable child run of the
+					// workflow it names (ADR 0028, slice 4).
+					workflow, _ := instruction.Data["workflow"].(string)
+					if workflow == "" {
+						return nil, fmt.Errorf("flow: child %q names no workflow", instruction.ID)
+					}
+					if literal != nil {
+						return nil, fmt.Errorf("flow: child %q: a literal input cannot be lowered", instruction.ID)
+					}
+					next.Kind, next.Node = "child", workflow
+					l.controlled = true
+				}
 			}
 		default:
 			control, err := l.control(instruction, current, depth)
@@ -479,7 +495,7 @@ func lowerReference(source string, current *scope, options Options) (contract.Re
 	switch {
 	case strings.HasPrefix(source, stepPrefix):
 		prefix = stepPrefix
-	case strings.HasPrefix(source, childPrefix) && options.Children:
+	case strings.HasPrefix(source, childPrefix) && (options.Children || options.Control):
 		prefix = childPrefix
 	case strings.HasPrefix(source, opPrefix) && options.Control:
 		prefix = opPrefix

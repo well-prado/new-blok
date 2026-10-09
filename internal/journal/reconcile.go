@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/well-prado/new-blok/contract/audit"
+	"github.com/well-prado/new-blok/internal/engine"
 )
 
 var (
@@ -514,6 +515,6 @@ func (j *Journal) CancelRun(ctx context.Context, runID, reason string) error {
 		if changed != 1 {
 			return ErrStaleAttempt
 		}
-		return nil
+		return j.settleParent(ctx, tx, runID, engine.ChildOutcome{State: "canceled"})
 	})
 }
