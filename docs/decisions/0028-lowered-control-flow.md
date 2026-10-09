@@ -356,8 +356,9 @@ second time, she follows the mark.
   run lease (ADR 0027). A durable runner whose journal does not implement
   it refuses every control program with `durable_control_unsupported`
   before touching the journal: `internal/cluster`'s step journal does not
-  (#396 must land first; `TestClusterRefusesControlPrograms` pins it).
-  Each and parallel need a `LoopJournal` too (slice 3).
+  (`TestClusterRefusesControlPrograms` pins it; its run suspensions are
+  already keyed so one step can suspend more than once, #396). Each and
+  parallel need a `LoopJournal` too (slice 3).
 - **Scopes.** If, choose and try-finally each enter a scope
   (`journal_scopes`) when they start: path
   `<invocation path>@<iteration path>` (`route@root`,
@@ -637,7 +638,8 @@ arm failed it 3/3).
   programs; a version-2 artifact for them is decided with the durable
   slices.
 - Child runs are slice 4; resuming accepted runs at startup is slice 5.
-  The cluster runs no control program durably (#396).
+  The cluster runs no control program durably: its step journal journals
+  no scopes yet (#333).
 - Slice 2's crash tests drive `engine.RunJournaled` over `RunJournal`
   with the leases the journal hands out, the calls the single-host
   resumer (#384) makes; slice 3 adds one crash test through the resumer
