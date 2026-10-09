@@ -336,7 +336,8 @@ second time, she follows the mark.
   run lease (ADR 0027). A durable runner whose journal does not implement
   it refuses every control program with `durable_control_unsupported`
   before touching the journal: `internal/cluster`'s step journal does not
-  (#396 must land first; `TestClusterRefusesControlPrograms` pins it). Each
+  (`TestClusterRefusesControlPrograms` pins it; its run suspensions are
+  already keyed so one step can suspend more than once, #396). Each
   and parallel are refused at any depth until slice 3.
 - **Scopes.** If, choose and try-finally each enter a scope
   (`journal_scopes`) when they start: path
@@ -513,7 +514,8 @@ recorded one.
   slices.
 - Each and parallel run in memory only (slice 3 journals their joins);
   child runs are slice 4; resuming accepted runs at startup is slice 5.
-  The cluster runs no control program durably (#396).
+  The cluster runs no control program durably: its step journal journals
+  no scopes yet (#333).
 - Slice 2's crash tests drive `engine.RunJournaled` over `RunJournal`
   with the leases `TakeRunLease` and `PendingResumptions` hand out, the
   calls the single-host resumer (#384) makes; they do not go through the
