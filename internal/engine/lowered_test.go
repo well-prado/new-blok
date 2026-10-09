@@ -282,3 +282,30 @@ func TestLoopsNeedALoopJournalAndHoldNoWait(t *testing.T) {
 		}
 	}
 }
+
+// A child run is durable (#333 slice 4): in memory a child step fails
+// (child_requires_durable_runner); a durable runner whose journal starts
+// no child runs refuses the program before touching it; and a child inside
+// an each or a parallel is refused for every runner, since it would
+// suspend one item or arm alone.
+func TestChildStepsNeedAChildJournal(t *testing.T) {
+	child := contract.InternalInstruction{ID: "kid", Kind: "child", Node: "kid"}
+	program := controlProgram(child, outputOf("kid"))
+	_, err := New(nil).Run(context.Background(), program, nil)
+	var classified *Error
+	if !errors.As(err, &classified) || classified.Code != "child_requires_durable_runner" {
+		t.Fatalf("in memory: err=%v", err)
+	}
+	program.Digest = "sha256:" + strings.Repeat("0", 64)
+	journal := &scopeOnlyJournal{}
+	if _, err := New(nil).RunJournaled(context.Background(), program, nil, "run-1", journal); !errors.As(err, &classified) || classified.Code != "durable_control_unsupported" || journal.calls != 0 {
+		t.Fatalf("scope-only journal: err=%v calls=%d", err, journal.calls)
+	}
+	loop := controlProgram(contract.InternalInstruction{ID: "loop", Kind: "each", Control: &contract.Control{Concurrency: 1, Operands: []contract.Operand{literal("[1]")}, Arms: []contract.Arm{{Name: "body", Instructions: []contract.InternalInstruction{child}, Output: ptr(literal("1"))}}}}, outputOf("loop"))
+	if _, err := New(nil).Run(context.Background(), loop, nil); !errors.As(err, &classified) || classified.Code != "invalid_control" {
+		t.Fatalf("a child inside an each: err=%v; want invalid_control", err)
+	}
+	if _, err := New(nil).Run(context.Background(), contract.InternalProgram{Instructions: []contract.InternalInstruction{child, outputOf("kid")}}, nil); !errors.As(err, &classified) || classified.Code != "unsupported_instruction" {
+		t.Fatalf("a child in a call-only program: err=%v; want unsupported_instruction", err)
+	}
+}

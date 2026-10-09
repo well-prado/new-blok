@@ -108,8 +108,10 @@ func (d Definition[I, O]) Program() Program { return cloneProgram(d.program) }
 // steps are visible only inside that arm: later instructions read the
 // construct's result, except a Parallel's, whose arms' steps are readable
 // once every arm has completed. A control operand may read the workflow
-// input ("$input[.<field>…]"); a call input still may not. Template and
-// Child are still rejected.
+// input ("$input[.<field>…]"); a call input still may not. Child lowers
+// to a durable child run of the workflow it names, readable later as its
+// result; it runs only under a durable runner (slice 4). Template is still
+// rejected.
 //
 // The rules live in internal/lowering, which the agent catalog lowers
 // composed workflows through as well, so the two cannot drift (#249). Lower

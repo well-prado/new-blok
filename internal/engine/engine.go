@@ -327,6 +327,7 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 	controls := controlIDs(program.Instructions, nil)
 	var scopes ScopeJournal
 	var loops LoopJournal
+	var children ChildJournal
 	if journal != nil && program.Format == contract.ControlFormat {
 		// A durable runner journals if, choose and try-finally through
 		// the journal's scopes (#333 slice 2), each and parallel through
@@ -339,6 +340,9 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 		loops, _ = journal.(LoopJournal)
 		if kind := unjournaledControl(program.Instructions); kind != "" && loops == nil {
 			return Result{}, &Error{Code: "durable_control_unsupported", Class: "configuration", Err: fmt.Errorf("this durable runner's journal does not journal the slots %s needs", kind)}
+		}
+		if children, _ = journal.(ChildJournal); children == nil && hasChild(program.Instructions) {
+			return Result{}, &Error{Code: "durable_control_unsupported", Class: "configuration", Err: fmt.Errorf("this durable runner's journal does not start child runs")}
 		}
 	}
 	if journal != nil {
@@ -510,6 +514,31 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 			appendStep := func(step StepResult) { recordStep(step, stepSpan, external) }
 			emit := func(event inspection.Event) { emitIn(event, f.iteration) }
 			switch instruction.Kind {
+			case "child":
+				// A child run is durable: in memory there is no run to start.
+				if children == nil {
+					step.Error = &Error{Code: "child_requires_durable_runner", Class: "configuration", Step: instruction.ID}
+					step.FinishedAt = time.Now().UTC()
+					appendStep(step)
+					return step.Error
+				}
+				callInput, err := resolveCallInput(f, instruction, input)
+				if err != nil {
+					step.Error = &Error{Code: "invalid_input_reference", Class: "validation", Step: instruction.ID, Err: err}
+					step.FinishedAt = time.Now().UTC()
+					appendStep(step)
+					return step.Error
+				}
+				step.Input, step.StartedAt, step.Attempt = callInput, time.Now().UTC(), 1
+				output, err := runChild(ctx, children, runID, program.Digest, f, instruction, callInput)
+				if err != nil {
+					step.Error = err
+					step.FinishedAt = time.Now().UTC()
+					appendStep(step)
+					return step.Error
+				}
+				f.values[instruction.ID] = output
+				step.Output = output
 			case "wait":
 				if journal == nil || instruction.Wait == nil {
 					step.Error = &Error{Code: "wait_requires_durable_runner", Class: "configuration", Step: instruction.ID}

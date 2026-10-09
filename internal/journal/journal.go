@@ -77,6 +77,10 @@ type Config struct {
 	// it, unless renewed, before another may take it over. Zero means 30
 	// seconds; negative is refused.
 	WakeupLease time.Duration
+	// MaxChildDepth bounds how deep child runs nest (ADR 0028, slice 4): a
+	// run started as a child of a run at that depth is refused
+	// (child_depth_exceeded). Zero means 8; negative is refused.
+	MaxChildDepth int
 }
 
 // RetainedRun identifies a completed run Compact is about to delete.
@@ -93,6 +97,7 @@ type Journal struct {
 	minimum  time.Duration
 	holder   string
 	lease    time.Duration
+	depth    int
 }
 
 type AdmissionRequest struct {
@@ -198,7 +203,13 @@ func New(ctx context.Context, database store.Database, config Config) (*Journal,
 	if config.WakeupLease < 0 {
 		return nil, errors.New("journal: wakeup lease must not be negative")
 	}
-	j := &Journal{database: database, clock: config.Clock, hooks: config.Hooks, audit: config.Audit, hold: config.Hold, minimum: config.MinRetention, holder: config.Holder, lease: config.WakeupLease}
+	if config.MaxChildDepth < 0 {
+		return nil, errors.New("journal: child depth must not be negative")
+	}
+	j := &Journal{database: database, clock: config.Clock, hooks: config.Hooks, audit: config.Audit, hold: config.Hold, minimum: config.MinRetention, holder: config.Holder, lease: config.WakeupLease, depth: config.MaxChildDepth}
+	if j.depth == 0 {
+		j.depth = 8
+	}
 	if j.clock == nil {
 		j.clock = time.Now
 	}
@@ -987,6 +998,9 @@ func (j *Journal) completeRun(ctx context.Context, tx *sql.Tx, runID string, out
 	if err != nil {
 		return err
 	}
+	if changed == 1 {
+		return j.settleParent(ctx, tx, runID, engine.ChildOutcome{State: "completed", Output: output})
+	}
 	if changed != 1 {
 		var state string
 		if scanErr := tx.QueryRowContext(ctx, `SELECT state FROM journal_runs WHERE run_id = ?`, runID).Scan(&state); scanErr != nil {
@@ -1056,7 +1070,7 @@ func (j *Journal) failRun(ctx context.Context, tx *sql.Tx, runID, errorCode, err
 	if changed != 1 {
 		return ErrStaleAttempt
 	}
-	return nil
+	return j.settleParent(ctx, tx, runID, engine.ChildOutcome{State: "failed", Code: errorCode, Class: errorClass})
 }
 
 // MarkRunUncertain records a conservative terminal projection when the
@@ -1082,7 +1096,7 @@ func (j *Journal) markRunUncertain(ctx context.Context, tx *sql.Tx, runID, error
 			return err
 		}
 		if changed == 1 {
-			return nil
+			return j.settleParent(ctx, tx, runID, engine.ChildOutcome{State: "uncertain", Code: errorCode, Class: errorClass})
 		}
 		var state, oldCode, oldClass string
 		if err := tx.QueryRowContext(ctx, `SELECT state,error_code,error_class FROM journal_runs WHERE run_id=?`, runID).Scan(&state, &oldCode, &oldClass); err != nil {

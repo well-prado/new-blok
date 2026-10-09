@@ -464,6 +464,12 @@ func TestLowerRejectsEveryControlConstructWithoutAProgramForm(t *testing.T) {
 					t.Fatalf("Lower err=%v format=%d; want the construct lowered", err, program.Format)
 				}
 				return
+			case "child":
+				// A durable child run of the workflow it names (#333 slice 4).
+				if err != nil || program.Format != contract.ControlFormat || program.Instructions[1].Kind != "child" || program.Instructions[1].Node != "conformance/child" {
+					t.Fatalf("Lower err=%v program=%+v; want a child instruction of conformance/child", err, program)
+				}
+				return
 			}
 			want := `flow: instruction "construct" of kind "` + tc.kind + `" cannot be lowered`
 			if err == nil || err.Error() != want {

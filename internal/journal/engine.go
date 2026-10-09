@@ -46,6 +46,7 @@ type RunJournal struct {
 	mu       sync.Mutex
 	artifact string
 	pending  []string
+	children func(string) (ChildWorkflow, bool)
 }
 
 // ForRun returns the engine journal for runID under lease token, from
@@ -75,7 +76,7 @@ var (
 func Permanent(err error) bool {
 	return errors.Is(err, ErrRequestConflict) || errors.Is(err, ErrWaitCanceled) || errors.Is(err, ErrStepResultLimit) ||
 		errors.Is(err, ErrChildPrincipalMismatch) || errors.Is(err, ErrChildCycle) || errors.Is(err, ErrRecordFinal) ||
-		errors.Is(err, engine.ErrScopeConflict)
+		errors.Is(err, engine.ErrScopeConflict) || errors.As(err, new(*engine.ChildError))
 }
 
 // uncertainStep marks an effect whose outcome is unknown; the engine fails

@@ -5,9 +5,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/well-prado/new-blok/contract/signal"
+	"github.com/well-prado/new-blok/internal/engine"
 )
 
 // A wait is waiting until a timer claim or a signal fires it. A fired wait
@@ -172,6 +174,10 @@ func (j *Journal) Signal(ctx context.Context, envelope signal.Envelope, authoriz
 func (j *Journal) SignalWait(ctx context.Context, envelope signal.Envelope, target WaitTarget, authorized bool) (SignalResult, error) {
 	if err := envelope.Validate(); err != nil {
 		return SignalResult{}, err
+	}
+	if strings.HasPrefix(envelope.Name, engine.ChildWaitPrefix) {
+		// Only a child run's end fires its parent's wait (StartChild).
+		return SignalResult{}, ErrReservedSignal
 	}
 	if (target.InvocationPath == "") != (target.IterationPath == "") {
 		return SignalResult{}, errors.New("journal: a wait target needs both its invocation and iteration path, or neither")
