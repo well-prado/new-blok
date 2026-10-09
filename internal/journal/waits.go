@@ -561,3 +561,13 @@ func scanWait(row interface{ Scan(...any) error }) (WaitRecord, error) {
 	record.Payload = append([]byte(nil), payload...)
 	return record, nil
 }
+
+// Waiting reports whether runID has an open wait: a live run that has one
+// is suspended there (at a wait or a child run) until it is woken.
+func (j *Journal) Waiting(ctx context.Context, runID string) (bool, error) {
+	var waiting bool
+	err := j.withRead(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM journal_waits WHERE run_id = ? AND state = ?)`, runID, waitWaiting).Scan(&waiting)
+	})
+	return waiting, err
+}

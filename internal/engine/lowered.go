@@ -547,8 +547,9 @@ func controlIDs(instructions []contract.InternalInstruction, ids map[string]bool
 		ids = map[string]bool{}
 	}
 	for _, instruction := range instructions {
-		if instruction.Kind == "child" {
-			// A child's result is its outcome's JSON value.
+		if instruction.Kind == "child" || instruction.Kind == "wait" {
+			// A child's result is its outcome's JSON value; a wait's, in a
+			// control program, the signal's.
 			ids[instruction.ID] = true
 		}
 		if instruction.Control == nil {

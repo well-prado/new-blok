@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/well-prado/new-blok/contract"
 	"github.com/well-prado/new-blok/internal/lowering"
@@ -16,7 +17,14 @@ import (
 type Durability string
 
 const (
+	// Memory runs a workflow in process, as it always ran (the default:
+	// the zero Durability is Memory).
 	Memory Durability = "memory"
+	// Durable runs a workflow through the application's journal
+	// (execution.Durable, ADR 0028 slice 5): a run survives a crash or a
+	// restart, waits and child runs suspend it without holding a goroutine,
+	// and every effect it committed is never run again.
+	Durable Durability = "durable"
 )
 
 type Spec struct {
@@ -388,6 +396,30 @@ func TryFinally[T any](builder *Builder, id string, tryArm func(*ArmBuilder) Ref
 	output := "$join." + id
 	builder.record(Instruction{Kind: "try-finally", ID: id, Output: output, Data: map[string]any{"try": try.Output, "suspension": "finally-not-guaranteed-after-suspension"}, Arms: []Arm{try, finally}})
 	return Ref[T]{expression: expression{Kind: "join", Source: output}}
+}
+
+// Signal is what a Wait resumes with: the signal that fired it, by ID and
+// payload, or a timeout.
+type Signal struct {
+	SignalID string          `json:"signalId,omitempty"`
+	Payload  json.RawMessage `json:"payload,omitempty"`
+	TimedOut bool            `json:"timedOut,omitempty"`
+}
+
+// Wait suspends a durable run until a signal named name reaches it, or
+// timeout passes (zero waits for the signal alone). It runs only under a
+// durable runner (flow.Durable), outside every Each and Parallel.
+func Wait(builder *Builder, id, name string, timeout time.Duration) Ref[Signal] {
+	if name == "" {
+		violate("flow: wait signal name is required")
+	}
+	if timeout < 0 {
+		violate("flow: wait timeout must not be negative")
+	}
+	builder.reserveID(id)
+	output := "$step." + id
+	builder.record(Instruction{Kind: "wait", ID: id, Input: "$input", Output: output, Data: map[string]any{"name": name, "timeoutMillis": timeout.Milliseconds()}})
+	return Ref[Signal]{expression: expression{Kind: "reference", Source: output}}
 }
 
 func Child[I, O any](builder *Builder, id, workflow string, input Ref[I]) Ref[O] {

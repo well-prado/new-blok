@@ -606,7 +606,8 @@ func TestDurableWaitInsideAnArmSuspendsAndResumes(t *testing.T) {
 	}
 	rj := j.ForRun(run, listed[0].LeaseToken)
 	result, err := runner.RunJournaled(ctx, program, engineValue{Value: 4}, run, rj)
-	if output, ok := result.Output.(engine.WaitResult); err != nil || !ok || output.SignalID != "s1" {
+	// In a control program a wait's result is a JSON value (#333 slice 5).
+	if output, ok := result.Output.(map[string]any); err != nil || !ok || output["signalId"] != "s1" {
 		t.Fatalf("resumed output=%#v err=%v; want the signal", result.Output, err)
 	}
 	if got, want := invocations(t, nodes.log), map[string]int{"release": 1}; !reflect.DeepEqual(got, want) {

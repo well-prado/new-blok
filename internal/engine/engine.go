@@ -574,8 +574,15 @@ func (e *Engine) run(ctx context.Context, program contract.InternalProgram, inpu
 					appendStep(step)
 					return step.Error
 				}
-				f.values[instruction.ID] = waitResult
-				step.Output = waitResult
+				var resumed any = waitResult
+				if program.Format == contract.ControlFormat {
+					// As a JSON value, like every construct value, so a typed
+					// node reading it (flow.Signal) receives it converted.
+					encoded, _ := json.Marshal(waitResult)
+					resumed, _ = decodeLiteral(encoded)
+				}
+				f.values[instruction.ID] = resumed
+				step.Output = resumed
 			case "call":
 				var stepAttempt StepAttempt
 				definition, ok := e.nodes[instruction.Node]

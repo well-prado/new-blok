@@ -146,7 +146,7 @@ func Lower(workflowID, version string, instructions []Instruction, output string
 // whose kind the options do not lower, wherever it is nested.
 func checkKinds(instructions []Instruction, options Options) error {
 	for _, instruction := range instructions {
-		supported := instruction.Kind == "call" || (options.Children || options.Control) && instruction.Kind == "child"
+		supported := instruction.Kind == "call" || (options.Children || options.Control) && instruction.Kind == "child" || options.Control && instruction.Kind == "wait"
 		switch instruction.Kind {
 		case "compare", "default", "if", "choose", "try-finally", "each", "parallel":
 			supported = options.Control
@@ -203,6 +203,16 @@ func (l *lowerer) block(instructions []Instruction, current *scope, depth int) (
 		next := contract.InternalInstruction{Index: index, ID: instruction.ID, Kind: "call", Node: instruction.Node}
 		prefix := stepPrefix
 		switch instruction.Kind {
+		case "wait":
+			// A durable wait (flow.Wait, ADR 0028 slice 5): its result is
+			// the signal, read later as "$step.<id>".
+			name, _ := instruction.Data["name"].(string)
+			timeout, ok := wholeNumber(instruction.Data["timeoutMillis"])
+			if name == "" || !ok || timeout < 0 {
+				return nil, fmt.Errorf("flow: wait %q needs a signal name and a timeout of zero or more", instruction.ID)
+			}
+			next = contract.InternalInstruction{Index: index, ID: instruction.ID, Kind: "wait", Wait: &contract.WaitInstruction{Name: name, TimeoutMillis: int64(timeout)}}
+			l.controlled = true
 		case "call", "child":
 			references, literal, err := lowerInput(instruction, func(source string) (contract.Reference, error) { return l.reference(source, current) }, l.options)
 			if err != nil {
