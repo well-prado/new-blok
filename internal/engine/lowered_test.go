@@ -242,3 +242,43 @@ func TestIsNullFollowsPointers(t *testing.T) {
 		}
 	}
 }
+
+// scopeOnlyJournal journals scopes but not loop slots.
+type scopeOnlyJournal struct{ refusingJournal }
+
+func (j *scopeOnlyJournal) EnterScope(context.Context, ScopeIdentity, json.RawMessage) (ScopeEntry, error) {
+	j.calls++
+	return ScopeEntry{}, nil
+}
+func (j *scopeOnlyJournal) ExitScope(context.Context, ScopeEntry, json.RawMessage) error {
+	j.calls++
+	return nil
+}
+
+// A durable runner journals each and parallel only through a LoopJournal
+// (#333 slice 3): with a journal that journals scopes alone it refuses
+// them, at any depth, before touching the journal; and a wait inside an
+// each or a parallel is refused for every runner, since it would suspend
+// one item or arm alone.
+func TestLoopsNeedALoopJournalAndHoldNoWait(t *testing.T) {
+	parallel := contract.InternalInstruction{ID: "fan", Kind: "parallel", Control: &contract.Control{Arms: []contract.Arm{{Name: "0", Instructions: []contract.InternalInstruction{compare("x", "eq", literal("1"), literal("1"))}}}}}
+	nested := controlProgram(contract.InternalInstruction{ID: "t", Kind: "try-finally", Control: &contract.Control{Arms: []contract.Arm{
+		{Name: "try", Instructions: []contract.InternalInstruction{parallel}, Output: ptr(literal("1"))}, {Name: "finally"},
+	}}}, outputOf("t"))
+	nested.Digest = "sha256:" + strings.Repeat("0", 64)
+	journal := &scopeOnlyJournal{}
+	_, err := New(nil).RunJournaled(context.Background(), nested, nil, "run-1", journal)
+	var classified *Error
+	if !errors.As(err, &classified) || classified.Code != "durable_control_unsupported" || journal.calls != 0 {
+		t.Fatalf("err=%v journal calls=%d; want durable_control_unsupported before the journal", err, journal.calls)
+	}
+	wait := contract.InternalInstruction{ID: "approval", Kind: "wait", Wait: &contract.WaitInstruction{Name: "approval"}}
+	for name, program := range map[string]contract.InternalProgram{
+		"each":     controlProgram(contract.InternalInstruction{ID: "loop", Kind: "each", Control: &contract.Control{Concurrency: 1, Operands: []contract.Operand{literal("[1]")}, Arms: []contract.Arm{{Name: "body", Instructions: []contract.InternalInstruction{wait}, Output: ptr(literal("1"))}}}}, outputOf("loop")),
+		"parallel": controlProgram(contract.InternalInstruction{ID: "fan", Kind: "parallel", Control: &contract.Control{Arms: []contract.Arm{{Name: "0", Instructions: []contract.InternalInstruction{wait}}}}}, outputOf("fan")),
+	} {
+		if _, err := New(nil).Run(context.Background(), program, nil); !errors.As(err, &classified) || classified.Code != "invalid_control" {
+			t.Fatalf("%s: a wait inside it: err=%v; want invalid_control", name, err)
+		}
+	}
+}

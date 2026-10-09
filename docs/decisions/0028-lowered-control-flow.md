@@ -3,10 +3,10 @@
 - Status: in progress for E07-T10 (#333), delivered as stacked PRs. Slice 1a
   lowers and runs compare, default, if, choose and try-finally in memory;
   slice 1b adds each and parallel, and lets control operands read the
-  workflow input. Slice 2 (this revision) runs compare, default, if, choose
-  and try-finally durably on a single host. Slice 3 makes each and
-  parallel durable, slice 4 child runs, slice 5 resumes at startup.
-- Date: 2026-10-07 (slice 2: 2026-10-08)
+  workflow input. Slice 2 runs compare, default, if, choose and
+  try-finally durably on a single host; slice 3 (this revision) each and
+  parallel. Slice 4 makes child runs durable, slice 5 resumes at startup.
+- Date: 2026-10-07 (slice 2: 2026-10-08; slice 3: 2026-10-08)
 - Roadmap: E07-T10 ([#333](https://github.com/well-prado/new-blok/issues/333)),
   closing gaps in E07-T05 (#47) and E07-T07 (#49)
 - Owners: `internal/lowering` (lowering), `internal/engine` (`lowered.go`,
@@ -228,7 +228,9 @@ write goes to the arm's frame only, so arm results never reach
   suspension. A finally failure replaces the try outcome, except in a
   sibling canceled by fail-fast, where the first error wins (the finally
   failure still appears in Steps); otherwise a try failure is the run's
-  failure, after finally ran. A finally fail-fast started is still
+  failure, after finally ran. A finally failure that replaces an
+  uncertain try failure is itself uncertain (#412 Review R round 1): the
+  try's effect still has an unknown outcome. A finally fail-fast started is still
   canceled when the caller then cancels the run (Review R round 2).
 - Each construct is itself a step in `Result.Steps`, after its arm's
   steps, carrying its result. It is never `Executed` (that reports a node
@@ -266,9 +268,9 @@ write goes to the arm's frame only, so arm results never reach
   per id, so each iteration is its own attempt of the step.
 
 A durable runner (`RunJournaled`) runs a format-2 program only through a
-journal that journals scopes (slice 2, below), and refuses each and
-parallel with `durable_control_unsupported` before touching its journal
-until slice 3 journals their joins.
+journal that journals scopes (slice 2, below), and each and parallel only
+through one that also journals their slots (slice 3, below); otherwise it
+refuses with `durable_control_unsupported` before touching its journal.
 
 ### Paths
 
@@ -315,15 +317,33 @@ Recorded here so slices 2 and 3 key their journal records consistently:
   `<invocation path>@<iteration path>` (`@` appears in no segment), parent
   path the scope of the construct that encloses it (empty at the top),
   kind the instruction kind.
-- A join (`journal.JoinRecord`, positional slots since #370) per each or
-  parallel execution: `Expected` = number of items or arms, slot `i` =
-  item `i` or arm `i`. #370 reads a JSON null slot as not yet filled, so a
-  slot always holds the result wrapped, `{"output": <result>}`: an
-  iteration whose body yields null, and every parallel arm (which yields
-  nothing), still fills its slot.
-- An each over no items has no join: `RecordJoin` requires `Expected ≥ 1`,
-  so slice 3 records the empty each's scope as completed with output `[]`
-  and writes no join row.
+- **Changed in slice 3: per-item scopes, not a join row.** This section
+  first planned one `journal_joins` row (`RecordJoin`'s positional slots,
+  #370) per each or parallel execution. A join row is rewritten whole on
+  every slot it fills, so its cost grows with the square of the items
+  (#386). Measured before slice 3 (real SQLite, synchronous FULL, one
+  slot per transaction, origin/main d19cddc, load 9–20):
+
+  | Storage | Items | Total | Per slot | Bytes rewritten |
+  | --- | --- | --- | --- | --- |
+  | One join row | 1,000 | 8.7 s | 8.7 ms | 14.9 MB |
+  | One join row | 10,000 | 3 min 5 s | 18.5 ms, growing with n | 1.54 GB |
+  | One row per slot (a table) | 10,000 | 4.8–21 s | 0.5–2.1 ms | 0.25 MB |
+  | One completed scope per slot | 10,000 | 11.8–12.5 s | about 1.2 ms | 0.25 MB |
+
+  So each item of an each, and each arm of a parallel, is a *slot*: a
+  scope of its own, recorded completed with the item's result. It costs
+  one row insert, flat per item, needs no schema change (`journal_scopes`,
+  no journal v8), and inherits the scope rules: a completed scope is final
+  (#334), compaction and inspection already handle scopes. `journal_joins`
+  is not used for each or parallel. #370's positional-slot rules carry
+  over: exactly N slots (the loop scope records N and a replay with
+  another N is `journal_scope_conflict`), a filled slot never changes
+  (`RecordSlot` with other bytes is `ErrRecordFinal`), and a slot holds
+  the result wrapped, `{"output": <result>}`, so a null result still
+  fills it.
+- An each over no items records its scope completed with output `[]` and
+  no slot.
 
 ### Durable if, choose and try-finally on a single host (slice 2)
 
@@ -336,8 +356,9 @@ second time, she follows the mark.
   run lease (ADR 0027). A durable runner whose journal does not implement
   it refuses every control program with `durable_control_unsupported`
   before touching the journal: `internal/cluster`'s step journal does not
-  (#396 must land first; `TestClusterRefusesControlPrograms` pins it). Each
-  and parallel are refused at any depth until slice 3.
+  (`TestClusterRefusesControlPrograms` pins it; its run suspensions are
+  already keyed so one step can suspend more than once, #396). Each and
+  parallel need a `LoopJournal` too (slice 3).
 - **Scopes.** If, choose and try-finally each enter a scope
   (`journal_scopes`) when they start: path
   `<invocation path>@<iteration path>` (`route@root`,
@@ -422,6 +443,78 @@ second time, she follows the mark.
   the arm's last step and the exit re-enters and re-exits the scope on
   replay. That is two extra synchronous commits per construct.
 
+### Durable each and parallel on a single host (slice 3)
+
+Like a stamp card: each item gets its stamp once it is done, and after a
+restart nobody redoes a stamped item; the card is read instead.
+
+- **Who journals.** `engine.LoopJournal` (a `ScopeJournal` plus `Slots`,
+  `RecordSlot`, `FailScope`), implemented by `journal.RunJournal`. A
+  durable runner whose journal journals scopes but not slots refuses each
+  and parallel at any depth (`durable_control_unsupported`); the cluster
+  journals neither.
+- **Scopes.** The each or parallel enters its scope with the decision
+  `{"items":N}` (N items or arms). Item `i` of an each is the slot
+  `<each invocation>/body@<iteration>` (`loop/body@loop[3]`); arm `i` of a
+  parallel is `<parallel invocation>/<i>@<iteration>` (`fan/0@root`); both
+  have the loop's scope as parent, kind `item` or `arm`. A construct
+  inside an item or arm has that slot as its parent
+  (`loop/body/route@loop[0]` under `loop/body@loop[0]`), and its steps the
+  item's iteration.
+- **Slots.** Once an item's body (or an arm) succeeds, its result is
+  recorded as its slot, `{"output": <result>}`, in one transaction
+  (`RecordSlot`), after the body's last step committed: no hook joins it
+  to that step's transaction. A crash in that window loses nothing: the
+  item has no slot, so it replays, and its committed steps load instead of
+  running. On entry an each reads its recorded slots in one range read of
+  the scope key (`Slots`, by path prefix and parent) and **skips every
+  item with a slot**: its body does not run again, its slot is its result.
+  A parallel's arms always run again on a replay (their committed steps
+  load), because steps after the parallel read their results; their slots
+  record that they completed.
+- **Results.** In a durable run an each's result is its slots' results as
+  JSON values (numbers as `json.Number`, objects as maps), live and
+  replayed alike, so a run that crashed and one that did not produce the
+  same value; a typed node reading it converts it as any construct value
+  (`node.Any.ConvertInput`). In memory it stays the Go values the bodies
+  returned. The result is assembled from the slots in index order, every
+  slot filled. The loop scope itself exits with a summary, `{"items":N}`,
+  not the results again: a scope output is bounded like a step result
+  (1 MiB), so storing every slot in it again bounded a whole loop by one
+  result's limit, and a loop failed permanently at its exit after all its
+  effects ran (#412 Review R round 1). Inspection reads the slots.
+- **Slot bound.** A slot holds any result a step may commit plus its
+  wrapping: `journal.MaxSlotBytes` = `MaxStepResultBytes` + 11 bytes of
+  `{"output":}`, so an item whose result is one step's result fits. An
+  item whose result is larger than any step result, such as an inner
+  each's results, does not (see Limits).
+- **Fail-fast is recorded.** When an item or arm fails and the loop fails
+  fast, the loop's own failure (not a suspension, the caller's
+  cancellation or a journal fault, which a later execution may get past)
+  is recorded in its scope's decision,
+  `{"items":N,"failed":{"code","class","step","uncertain"}}`
+  (`FailScope`, fenced by the scope attempt). A later execution of the run
+  reports that failure at once, starting no item, so a run that crashed
+  after failing fast cannot run items it would never have run. The record
+  is written when the loop joins its in-flight items; a crash before it
+  lets a replay run the loop again. **Uncertainty is never lost** (#412
+  Review R round 1, BLOCKER): the first failure is reported, but if any
+  item or arm it canceled failed uncertain (an effect in flight, whose
+  outcome is now unknown), the reported and recorded failure is marked
+  uncertain, so the run ends uncertain instead of failing. Otherwise
+  `FailRun` refuses the run (`ErrUncertain`) and every replay reports the
+  same certain failure: the run would never settle. As a second line,
+  the resumer ends a run uncertain when `FailRun` refuses it with
+  `ErrUncertain`, whatever failure the execution reported.
+- **Waits** stay refused inside an each or parallel (`checkProgram`), so
+  no item suspends alone; the loop scope's entry is the run's first
+  commit after a wait before it, so concurrent items never share a
+  pending wakeup acknowledgement.
+- **Cost.** One transaction per slot, plus the loop's entry and exit; a
+  replay reads the slots once. A 1,000-item each leaves 1,001 scopes,
+  which inspection pages over and compaction removes with the run
+  (`TestThousandItemLoopInspectsAndCompacts`).
+
 ## Compatibility (ADR 0001)
 
 | Change | Class | Migration |
@@ -448,6 +541,10 @@ second time, she follows the mark.
 | A suspension inside try does not run finally | behavioral (only reachable durably) | None |
 | `Journal.FailRun`, `RunJournal.FailRun` and `Journal.CancelRun` cancel the run's running scopes (they used to refuse a run with one); `journal.Permanent` reports `ErrRecordFinal` and `engine.ErrScopeConflict` | behavioral | None |
 | The engine refuses a program whose step id appears twice anywhere in its tree (`duplicate_step_id`), any format | behavioral, fail closed; lowering and v1 artifacts already refused it | None |
+| `engine.LoopJournal`; `RunJournal.Slots`, `.RecordSlot`, `.FailScope` (slice 3) | API, additive | None |
+| A durable runner whose journal is a `LoopJournal` runs each and parallel; item and arm slots are `journal_scopes` rows of kind `item`/`arm` | behavioral: programs it refused now run; no schema change | None |
+| A durable each's result is its slots' JSON values | behavioral (durable runs only, which refused each before) | None |
+| `journal.MaxSlotBytes`; a loop scope's output is `{"items":N}`; a failure reported over an uncertain sibling or try is uncertain; the resumer ends uncertain a run `FailRun` refuses with `ErrUncertain` (#412 Review R round 1) | API additive; behavioral | None |
 
 ## Evidence (slice 1a)
 
@@ -502,6 +599,39 @@ no each/parallel refusal, any journal running control (cluster), no
 kind/parent check, a non-root iteration, the new decision replacing the
 recorded one.
 
+## Evidence (slice 3)
+
+`internal/journal/loop_test.go` (real SQLite, real SIGKILL of a child
+process at commit barriers, resumed in the parent; node invocations
+logged to a file) and `internal/resumer/loop_crash_test.go` (a resumer in
+a child process is killed after the third slot; a resumer in the parent
+finds the run interrupted once the lease lapses and completes it). All
+RED on origin/main d19cddc (the durable runner refused each and
+parallel). Mutations, RED: slots never skipped, a null result read as an
+empty slot, slots not wrapped, fail-fast not recorded, a recorded failure
+ignored, the item count unchecked, a recorded slot overwritten, `Slots`
+with neither its prefix range nor its parent bound (either bound alone
+reads exactly the loop's slots, so removing only one stays GREEN), item
+frames not their slot, no loop exit,
+slots out of order, M47a and a blank slot parent, any scope journal
+running loops. One mutation stays GREEN by construction: recording a
+caller's cancellation as the loop's failure, because the record itself
+is written under the canceled context and so never commits.
+
+Review R round 1 (#412) added, each RED under a mutation of its fix:
+fail-fast over a sibling's uncertain effect (journal and through the
+resumer: settled uncertain on the first execution, where it was left
+interrupted forever), the resumer's `ErrUncertain` fallback, the recorded
+and replayed uncertainty, finally replacing an uncertain try, four
+300 KiB items completing, an item of exactly `MaxStepResultBytes`
+fitting its slot, a journal fault not recorded as the loop's failure,
+`FailScope`'s attempt fence, and `RecordSlot`/`Slots` refused after the
+run ended or under a stale lease. The parallel kill test now parks only
+once its second arm has started (it counted that invocation; a delayed
+arm failed it 3/3). Round 2 added the parallel half of the uncertainty
+rule and kept a suspension from being marked uncertain, each RED under
+a mutation of its fix.
+
 ## Limits
 
 - Child and template still do not lower (child needs a child-run path;
@@ -511,13 +641,20 @@ recorded one.
 - `internal/program`'s artifact format (version 1) refuses control
   programs; a version-2 artifact for them is decided with the durable
   slices.
-- Each and parallel run in memory only (slice 3 journals their joins);
-  child runs are slice 4; resuming accepted runs at startup is slice 5.
-  The cluster runs no control program durably (#396).
+- Child runs are slice 4; resuming accepted runs at startup is slice 5.
+  The cluster runs no control program durably: its step journal journals
+  no scopes yet (#333).
 - Slice 2's crash tests drive `engine.RunJournaled` over `RunJournal`
-  with the leases `TakeRunLease` and `PendingResumptions` hand out, the
-  calls the single-host resumer (#384) makes; they do not go through the
-  resumer itself, which is not on main yet.
+  with the leases the journal hands out, the calls the single-host
+  resumer (#384) makes; slice 3 adds one crash test through the resumer
+  itself.
+- No bound on a run's total work across nested loops yet (#386 part 1).
+- A slot is bounded like a step result, so nested loops can exceed it: an
+  outer each item whose result is an inner each's results (four 300 KiB
+  inner items, 1.2 MB) fails permanently (`journal_scope_slot`,
+  `ErrStepResultLimit`) after the inner slots were written (#412 Review R
+  round 2). Return a smaller result from the outer body, or read the inner
+  results where they are used.
 - `flow` cannot record a wait, so a wait in an arm comes only from a
   program built otherwise; flow keeps its suspension note.
 - A construct's result over `journal.MaxStepResultBytes` (1 MiB) fails a
