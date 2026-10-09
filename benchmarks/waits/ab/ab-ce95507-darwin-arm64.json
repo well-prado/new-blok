@@ -1,0 +1,1165 @@
+{
+ "SchemaVersion": 1,
+ "Workload": "issue332-wait-v1 (benchmarks/waits TestWaitFootprintAndBurstSamples), 10,000 runs, 8 workers, batch 500; one repetition per arm; arms are separate processes run back to back, their order alternated per pair",
+ "Old": "ce9550769d8e78b5564e683098420c7ff9ff92d1 (#385 as first measured: the resumer of #384 at 1fd524a)",
+ "Host": "Darwin arm64 Apple M4 (10 CPUs, 24 GiB), shared developer host with other agents work running; Go 1.27.1 non-race test binaries; journal on the host APFS temporary directory",
+ "Note": "load1m is the host 1-minute load average sampled before and after each arm; newOverOld is new divided by old within a pair (above 1: new is higher, i.e. faster for runsPerSecond, slower for suspendSeconds, p50 and p99)",
+ "Batches": [
+  {
+   "new": "76f5ea8 (#384 after Review R round 3, merged into #385)",
+   "pairs": [
+    {
+     "pair": 1,
+     "order": "old then new",
+     "old": {
+      "load1mBefore": 61.95,
+      "load1mAfter": 77.47,
+      "suspendSeconds": 32.794,
+      "burstSeconds": 38.401,
+      "signalSeconds": 38.395,
+      "runsPerSecond": 260.4,
+      "p50Ms": 11.351,
+      "p90Ms": 39.481,
+      "p99Ms": 1124.582,
+      "maxMs": 1585.505,
+      "goroutinesBeforeSuspendedAfter": [
+       3,
+       3,
+       3
+      ],
+      "rssKiBBeforeSuspended": [
+       29248,
+       37712
+      ],
+      "heapInuseBytesBeforeSuspended": [
+       6586368,
+       7258112
+      ]
+     },
+     "new": {
+      "load1mBefore": 77.47,
+      "load1mAfter": 54.83,
+      "suspendSeconds": 30.354,
+      "burstSeconds": 44.413,
+      "signalSeconds": 44.388,
+      "runsPerSecond": 225.2,
+      "p50Ms": 22.714,
+      "p90Ms": 3598.845,
+      "p99Ms": 4936.467,
+      "maxMs": 5155.657,
+      "goroutinesBeforeSuspendedAfter": [
+       3,
+       3,
+       3
+      ],
+      "rssKiBBeforeSuspended": [
+       30080,
+       36672
+      ],
+      "heapInuseBytesBeforeSuspended": [
+       6471680,
+       6987776
+      ]
+     },
+     "newOverOld": {
+      "runsPerSecond": 0.865,
+      "suspendSeconds": 0.926,
+      "p50": 2.001,
+      "p99": 4.39
+     }
+    },
+    {
+     "pair": 2,
+     "order": "new then old",
+     "old": {
+      "load1mBefore": 46.67,
+      "load1mAfter": 48.03,
+      "suspendSeconds": 38.836,
+      "burstSeconds": 59.318,
+      "signalSeconds": 59.312,
+      "runsPerSecond": 168.6,
+      "p50Ms": 14.744,
+      "p90Ms": 65.955,
+      "p99Ms": 355.334,
+      "maxMs": 1157.197,
+      "goroutinesBeforeSuspendedAfter": [
+       3,
+       3,
+       3
+      ],
+      "rssKiBBeforeSuspended": [
+       29568,
+       35408
+      ],
+      "heapInuseBytesBeforeSuspended": [
+       6414336,
+       7192576
+      ]
+     },
+     "new": {
+      "load1mBefore": 54.83,
+      "load1mAfter": 46.67,
+      "suspendSeconds": 69.543,
+      "burstSeconds": 73.427,
+      "signalSeconds": 73.42,
+      "runsPerSecond": 136.2,
+      "p50Ms": 18.439,
+      "p90Ms": 132.512,
+      "p99Ms": 590.429,
+      "maxMs": 1058.975,
+      "goroutinesBeforeSuspendedAfter": [
+       3,
+       3,
+       3
+      ],
+      "rssKiBBeforeSuspended": [
+       29264,
+       35504
+      ],
+      "heapInuseBytesBeforeSuspended": [
+       6520832,
+       6881280
+      ]
+     },
+     "newOverOld": {
+      "runsPerSecond": 0.808,
+      "suspendSeconds": 1.791,
+      "p50": 1.251,
+      "p99": 1.662
+     }
+    },
+    {
+     "pair": 3,
+     "order": "old then new",
+     "old": {
+      "load1mBefore": 48.03,
+      "load1mAfter": 43.61,
+      "suspendSeconds": 33.623,
+      "burstSeconds": 36.038,
+      "signalSeconds": 35.955,
+      "runsPerSecond": 277.5,
+      "p50Ms": 12.364,
+      "p90Ms": 33.227,
+      "p99Ms": 134.01,
+      "maxMs": 275.151,
+      "goroutinesBeforeSuspendedAfter": [
+       3,
+       3,
+       3
+      ],
+      "rssKiBBeforeSuspended": [
+       28816,
+       35968
+      ],
+      "heapInuseBytesBeforeSuspended": [
+       6545408,
+       7315456
+      ]
+     },
+     "new": {
+      "load1mBefore": 43.61,
+      "load1mAfter": 43.65,
+      "suspendSeconds": 36.924,
+      "burstSeconds": 39.25,
+      "signalSeconds": 39.239,
+      "runsPerSecond": 254.8,
+      "p50Ms": 12.853,
+      "p90Ms": 48.14,
+      "p99Ms": 174.779,
+      "maxMs": 898.638,
+      "goroutinesBeforeSuspendedAfter": [
+       3,
+       3,
+       3
+      ],
+      "rssKiBBeforeSuspended": [
+       30768,
+       40016
+      ],
+      "heapInuseBytesBeforeSuspended": [
+       6553600,
+       7159808
+      ]
+     },
+     "newOverOld": {
+      "runsPerSecond": 0.918,
+      "suspendSeconds": 1.098,
+      "p50": 1.04,
+      "p99": 1.304
+     }
+    },
+    {
+     "pair": 4,
+     "order": "new then old",
+     "old": {
+      "load1mBefore": 42.88,
+      "load1mAfter": 30.82,
+      "suspendSeconds": 46.251,
+      "burstSeconds": 63.697,
+      "signalSeconds": 63.647,
+      "runsPerSecond": 157.0,
+      "p50Ms": 13.496,
+      "p90Ms": 58.004,
+      "p99Ms": 320.01,
+      "maxMs": 1774.742,
+      "goroutinesBeforeSuspendedAfter": [
+       3,
+       3,
+       3
+      ],
+      "rssKiBBeforeSuspended": [
+       27632,
+       34288
+      ],
+      "heapInuseBytesBeforeSuspended": [
+       6455296,
+       7118848
+      ]
+     },
+     "new": {
+      "load1mBefore": 43.65,
+      "load1mAfter": 42.88,
+      "suspendSeconds": 51.738,
+      "burstSeconds": 75.762,
+      "signalSeconds": 75.757,
+      "runsPerSecond": 132.0,
+      "p50Ms": 17.893,
+      "p90Ms": 72.495,
+      "p99Ms": 248.728,
+      "maxMs": 860.22,
+      "goroutinesBeforeSuspendedAfter": [
+       3,
+       3,
+       3
+      ],
+      "rssKiBBeforeSuspended": [
+       30272,
+       35104
+      ],
+      "heapInuseBytesBeforeSuspended": [
+       6717440,
+       7307264
+      ]
+     },
+     "newOverOld": {
+      "runsPerSecond": 0.841,
+      "suspendSeconds": 1.119,
+      "p50": 1.326,
+      "p99": 0.777
+     }
+    },
+    {
+     "pair": 5,
+     "order": "old then new",
+     "old": {
+      "load1mBefore": 30.82,
+      "load1mAfter": 48.36,
+      "suspendSeconds": 30.495,
+      "burstSeconds": 51.803,
+      "signalSeconds": 51.79,
+      "runsPerSecond": 193.0,
+      "p50Ms": 9.05,
+      "p90Ms": 37.317,
+      "p99Ms": 186.555,
+      "maxMs": 1671.443,
+      "goroutinesBeforeSuspendedAfter": [
+       3,
+       3,
+       3
+      ],
+      "rssKiBBeforeSuspended": [
+       27552,
+       34672
+      ],
+      "heapInuseBytesBeforeSuspended": [
+       6389760,
+       7135232
+      ]
+     },
+     "new": {
+      "load1mBefore": 48.36,
+      "load1mAfter": 28.99,
+      "suspendSeconds": 56.742,
+      "burstSeconds": 37.645,
+      "signalSeconds": 37.643,
+      "runsPerSecond": 265.6,
+      "p50Ms": 7.538,
+      "p90Ms": 25.805,
+      "p99Ms": 131.44,
+      "maxMs": 1135.686,
+      "goroutinesBeforeSuspendedAfter": [
+       3,
+       3,
+       3
+      ],
+      "rssKiBBeforeSuspended": [
+       28432,
+       37616
+      ],
+      "heapInuseBytesBeforeSuspended": [
+       6553600,
+       7405568
+      ]
+     },
+     "newOverOld": {
+      "runsPerSecond": 1.376,
+      "suspendSeconds": 1.861,
+      "p50": 0.833,
+      "p99": 0.705
+     }
+    },
+    {
+     "pair": 6,
+     "order": "new then old",
+     "old": {
+      "load1mBefore": 32.64,
+      "load1mAfter": 34.0,
+      "suspendSeconds": 26.736,
+      "burstSeconds": 35.591,
+      "signalSeconds": 35.587,
+      "runsPerSecond": 281.0,
+      "p50Ms": 7.548,
+      "p90Ms": 24.147,
+      "p99Ms": 154.697,
+      "maxMs": 840.713,
+      "goroutinesBeforeSuspendedAfter": [
+       3,
+       3,
+       3
+      ],
+      "rssKiBBeforeSuspended": [
+       29744,
+       33744
+      ],
+      "heapInuseBytesBeforeSuspended": [
+       6561792,
+       7364608
+      ]
+     },
+     "new": {
+      "load1mBefore": 28.99,
+      "load1mAfter": 32.64,
+      "suspendSeconds": 31.51,
+      "burstSeconds": 36.153,
+      "signalSeconds": 36.141,
+      "runsPerSecond": 276.6,
+      "p50Ms": 8.153,
+      "p90Ms": 33.622,
+      "p99Ms": 502.67,
+      "maxMs": 1633.776,
+      "goroutinesBeforeSuspendedAfter": [
+       15,
+       3,
+       3
+      ],
+      "rssKiBBeforeSuspended": [
+       29680,
+       35712
+      ],
+      "heapInuseBytesBeforeSuspended": [
+       6512640,
+       7176192
+      ]
+     },
+     "newOverOld": {
+      "runsPerSecond": 0.984,
+      "suspendSeconds": 1.179,
+      "p50": 1.08,
+      "p99": 3.249
+     }
+    },
+    {
+     "pair": 7,
+     "order": "old then new",
+     "old": {
+      "load1mBefore": 34.0,
+      "load1mAfter": 54.05,
+      "suspendSeconds": 24.699,
+      "burstSeconds": 50.828,
+      "signalSeconds": 50.809,
+      "runsPerSecond": 196.7,
+      "p50Ms": 10.857,
+      "p90Ms": 52.634,
+      "p99Ms": 391.225,
+      "maxMs": 1484.907,
+      "goroutinesBeforeSuspendedAfter": [
+       3,
+       3,
+       3
+      ],
+      "rssKiBBeforeSuspended": [
+       29808,
+       37728
+      ],
+      "heapInuseBytesBeforeSuspended": [
+       6856704,
+       7438336
+      ]
+     },
+     "new": {
+      "load1mBefore": 54.05,
+      "load1mAfter": 140.35,
+      "suspendSeconds": 55.349,
+      "burstSeconds": 49.372,
+      "signalSeconds": 49.158,
+      "runsPerSecond": 202.5,
+      "p50Ms": 14.484,
+      "p90Ms": 231.721,
+      "p99Ms": 1374.994,
+      "maxMs": 1587.843,
+      "goroutinesBeforeSuspendedAfter": [
+       3,
+       3,
+       3
+      ],
+      "rssKiBBeforeSuspended": [
+       28528,
+       37360
+      ],
+      "heapInuseBytesBeforeSuspended": [
+       6668288,
+       7315456
+      ]
+     },
+     "newOverOld": {
+      "runsPerSecond": 1.029,
+      "suspendSeconds": 2.241,
+      "p50": 1.334,
+      "p99": 3.515
+     }
+    },
+    {
+     "pair": 8,
+     "order": "new then old",
+     "old": {
+      "load1mBefore": 125.2,
+      "load1mAfter": 77.64,
+      "suspendSeconds": 29.767,
+      "burstSeconds": 39.823,
+      "signalSeconds": 39.818,
+      "runsPerSecond": 251.1,
+      "p50Ms": 9.118,
+      "p90Ms": 27.151,
+      "p99Ms": 112.016,
+      "maxMs": 694.881,
+      "goroutinesBeforeSuspendedAfter": [
+       3,
+       3,
+       3
+      ],
+      "rssKiBBeforeSuspended": [
+       29728,
+       36544
+      ],
+      "heapInuseBytesBeforeSuspended": [
+       6651904,
+       7241728
+      ]
+     },
+     "new": {
+      "load1mBefore": 140.35,
+      "load1mAfter": 125.2,
+      "suspendSeconds": 39.957,
+      "burstSeconds": 39.334,
+      "signalSeconds": 39.322,
+      "runsPerSecond": 254.2,
+      "p50Ms": 9.901,
+      "p90Ms": 52.344,
+      "p99Ms": 272.897,
+      "maxMs": 903.77,
+      "goroutinesBeforeSuspendedAfter": [
+       3,
+       3,
+       3
+      ],
+      "rssKiBBeforeSuspended": [
+       30976,
+       35568
+      ],
+      "heapInuseBytesBeforeSuspended": [
+       6594560,
+       7118848
+      ]
+     },
+     "newOverOld": {
+      "runsPerSecond": 1.012,
+      "suspendSeconds": 1.342,
+      "p50": 1.086,
+      "p99": 2.436
+     }
+    }
+   ],
+   "newOverOld": {
+    "runsPerSecond": {
+     "geomean": 0.966,
+     "median": 0.951,
+     "min": 0.808,
+     "max": 1.376,
+     "pairsAbove1": 3
+    },
+    "suspendSeconds": {
+     "geomean": 1.384,
+     "median": 1.26,
+     "min": 0.926,
+     "max": 2.241,
+     "pairsAbove1": 7
+    },
+    "p50": {
+     "geomean": 1.207,
+     "median": 1.168,
+     "min": 0.833,
+     "max": 2.001,
+     "pairsAbove1": 7
+    },
+    "p99": {
+     "geomean": 1.863,
+     "median": 2.049,
+     "min": 0.705,
+     "max": 4.39,
+     "pairsAbove1": 6
+    }
+   }
+  },
+  {
+   "new": "7d08ca95c12926ca527a270a52f06de0339a38e8 (this PR after merging main d19cddc: #384 merged, #402, #403, #404)",
+   "pairs": [
+    {
+     "pair": 1,
+     "order": "old then new",
+     "old": {
+      "load1mBefore": 12.57,
+      "load1mAfter": 11.11,
+      "suspendSeconds": 8.14,
+      "burstSeconds": 11.417,
+      "signalSeconds": 11.415,
+      "runsPerSecond": 875.9,
+      "p50Ms": 3.34,
+      "p90Ms": 5.529,
+      "p99Ms": 18.807,
+      "maxMs": 59.314,
+      "goroutinesBeforeSuspendedAfter": [
+       3,
+       3,
+       3
+      ],
+      "rssKiBBeforeSuspended": [
+       29984,
+       36624
+      ],
+      "heapInuseBytesBeforeSuspended": [
+       6496256,
+       7159808
+      ]
+     },
+     "new": {
+      "load1mBefore": 11.11,
+      "load1mAfter": 17.76,
+      "suspendSeconds": 9.299,
+      "burstSeconds": 24.612,
+      "signalSeconds": 24.603,
+      "runsPerSecond": 406.3,
+      "p50Ms": 6.327,
+      "p90Ms": 367.835,
+      "p99Ms": 574.131,
+      "maxMs": 682.449,
+      "goroutinesBeforeSuspendedAfter": [
+       3,
+       3,
+       3
+      ],
+      "rssKiBBeforeSuspended": [
+       29600,
+       35616
+      ],
+      "heapInuseBytesBeforeSuspended": [
+       6455296,
+       7143424
+      ]
+     },
+     "newOverOld": {
+      "runsPerSecond": 0.464,
+      "suspendSeconds": 1.142,
+      "p50": 1.894,
+      "p99": 30.528
+     }
+    },
+    {
+     "pair": 2,
+     "order": "new then old",
+     "old": {
+      "load1mBefore": 15.16,
+      "load1mAfter": 13.88,
+      "suspendSeconds": 18.129,
+      "burstSeconds": 25.046,
+      "signalSeconds": 25.041,
+      "runsPerSecond": 399.3,
+      "p50Ms": 4.475,
+      "p90Ms": 14.862,
+      "p99Ms": 79.237,
+      "maxMs": 1051.488,
+      "goroutinesBeforeSuspendedAfter": [
+       3,
+       11,
+       3
+      ],
+      "rssKiBBeforeSuspended": [
+       29936,
+       35824
+      ],
+      "heapInuseBytesBeforeSuspended": [
+       6488064,
+       7110656
+      ]
+     },
+     "new": {
+      "load1mBefore": 17.76,
+      "load1mAfter": 15.16,
+      "suspendSeconds": 24.235,
+      "burstSeconds": 20.77,
+      "signalSeconds": 20.769,
+      "runsPerSecond": 481.5,
+      "p50Ms": 3.568,
+      "p90Ms": 9.272,
+      "p99Ms": 70.026,
+      "maxMs": 946.774,
+      "goroutinesBeforeSuspendedAfter": [
+       3,
+       3,
+       3
+      ],
+      "rssKiBBeforeSuspended": [
+       30128,
+       36752
+      ],
+      "heapInuseBytesBeforeSuspended": [
+       6553600,
+       7266304
+      ]
+     },
+     "newOverOld": {
+      "runsPerSecond": 1.206,
+      "suspendSeconds": 1.337,
+      "p50": 0.797,
+      "p99": 0.884
+     }
+    },
+    {
+     "pair": 3,
+     "order": "old then new",
+     "old": {
+      "load1mBefore": 13.88,
+      "load1mAfter": 23.69,
+      "suspendSeconds": 28.672,
+      "burstSeconds": 45.17,
+      "signalSeconds": 45.142,
+      "runsPerSecond": 221.4,
+      "p50Ms": 10.721,
+      "p90Ms": 31.93,
+      "p99Ms": 128.202,
+      "maxMs": 966.779,
+      "goroutinesBeforeSuspendedAfter": [
+       3,
+       3,
+       3
+      ],
+      "rssKiBBeforeSuspended": [
+       29104,
+       41312
+      ],
+      "heapInuseBytesBeforeSuspended": [
+       6504448,
+       7168000
+      ]
+     },
+     "new": {
+      "load1mBefore": 23.69,
+      "load1mAfter": 25.38,
+      "suspendSeconds": 54.687,
+      "burstSeconds": 43.056,
+      "signalSeconds": 43.053,
+      "runsPerSecond": 232.3,
+      "p50Ms": 8.883,
+      "p90Ms": 33.712,
+      "p99Ms": 216.206,
+      "maxMs": 727.862,
+      "goroutinesBeforeSuspendedAfter": [
+       3,
+       3,
+       3
+      ],
+      "rssKiBBeforeSuspended": [
+       30208,
+       34224
+      ],
+      "heapInuseBytesBeforeSuspended": [
+       6561792,
+       7077888
+      ]
+     },
+     "newOverOld": {
+      "runsPerSecond": 1.049,
+      "suspendSeconds": 1.907,
+      "p50": 0.829,
+      "p99": 1.686
+     }
+    },
+    {
+     "pair": 4,
+     "order": "new then old",
+     "old": {
+      "load1mBefore": 13.66,
+      "load1mAfter": 9.78,
+      "suspendSeconds": 12.297,
+      "burstSeconds": 19.415,
+      "signalSeconds": 19.414,
+      "runsPerSecond": 515.1,
+      "p50Ms": 2.979,
+      "p90Ms": 7.538,
+      "p99Ms": 80.055,
+      "maxMs": 666.121,
+      "goroutinesBeforeSuspendedAfter": [
+       3,
+       3,
+       3
+      ],
+      "rssKiBBeforeSuspended": [
+       29008,
+       36144
+      ],
+      "heapInuseBytesBeforeSuspended": [
+       6512640,
+       7208960
+      ]
+     },
+     "new": {
+      "load1mBefore": 25.38,
+      "load1mAfter": 13.66,
+      "suspendSeconds": 22.911,
+      "burstSeconds": 20.915,
+      "signalSeconds": 20.912,
+      "runsPerSecond": 478.1,
+      "p50Ms": 2.861,
+      "p90Ms": 5.733,
+      "p99Ms": 95.551,
+      "maxMs": 687.056,
+      "goroutinesBeforeSuspendedAfter": [
+       3,
+       3,
+       3
+      ],
+      "rssKiBBeforeSuspended": [
+       29328,
+       36560
+      ],
+      "heapInuseBytesBeforeSuspended": [
+       6602752,
+       7331840
+      ]
+     },
+     "newOverOld": {
+      "runsPerSecond": 0.928,
+      "suspendSeconds": 1.863,
+      "p50": 0.96,
+      "p99": 1.194
+     }
+    },
+    {
+     "pair": 5,
+     "order": "old then new",
+     "old": {
+      "load1mBefore": 9.78,
+      "load1mAfter": 7.74,
+      "suspendSeconds": 17.861,
+      "burstSeconds": 20.692,
+      "signalSeconds": 20.69,
+      "runsPerSecond": 483.3,
+      "p50Ms": 3.621,
+      "p90Ms": 8.129,
+      "p99Ms": 86.299,
+      "maxMs": 295.639,
+      "goroutinesBeforeSuspendedAfter": [
+       3,
+       3,
+       3
+      ],
+      "rssKiBBeforeSuspended": [
+       28784,
+       35232
+      ],
+      "heapInuseBytesBeforeSuspended": [
+       6496256,
+       7192576
+      ]
+     },
+     "new": {
+      "load1mBefore": 7.74,
+      "load1mAfter": 38.27,
+      "suspendSeconds": 29.59,
+      "burstSeconds": 67.698,
+      "signalSeconds": 67.687,
+      "runsPerSecond": 147.7,
+      "p50Ms": 37.03,
+      "p90Ms": 1489.223,
+      "p99Ms": 2876.815,
+      "maxMs": 3241.975,
+      "goroutinesBeforeSuspendedAfter": [
+       3,
+       3,
+       3
+      ],
+      "rssKiBBeforeSuspended": [
+       29664,
+       30688
+      ],
+      "heapInuseBytesBeforeSuspended": [
+       6504448,
+       7299072
+      ]
+     },
+     "newOverOld": {
+      "runsPerSecond": 0.306,
+      "suspendSeconds": 1.657,
+      "p50": 10.226,
+      "p99": 33.335
+     }
+    },
+    {
+     "pair": 6,
+     "order": "new then old",
+     "old": {
+      "load1mBefore": 22.14,
+      "load1mAfter": 14.78,
+      "suspendSeconds": 19.04,
+      "burstSeconds": 36.365,
+      "signalSeconds": 36.36,
+      "runsPerSecond": 275.0,
+      "p50Ms": 6.908,
+      "p90Ms": 16.394,
+      "p99Ms": 120.104,
+      "maxMs": 1015.248,
+      "goroutinesBeforeSuspendedAfter": [
+       3,
+       3,
+       3
+      ],
+      "rssKiBBeforeSuspended": [
+       28928,
+       35968
+      ],
+      "heapInuseBytesBeforeSuspended": [
+       6488064,
+       7159808
+      ]
+     },
+     "new": {
+      "load1mBefore": 38.27,
+      "load1mAfter": 22.14,
+      "suspendSeconds": 65.004,
+      "burstSeconds": 31.472,
+      "signalSeconds": 31.468,
+      "runsPerSecond": 317.7,
+      "p50Ms": 6.034,
+      "p90Ms": 16.518,
+      "p99Ms": 145.4,
+      "maxMs": 549.321,
+      "goroutinesBeforeSuspendedAfter": [
+       3,
+       3,
+       3
+      ],
+      "rssKiBBeforeSuspended": [
+       30448,
+       37696
+      ],
+      "heapInuseBytesBeforeSuspended": [
+       6651904,
+       7217152
+      ]
+     },
+     "newOverOld": {
+      "runsPerSecond": 1.155,
+      "suspendSeconds": 3.414,
+      "p50": 0.873,
+      "p99": 1.211
+     }
+    },
+    {
+     "pair": 7,
+     "order": "old then new",
+     "old": {
+      "load1mBefore": 14.78,
+      "load1mAfter": 21.29,
+      "suspendSeconds": 42.357,
+      "burstSeconds": 35.073,
+      "signalSeconds": 35.06,
+      "runsPerSecond": 285.1,
+      "p50Ms": 7.238,
+      "p90Ms": 24.088,
+      "p99Ms": 103.564,
+      "maxMs": 796.983,
+      "goroutinesBeforeSuspendedAfter": [
+       3,
+       3,
+       3
+      ],
+      "rssKiBBeforeSuspended": [
+       28880,
+       36400
+      ],
+      "heapInuseBytesBeforeSuspended": [
+       6496256,
+       7241728
+      ]
+     },
+     "new": {
+      "load1mBefore": 21.29,
+      "load1mAfter": 37.88,
+      "suspendSeconds": 74.467,
+      "burstSeconds": 49.187,
+      "signalSeconds": 49.183,
+      "runsPerSecond": 203.3,
+      "p50Ms": 13.428,
+      "p90Ms": 54.028,
+      "p99Ms": 373.593,
+      "maxMs": 1014.871,
+      "goroutinesBeforeSuspendedAfter": [
+       3,
+       3,
+       3
+      ],
+      "rssKiBBeforeSuspended": [
+       30016,
+       39136
+      ],
+      "heapInuseBytesBeforeSuspended": [
+       6709248,
+       7348224
+      ]
+     },
+     "newOverOld": {
+      "runsPerSecond": 0.713,
+      "suspendSeconds": 1.758,
+      "p50": 1.855,
+      "p99": 3.607
+     }
+    },
+    {
+     "pair": 8,
+     "order": "new then old",
+     "old": {
+      "load1mBefore": 24.22,
+      "load1mAfter": 23.4,
+      "suspendSeconds": 13.981,
+      "burstSeconds": 37.043,
+      "signalSeconds": 37.035,
+      "runsPerSecond": 270.0,
+      "p50Ms": 5.982,
+      "p90Ms": 29.077,
+      "p99Ms": 1179.614,
+      "maxMs": 1491.584,
+      "goroutinesBeforeSuspendedAfter": [
+       3,
+       3,
+       3
+      ],
+      "rssKiBBeforeSuspended": [
+       28688,
+       35552
+      ],
+      "heapInuseBytesBeforeSuspended": [
+       6529024,
+       7184384
+      ]
+     },
+     "new": {
+      "load1mBefore": 37.88,
+      "load1mAfter": 24.22,
+      "suspendSeconds": 46.026,
+      "burstSeconds": 34.078,
+      "signalSeconds": 34.076,
+      "runsPerSecond": 293.4,
+      "p50Ms": 6.855,
+      "p90Ms": 18.116,
+      "p99Ms": 151.546,
+      "maxMs": 1061.946,
+      "goroutinesBeforeSuspendedAfter": [
+       3,
+       3,
+       3
+      ],
+      "rssKiBBeforeSuspended": [
+       29536,
+       34848
+      ],
+      "heapInuseBytesBeforeSuspended": [
+       6692864,
+       7340032
+      ]
+     },
+     "newOverOld": {
+      "runsPerSecond": 1.087,
+      "suspendSeconds": 3.292,
+      "p50": 1.146,
+      "p99": 0.128
+     }
+    }
+   ],
+   "newOverOld": {
+    "runsPerSecond": {
+     "geomean": 0.788,
+     "median": 0.988,
+     "min": 0.306,
+     "max": 1.206,
+     "pairsAbove1": 4
+    },
+    "suspendSeconds": {
+     "geomean": 1.911,
+     "median": 1.81,
+     "min": 1.142,
+     "max": 3.414,
+     "pairsAbove1": 8
+    },
+    "p50": {
+     "geomean": 1.478,
+     "median": 1.053,
+     "min": 0.797,
+     "max": 10.226,
+     "pairsAbove1": 4
+    },
+    "p99": {
+     "geomean": 2.375,
+     "median": 1.449,
+     "min": 0.128,
+     "max": 33.335,
+     "pairsAbove1": 6
+    }
+   }
+  }
+ ],
+ "Diagnostic": {
+  "question": "is the new head's slower suspension caused by Start taking a worker before the lease (#384 Review R round 1, B2)?",
+  "var": "7d08ca9 with Start leasing first and queueing on a worker in a goroutine, as ce95507 did (go test -overlay; not committed code)",
+  "runs": [
+   {
+    "triple": 1,
+    "arm": "old",
+    "load1mBefore": 17.64,
+    "load1mAfter": 14.64,
+    "suspendSeconds": 8.536,
+    "runsPerSecond": 681.1,
+    "p50Ms": 2.848,
+    "p99Ms": 48.748
+   },
+   {
+    "triple": 1,
+    "arm": "new",
+    "load1mBefore": 14.64,
+    "load1mAfter": 10.54,
+    "suspendSeconds": 14.897,
+    "runsPerSecond": 401.0,
+    "p50Ms": 4.778,
+    "p99Ms": 95.848
+   },
+   {
+    "triple": 1,
+    "arm": "var",
+    "load1mBefore": 10.54,
+    "load1mAfter": 8.0,
+    "suspendSeconds": 16.934,
+    "runsPerSecond": 502.2,
+    "p50Ms": 3.01,
+    "p99Ms": 80.016
+   },
+   {
+    "triple": 2,
+    "arm": "new",
+    "load1mBefore": 8.0,
+    "load1mAfter": 6.96,
+    "suspendSeconds": 13.868,
+    "runsPerSecond": 565.4,
+    "p50Ms": 2.967,
+    "p99Ms": 72.789
+   },
+   {
+    "triple": 2,
+    "arm": "var",
+    "load1mBefore": 6.96,
+    "load1mAfter": 5.54,
+    "suspendSeconds": 20.074,
+    "runsPerSecond": 570.9,
+    "p50Ms": 2.672,
+    "p99Ms": 82.642
+   },
+   {
+    "triple": 2,
+    "arm": "old",
+    "load1mBefore": 5.54,
+    "load1mAfter": 4.61,
+    "suspendSeconds": 21.701,
+    "runsPerSecond": 610.4,
+    "p50Ms": 2.646,
+    "p99Ms": 89.524
+   },
+   {
+    "triple": 3,
+    "arm": "var",
+    "load1mBefore": 4.61,
+    "load1mAfter": 4.17,
+    "suspendSeconds": 16.165,
+    "runsPerSecond": 694.1,
+    "p50Ms": 2.189,
+    "p99Ms": 54.697
+   },
+   {
+    "triple": 3,
+    "arm": "old",
+    "load1mBefore": 4.17,
+    "load1mAfter": 6.43,
+    "suspendSeconds": 15.245,
+    "runsPerSecond": 407.2,
+    "p50Ms": 3.977,
+    "p99Ms": 103.477
+   },
+   {
+    "triple": 3,
+    "arm": "new",
+    "load1mBefore": 6.43,
+    "load1mAfter": 4.64,
+    "suspendSeconds": 16.082,
+    "runsPerSecond": 679.6,
+    "p50Ms": 2.514,
+    "p99Ms": 43.449
+   },
+   {
+    "triple": 4,
+    "arm": "old",
+    "load1mBefore": 4.64,
+    "load1mAfter": 5.34,
+    "suspendSeconds": 14.072,
+    "runsPerSecond": 553.0,
+    "p50Ms": 2.811,
+    "p99Ms": 71.982
+   },
+   {
+    "triple": 4,
+    "arm": "new",
+    "load1mBefore": 5.34,
+    "load1mAfter": 7.54,
+    "suspendSeconds": 23.753,
+    "runsPerSecond": 411.6,
+    "p50Ms": 3.627,
+    "p99Ms": 79.954
+   },
+   {
+    "triple": 4,
+    "arm": "var",
+    "load1mBefore": 7.54,
+    "load1mAfter": 6.57,
+    "suspendSeconds": 11.559,
+    "runsPerSecond": 683.9,
+    "p50Ms": 2.461,
+    "p99Ms": 38.293
+   }
+  ]
+ }
+}

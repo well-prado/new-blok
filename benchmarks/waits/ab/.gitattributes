@@ -1,0 +1,2 @@
+# A patch carries its context lines verbatim: a space, then the source line.
+*.patch -whitespace
