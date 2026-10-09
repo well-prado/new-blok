@@ -456,11 +456,11 @@ func (r *Runtime) suspend(ctx context.Context, owner distributed.Owner, run RunR
 		return nil
 	}
 	if latest.State != "running" {
-		return fmt.Errorf("cluster: cannot suspend run in state %q", latest.State)
+		return fmt.Errorf("cluster: cannot suspend run in state %q at step %s", latest.State, stepID)
 	}
 	latest.State = "waiting"
 	state, _ := json.Marshal(latest)
-	transition := transitionID("suspend", run.RunID+"\x00"+stepID, owner.Token)
+	transition := suspendTransitionID(run.RunID, revision, owner.Token)
 	if _, err := r.store.CommitFencedState(ctx, owner, run.RunID, revision, transition, "run.waiting", state, state); err != nil {
 		if errors.Is(err, distributed.ErrAlreadyWritten) {
 			current, _, readErr := r.readRun(ctx, owner.Partition, run.RunID)
@@ -687,6 +687,26 @@ func nextFairCandidate(lastTenant string, records []RunRecord) RunRecord {
 func digest(data []byte) string {
 	hash := sha256.Sum256(data)
 	return "sha256:" + hex.EncodeToString(hash[:])
+}
+
+// suspendTransitionID identifies one suspension of a run: the transition
+// from the exact run revision it read, under the owner's fence, as a claim
+// is identified. Each suspension starts from a later revision than the
+// last (the claim or re-admission that let the run execute again moved
+// it), so a loop's next iteration, a parallel arm or any later construct
+// suspending at a step already suspended at is a new transition, whatever
+// the engine reports as the suspending step (#396). A retry of a
+// suspension whose commit outcome was unknown is safe because suspend
+// first reads the run and returns early when it is already waiting under
+// this owner; the ErrAlreadyWritten branch after the commit is defensive
+// (a committed transition has moved the revision, so the same ID is not
+// normally re-sent). Before #396 the identity was the run and step
+// ("suspend", runID \x00 stepID, fence); that encoding is no longer
+// written and cannot coincide with this one, since a step ID never
+// contains '=' (contract.IDPattern). Pinned by
+// TestSuspendTransitionIDIsPinned.
+func suspendTransitionID(runID string, revision, fence int64) string {
+	return transitionID("suspend", runID+"\x00revision="+strconv.FormatInt(revision, 10), fence)
 }
 
 func transitionID(kind, runID string, fence int64) string {

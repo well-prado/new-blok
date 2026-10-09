@@ -307,6 +307,28 @@ iteration is part of it, and nothing but the identity's values moves it.
   #382; another iteration adds `"IterationPath"`. Every wait, step record
   and operation already stored keeps its ID: no migration, and no journal
   schema change.
+- **Suspension.** `internal/cluster` commits a run's suspension (the
+  `run.waiting` event) under the run revision the transition starts
+  from, under the owner's fence: `transitionID("suspend", runID \x00
+  "revision=" revision, fence)`, as a claim is identified (#396). Each
+  suspension starts from a later revision than the last, because the
+  claim or the signal or timer that let the run continue moved it, so a
+  loop's next iteration suspending at the same step under the same owner
+  is a new event. A retry of a suspension whose commit outcome was
+  unknown is safe because `suspend` first reads the run and returns early
+  when it is already `waiting` under this owner; its `ErrAlreadyWritten`
+  reconcile after the commit is defensive only (the committed transition
+  moved the revision, so the same ID is not normally sent again). The
+  engine reports only the suspending step, not its iteration, so the
+  runtime does not depend on it. Before #396 the ID was the run and step (`runID \x00 stepID`)
+  and the second iteration was refused as already written. Events
+  written that way stay readable under their IDs; nothing reads them back
+  but the transition that wrote them, and the new encoding cannot produce
+  one (a step ID never contains `=`). No other cluster event is keyed by
+  run and step: waits (scheduled, signaled, late signal, timed out) are
+  keyed by the wait ID, which carries the iteration, step records by the
+  operation key and attempt, a claim and the scheduler cursor by
+  revision, and a run's terminal transition happens once per run.
 - **Explicit encodings.** What is hashed or stored never follows a Go
   field name. `engine.OperationKey` hashes its own versioned encoding
   (`operationKeyV1`), not `StepIdentity`; `StepIdentity` (stored in every
@@ -335,8 +357,10 @@ iteration is part of it, and nothing but the identity's values moves it.
 Pinned by `TestStepIdentityEncodingIsPinned` (`internal/engine`),
 `TestOperationKeyFormatIsPinned` and the existing `TestWaitIDFormatIsPinned`
 (`internal/journal`), and `TestWaitIDFormatIsPinned` (`internal/cluster`),
-each with vectors taken from origin/main a3d90d2. The engine and journal
-vectors failed on a3d90d2 when a Go field of the identity was renamed
+each with vectors taken from origin/main a3d90d2;
+`TestSuspendTransitionIDIsPinned` (`internal/cluster`) pins the
+suspension encoding and the pre-#396 ID origin/main f3ffd4d wrote. The
+engine and journal vectors failed on a3d90d2 when a Go field of the identity was renamed
 (`ArtifactDigest`, `InvocationPath`) and pass with the same rename after
 #382. The engine does not pass iteration paths yet (#333 slice 2 does);
 ADR 0028 has a durable runner refuse control flow until then.
@@ -424,6 +448,7 @@ not gain a scheduler).
 | `engine.StepIdentity.IterationPath`, `RootIteration`, `NewStepIdentity`, `OperationKey`, `Iteration`, `Canonical`, `SameExecution`; JSON tags on `StepIdentity` and `journal.OperationIdentity` with the names already used (#382) | API, additive; stored bytes unchanged | None |
 | `cluster.WaitIDFor` takes the iteration path; root-iteration IDs unchanged (#382) | API, breaking for its callers (tests only) | Pass `""` (or `engine.RootIteration`) for a step outside every loop |
 | `RunJournal` keys steps and waits by the identity's iteration path; the cluster step journal refuses an identity whose operation key its fields do not derive (#382) | behavioral; the engine passes the root iteration until #333 | None |
+| A cluster run suspension (`run.waiting`) is identified by run revision and owner fence, not run and step (#396) | behavioral; suspensions committed before it keep their event IDs | None |
 | The engine refuses a program whose step id does not match `contract.IDPattern` (`invalid_step_id`, class `configuration`) (#382) | behavioral, fail closed; every lowered program already matches it | Rename the step to an id of the grammar |
 | `internal/resumer`; `Journal.InterruptedRuns`, `RunLease` (slice C2) | API, additive | None |
 
@@ -485,6 +510,18 @@ Review R round 1, `TestStepIDsMustFollowTheGrammar` (`internal/engine`),
 and `TestEngineSuspendsAndResumesThroughTheJournal` with its siblings now
 pin the root iteration of the engine's waits and steps in the journal.
 
+#396 (against a real three-voter etcd cluster, `internal/cluster`):
+`TestLoopIterationsSuspendIndependently` (two iterations suspend at one
+step under one owner; each is signaled and resumes with its own outcome)
+and `TestLoopIterationTimersSuspendIndependently` (iteration 0 times out,
+iteration 1 is signaled before its timer) failed on f3ffd4d with "event
+already committed" at the second suspension and pass after it;
+`TestSuspendTransitionIDIsPinned`. An upgrade probe had f3ffd4d suspend a
+run at its root wait and this change signal and complete it, with the
+same owner token and with a new one: the run's outcome and event kinds
+equal an f3ffd4d-only control, and the old suspension event is still
+read under its pre-#396 ID.
+
 ## Limits
 
 - Nothing calls `PendingResumptions` or `AcknowledgeWait` yet: slice C's
@@ -530,11 +567,6 @@ pin the root iteration of the engine's waits and steps in the journal.
 - A cluster wait inside a parallel arm or other construct is still told
   apart by step ID only; ADR 0028's invocation paths are unique per step,
   so this holds while step IDs are unique per workflow.
-- `internal/cluster`'s run suspension (`Runtime.suspend`) commits an event
-  identified by run, step and owner token: a second suspension at the same
-  step under the same owner (a loop's next iteration) is refused as
-  already written and the run stays `running` (a probe in #382's PR).
-  Durable loops on the cluster must identify it by iteration too.
 - Effect inputs over `MaxInspectionInputBytes` are refused at dispatch, as
   `BeginEffect` refuses them.
 - Pending signals of a run that ends stay pending (never late
