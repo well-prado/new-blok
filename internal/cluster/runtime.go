@@ -521,11 +521,22 @@ func (r *Runtime) runPartition(ctx context.Context, partition, ownerID string) e
 			continue
 		}
 		ownerCtx, cancelOwner := context.WithCancel(ctx)
+		// Arm the lease guard before any work starts: an acquisition whose
+		// response came back late may leave little or none of the proven
+		// lease (#405).
+		validUntil := acquireSent.Add(r.limits.OwnerTTL - leaseSafetyMargin(r.limits.OwnerTTL))
+		guard := time.AfterFunc(time.Until(validUntil), cancelOwner)
 		renewDone := make(chan struct{})
-		go func() {
-			defer close(renewDone)
-			r.keepOwnership(ownerCtx, cancelOwner, owner, acquireSent)
-		}()
+		if time.Now().Before(validUntil) {
+			go func() {
+				defer close(renewDone)
+				r.keepOwnership(ownerCtx, cancelOwner, owner, acquireSent, guard)
+			}()
+		} else {
+			// The lease can no longer be proven alive: do no work under it.
+			cancelOwner()
+			close(renewDone)
+		}
 		var processErr error
 		for ownerCtx.Err() == nil {
 			_, err := r.processOne(ownerCtx, owner)
@@ -545,6 +556,7 @@ func (r *Runtime) runPartition(ctx context.Context, partition, ownerID string) e
 		}
 		cancelOwner()
 		<-renewDone
+		guard.Stop()
 		// Relinquish the exact fence explicitly, so another worker can take
 		// the partition at once instead of after lease expiry. Release is
 		// fenced: it is a no-op error if ownership was already lost.
@@ -601,12 +613,14 @@ func renewRetryInterval(ttl time.Duration) time.Duration { return ttl / 10 }
 // ownership at once. Durable writes stay fenced by etcd regardless; this
 // bound only stops the worker from dispatching more work on a partition whose
 // lease could have expired.
-func (r *Runtime) keepOwnership(ownerCtx context.Context, cancelOwner context.CancelFunc, owner distributed.Owner, proven time.Time) {
+//
+// guard is the already-armed timer that cancels the worker at
+// proven + OwnerTTL - margin; keepOwnership moves it forward after each
+// successful renewal.
+func (r *Runtime) keepOwnership(ownerCtx context.Context, cancelOwner context.CancelFunc, owner distributed.Owner, proven time.Time, guard *time.Timer) {
 	ttl := r.limits.OwnerTTL
 	validFor := ttl - leaseSafetyMargin(ttl)
 	validUntil := proven.Add(validFor)
-	guard := time.AfterFunc(time.Until(validUntil), cancelOwner)
-	defer guard.Stop()
 	interval := ttl / 3
 	next := time.NewTimer(time.Until(proven.Add(interval)))
 	defer next.Stop()

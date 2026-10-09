@@ -107,7 +107,10 @@ acquisition already used that up). A failed or slow renewal is retried every
 OwnerTTL/10, and each attempt is bounded by `validUntil`. A renewal that succeeds moves
 `validUntil` to its own send time + OwnerTTL - OwnerTTL/4. A timer cancels the
 worker's execution context at `validUntil` even when a renewal call is stuck,
-so the worker dispatches no further step once its lease could be gone. A
+so the worker dispatches no further step once its lease could be gone. The
+timer is armed as soon as the acquisition returns, before any work starts. An
+acquisition whose response arrives after its `validUntil` has passed does no
+work at all: the worker releases that fence and tries again. A
 renewal that proves ownership is lost (lease expired, owner key deleted, or
 fence or incarnation changed) ends ownership at once. With renewals every
 OwnerTTL/3, a renewal therefore has about 5/12 of OwnerTTL to succeed
