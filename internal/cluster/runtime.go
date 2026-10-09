@@ -695,9 +695,12 @@ func digest(data []byte) string {
 // last (the claim or re-admission that let the run execute again moved
 // it), so a loop's next iteration, a parallel arm or any later construct
 // suspending at a step already suspended at is a new transition, whatever
-// the engine reports as the suspending step (#396). A retry of the same
-// suspension after an unresolved commit is the same transition, which
-// suspend reconciles. Before #396 the identity was the run and step
+// the engine reports as the suspending step (#396). A retry of a
+// suspension whose commit outcome was unknown is safe because suspend
+// first reads the run and returns early when it is already waiting under
+// this owner; the ErrAlreadyWritten branch after the commit is defensive
+// (a committed transition has moved the revision, so the same ID is not
+// normally re-sent). Before #396 the identity was the run and step
 // ("suspend", runID \x00 stepID, fence); that encoding is no longer
 // written and cannot coincide with this one, since a step ID never
 // contains '=' (contract.IDPattern). Pinned by

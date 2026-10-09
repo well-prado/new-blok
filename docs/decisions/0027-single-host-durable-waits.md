@@ -314,10 +314,13 @@ iteration is part of it, and nothing but the identity's values moves it.
   suspension starts from a later revision than the last, because the
   claim or the signal or timer that let the run continue moved it, so a
   loop's next iteration suspending at the same step under the same owner
-  is a new event; a retry of the same suspension after an unresolved
-  commit is the same event and is reconciled. The engine reports only
-  the suspending step, not its iteration, so the runtime does not depend
-  on it. Before #396 the ID was the run and step (`runID \x00 stepID`)
+  is a new event. A retry of a suspension whose commit outcome was
+  unknown is safe because `suspend` first reads the run and returns early
+  when it is already `waiting` under this owner; its `ErrAlreadyWritten`
+  reconcile after the commit is defensive only (the committed transition
+  moved the revision, so the same ID is not normally sent again). The
+  engine reports only the suspending step, not its iteration, so the
+  runtime does not depend on it. Before #396 the ID was the run and step (`runID \x00 stepID`)
   and the second iteration was refused as already written. Events
   written that way stay readable under their IDs; nothing reads them back
   but the transition that wrote them, and the new encoding cannot produce

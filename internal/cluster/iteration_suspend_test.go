@@ -25,6 +25,9 @@ type iterationSuspendFixture struct {
 	runID    string
 	artifact string
 	timeout  int64
+	// suspensions holds the event ID each suspendAt expects, derived from
+	// the run revision read just before it suspended.
+	suspensions []string
 }
 
 func newIterationSuspendFixture(t *testing.T, ctx context.Context, name string, timeoutMillis int64) *iterationSuspendFixture {
@@ -61,17 +64,60 @@ func (f *iterationSuspendFixture) runState() string {
 }
 
 // suspendAt opens iteration's wait and suspends the run there, as
-// processOne does when the engine reports the suspension.
+// processOne does when the engine reports the suspension, and records the
+// event ID the suspension must have: the one for the run revision it
+// starts from.
 func (f *iterationSuspendFixture) suspendAt(j *runStepJournal, iteration string) {
 	f.t.Helper()
 	if result, ready, err := j.Await(f.ctx, f.wait(iteration)); err != nil || ready {
 		f.t.Fatalf("%s: result=%+v ready=%v err=%v; want a wait of its own", iteration, result, ready, err)
 	}
+	_, revision, err := f.store.ReadState(f.ctx, f.owner.Partition, f.runID)
+	if err != nil || revision == 0 {
+		f.t.Fatalf("%s: read run revision before suspension: revision=%d err=%v", iteration, revision, err)
+	}
+	expected := suspendTransitionID(f.runID, revision, f.owner.Token)
+	f.suspensions = append(f.suspensions, expected)
 	if err := f.runtime.suspend(f.ctx, f.owner, j.record, "approval"); err != nil {
 		f.t.Fatalf("%s: suspend: %v; want the run suspended", iteration, err)
 	}
 	if state := f.runState(); state != "waiting" {
 		f.t.Fatalf("%s: run state %q after suspension; want waiting", iteration, state)
+	}
+	data, err := f.store.Read(f.ctx, f.owner.Partition, expected)
+	var event struct {
+		Kind string `json:"kind"`
+	}
+	if err != nil || json.Unmarshal(data, &event) != nil || event.Kind != "run.waiting" {
+		f.t.Fatalf("%s: no run.waiting event %s for the run revision %d the suspension read: kind=%q err=%v", iteration, expected, revision, event.Kind, err)
+	}
+}
+
+// checkSuspensionIDs: the run's run.waiting events are exactly the ones
+// suspendAt expected, each named by the revision its suspension read.
+func (f *iterationSuspendFixture) checkSuspensionIDs() {
+	f.t.Helper()
+	events, err := f.store.ListEvents(f.ctx, f.owner.Partition)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, event := range events {
+		if event.Kind == "run.waiting" {
+			got[event.ID] = true
+		}
+	}
+	want := map[string]bool{}
+	for _, id := range f.suspensions {
+		want[id] = true
+	}
+	if len(got) != len(want) || len(want) != len(f.suspensions) {
+		f.t.Fatalf("run.waiting event IDs %v; want one per suspension %v", got, f.suspensions)
+	}
+	for id := range want {
+		if !got[id] {
+			f.t.Fatalf("run.waiting event IDs %v; want %v (the revision each suspension read)", got, f.suspensions)
+		}
 	}
 }
 
@@ -120,6 +166,7 @@ func TestLoopIterationsSuspendIndependently(t *testing.T) {
 	if waiting := eventCount(t, ctx, f.store, f.owner.Partition, "run.waiting"); waiting != 2 {
 		t.Fatalf("run.waiting events=%d; want one per suspension (2)", waiting)
 	}
+	f.checkSuspensionIDs()
 }
 
 // TestLoopIterationTimersSuspendIndependently: the timer path keys by
@@ -160,6 +207,7 @@ func TestLoopIterationTimersSuspendIndependently(t *testing.T) {
 			t.Fatalf("%s events=%d; want %d", kind, got, want)
 		}
 	}
+	f.checkSuspensionIDs()
 }
 
 // TestSuspendTransitionIDIsPinned: a suspension's event ID is the run, the
