@@ -422,7 +422,10 @@ not gain a scheduler).
   engine input, a changed wait plan, a canceled wait, an oversize result)
   and workflow errors fail the run with a diagnostic; a transient fault
   leaves it to be retried at the scan's pace, `MaxRetries` times in a row,
-  then fails it (`retries_exhausted`). The count is of consecutive faults
+  then fails it (`retries_exhausted`). A run `FailRun` refuses because it
+  holds an effect of unknown outcome (`ErrUncertain`) is ended uncertain
+  instead (`MarkRunUncertain`), so it is never retried forever (#333
+  slice 3, #412 Review R round 1). The count is of consecutive faults
   here: it is forgotten when the run suspends or ends, when another
   holder takes it (a lost lease, at renewal or at completion, is not a
   fault), and, at each interrupted-run scan, for runs that ended

@@ -86,7 +86,16 @@ func (f *frame) item(id string, body contract.Arm, index int, item any) *frame {
 	if f.iteration != rootIteration {
 		inner.iteration = f.iteration + "/" + inner.iteration
 	}
+	inner.scope = inner.slotPath()
 	return inner
+}
+
+// slotPath is the path of the slot this frame runs, an each's item or a
+// parallel's arm: "<arm invocation path>@<iteration path>"
+// (loop/body@loop[3], fan/0@root). Constructs inside it have it as their
+// parent scope.
+func (f *frame) slotPath() string {
+	return f.prefix + "@" + f.iteration
 }
 
 func (f *frame) resolve(reference contract.Reference) (any, error) {
@@ -291,7 +300,10 @@ func checkOperand(operand contract.Operand) error {
 // enter is called once an if or choose has decided which arm to run, with
 // that arm's name, and when a try-finally starts, with none; the arm it
 // returns is the one that runs (the decision a durable run recorded).
-func runControl(ctx context.Context, f *frame, instruction contract.InternalInstruction, maxItems int, runArm func(context.Context, *frame, contract.Arm) (any, error), enter func(string) (string, error)) (any, error) {
+// loop, set only in a durable run, journals an each's or a parallel's
+// scope and slots: a recorded item is not run again, its slot is its
+// result (ADR 0028, slice 3).
+func runControl(ctx context.Context, f *frame, instruction contract.InternalInstruction, maxItems int, runArm func(context.Context, *frame, contract.Arm) (any, error), enter func(string) (string, error), loop *loopScope) (any, error) {
 	control := instruction.Control
 	operands := make([]any, len(control.Operands))
 	for index, operand := range control.Operands {
@@ -382,27 +394,79 @@ func runControl(ctx context.Context, f *frame, instruction contract.InternalInst
 			return nil, &Error{Code: "step_budget_exceeded", Class: "admission", Step: instruction.ID, Err: fmt.Errorf("each has %d items; at most %d run", len(items), maxItems)}
 		}
 		body := control.Arms[0]
+		if loop != nil {
+			// Every item's slot path begins with this prefix (frame.item).
+			iteration := instruction.ID + "["
+			if f.iteration != rootIteration {
+				iteration = f.iteration + "/" + iteration
+			}
+			if err := loop.begin(ctx, instruction.ID, len(items), f.invocation(instruction.ID)+"/"+body.Name+"@"+iteration); err != nil {
+				return nil, err
+			}
+		}
 		step.Kind = ControlEach
 		step.Each = &EachPlan{Items: items, Concurrency: control.Concurrency, Run: func(ctx context.Context, item any, index int) (any, error) {
-			return runArm(ctx, f.item(instruction.ID, body, index, item), body)
+			itemFrame := f.item(instruction.ID, body, index, item)
+			if loop == nil {
+				return runArm(ctx, itemFrame, body)
+			}
+			if value, filled, err := loop.filled(instruction.ID, index, itemFrame.scope); filled || err != nil {
+				return value, err
+			}
+			output, err := runArm(ctx, itemFrame, body)
+			if err != nil {
+				return nil, err
+			}
+			return loop.record(ctx, instruction.ID, index, itemFrame.scope, "item", output)
 		}}
+		if loop != nil {
+			output, err := runControlStep(ctx, step, 0, maxNesting)
+			if err != nil {
+				loop.fail(ctx, err)
+				return nil, err
+			}
+			return output, loop.exit(ctx, instruction.ID)
+		}
 	case "parallel":
 		// Each arm runs in its own frame; once every arm has completed,
 		// their results join this frame, where later steps read them.
+		// In a durable run every arm runs again on a replay, its steps
+		// loading what they committed, because later steps read its
+		// results; its slot records only that it completed.
 		frames := make([]*frame, len(control.Arms))
 		step.Kind = ControlParallel
 		step.Parallel = &ParallelPlan{}
+		if loop != nil {
+			if err := loop.begin(ctx, instruction.ID, len(control.Arms), ""); err != nil {
+				return nil, err
+			}
+		}
 		for index, arm := range control.Arms {
 			frames[index] = f.arm(instruction.ID, arm)
 			armFrame := frames[index]
-			step.Parallel.Actions = append(step.Parallel.Actions, Action{ID: instruction.ID, Run: func(ctx context.Context) (any, error) { return runArm(ctx, armFrame, arm) }})
+			armFrame.scope = armFrame.slotPath()
+			step.Parallel.Actions = append(step.Parallel.Actions, Action{ID: instruction.ID, Run: func(ctx context.Context) (any, error) {
+				output, err := runArm(ctx, armFrame, arm)
+				if err != nil || loop == nil {
+					return output, err
+				}
+				return loop.record(ctx, instruction.ID, index, armFrame.scope, "arm", output)
+			}})
 		}
 		if _, err := runControlStep(ctx, step, 0, maxNesting); err != nil {
+			if loop != nil {
+				loop.fail(ctx, err)
+			}
 			return nil, err
 		}
 		for _, armFrame := range frames {
 			for id, value := range armFrame.values {
 				f.values[id] = value
+			}
+		}
+		if loop != nil {
+			if err := loop.exit(ctx, instruction.ID); err != nil {
+				return nil, err
 			}
 		}
 		return nil, nil
