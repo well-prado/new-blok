@@ -507,6 +507,9 @@ func (r *Runtime) Run(ctx context.Context, ownerID string) error {
 func (r *Runtime) runPartition(ctx context.Context, partition, ownerID string) error {
 	consecutiveFailures := 0
 	for ctx.Err() == nil {
+		// The lease's TTL starts when etcd processes the grant, which is after
+		// this instant: it is the earliest the lease could have started.
+		acquireSent := time.Now()
 		owner, err := r.store.Acquire(ctx, partition, ownerID, r.limits.OwnerTTL)
 		if err != nil {
 			// Whether another owner holds the partition or storage refused the
@@ -518,26 +521,22 @@ func (r *Runtime) runPartition(ctx context.Context, partition, ownerID string) e
 			continue
 		}
 		ownerCtx, cancelOwner := context.WithCancel(ctx)
+		// Arm the lease guard before any work starts: an acquisition whose
+		// response came back late may leave little or none of the proven
+		// lease (#405).
+		validUntil := acquireSent.Add(r.limits.OwnerTTL - leaseSafetyMargin(r.limits.OwnerTTL))
+		guard := time.AfterFunc(time.Until(validUntil), cancelOwner)
 		renewDone := make(chan struct{})
-		go func() {
-			defer close(renewDone)
-			ticker := time.NewTicker(r.limits.OwnerTTL / 3)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ownerCtx.Done():
-					return
-				case <-ticker.C:
-					renewCtx, cancel := context.WithTimeout(ownerCtx, r.limits.OwnerTTL/4)
-					if renewErr := r.store.Renew(renewCtx, owner); renewErr != nil {
-						cancel()
-						cancelOwner()
-						return
-					}
-					cancel()
-				}
-			}
-		}()
+		if time.Now().Before(validUntil) {
+			go func() {
+				defer close(renewDone)
+				r.keepOwnership(ownerCtx, cancelOwner, owner, acquireSent, guard)
+			}()
+		} else {
+			// The lease can no longer be proven alive: do no work under it.
+			cancelOwner()
+			close(renewDone)
+		}
 		var processErr error
 		for ownerCtx.Err() == nil {
 			_, err := r.processOne(ownerCtx, owner)
@@ -557,6 +556,7 @@ func (r *Runtime) runPartition(ctx context.Context, partition, ownerID string) e
 		}
 		cancelOwner()
 		<-renewDone
+		guard.Stop()
 		// Relinquish the exact fence explicitly, so another worker can take
 		// the partition at once instead of after lease expiry. Release is
 		// fenced: it is a no-op error if ownership was already lost.
@@ -583,6 +583,82 @@ func (r *Runtime) runPartition(ctx context.Context, partition, ownerID string) e
 		}
 	}
 	return ctx.Err()
+}
+
+// leaseSafetyMargin is how long before its lease could expire a worker stops
+// acting on its partition. It covers the time the worker takes to notice the
+// cancellation and any drift between the local clock and etcd's.
+func leaseSafetyMargin(ttl time.Duration) time.Duration { return ttl / 4 }
+
+// renewRetryInterval is the pause between renewal attempts after a transient
+// failure. Each attempt is still bounded by how long the lease is provably
+// alive.
+func renewRetryInterval(ttl time.Duration) time.Duration { return ttl / 10 }
+
+// keepOwnership renews owner's lease OwnerTTL/3 after each request that
+// proved it alive until ownerCtx ends, and cancels the worker once the lease
+// can no longer be proven alive (#405).
+//
+// etcd restarts a lease's TTL when it processes a grant or keepalive, which is
+// after the client sent it, and a leader change only extends a lease. A lease
+// last proven alive by a request sent at S therefore cannot expire before
+// S + OwnerTTL (etcd grants at least the requested TTL, rounded up to whole
+// seconds). The worker treats it as valid until S + OwnerTTL - margin. A slow
+// or failed renewal is retried within that window, each attempt bounded by
+// it; a timer cancels the worker at the deadline even when a renewal call is
+// stuck. Anchoring the schedule to the proof, not to a free-running ticker,
+// renews at once after a slow acquisition instead of letting the deadline
+// pass before the first renewal is due. A renewal that proves ownership is
+// gone (lease expired, owner key deleted or fenced by a successor) ends
+// ownership at once. Durable writes stay fenced by etcd regardless; this
+// bound only stops the worker from dispatching more work on a partition whose
+// lease could have expired.
+//
+// guard is the already-armed timer that cancels the worker at
+// proven + OwnerTTL - margin; keepOwnership moves it forward after each
+// successful renewal.
+func (r *Runtime) keepOwnership(ownerCtx context.Context, cancelOwner context.CancelFunc, owner distributed.Owner, proven time.Time, guard *time.Timer) {
+	ttl := r.limits.OwnerTTL
+	validFor := ttl - leaseSafetyMargin(ttl)
+	validUntil := proven.Add(validFor)
+	interval := ttl / 3
+	next := time.NewTimer(time.Until(proven.Add(interval)))
+	defer next.Stop()
+	for {
+		select {
+		case <-ownerCtx.Done():
+			return
+		case <-next.C:
+		}
+		for {
+			sent := time.Now()
+			if !sent.Before(validUntil) {
+				cancelOwner()
+				return
+			}
+			renewCtx, cancel := context.WithDeadline(ownerCtx, validUntil)
+			err := r.store.Renew(renewCtx, owner)
+			cancel()
+			if err == nil {
+				if !guard.Stop() {
+					// The deadline passed while this renewal was in flight and
+					// the worker is already canceled.
+					return
+				}
+				validUntil = sent.Add(validFor)
+				guard.Reset(time.Until(validUntil))
+				next.Reset(time.Until(sent.Add(interval)))
+				break
+			}
+			if errors.Is(err, distributed.ErrOwnershipLost) || ownerCtx.Err() != nil {
+				cancelOwner()
+				return
+			}
+			if waitErr := waitContext(ownerCtx, min(renewRetryInterval(ttl), time.Until(validUntil))); waitErr != nil {
+				return
+			}
+		}
+	}
 }
 
 func waitContext(ctx context.Context, duration time.Duration) error {
