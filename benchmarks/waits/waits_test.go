@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"strconv"
@@ -36,10 +37,22 @@ var program = contract.InternalProgram{WorkflowID: "approval", Digest: artifact,
 	{Index: 1, ID: "output", Kind: "output", References: []contract.Reference{{Step: "approval"}}},
 }}
 
+// Modes of a sample's wakeup phase.
+const (
+	// Burst: every run is signalled back to back while Run sweeps, with
+	// Wake after each signal.
+	Burst = "burst"
+	// Backlog: every run is signalled with Run stopped and no Wake, as
+	// signals from another process or timers due together arrive; then
+	// Run starts and drains them.
+	Backlog = "backlog"
+)
+
 // Sample is one repetition: a fresh journal, runs admitted, started and
-// suspended, then every run signalled at once and resumed to completion.
+// suspended, then every run signalled and resumed to completion.
 type Sample struct {
 	StartedAtUTC string
+	Mode         string
 	Runs         int
 	// Suspension: admitting every run, then starting each until all are
 	// suspended at their wait.
@@ -54,8 +67,16 @@ type Sample struct {
 	RSSSuspendedKiB     int64
 	HeapInuseBeforeB    uint64
 	HeapInuseSuspendedB uint64
-	// Burst: every run signalled back to back while the resumer sweeps;
-	// latency is from a run's signal commit to its completion settling.
+	// The same, with all runs suspended while Run sweeps (several sweeps
+	// in, before any signal): a resumer that kept anything per suspended
+	// run while sweeping would show it here.
+	GoroutinesSweeping int
+	RSSSweepingKiB     int64
+	HeapInuseSweepingB uint64
+	// Wakeup: every run signalled (see Mode); latency is from a run's
+	// signal commit to its completion settling. BurstNanoseconds runs
+	// from the first signal (Burst) or from Run's start (Backlog) to the
+	// last completion; ThroughputRunsPerSec is Runs over it.
 	SignalNanoseconds                              int64
 	BurstNanoseconds                               int64
 	ThroughputRunsPerSec                           float64
@@ -64,10 +85,10 @@ type Sample struct {
 	GoroutinesAfterBurst                           int
 }
 
-func measure(t *testing.T, dir string, runs, workers, batch int) Sample {
+func measure(t *testing.T, dir, mode string, runs, workers, batch int) Sample {
 	t.Helper()
 	ctx := context.Background()
-	sample := Sample{StartedAtUTC: time.Now().UTC().Format(time.RFC3339Nano), Runs: runs}
+	sample := Sample{StartedAtUTC: time.Now().UTC().Format(time.RFC3339Nano), Mode: mode, Runs: runs}
 	database, err := (sqlite.Backend{}).Open(ctx, filepath.Join(dir, "journal.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -81,6 +102,7 @@ func measure(t *testing.T, dir string, runs, workers, batch int) Sample {
 	signalled := make(map[string]time.Time, runs)
 	completed := make(map[string]time.Time, runs)
 	suspended, done := make(chan string, runs), make(chan string, runs)
+	unexpected := make(chan error, 1)
 	r, err := resumer.New(resumer.Config{
 		Journal: j,
 		Engine:  engine.New(nil),
@@ -89,7 +111,7 @@ func measure(t *testing.T, dir string, runs, workers, batch int) Sample {
 			err := json.Unmarshal(raw, &input)
 			return input, err
 		}}},
-		Interval: 20 * time.Millisecond,
+		Interval: interval,
 		Batch:    batch,
 		Workers:  workers,
 		Settled: func(runID string, outcome resumer.Outcome, err error) {
@@ -102,7 +124,10 @@ func measure(t *testing.T, dir string, runs, workers, batch int) Sample {
 				mu.Unlock()
 				done <- runID
 			default:
-				t.Errorf("run %s: %s %v", runID, outcome, err)
+				select {
+				case unexpected <- fmt.Errorf("run %s: %s %v", runID, outcome, err):
+				default:
+				}
 			}
 		},
 	})
@@ -127,13 +152,33 @@ func measure(t *testing.T, dir string, runs, workers, batch int) Sample {
 			t.Fatal(err)
 		}
 	}
-	collect(t, suspended, runs, "suspended")
+	collect(t, suspended, unexpected, runs, "suspended")
 	sample.SuspendNanoseconds = time.Since(begin).Nanoseconds()
 	sample.GoroutinesSuspended, sample.RSSSuspendedKiB, sample.HeapInuseSuspendedB = footprint(t)
 
-	runCtx, stop := context.WithCancel(ctx)
-	defer stop()
-	go r.Run(runCtx)
+	run := func() (stop func()) {
+		runCtx, cancel := context.WithCancel(ctx)
+		returned := make(chan struct{})
+		go func() { r.Run(runCtx); close(returned) }()
+		return func() { cancel(); <-returned }
+	}
+	stop := run()
+	defer func() { stop() }()
+	time.Sleep(sweepsBeforeSample * interval) // Run sweeps at once, then every interval
+	// A sweep in flight holds the database's transient goroutines (a
+	// context watcher per statement); the fewest of a few samples is the
+	// count that persists, and a goroutine per suspended run would be in
+	// every one.
+	sample.GoroutinesSweeping = -1
+	for range 5 {
+		goroutines, rss, heap := footprint(t)
+		if sample.GoroutinesSweeping < 0 || goroutines < sample.GoroutinesSweeping {
+			sample.GoroutinesSweeping, sample.RSSSweepingKiB, sample.HeapInuseSweepingB = goroutines, rss, heap
+		}
+	}
+	if mode == Backlog {
+		stop()
+	}
 	begin = time.Now()
 	for _, id := range ids {
 		if _, err := j.Signal(ctx, signal.Envelope{RunID: id, SignalID: "s-" + id, Name: "approval", Principal: "bench", Payload: []byte(`{"approved":true}`)}, true); err != nil {
@@ -142,10 +187,16 @@ func measure(t *testing.T, dir string, runs, workers, batch int) Sample {
 		mu.Lock()
 		signalled[id] = time.Now()
 		mu.Unlock()
-		r.Wake()
+		if mode == Burst {
+			r.Wake()
+		}
 	}
 	sample.SignalNanoseconds = time.Since(begin).Nanoseconds()
-	collect(t, done, runs, "completed")
+	if mode == Backlog {
+		begin = time.Now()
+		stop = run()
+	}
+	collect(t, done, unexpected, runs, "completed")
 	stop()
 	if err := r.Close(ctx); err != nil {
 		t.Fatal(err)
@@ -180,12 +231,24 @@ func measure(t *testing.T, dir string, runs, workers, batch int) Sample {
 	return sample
 }
 
-func collect(t *testing.T, settled chan string, want int, what string) {
+// interval is the resumer's sweep interval in every sample; the
+// sweeping footprint is taken sweepsBeforeSample intervals after Run
+// starts.
+const (
+	interval           = 20 * time.Millisecond
+	sweepsBeforeSample = 5
+)
+
+// collect waits for want runs to settle as what, and fails at once on an
+// outcome the workload never expects.
+func collect(t *testing.T, settled chan string, unexpected chan error, want int, what string) {
 	t.Helper()
 	timeout := time.After(10 * time.Minute)
 	for n := 0; n < want; n++ {
 		select {
 		case <-settled:
+		case err := <-unexpected:
+			t.Fatalf("after %d of %d runs %s: %v", n, want, what, err)
 		case <-timeout:
 			t.Fatalf("%d of %d runs %s", n, want, what)
 		}
@@ -213,16 +276,22 @@ func footprint(t *testing.T) (int, int64, uint64) {
 
 // TestSuspendedRunsCostStorageNotGoroutines is the always-run check: 1,000
 // runs suspended through the resumer leave the goroutine count where it
-// was, and a burst wakes and completes every one.
+// was, while they wait and while Run sweeps over them, and both wakeup
+// modes (a burst with Wake, a backlog without) complete every one.
 func TestSuspendedRunsCostStorageNotGoroutines(t *testing.T) {
-	sample := measure(t, t.TempDir(), 1000, 8, 500)
-	if growth := sample.GoroutinesSuspended - sample.GoroutinesBefore; growth > 10 {
-		t.Fatalf("goroutines %d before, %d with %d runs suspended", sample.GoroutinesBefore, sample.GoroutinesSuspended, sample.Runs)
+	for _, mode := range []string{Burst, Backlog} {
+		sample := measure(t, t.TempDir(), mode, 1000, 8, 500)
+		if growth := sample.GoroutinesSuspended - sample.GoroutinesBefore; growth > 10 {
+			t.Fatalf("%s: goroutines %d before, %d with %d runs suspended", mode, sample.GoroutinesBefore, sample.GoroutinesSuspended, sample.Runs)
+		}
+		if growth := sample.GoroutinesSweeping - sample.GoroutinesBefore; growth > 10 {
+			t.Fatalf("%s: goroutines %d before, %d with %d runs suspended while Run sweeps", mode, sample.GoroutinesBefore, sample.GoroutinesSweeping, sample.Runs)
+		}
+		if growth := sample.GoroutinesAfterBurst - sample.GoroutinesBefore; growth > 10 {
+			t.Fatalf("%s: goroutines %d before, %d after the wakeups", mode, sample.GoroutinesBefore, sample.GoroutinesAfterBurst)
+		}
+		t.Logf("%s, 1000 runs: goroutines %d→%d→%d (sweeping), RSS %d→%d KiB, p50 %dµs p99 %dµs, %.0f runs/s", mode, sample.GoroutinesBefore, sample.GoroutinesSuspended, sample.GoroutinesSweeping, sample.RSSBeforeKiB, sample.RSSSuspendedKiB, sample.LatencyP50, sample.LatencyP99, sample.ThroughputRunsPerSec)
 	}
-	if growth := sample.GoroutinesAfterBurst - sample.GoroutinesBefore; growth > 10 {
-		t.Fatalf("goroutines %d before, %d after the burst", sample.GoroutinesBefore, sample.GoroutinesAfterBurst)
-	}
-	t.Logf("1000 runs: goroutines %d→%d, RSS %d→%d KiB, burst p50 %dµs p99 %dµs, %.0f runs/s", sample.GoroutinesBefore, sample.GoroutinesSuspended, sample.RSSBeforeKiB, sample.RSSSuspendedKiB, sample.LatencyP50, sample.LatencyP99, sample.ThroughputRunsPerSec)
 }
 
 // Report is the committed evidence file.
@@ -249,14 +318,27 @@ func TestWaitFootprintAndBurstSamples(t *testing.T) {
 	if path == "" {
 		t.Skip("explicit measured evidence gate: BLOK_WAITS_REPORT")
 	}
+	revision := os.Getenv("BLOK_BENCH_SOURCE_REVISION")
+	if !fullRevision.MatchString(revision) {
+		t.Fatalf("BLOK_BENCH_SOURCE_REVISION=%q: want the full commit of the measured source", revision)
+	}
+	if os.Getenv("BLOK_BENCH_TOPOLOGY") == "" {
+		t.Fatal("BLOK_BENCH_TOPOLOGY is required: the host, CPU, disk and load the samples were taken on")
+	}
+	modes := strings.Split(envString("BLOK_WAITS_MODES", Burst+","+Backlog), ",")
+	for _, mode := range modes {
+		if mode != Burst && mode != Backlog {
+			t.Fatalf("BLOK_WAITS_MODES: unknown mode %q", mode)
+		}
+	}
 	runs, repetitions := envInt(t, "BLOK_WAITS_RUNS", 10000), envInt(t, "BLOK_WAITS_REPETITIONS", 3)
 	workers, batch := envInt(t, "BLOK_WAITS_WORKERS", 8), envInt(t, "BLOK_WAITS_BATCH", 500)
 	kernel, _ := exec.Command("uname", "-srv").Output()
 	report := Report{
-		SchemaVersion:  1,
-		Workload:       "issue332-wait-v1: admit, start to suspension at one wait, signal all back to back, resume to completion; no node runs",
+		SchemaVersion:  2,
+		Workload:       "issue332-wait-v2: admit, start to suspension at one wait, sample while Run sweeps, then signal all and resume to completion, as a burst (Run sweeping, Wake per signal) or a backlog (signals committed with Run stopped, then Run started); no node runs",
 		Guarantees:     "real SQLite file journal (WAL, synchronous FULL), real engine and resumer, one process; footprint is of the whole test process; not a capacity, fleet or durability-under-load claim",
-		SourceRevision: os.Getenv("BLOK_BENCH_SOURCE_REVISION"),
+		SourceRevision: revision,
 		Topology:       os.Getenv("BLOK_BENCH_TOPOLOGY"),
 		Go:             runtime.Version(), OS: runtime.GOOS, Arch: runtime.GOARCH,
 		Kernel:       strings.TrimSpace(string(kernel)),
@@ -267,9 +349,11 @@ func TestWaitFootprintAndBurstSamples(t *testing.T) {
 		StartedAtUTC: time.Now().UTC().Format(time.RFC3339Nano),
 	}
 	for i := range repetitions {
-		sample := measure(t, t.TempDir(), runs, workers, batch)
-		t.Logf("repetition %d: goroutines %d→%d, RSS %d→%d KiB, suspend %v, burst %v (%.0f runs/s), p50 %dµs p90 %dµs p99 %dµs max %dµs", i+1, sample.GoroutinesBefore, sample.GoroutinesSuspended, sample.RSSBeforeKiB, sample.RSSSuspendedKiB, time.Duration(sample.SuspendNanoseconds), time.Duration(sample.BurstNanoseconds), sample.ThroughputRunsPerSec, sample.LatencyP50, sample.LatencyP90, sample.LatencyP99, sample.LatencyMax)
-		report.Samples = append(report.Samples, sample)
+		for _, mode := range modes {
+			sample := measure(t, t.TempDir(), mode, runs, workers, batch)
+			t.Logf("repetition %d %s: goroutines %d→%d→%d (sweeping), RSS %d→%d KiB, suspend %v, signals %v, wakeup %v (%.0f runs/s), p50 %dµs p90 %dµs p99 %dµs max %dµs", i+1, mode, sample.GoroutinesBefore, sample.GoroutinesSuspended, sample.GoroutinesSweeping, sample.RSSBeforeKiB, sample.RSSSuspendedKiB, time.Duration(sample.SuspendNanoseconds), time.Duration(sample.SignalNanoseconds), time.Duration(sample.BurstNanoseconds), sample.ThroughputRunsPerSec, sample.LatencyP50, sample.LatencyP90, sample.LatencyP99, sample.LatencyMax)
+			report.Samples = append(report.Samples, sample)
+		}
 	}
 	report.FinishedAtUTC = time.Now().UTC().Format(time.RFC3339Nano)
 	raw, err := json.MarshalIndent(report, "", " ")
@@ -279,6 +363,15 @@ func TestWaitFootprintAndBurstSamples(t *testing.T) {
 	if err := os.WriteFile(path, append(raw, '\n'), 0o600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+var fullRevision = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
+func envString(name, fallback string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
+	}
+	return fallback
 }
 
 func envInt(t *testing.T, name string, fallback int) int {

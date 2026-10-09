@@ -1,60 +1,60 @@
 {
   "schemaVersion": 1,
-  "purpose": "Synthetic single-host wait cases (#332, ADR 0027) with predeclared outcomes, read by internal/resumer TestWaitFixtures. Each case starts one run of a program that waits on \"approval\" and then calls a node, applies the steps in order, and ends with the expected run, wait and node-call state. A step's expect is checked against what the step returns.",
+  "purpose": "Synthetic single-host wait cases (#332, ADR 0027) with predeclared outcomes, read by internal/resumer TestWaitFixtures. Each case starts one run of a program that waits on \"approval\" and then calls a node, applies the steps in order, and ends with the expected run, wait and node-call state. A step's expect is checked against what the step returns. Every case spells out every field (the loader refuses unknown and missing fields, and duplicate names): the run's state, its lease owner (\"-\" when released), the wait's state and signal, the outcomes, the node calls, the run's output (null when it has none) and its error code.",
   "cases": [
     {
       "name": "signal-resumes",
       "program": {"timeoutMillis": 0, "node": "test/notify"},
       "steps": [{"do": "start"}, {"do": "signal", "id": "s1", "expect": "delivered"}, {"do": "sweep"}],
-      "expect": {"run": "completed", "wait": "acknowledged", "signal": "s1", "outcomes": ["suspended", "completed"], "calls": 1}
+      "expect": {"run": "completed", "lease": "-", "wait": "acknowledged", "signal": "s1", "outcomes": ["suspended", "completed"], "calls": 1, "output": "{\"signalId\":\"s1\",\"payload\":{\"approved\":true}}", "errorCode": ""}
     },
     {
       "name": "timeout-resumes",
       "program": {"timeoutMillis": 60000, "node": "test/notify"},
       "steps": [{"do": "start"}, {"do": "advance", "seconds": 59}, {"do": "sweep"}, {"do": "advance", "seconds": 1}, {"do": "sweep"}],
-      "expect": {"run": "completed", "wait": "acknowledged", "signal": "", "outcomes": ["suspended", "completed"], "calls": 1, "output": "{\"timedOut\":true}"}
+      "expect": {"run": "completed", "lease": "-", "wait": "acknowledged", "signal": "", "outcomes": ["suspended", "completed"], "calls": 1, "output": "{\"timedOut\":true}", "errorCode": ""}
     },
     {
       "name": "signal-before-the-wait",
       "program": {"timeoutMillis": 0, "node": "test/notify"},
       "steps": [{"do": "signal", "id": "early", "expect": "pending"}, {"do": "start"}],
-      "expect": {"run": "completed", "wait": "acknowledged", "signal": "early", "outcomes": ["completed"], "calls": 1}
+      "expect": {"run": "completed", "lease": "-", "wait": "acknowledged", "signal": "early", "outcomes": ["completed"], "calls": 1, "output": "{\"signalId\":\"early\",\"payload\":{\"approved\":true}}", "errorCode": ""}
     },
     {
       "name": "duplicate-signal",
       "program": {"timeoutMillis": 0, "node": "test/notify"},
       "steps": [{"do": "start"}, {"do": "signal", "id": "s1", "expect": "delivered"}, {"do": "signal", "id": "s1", "expect": "duplicate"}, {"do": "sweep"}],
-      "expect": {"run": "completed", "wait": "acknowledged", "signal": "s1", "outcomes": ["suspended", "completed"], "calls": 1}
+      "expect": {"run": "completed", "lease": "-", "wait": "acknowledged", "signal": "s1", "outcomes": ["suspended", "completed"], "calls": 1, "output": "{\"signalId\":\"s1\",\"payload\":{\"approved\":true}}", "errorCode": ""}
     },
     {
       "name": "negative-signal-after-the-run-ended",
       "program": {"timeoutMillis": 0, "node": "test/notify"},
       "steps": [{"do": "start"}, {"do": "signal", "id": "s1", "expect": "delivered"}, {"do": "sweep"}, {"do": "signal", "id": "s2", "expect": "late"}],
-      "expect": {"run": "completed", "wait": "acknowledged", "signal": "s1", "outcomes": ["suspended", "completed"], "calls": 1}
+      "expect": {"run": "completed", "lease": "-", "wait": "acknowledged", "signal": "s1", "outcomes": ["suspended", "completed"], "calls": 1, "output": "{\"signalId\":\"s1\",\"payload\":{\"approved\":true}}", "errorCode": ""}
     },
     {
       "name": "negative-unauthorized-signal",
       "program": {"timeoutMillis": 0, "node": "test/notify"},
       "steps": [{"do": "start"}, {"do": "signal", "id": "s1", "unauthorized": true, "expect": "unauthorized"}, {"do": "sweep"}],
-      "expect": {"run": "accepted", "wait": "waiting", "signal": "", "outcomes": ["suspended"], "calls": 0}
+      "expect": {"run": "accepted", "lease": "-", "wait": "waiting", "signal": "", "outcomes": ["suspended"], "calls": 0, "output": null, "errorCode": ""}
     },
     {
       "name": "negative-signal-to-an-unknown-run",
       "program": {"timeoutMillis": 0, "node": "test/notify"},
       "steps": [{"do": "start"}, {"do": "signal", "id": "s1", "run": "run:unknown", "expect": "not_found"}],
-      "expect": {"run": "accepted", "wait": "waiting", "signal": "", "outcomes": ["suspended"], "calls": 0}
+      "expect": {"run": "accepted", "lease": "-", "wait": "waiting", "signal": "", "outcomes": ["suspended"], "calls": 0, "output": null, "errorCode": ""}
     },
     {
       "name": "negative-node-fails-after-the-wait",
       "program": {"timeoutMillis": 0, "node": "test/reject"},
       "steps": [{"do": "start"}, {"do": "signal", "id": "s1", "expect": "delivered"}, {"do": "sweep"}],
-      "expect": {"run": "failed", "wait": "acknowledged", "signal": "s1", "outcomes": ["suspended", "failed"], "calls": 0, "errorCode": "node_error"}
+      "expect": {"run": "failed", "lease": "-", "wait": "acknowledged", "signal": "s1", "outcomes": ["suspended", "failed"], "calls": 0, "output": null, "errorCode": "node_error"}
     },
     {
       "name": "negative-workflow-not-registered",
       "program": {"timeoutMillis": 0, "node": "test/notify", "artifact": "sha256:9999999999999999999999999999999999999999999999999999999999999999"},
       "steps": [{"do": "start"}],
-      "expect": {"run": "accepted", "wait": "", "signal": "", "outcomes": ["interrupted"], "calls": 0}
+      "expect": {"run": "accepted", "lease": "-", "wait": "", "signal": "", "outcomes": ["interrupted"], "calls": 0, "output": null, "errorCode": ""}
     }
   ]
 }

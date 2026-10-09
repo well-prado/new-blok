@@ -3,7 +3,8 @@
 - Status: implemented for E07-T09 (#332), delivered in slices: A (#350)
   wait identity and signal routing; B (#366, #378) crash-safe wakeups and
   run leases; C1 (#380) the journal as the engine's step and wait journal;
-  C2 (#384, and this revision's measured evidence) the single-host resumer
+  C2 the single-host resumer (#384) and its measured evidence and wait
+  fixtures (#385)
 - Date: 2026-10-07
 - Roadmap: E07-T09 ([#332](https://github.com/well-prado/new-blok/issues/332)),
   closing gaps in E07-T04 (#46); prerequisite of E07-T10 (#333, nested
@@ -430,35 +431,45 @@ not gain a scheduler).
 - **Typed inputs** run whatever their decode reshapes: the run's engine
   input is fixed at admission or first execution (slice C1).
 
-## Measured footprint and wakeup bursts (slice C2)
+## Measured footprint and wakeup bursts (slice C2, #385)
 
 `benchmarks/waits` runs the real journal, engine and resumer on a SQLite file:
-N runs admitted, started to suspension at one wait, then all signalled back
-to back and resumed to completion. Its README holds the tables.
+N runs admitted, started to suspension at one wait, sampled while `Run`
+sweeps over them, then all signalled and resumed to completion, either as a
+burst (`Run` sweeping, `Wake` per signal) or as a backlog (signals committed
+with `Run` stopped, then `Run` started). Its README holds the tables.
 
 - **Report** (`waits-go1.27.1-darwin-arm64.json`, raw per-run latencies
-  included): three repetitions of 10,000 runs of `7d08ca9` (the resumer after
-  #384's Review R rounds 1–3) on a shared Apple M4 developer host at load
-  about 5. Goroutines 3 before, 3 with all 10,000 suspended, 3 after the
-  burst, in every repetition: a suspended run holds no goroutine. Resident
-  memory rose about 7 MiB with the first 10,000 suspended runs, SQLite's page
-  cache included; heap in use rose under 1 MiB. The burst drained at 562–1,037
-  runs/s (p50 2.8–3.7 ms), bound by one goroutine committing the signals: the
-  resumer kept pace with them.
-- **Old against new** (`ab-ce95507-darwin-arm64.json`): 16 interleaved pairs
-  of the first measured revision (`ce95507`) and the new one, at load 8–140.
-  Footprint unchanged; burst throughput unchanged within the noise (median
-  new ÷ old 0.95 and 0.99). Starting 10,000 runs to their wait was slower in
-  15 of 16 pairs (median 1.26× and 1.81×); the cause is not isolated (the
-  arms also differ in engine and journal changes merged since), and `Start`
-  taking a worker before its lease was tested and not confirmed as it.
+  included): three repetitions of 10,000 runs per mode on `f2ccd51` (#384's
+  resumer after Review R rounds 1–3, without #413's fix), on a shared Apple
+  M4 developer host (1-minute load 47 at the start, 14 at the end).
+  Goroutines 3 before, 3 with all 10,000 suspended, 4 while `Run` swept
+  (its own goroutine), 3 after: a suspended run holds no goroutine, sweeping
+  or not. Resident memory rose about 6 MiB with the first 10,000 suspended
+  runs, SQLite's page cache included; heap in use rose under 1 MiB. A burst
+  drained at 747–1,502 runs/s, bound by one goroutine committing the
+  signals (the last completion 1.4–3.8 ms after the last signal).
+- **Backlog.** 10,000 woken runs drained at 131–251 runs/s: `Run` capped a
+  backlog at `Workers / Interval` (#413, PR #421 removes it), and each
+  `PendingResumptions` call reads every fired wait (#422). The arm is
+  re-measured once #413 merges; #46 V4 is not tick-ready until then.
+- **Old against new** (`ab/ab-ce95507-darwin-arm64.json`, burst mode): 16
+  interleaved pairs of the first measured revision (`ce95507`) and the new
+  one, at load 8–140. Footprint unchanged; burst throughput unchanged by
+  median (new ÷ old 0.95 and 0.99; geomeans 0.97 and 0.79). Starting 10,000
+  runs to their wait was slower in 15 of 16 pairs (median 1.26× and 1.81×,
+  geomeans 1.38× and 1.91×) and p99 latency higher in 12 of 16 (median
+  2.05× and 1.45×, geomeans 1.86× and 2.38×). The causes are not isolated
+  (#410): the arms also differ in engine and journal changes merged since,
+  and `Start` taking a worker before its lease was tested and not confirmed
+  as one.
 - **Scan cost.** Looking for interrupted runs on every sweep, inside a write
   transaction over every live run, cut the burst to about 464 runs/s
   (p50 8.9 ms) against about 2,000 without it, on 2026-10-07. It now reads
   first and runs once per third of a lease (#384).
-- Times on this host vary with its load more than with the code (the same
-  old resumer ran 2,000–2,083 runs/s on 2026-10-07 and 400–680 on 2026-10-08):
-  compare within one pair, not across reports.
+- Times on this host vary between days, most likely with its load (a
+  hypothesis: the same old resumer ran 2,000–2,083 runs/s on 2026-10-07
+  and 400–680 on 2026-10-08): compare within one pair, not across reports.
 
 These are local samples, not a capacity or fleet claim.
 
@@ -551,9 +562,15 @@ Slice C2: `internal/resumer` (`TestResumerSuspendsAndResumesRuns`,
 `TestSaturatedSweepDoesNotDelayTheScan`; round 3's delta, the merge of
 #382's iteration-aware identity, added none), the fixtures in
 `testdata/waits/fixtures.json` (`TestWaitFixtures`, nine cases, five of
-them negative) and `benchmarks/waits`
-(`TestSuspendedRunsCostStorageNotGoroutines`, always run at 1,000 runs, and
-the gated `TestWaitFootprintAndBurstSamples`).
+them negative, decoded strictly: unknown, missing and duplicate fields
+refused; each asserts the run, its lease owner, wait, signal, outcomes,
+node calls, output and error code), `benchmarks/waits`
+(`TestSuspendedRunsCostStorageNotGoroutines`, always run at 1,000 runs in
+both modes and sampled while `Run` sweeps, and the gated
+`TestWaitFootprintAndBurstSamples`) and, after #385's Review R round 1,
+`TestResumerKilledMidResumptionIsFinishedByAnother` (a real SIGKILL of a
+process inside a resumed run; a new resumer finishes it once the dead
+lease lapses).
 
 #382: `TestStepIdentityEncodingIsPinned` (`internal/engine`),
 `TestOperationKeyFormatIsPinned`, `TestLoopIterationsWaitIndependently`
@@ -578,14 +595,12 @@ read under its pre-#396 ID.
 
 ## Limits
 
-- Nothing calls `PendingResumptions` or `AcknowledgeWait` yet: slice C's
-  single-host resumer does, and decides whether acknowledgement commits in
-  the same transaction as the resumed step.
 - A lease is time-based on the caller's clock: a holder that stalls past
   its lease without renewing it can be overtaken, and the run executed
-  twice. The engine's step journal makes replay of committed steps
-  idempotent; fencing the stale holder's later writes is not part of this
-  slice.
+  twice up to its next journal write. The engine's step journal makes
+  replay of committed steps idempotent, and the lease token fences every
+  later write of the stale holder (slice C1); a pure node may run twice,
+  an effect is recorded uncertain.
 - `RenewRunLease` and `ReleaseRunLease` still succeed under the current
   token after the run has ended. That is harmless (resumption listings and
   claims only consider live runs); slice C's runner releases the lease when
