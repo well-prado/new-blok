@@ -44,6 +44,9 @@ func TestSignalRaceReconcilesAnHTMLDuplicate(t *testing.T) {
 		t.Fatal(err)
 	}
 	releaseOwnerOnCleanup(t, wrappedStore, owner)
+	// Renewed through the unwrapped client, so the barrier sees only the
+	// signal path's transactions.
+	holdOwner(t, directStore, owner, 5*time.Second)
 
 	const winner = `{"note":"<a> & <b>","n":1}`
 	for index, race := range []struct {

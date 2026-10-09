@@ -224,6 +224,7 @@ func TestClusterRunIsReconstructedThroughTheInspectionStream(t *testing.T) {
 		t.Fatal(err)
 	}
 	owner := acquireWhenFree(t, ctx, store, partition, "inspection-owner", 5*time.Second)
+	holdOwner(t, store, owner, 5*time.Second)
 	processed := make(chan error, 1)
 	go func() { _, err := runtime.processOne(ctx, owner); processed <- err }()
 	select {

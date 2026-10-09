@@ -434,7 +434,11 @@ func TestSustainedLoadFailoverWithWorkerKill(t *testing.T) {
 		writesPerRun /= float64(terminalAtIngressEnd)
 	}
 
-	drainDeadline := time.Now().Add(time.Duration(fixture.DrainTimeoutSeconds) * time.Second)
+	drainStart := time.Now()
+	drainDeadline := drainStart.Add(time.Duration(fixture.DrainTimeoutSeconds) * time.Second)
+	// trail samples the pending count every 10s, so a failure shows whether
+	// the drain was slow or stopped (#411).
+	trail := []string{fmt.Sprintf("0s:%d", activeAtIngressEnd)}
 	for {
 		pending := 0
 		for partition := 0; partition < limits.Partitions; partition++ {
@@ -447,8 +451,11 @@ func TestSustainedLoadFailoverWithWorkerKill(t *testing.T) {
 		if pending == 0 {
 			break
 		}
+		if elapsed := time.Since(drainStart); elapsed >= time.Duration(len(trail))*10*time.Second {
+			trail = append(trail, fmt.Sprintf("%s:%d", elapsed.Round(time.Second), pending))
+		}
 		if time.Now().After(drainDeadline) {
-			t.Fatalf("%d accepted runs still active %s after ingress stopped", pending, time.Duration(fixture.DrainTimeoutSeconds)*time.Second)
+			t.Fatalf("%d accepted runs still active %s after ingress stopped; pending over the drain %v; partitions now: %s", pending, time.Duration(fixture.DrainTimeoutSeconds)*time.Second, trail, partitionOwners(ctx, store, limits))
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
@@ -553,6 +560,28 @@ func TestSustainedLoadFailoverWithWorkerKill(t *testing.T) {
 	if ratio < fixture.Expected.MinSteadyToNoisyCompletionRate {
 		t.Errorf("steady/noisy ratio=%.2f; fixture min %.2f", ratio, fixture.Expected.MinSteadyToNoisyCompletionRate)
 	}
+}
+
+// partitionOwners describes each partition's current owner (with its fence
+// token, which grows with every acquisition) and active run count, for a
+// drain failure.
+func partitionOwners(ctx context.Context, store *distributed.Store, limits Limits) string {
+	parts := make([]string, 0, limits.Partitions)
+	for partition := 0; partition < limits.Partitions; partition++ {
+		name := fmt.Sprintf("p-%04d", partition)
+		owner, ownerErr := store.CurrentOwner(ctx, name)
+		active, activeErr := store.ListActiveRunIDs(ctx, name, limits.PartitionAdmissions)
+		holder := fmt.Sprintf("%s@%d", owner.ID, owner.Token)
+		if ownerErr != nil {
+			holder = "none (" + ownerErr.Error() + ")"
+		}
+		count := fmt.Sprint(len(active))
+		if activeErr != nil {
+			count = "unknown (" + activeErr.Error() + ")"
+		}
+		parts = append(parts, fmt.Sprintf("%s owner=%s active=%s", name, holder, count))
+	}
+	return strings.Join(parts, "; ")
 }
 
 func sumCounts(values map[string]int) int {

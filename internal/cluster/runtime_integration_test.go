@@ -154,6 +154,7 @@ func TestTwoIngressNodesPersistAndExecuteOneIdempotentRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	releaseOwnerOnCleanup(t, storeA, owner)
+	holdOwner(t, storeA, owner, 5*time.Second)
 	if _, err := first.processOne(ctx, owner); err != nil {
 		t.Fatalf("execute persisted run: %v", err)
 	}
@@ -574,6 +575,7 @@ func TestSignalResumesDistributedRunFromCommittedPrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 	releaseOwnerOnCleanup(t, store, owner)
+	holdOwner(t, store, owner, 5*time.Second)
 	if _, err := runtime.processOne(ctx, owner); !errors.Is(err, ErrNoWork) {
 		t.Fatalf("initial process error=%v, want suspended work yield", err)
 	}
@@ -637,6 +639,7 @@ func TestTimerResumesDistributedRunFromCommittedPrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 	releaseOwnerOnCleanup(t, store, owner)
+	holdOwner(t, store, owner, 5*time.Second)
 	if _, err := runtime.processOne(ctx, owner); !errors.Is(err, ErrNoWork) {
 		t.Fatalf("initial process error=%v, want suspended work yield", err)
 	}
@@ -1085,6 +1088,25 @@ func keepOwnerAlive(ctx context.Context, store *distributed.Store, owner distrib
 		})
 		return result
 	}
+}
+
+// holdOwner plays a live worker for a test that drives processOne,
+// DeliverSignal or FireDueWaits by hand on owner: it renews the lease every
+// ttl/3 for the rest of the test (#407, #411), so the test's own duration
+// under -race and load can no longer expire it. ttl must be the TTL the owner
+// was acquired with. A renewal that fails (the lease expired anyway, the
+// fence moved, the key is gone) is reported when the test ends, so a genuine
+// loss of ownership still fails it. Call the returned stop early to end the
+// renewal and read its result, for example to put it in a failure message.
+func holdOwner(t *testing.T, store *distributed.Store, owner distributed.Owner, ttl time.Duration) (stop func() error) {
+	t.Helper()
+	stop = keepOwnerAlive(context.Background(), store, owner, ttl)
+	t.Cleanup(func() {
+		if err := stop(); err != nil {
+			t.Errorf("owner %s/%s lost its partition lease while the test held it: %v", owner.Partition, owner.ID, err)
+		}
+	})
+	return stop
 }
 
 func tenantForEmptyPartition(t *testing.T, ctx context.Context, store *distributed.Store, runtime *Runtime, prefix string) (string, string) {

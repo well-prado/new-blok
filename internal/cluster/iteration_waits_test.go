@@ -75,6 +75,7 @@ func TestLoopIterationsWaitIndependently(t *testing.T) {
 		t.Fatal(err)
 	}
 	releaseOwnerOnCleanup(t, store, owner)
+	holdOwner(t, store, owner, 5*time.Second)
 	artifact := runtime.workflows["loop-waits"].Program.Digest
 	at := func(iteration string) engine.WaitIdentity {
 		return engine.WaitIdentity{Step: engine.NewStepIdentity(admission.RunID, artifact, "approval", iteration, []byte(`{"name":"approval"}`)), Name: "approval"}

@@ -210,7 +210,12 @@ type encodedSizeFixture struct {
 	runtime *cluster.Runtime
 	tenant  string
 	ctx     context.Context
+	// admitted lists every run a 202 admission created, for awaitRun's
+	// progress check.
+	admitted []admittedRun
 }
+
+type admittedRun struct{ tenant, runID string }
 
 func newEncodedSizeFixture(t *testing.T, partitions int) *encodedSizeFixture {
 	t.Helper()
@@ -243,8 +248,19 @@ func newEncodedSizeFixture(t *testing.T, partitions int) *encodedSizeFixture {
 func (f *encodedSizeFixture) startWorker(t *testing.T, ownerID string) func() {
 	t.Helper()
 	worker := DistributedWorkerDependency(f.runtime, ownerID)
-	if err := worker.Start(f.ctx); err != nil {
-		t.Fatal(err)
+	// Start's readiness check has its own one-second bound, which etcd can
+	// miss on a loaded host; a supervisor would start the worker again.
+	// Anything other than that timeout still fails at once.
+	for {
+		err := worker.Start(f.ctx)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, context.DeadlineExceeded) || f.ctx.Err() != nil {
+			t.Fatal(err)
+		}
+		t.Logf("worker %.20q readiness check timed out, starting it again: %v", ownerID, err)
+		time.Sleep(100 * time.Millisecond)
 	}
 	stopped := false
 	stop := func() {
@@ -267,6 +283,10 @@ func (f *encodedSizeFixture) admit(key, body string) *httptest.ResponseRecorder 
 	request := httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader(body)).WithContext(f.ctx)
 	request.Header.Set("Idempotency-Key", key)
 	NewDistributedWorkflowHandler(f.runtime, "encoded-size-bound", func(*http.Request) (string, error) { return f.tenant, nil }).ServeHTTP(recorder, request)
+	var admission cluster.Admission
+	if recorder.Code == http.StatusAccepted && json.Unmarshal(recorder.Body.Bytes(), &admission) == nil && admission.RunID != "" {
+		f.admitted = append(f.admitted, admittedRun{tenant: f.tenant, runID: admission.RunID})
+	}
 	return recorder
 }
 
@@ -279,19 +299,45 @@ func (f *encodedSizeFixture) signal(waitID, signalID string, payload []byte) *ht
 	return recorder
 }
 
-// awaitRun polls until the run reaches state or d elapses, returning the
-// last state seen.
-func (f *encodedSizeFixture) awaitRun(runID, state string, d time.Duration) string {
-	deadline, last := time.Now().Add(d), ""
+// awaitRun polls until the run reaches state, returning the last state seen.
+// It gives up when the worker stops making progress: stall passes without
+// the run changing state and without any other admitted run reaching its
+// wait. One worker claims a partition's runs one at a time, so a run
+// admitted behind a backlog of near-limit runs waits for all of them; on a
+// loaded host that backlog alone can take longer than any fixed window
+// (#411), while a run that can never be claimed still stalls and fails.
+func (f *encodedSizeFixture) awaitRun(runID, state string, stall time.Duration) string {
+	last, reached := "", -1
+	deadline := time.Now().Add(stall)
+	nextProgress := time.Now()
 	for time.Now().Before(deadline) && f.ctx.Err() == nil {
-		if run, err := f.runtime.GetRun(f.ctx, f.tenant, runID); err == nil {
+		if run, err := f.runtime.GetRun(f.ctx, f.tenant, runID); err == nil && run.State != last {
 			if last = run.State; last == state {
 				return last
+			}
+			deadline = time.Now().Add(stall)
+		}
+		if time.Now().After(nextProgress) {
+			nextProgress = time.Now().Add(time.Second)
+			if count := f.runsAtTheirWait(); count > reached {
+				reached, deadline = count, time.Now().Add(stall)
 			}
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 	return last
+}
+
+// runsAtTheirWait counts the admitted runs whose wait record exists, which a
+// run gets once a worker has claimed it and suspended it at its wait.
+func (f *encodedSizeFixture) runsAtTheirWait() int {
+	count := 0
+	for _, run := range f.admitted {
+		if _, err := f.runtime.GetWait(f.ctx, run.tenant, cluster.WaitIDFor(run.runID, "approval", "")); err == nil {
+			count++
+		}
+	}
+	return count
 }
 
 // TestDistributedNearLimitAdmissionStaysClaimableAndSignalable covers the
@@ -334,7 +380,7 @@ func TestDistributedNearLimitAdmissionStaysClaimableAndSignalable(t *testing.T) 
 	}
 	t.Logf("largest admissible input: %d '<' (run %s)", lo, largest)
 	if state := f.awaitRun(largest, "waiting", 15*time.Second); state != "waiting" {
-		t.Fatalf("largest 202-accepted run state=%q after 15s, want claimed and suspended at its wait", state)
+		t.Fatalf("largest 202-accepted run state=%q after 15s without worker progress (%d of %d admitted runs at their wait), want claimed and suspended at its wait", state, f.runsAtTheirWait(), len(f.admitted))
 	}
 
 	t.Run("takeover by the longest owner ID keeps a tiny signal valid", func(t *testing.T) {
@@ -390,8 +436,28 @@ func TestDistributedNearLimitAdmissionStaysClaimableAndSignalable(t *testing.T) 
 		outcomes := map[string]int{}
 		requestLevel := 0
 		accepted := false
+		partition := f.runtime.Partition(f.tenant)
 		for k := distributed.MaxPayloadBytes / 6; k > distributed.MaxPayloadBytes/6-1000 && !accepted; k-- {
-			_, err := f.runtime.DeliverSignal(f.ctx, f.tenant, waitID, fmt.Sprintf("sweep-%d", k), "synthetic-principal", json.RawMessage(`"`+strings.Repeat("<", k)+`"`), true)
+			// ErrUnavailable is the right answer while the partition is
+			// between owners (the worker can drop it on a slow lease
+			// renewal, #405), whatever the signal's size: then the same
+			// signal is sent again, as a client retries a 503. An
+			// ErrUnavailable while one owner held the partition throughout
+			// is never retried.
+			var err error
+			for attempt := 0; ; attempt++ {
+				before, beforeErr := f.store.CurrentOwner(f.ctx, partition)
+				_, err = f.runtime.DeliverSignal(f.ctx, f.tenant, waitID, fmt.Sprintf("sweep-%d", k), "synthetic-principal", json.RawMessage(`"`+strings.Repeat("<", k)+`"`), true)
+				if !errors.Is(err, cluster.ErrUnavailable) || attempt == 50 {
+					break
+				}
+				after, afterErr := f.store.CurrentOwner(f.ctx, partition)
+				if beforeErr == nil && afterErr == nil && before.Token == after.Token {
+					break
+				}
+				outcomes["retried across an owner change"]++
+				time.Sleep(100 * time.Millisecond)
+			}
 			var tooLarge *distributed.RecordTooLargeError
 			switch {
 			case err == nil:

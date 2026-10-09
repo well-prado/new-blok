@@ -47,6 +47,7 @@ func newIterationSuspendFixture(t *testing.T, ctx context.Context, name string, 
 		t.Fatal(err)
 	}
 	releaseOwnerOnCleanup(t, store, owner)
+	holdOwner(t, store, owner, 5*time.Second)
 	return &iterationSuspendFixture{t: t, ctx: ctx, store: store, runtime: runtime, owner: owner, tenant: tenant, runID: admission.RunID, artifact: runtime.workflows[name].Program.Digest, timeout: timeoutMillis}
 }
 

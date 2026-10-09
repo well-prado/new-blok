@@ -78,9 +78,16 @@ func completedChainRun(t *testing.T, steps int) (*Runtime, *countingClient, stri
 		t.Fatal(err)
 	}
 	owner := acquireWhenFree(t, ctx, store, partition, "inspect-chain-owner", 30*time.Second)
+	// One processOne drives the whole chain; under -race a 300-step chain
+	// outlasts the 30s lease unless it is renewed like a live worker's (#411).
+	// Renewed through another client, so client counts only the run's reads.
+	stopRenewal := holdOwner(t, integrationDistributedStore(t), owner, 30*time.Second)
 	run, err := runtime.processOne(ctx, owner)
 	if err != nil || run.State != "completed" || string(run.Output) != fmt.Sprintf(`{"value":%d}`, steps) {
-		t.Fatalf("chain run=%+v err=%v", run, err)
+		t.Fatalf("chain run=%+v err=%v (owner lease renewal: %v)", run, err, stopRenewal())
+	}
+	if err := stopRenewal(); err != nil {
+		t.Fatalf("chain owner lost its partition lease while the run executed: %v", err)
 	}
 	return runtime, client, tenant, admission.RunID
 }

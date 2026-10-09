@@ -67,6 +67,9 @@ func TestSignalRetriesAWaitRunCASConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	releaseOwnerOnCleanup(t, wrappedStore, owner)
+	// Renewed through the unwrapped client, so the barrier sees only the
+	// signal path's transactions.
+	holdOwner(t, directStore, owner, 5*time.Second)
 	if _, err := runtime.processOne(ctx, owner); !errors.Is(err, ErrNoWork) {
 		t.Fatalf("initial process error=%v, want suspended work yield", err)
 	}

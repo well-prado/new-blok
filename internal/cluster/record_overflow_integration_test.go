@@ -430,7 +430,9 @@ func TestDueTimerOfATerminalRunClosesItsWait(t *testing.T) {
 	stop := h.startWorker("w1")
 	h.awaitState(runID, "waiting")
 	stop()
-	owner := acquireWhenFree(t, h.ctx, h.store, h.partition, "w2", time.Duration(h.fixture.Limits.OwnerTTLMillis)*time.Millisecond)
+	ownerTTL := time.Duration(h.fixture.Limits.OwnerTTLMillis) * time.Millisecond
+	owner := acquireWhenFree(t, h.ctx, h.store, h.partition, "w2", ownerTTL)
+	holdOwner(t, h.store, owner, ownerTTL)
 	run, err := h.runtime.GetRun(h.ctx, h.tenant, runID)
 	if err != nil {
 		t.Fatal(err)
