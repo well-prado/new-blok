@@ -42,7 +42,7 @@ func NewCache(root string) (*Cache, error) {
 		return nil, fmt.Errorf("package: resolve cache directory: %w", err)
 	}
 	for _, dir := range []string{abs, filepath.Join(abs, "blobs"), filepath.Join(abs, "indexes")} {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
+		if err := mkdirPrivate(dir); err != nil {
 			return nil, fmt.Errorf("package: create cache directory")
 		}
 	}
@@ -467,7 +467,7 @@ func atomicWrite(path string, data []byte, mode os.FileMode) error {
 		return err
 	}
 	dir := filepath.Dir(absolute)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := mkdirPrivate(dir); err != nil {
 		return err
 	}
 	temp, err := os.CreateTemp(dir, ".blok-package-*.tmp")
