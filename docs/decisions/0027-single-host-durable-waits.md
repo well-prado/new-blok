@@ -361,7 +361,16 @@ not gain a scheduler).
   executes it. `Run(ctx)` sweeps at once and every interval (and on
   `Wake`): `PendingResumptions` (woken runs), `ClaimDueWaits` (due
   timers), `InterruptedRuns` (below), each up to `Batch`, executed by at
-  most `Workers` at a time.
+  most `Workers` at a time. While a sweep leaves work behind (a listing
+  took as many runs as it had free workers for), `Run` sweeps again as
+  workers free: once half of them are free, or 2 ms after an execution
+  settles its run, whichever comes first, so each listing takes a batch
+  rather than one run. A continued sweep lists again only what came back
+  full (woken runs, due timers, or an interrupted-run scan, which then
+  does not wait a third of a lease). A backlog drains back to back,
+  not `Workers` per `Interval` (#413). An execution that settles nothing
+  (lost lease, stop, unknown workflow, transient fault) prompts no sweep,
+  so runs this resumer cannot settle are not retaken between ticks.
 - An execution decodes the run's input, runs `RunJournaled` through
   `ForRun(run, token)`, renews the lease every `RenewEvery` (default a
   third of the lease; an `ErrLeaseLost` renewal cancels the execution,
@@ -485,6 +494,13 @@ Review R round 1, `TestStepIDsMustFollowTheGrammar` (`internal/engine`),
 and `TestEngineSuspendsAndResumesThroughTheJournal` with its siblings now
 pin the root iteration of the engine's waits and steps in the journal.
 
+#413: `TestSignalBacklogDrainsWithoutWaitingForTicks`,
+`TestTimerBurstDrainsWithoutWaitingForTicks`,
+`TestInterruptedBacklogDrainsWithoutWaitingForTicks` (each fails on
+`e7e98b2`: 4 of 200 / 200 / 60 runs in 20 s with a 1 h interval and 4
+workers) and `TestUnsettledRunsDoNotSpinTheResumer` (fails, 880 executions
+in 500 ms, when every outcome prompts a sweep).
+
 ## Limits
 
 - Nothing calls `PendingResumptions` or `AcknowledgeWait` yet: slice C's
@@ -511,6 +527,10 @@ pin the root iteration of the engine's waits and steps in the journal.
   first open by this binary remaps that wait to `fired` and a holder may
   then list and execute the same run: a double-resume window that lasts
   until the old process stops. Upgrade by stopping old processes first.
+- A backlog drains back to back only while executions settle runs. If
+  every busy worker's execution ends without settling (transient faults,
+  lost leases), the next sweep waits for the tick or `Wake`, as before
+  #413.
 - `InterruptedRuns` reads the live runs of the resumer's workflows once
   per third of a lease, without an index on their state (a follow-up). A
   woken run whose workflow is not registered here is re-leased by every

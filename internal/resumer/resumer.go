@@ -79,9 +79,13 @@ type Resumer struct {
 	slots     chan struct{}
 	stop      chan struct{}
 	wake      chan struct{}
+	progress  chan struct{} // an execution settled a run and freed its worker
 
 	mu        sync.Mutex
 	scanned   time.Time                    // the last interrupted-run scan
+	scanMore  bool                         // it found as many runs as it could take
+	wokenMore bool                         // so did the last woken-run listing
+	dueMore   bool                         // and the last due-timer claim
 	running   map[int64]context.CancelFunc // by lease token
 	retries   map[string]int               // consecutive transient faults here, by live run
 	closing   bool
@@ -122,16 +126,58 @@ func New(config Config) (*Resumer, error) {
 	if config.MaxRetries <= 0 {
 		config.MaxRetries = 5
 	}
-	return &Resumer{config: config, lease: lease, workflows: names, slots: make(chan struct{}, config.Workers), stop: make(chan struct{}), wake: make(chan struct{}, 1), running: map[int64]context.CancelFunc{}, retries: map[string]int{}}, nil
+	return &Resumer{config: config, lease: lease, workflows: names, slots: make(chan struct{}, config.Workers), stop: make(chan struct{}), wake: make(chan struct{}, 1), progress: make(chan struct{}, 1), running: map[int64]context.CancelFunc{}, retries: map[string]int{}}, nil
 }
 
 // Run sweeps at once and then every interval until ctx ends or Close is
-// called.
+// called. While a sweep leaves work behind (a listing took as many runs
+// as it had free workers for, or found none free), Run sweeps again once
+// an execution has settled its run: when half the workers are free, or
+// gatherWorkers after that first settlement, whichever comes first, so
+// each listing takes a batch rather than one run. A backlog of woken, due
+// or interrupted runs drains back to back, not Workers per Interval
+// (#413). Only a settled run prompts it: an execution that settles
+// nothing (a lost lease, a stop, an unknown workflow, a transient fault)
+// does not, so runs this resumer cannot settle are not taken again and
+// again between ticks.
 func (r *Resumer) Run(ctx context.Context) {
 	ticker := time.NewTicker(r.config.Interval)
 	defer ticker.Stop()
+	continued := false
 	for {
-		_ = r.Sweep(ctx)
+		select { // a settlement before this sweep is not progress after it
+		case <-r.progress:
+		default:
+		}
+		more, _ := r.sweep(ctx, continued)
+		continued = false
+		now := false // a tick or Wake came while waiting for workers
+		var gather <-chan time.Time
+		for more && !continued && !now {
+			if gather != nil && 2*(cap(r.slots)-len(r.slots)) >= cap(r.slots) {
+				continued = true
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-r.stop:
+				return
+			case <-ticker.C:
+				now = true
+			case <-r.wake:
+				now = true
+			case <-r.progress:
+				if gather == nil {
+					gather = time.After(gatherWorkers)
+				}
+			case <-gather:
+				continued = true
+			}
+		}
+		if more {
+			continue
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -142,6 +188,10 @@ func (r *Resumer) Run(ctx context.Context) {
 		}
 	}
 }
+
+// gatherWorkers is how long Run waits, after a worker frees, for more to
+// free before it sweeps a backlog again.
+const gatherWorkers = 2 * time.Millisecond
 
 // Wake asks Run to sweep now, for example after a signal.
 func (r *Resumer) Wake() {
@@ -156,34 +206,60 @@ func (r *Resumer) Wake() {
 // they are started, with the errors of the listings (also given to
 // OnError).
 func (r *Resumer) Sweep(ctx context.Context) error {
+	_, err := r.sweep(ctx, false)
+	return err
+}
+
+// sweep is Sweep; it also reports whether it may have left due work
+// behind: a listing took as many runs as it had workers for, or found no
+// worker free. A continued sweep (one Run makes because the last left
+// work behind) also continues an interrupted-run scan that found as many
+// runs as it could take, instead of waiting a third of a lease.
+func (r *Resumer) sweep(ctx context.Context, continued bool) (more bool, err error) {
 	if r.isClosing() {
-		return ErrClosed
+		return false, ErrClosed
 	}
 	now := r.config.Clock()
 	j := r.config.Journal
 	var errs []error
-	list := func(take func(limit int) ([]journal.RunLease, error)) {
+	list := func(take func(limit int) ([]journal.RunLease, int, error)) bool {
 		reserved := r.reserve(r.config.Batch)
 		if reserved == 0 {
-			return
+			more = true
+			return true
 		}
-		leases, err := take(reserved)
+		leases, found, err := take(reserved)
 		r.unreserve(reserved - len(leases))
 		if err != nil {
 			errs = append(errs, err)
 			r.report(err)
-			return
+			return false
 		}
 		r.startReserved(ctx, leases)
+		full := found >= reserved
+		more = more || full
+		return full
 	}
-	list(func(limit int) ([]journal.RunLease, error) {
-		woken, err := j.PendingResumptions(ctx, now, limit)
-		return leasesOf(woken), err
-	})
-	list(func(limit int) ([]journal.RunLease, error) {
-		due, err := j.ClaimDueWaits(ctx, now, limit)
-		return leasesOf(due), err
-	})
+	// A continued sweep lists again only what came back full (or found no
+	// worker) last time; the rest waits for the next tick or Wake.
+	r.mu.Lock()
+	wokenMore, dueMore := r.wokenMore, r.dueMore
+	r.mu.Unlock()
+	if !continued || wokenMore {
+		wokenMore = list(func(limit int) ([]journal.RunLease, int, error) {
+			woken, err := j.PendingResumptions(ctx, now, limit)
+			return leasesOf(woken), len(woken), err
+		})
+	}
+	if !continued || dueMore {
+		dueMore = list(func(limit int) ([]journal.RunLease, int, error) {
+			due, err := j.ClaimDueWaits(ctx, now, limit)
+			return leasesOf(due), len(due), err
+		})
+	}
+	r.mu.Lock()
+	r.wokenMore, r.dueMore = wokenMore, dueMore
+	r.mu.Unlock()
 	// A run is interrupted only once its lease lapses (or a lease after
 	// its admission), so looking a third of a lease apart finds every one
 	// within a lease and a third of becoming one; the scan reads every
@@ -191,10 +267,12 @@ func (r *Resumer) Sweep(ctx context.Context) error {
 	// with no free worker does not scan, and does not count as a scan:
 	// the next sweep with a free worker does.
 	r.mu.Lock()
-	due := r.scanned.IsZero() || now.Sub(r.scanned) >= r.lease/3 || now.Before(r.scanned)
+	due := r.scanned.IsZero() || now.Sub(r.scanned) >= r.lease/3 || now.Before(r.scanned) || continued && r.scanMore
 	r.mu.Unlock()
 	if due {
-		list(func(limit int) ([]journal.RunLease, error) {
+		scanned := false
+		full := list(func(limit int) ([]journal.RunLease, int, error) {
+			scanned = true
 			r.mu.Lock()
 			r.scanned = now
 			r.mu.Unlock()
@@ -202,10 +280,16 @@ func (r *Resumer) Sweep(ctx context.Context) error {
 				errs = append(errs, err)
 				r.report(err)
 			}
-			return j.InterruptedRuns(ctx, now, limit, r.workflows)
+			leases, err := j.InterruptedRuns(ctx, now, limit, r.workflows)
+			return leases, len(leases), err
 		})
+		if scanned {
+			r.mu.Lock()
+			r.scanMore = full
+			r.mu.Unlock()
+		}
 	}
-	return errors.Join(errs...)
+	return more, errors.Join(errs...)
 }
 
 // prune forgets the transient-fault counts of runs that have ended or no
@@ -312,7 +396,16 @@ func (r *Resumer) startReserved(ctx context.Context, leases []journal.RunLease) 
 		r.executing.Add(1)
 		r.mu.Unlock()
 		go func() {
+			var outcome Outcome
 			defer r.executing.Done()
+			defer func() {
+				if outcome != Interrupted {
+					select {
+					case r.progress <- struct{}{}:
+					default:
+					}
+				}
+			}()
 			defer r.unreserve(1)
 			defer cancel()
 			outcome, err := r.execute(runCtx, lease)
