@@ -1,0 +1,31 @@
+--- a/internal/resumer/resumer.go
++++ b/internal/resumer/resumer.go
+@@ -267,23 +267,17 @@
+ // closing resumer refuses with ErrClosed.
+ func (r *Resumer) Start(ctx context.Context, runID string) error {
+ 	if r.isClosing() {
+-		return ErrClosed
+-	}
+-	select {
+-	case r.slots <- struct{}{}:
+-	case <-ctx.Done():
+-		return ctx.Err()
+-	case <-r.stop:
+ 		return ErrClosed
+ 	}
+ 	token, err := r.config.Journal.TakeRunLease(ctx, runID, r.config.Clock())
+ 	if err != nil {
+-		r.unreserve(1)
+ 		return err
+ 	}
+-	if !r.startReserved(ctx, []journal.RunLease{{RunID: runID, Token: token}}) {
+-		return ErrClosed
+-	}
++	// diagnostic variant: queue on a worker after leasing, as ce95507 did
++	go func() {
++		r.slots <- struct{}{}
++		r.startReserved(ctx, []journal.RunLease{{RunID: runID, Token: token}})
++	}()
+ 	return nil
+ }
+ 
