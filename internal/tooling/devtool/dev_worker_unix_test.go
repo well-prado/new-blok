@@ -90,6 +90,14 @@ func executableOf(t *testing.T, pid int) string {
 	if len(fields) == 0 {
 		t.Fatalf("no command line for %d", pid)
 	}
+	// ps prints the command line unquoted, so a path with a space is
+	// the shortest prefix of fields that names a file.
+	for end := 1; end <= len(fields); end++ {
+		candidate := strings.Join(fields[:end], " ")
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
+	}
 	return fields[0]
 }
 

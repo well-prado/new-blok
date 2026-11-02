@@ -209,7 +209,15 @@ func TestDevSignalsLeaveNothingRunning(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			builds := filepath.Dir(filepath.Dir(strings.Fields(string(executable))[0]))
+			// ps prints the command line unquoted, so a path with a space
+			// cannot be split on spaces: cut at the blok-dev-* directory.
+			command := string(executable)
+			var builds string
+			if start := strings.Index(command, "/blok-dev-"); start >= 0 {
+				builds = command[:start+1]
+				rest := command[start+1:]
+				builds += rest[:max(strings.Index(rest, "/"), 0)]
+			}
 			if !strings.HasPrefix(filepath.Base(builds), "blok-dev-") {
 				t.Fatalf("unexpected build directory %s", builds)
 			}
