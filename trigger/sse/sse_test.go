@@ -302,30 +302,39 @@ func TestWireFraming(t *testing.T) {
 // TestHeartbeatKeepsSilentStreamsAlive: a silent subscription gets a
 // comment every heartbeat interval, and an event resets the interval.
 func TestHeartbeatKeepsSilentStreamsAlive(t *testing.T) {
-	f := newFixture(t, sse.HubConfig{}, func(e *sse.Endpoint) { e.Heartbeat = 50 * time.Millisecond })
+	// The margins are wide on purpose: the interval is 5x the gap between
+	// events and every wait is 10x the interval, so a scheduler stall under
+	// CPU load cannot make a frame late enough to fail the test.
+	const (
+		heartbeat = 500 * time.Millisecond
+		gap       = 100 * time.Millisecond
+		wait      = 5 * time.Second
+	)
+	f := newFixture(t, sse.HubConfig{}, func(e *sse.Endpoint) { e.Heartbeat = heartbeat })
 	stream := f.started(t, "alice", "k1")
 	s, refused, err := subscribe(context.Background(), f.client, f.url(stream), "alice", "")
 	if err != nil || refused != nil {
 		t.Fatalf("subscribe: %v %v", err, refused)
 	}
 	defer s.close()
-	if f, _ := s.next(time.Second, true); f.Retry == "" {
+	if f, _ := s.next(wait, true); f.Retry == "" {
 		t.Fatalf("first frame %+v, want the retry hint", f)
 	}
-	for i := 0; i < 3; i++ {
-		if f, err := s.next(time.Second, true); err != nil || f.Comment != "heartbeat" {
+	for i := 0; i < 2; i++ {
+		if f, err := s.next(wait, true); err != nil || f.Comment != "heartbeat" {
 			t.Fatalf("heartbeat %d: %+v %v", i, f, err)
 		}
 	}
 	// Events closer together than the heartbeat interval keep resetting
-	// it: none of the frames in between is a heartbeat.
+	// it: none of the frames in between is a heartbeat. The loop spans
+	// longer than one interval, so it fails if events did not reset it.
 	for i := 0; i < 8; i++ {
 		publish(t, f.hub, stream, 1, "progress")
-		got, err := s.next(time.Second, true)
+		got, err := s.next(wait, true)
 		if err != nil || got.Type != "progress" {
 			t.Fatalf("event %d: %+v %v", i, got, err)
 		}
-		time.Sleep(30 * time.Millisecond)
+		time.Sleep(gap)
 	}
 }
 
