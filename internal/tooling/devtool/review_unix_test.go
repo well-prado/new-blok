@@ -112,7 +112,7 @@ func TestGraceKillsAGroupThatIgnoresInterrupts(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "pid")
 	stubborn := fakeGo(t, `trap '' INT
 sleep 600 &
-echo $! > `+marker+`
+echo $! > `+shellQuote(marker)+`
 wait
 `)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -144,7 +144,7 @@ func TestPanicKillsTheGroup(t *testing.T) {
 	dir := fakeProject(t)
 	marker := filepath.Join(t.TempDir(), "pid")
 	slow := fakeGo(t, `sleep 600 &
-echo $! > `+marker+`
+echo $! > `+shellQuote(marker)+`
 echo '{"Action":"run","Package":"example.com/fake","Test":"TestSlow"}'
 wait
 `)
@@ -183,7 +183,7 @@ func TestMissingGuardShellIsItsOwnFailure(t *testing.T) {
 	t.Cleanup(func() { guardShell = saved })
 	dir := fakeProject(t)
 	marker := filepath.Join(t.TempDir(), "ran")
-	never := fakeGo(t, "touch "+marker+"\nsleep 600\n")
+	never := fakeGo(t, "touch "+shellQuote(marker)+"\nsleep 600\n")
 	for _, report := range []Report{Check(context.Background(), Options{Root: dir, Go: never}), Test(context.Background(), TestOptions{Options: Options{Root: dir, Go: never}})} {
 		if report.ExitCode != ExitTool || len(report.Diagnostics) != 1 || report.Diagnostics[0].Code != "process_guard_unavailable" || !strings.Contains(report.Diagnostics[0].Remediation, "no-sh") {
 			t.Fatalf("%s: %s", report.Command, encode(t, report))

@@ -593,7 +593,7 @@ wait`)
 			continue
 		}
 		refused := session.await(func(e DevEvent) bool { return e.Event == EventAppExited && e.Build == build }, fmt.Sprintf("build %d refusing", build))
-		want := "cd " + resolvedRoot + " && " + filepath.Join(buildDir, "build-2", "fake") + ` --flag 'it'\''s quoted'`
+		want := "cd " + shellQuote(resolvedRoot) + " && " + shellQuote(filepath.Join(buildDir, "build-2", "fake")) + ` --flag 'it'\''s quoted'`
 		if refused.Status != "exit status 65" || len(refused.Diagnostics) != 1 || refused.Diagnostics[0].Code != "dev_durable_incompatible" || refused.Resume != want {
 			t.Fatalf("build %d: %+v\nwant resume %s\n%s", build, refused.DevEvent, want, session.dump())
 		}

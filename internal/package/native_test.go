@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -227,7 +228,7 @@ func TestGoLocalReplaceSourceIsPinnedAndExternalSourceRejected(t *testing.T) {
 	external := filepath.Join(t.TempDir(), "external")
 	writeFixtureFile(t, filepath.Join(external, "go.mod"), "module example.test/dep\n\ngo 1.27.1\n")
 	writeFixtureFile(t, filepath.Join(external, "dep.go"), "package dep\n")
-	writeFixtureFile(t, filepath.Join(root, "go.mod"), "module example.test/app\n\ngo 1.27.1\n\nrequire example.test/dep v1.0.0\nreplace example.test/dep => "+filepath.ToSlash(external)+"\n")
+	writeFixtureFile(t, filepath.Join(root, "go.mod"), "module example.test/app\n\ngo 1.27.1\n\nrequire example.test/dep v1.0.0\nreplace example.test/dep => "+strconv.Quote(filepath.ToSlash(external))+"\n")
 	if _, err := CaptureNativeLocks(context.Background(), root); err == nil || !strings.Contains(err.Error(), "outside project root is unsupported") {
 		t.Fatalf("external local replacement did not fail clearly: %v", err)
 	}
