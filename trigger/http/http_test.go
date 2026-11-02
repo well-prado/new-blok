@@ -58,8 +58,12 @@ func TestHTTPRejectsWrongTypesOversizedAndHidesInternalDetails(t *testing.T) {
 	}
 	wrong := httptest.NewRecorder()
 	server.ServeHTTP(wrong, httptest.NewRequest(http.MethodPost, "/quote", strings.NewReader(`{"quantity":"two"}`)))
-	if wrong.Code != http.StatusBadRequest {
-		t.Fatalf("wrong type status=%d", wrong.Code)
+	var refusal struct {
+		Error     string `json:"error"`
+		RequestID string `json:"requestId"`
+	}
+	if wrong.Code != http.StatusBadRequest || json.Unmarshal(wrong.Body.Bytes(), &refusal) != nil || refusal.Error != "invalid request" || refusal.RequestID == "" {
+		t.Fatalf("wrong type status=%d body=%s; want 400 invalid request with a requestId", wrong.Code, wrong.Body)
 	}
 	large := httptest.NewRecorder()
 	server.ServeHTTP(large, httptest.NewRequest(http.MethodPost, "/quote", strings.NewReader(`{"quantity":123456789}`)))

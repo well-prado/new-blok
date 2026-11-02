@@ -23,7 +23,17 @@ import (
 	"github.com/well-prado/new-blok/internal/tooling/layout"
 )
 
-const version = "0.0.0-dev"
+// devVersion is what blok version prints for a local or modified build.
+const devVersion = "0.0.0-dev"
+
+// version is the module version this binary was installed from, or devVersion
+// when the build carries no real version.
+func version() string {
+	if stamped := buildVersion(); stamped != "" && stamped != "(devel)" && !strings.Contains(stamped, "+dirty") {
+		return stamped
+	}
+	return devVersion
+}
 
 func run(args []string, out io.Writer) error { return runWithIO(args, out, os.Stdin) }
 
@@ -36,7 +46,7 @@ func runWithIO(args []string, out io.Writer, in io.Reader) error {
 		if len(args) != 1 {
 			return fmt.Errorf("unsupported command %q; run blok help", args[0])
 		}
-		_, err := fmt.Fprintln(out, "blok "+version)
+		_, err := fmt.Fprintln(out, "blok "+version())
 		return err
 	case "new":
 		return runNew(args[1:], out, in)
@@ -48,7 +58,7 @@ func runWithIO(args []string, out io.Writer, in io.Reader) error {
 }
 
 func writeHelp(out io.Writer) error {
-	_, err := fmt.Fprintln(out, "New Blok — Go application framework\n\nUsage: blok <command>\n\nCommands:\n  new       Create a conventional Go application\n  generate  Generate deterministic typed bindings\n  check     Validate the application without running it\n  test      Run the application's tests with go test\n  inspect   Describe the application's nodes, workflows and triggers\n  dev       Build, run and watch the application, restarting it on changes\n  version   Print the development version\n  help      Show this help\n\nUse blok <command> --help for command options.")
+	_, err := fmt.Fprintln(out, "New Blok — Go application framework\n\nUsage: blok <command>\n\nCommands:\n  new       Create a conventional Go application\n  generate  Generate deterministic typed bindings\n  check     Validate the application without running it\n  test      Run the application's tests with go test\n  inspect   Describe the application's nodes, workflows and triggers\n  dev       Build, run and watch the application, restarting it on changes\n  version   Print the blok version\n  help      Show this help\n\nUse blok <command> --help for command options.")
 	return err
 }
 
@@ -171,11 +181,11 @@ func frameworkFor(value string) (scaffold.Framework, error) {
 		}
 		return scaffold.Framework{Version: value}, nil
 	}
-	version := buildVersion()
-	if version == "" || version == "(devel)" || strings.Contains(version, "+dirty") {
-		return scaffold.Framework{}, fmt.Errorf("new: this blok was built from a local or modified checkout (version %q), so the starter cannot depend on it from the module proxy; pass --framework with a framework version or the path of a framework checkout", version)
+	stamped := buildVersion()
+	if stamped == "" || stamped == "(devel)" || strings.Contains(stamped, "+dirty") {
+		return scaffold.Framework{}, fmt.Errorf("new: this blok was built from a local or modified checkout (version %q), so the starter cannot depend on it from the module proxy; pass --framework with a framework version or the path of a framework checkout", stamped)
 	}
-	return scaffold.Framework{Version: version}, nil
+	return scaffold.Framework{Version: stamped}, nil
 }
 
 func prompt(in *bufio.Reader, out io.Writer, label, current string) (string, error) {

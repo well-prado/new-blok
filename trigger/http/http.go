@@ -125,7 +125,7 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			candidate = []byte("null")
 		}
 		if _, validateErr := inputSchema.Normalize(candidate); validateErr != nil {
-			writeJSON(writer, http.StatusBadRequest, map[string]any{"error": "invalid request"})
+			writeJSON(writer, http.StatusBadRequest, map[string]any{"error": "invalid request", "requestId": s.newRequestID()})
 			return
 		}
 	}

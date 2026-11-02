@@ -40,6 +40,13 @@ go test -race ./...
 go build -o bin/blok ./cmd/blok
 ```
 
+Or install the tagged CLI with Go and check the version it reports:
+
+```sh
+go install github.com/well-prado/new-blok/cmd/blok@v0.1.0-alpha
+blok version
+```
+
 Create a conventional Go application without a registry account or foreign runtime:
 
 ```sh

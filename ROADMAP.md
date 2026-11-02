@@ -6,7 +6,7 @@ Revision 3 · 2026-10-05 · native Windows gates deferred to a separate Windows 
 
 Build an open-source Go application framework with typed nodes, structural workflows, independent triggers, honest durability and persistent language workers. Developers and AI assistants should compose entire applications from reusable generic nodes and small custom nodes, test them with normal tools and deploy selected capabilities.
 
-The current repository contains a tested Go CLI bootstrap (`help`, `version`), CI and governance. Application engine/tooling capabilities below are planned until their issues pass. This roadmap preserves the Go application design's scope while requiring stronger evidence than the architecture lab provided. Millions of requests per second is a fleet capacity target; it is a release claim only after controlled measurements with stated workload/guarantees.
+The repository is tagged [v0.1.0-alpha](https://github.com/well-prado/new-blok/releases/tag/v0.1.0-alpha). Milestones M0, M1, M2 and M4 are closed and M5 has no open issues; the milestone table below states each exit evidence. The `blok` CLI provides `new`, `generate`, `check`, `test`, `inspect`, `dev`, `version` and `help`, alongside CI and governance. Capabilities in milestones that still have open issues (for example M3 and M6 onward) remain planned until their issues pass, and native Windows is unverified (see §3). This roadmap preserves the Go application design's scope while requiring stronger evidence than the architecture lab provided. Millions of requests per second is a fleet capacity target; it is a release claim only after controlled measurements with stated workload/guarantees.
 
 ## 2. Product boundaries
 
