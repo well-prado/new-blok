@@ -2,6 +2,7 @@ package journal
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -322,6 +323,40 @@ func TestWaitIDFormatIsPinned(t *testing.T) {
 	got := waitID(operation, engine.StepIdentity{InputDigest: "sha256:" + strings.Repeat("ab", 32)})
 	if want := "wait:bd2915d8a536eaad10768d3cd6c0f90f491b6eeea818ed875fb3f5f8116fdcb1"; got != want {
 		t.Fatalf("waitID=%s; want %s (format wait/v1)", got, want)
+	}
+}
+
+// TestEngineWaitIDIsPinnedEndToEnd: the whole derivation chain, from the
+// engine's plan of a wait through its step-identity digest to the wait ID
+// the journal schedules, is pinned for a fixed run and artifact. A change
+// to the engine's step identity (prefix, fields, hash) moves the address
+// every suspended run's signals are delivered to (#391).
+func TestEngineWaitIDIsPinnedEndToEnd(t *testing.T) {
+	ctx := context.Background()
+	database, j := newJournal(t, "wait-id-chain.db", Config{Holder: "a", Clock: ticking(fixtureBase)})
+	defer database.Close()
+	flow, program := newApprovalFlow(), approvalProgram("approval", 60000)
+	// Admission picks a random run ID; the vector needs a fixed one.
+	const run = "run:00000000000000000000000000000391"
+	if err := database.WithTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE journal_runs SET run_id = ? WHERE run_id = ?`, run, admitApproval(t, j, "wait-id-chain"))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	token, err := j.TakeRunLease(ctx, run, fixtureBase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := flow.run(j, program, run, token); !suspended(err) {
+		t.Fatalf("first execution err=%v; want suspended", err)
+	}
+	wait, err := j.WaitAt(ctx, run, "approval", engine.RootIteration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "wait:f340b857909c3c0c02ac7a69d200908af88aef62eecd357c08b42987e54cb2ec"; wait.WaitID != want {
+		t.Fatalf("WaitID=%s; want %s (engine plan -> step identity digest -> wait/v1)", wait.WaitID, want)
 	}
 }
 
