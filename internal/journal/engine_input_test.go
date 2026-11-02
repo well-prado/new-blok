@@ -331,6 +331,12 @@ func TestWaitIDFormatIsPinned(t *testing.T) {
 // (stepIdentity over the run ID, artifact digest, step ID and plan). A run
 // suspended before an upgrade is signalled by this ID, so a fixed program
 // under a fixed run ID must keep scheduling the wait under the same one.
+//
+// Recorded mutation (#391 acceptance): changing "sha256:" to "sha256x:" in
+// engine.NewStepIdentity's InputDigest turns this test red:
+//
+//	scheduled WaitID=wait:62af9125139164dfb9700901385b775ce3aa4ddcd896dcd39e37df56bbfea392;
+//	want wait:a12934e45ac22f6122919d6c9f099d113db0f24599fadcaf75ccec44bda4afec
 func TestEngineWaitIDIsPinnedEndToEnd(t *testing.T) {
 	ctx := context.Background()
 	database, j := newJournal(t, "wait-id.db", Config{Holder: "a", Clock: ticking(fixtureBase)})
