@@ -149,10 +149,13 @@ type refHoldsPointerAppender struct {
 }
 
 // refAppendKey is a map key whose AppendText upper-cases it.
-type refAppendKey string
+// It is a struct, not a string kind: Go 1.27.2 stopped applying a string-kind
+// key's text methods, so only a non-string kind encodes as its text on every
+// supported Go 1.27 release.
+type refAppendKey struct{ Name string }
 
 func (k refAppendKey) AppendText(text []byte) ([]byte, error) {
-	return append(text, strings.ToUpper(string(k))...), nil
+	return append(text, strings.ToUpper(k.Name)...), nil
 }
 
 // refIgnoredOption carries a tag option encoding/json ignores.
@@ -160,11 +163,12 @@ type refIgnoredOption struct {
 	ID string `json:"id,required"`
 }
 
-// refUpperKey is a string-kind map key with its own text form; encoding/json
+// refUpperKey is a struct-kind map key (see refAppendKey) with its own text
+// form; encoding/json
 // writes the text form, not the string.
-type refUpperKey string
+type refUpperKey struct{ Name string }
 
-func (k refUpperKey) MarshalText() ([]byte, error) { return []byte(strings.ToUpper(string(k))), nil }
+func (k refUpperKey) MarshalText() ([]byte, error) { return []byte(strings.ToUpper(k.Name)), nil }
 
 // refPointerMarshaler encodes through a pointer receiver, which encoding/json
 // uses only where the value is addressable (inside a pointer output).
@@ -215,7 +219,7 @@ func referenceSources() map[string]any {
 		"namedKeyMap":        map[refCode]int{"a": 1},
 		"intKeyMap":          map[int]string{7: "seven"},
 		"nilMap":             map[string]any(nil),
-		"textKeyMap":         map[refUpperKey]int{"x": 1},
+		"textKeyMap":         map[refUpperKey]int{{"x"}: 1},
 		"addressable":        &refHoldsPointerMarshaler{},
 		"notAddressable":     refHoldsPointerMarshaler{},
 		"duplicateNames":     refDuplicateNames{},
@@ -227,7 +231,7 @@ func referenceSources() map[string]any {
 		"recursive":          RefRecursive{RefRecursive: &RefRecursive{V: 2}, V: 1},
 		"encodesTo":          refEncodesTo{Secret: 1},
 		"appendsText":        refAppendsText{Secret: 1},
-		"appendKeyMap":       map[refAppendKey]int{"x": 1},
+		"appendKeyMap":       map[refAppendKey]int{{"x"}: 1},
 		"appenderInPointer":  &refHoldsPointerAppender{},
 		"appenderInValue":    refHoldsPointerAppender{},
 		"ignoredOption":      refIgnoredOption{ID: "b-1"},
