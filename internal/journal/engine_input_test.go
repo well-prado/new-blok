@@ -2,6 +2,7 @@ package journal
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -322,6 +323,45 @@ func TestWaitIDFormatIsPinned(t *testing.T) {
 	got := waitID(operation, engine.StepIdentity{InputDigest: "sha256:" + strings.Repeat("ab", 32)})
 	if want := "wait:bd2915d8a536eaad10768d3cd6c0f90f491b6eeea818ed875fb3f5f8116fdcb1"; got != want {
 		t.Fatalf("waitID=%s; want %s (format wait/v1)", got, want)
+	}
+}
+
+// TestEngineWaitIDIsPinnedEndToEnd pins the middle of the derivation that
+// TestWaitIDFormatIsPinned leaves out: the engine's digest of a wait plan
+// (stepIdentity over the run ID, artifact digest, step ID and plan). A run
+// suspended before an upgrade is signalled by this ID, so a fixed program
+// under a fixed run ID must keep scheduling the wait under the same one.
+func TestEngineWaitIDIsPinnedEndToEnd(t *testing.T) {
+	ctx := context.Background()
+	database, j := newJournal(t, "wait-id.db", Config{Holder: "a", Clock: ticking(fixtureBase)})
+	defer database.Close()
+	const run = "run:00000000000000000000000000000332"
+	if err := database.WithTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `INSERT INTO journal_runs
+			(run_id, request_key, workflow, artifact_digest, input_json, input_digest, state, created_at, principal)
+			VALUES (?, 'wait-id', 'approval', ?, ?, 'sha256:input', 'accepted', 1, '')`, run, engineArtifact, []byte(`{}`))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	token, err := j.TakeRunLease(ctx, run, fixtureBase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	program := contract.InternalProgram{WorkflowID: "approval", Digest: engineArtifact, Instructions: []contract.InternalInstruction{
+		{Index: 0, ID: "approval", Kind: "wait", Wait: &contract.WaitInstruction{Name: "approval", TimeoutMillis: 60000}},
+		{Index: 1, ID: "output", Kind: "output", References: []contract.Reference{{Step: "approval"}}},
+	}}
+	_, err = engine.New(nil).RunJournaled(ctx, program, map[string]any{}, run, j.ForRun(run, token))
+	if !suspended(err) {
+		t.Fatalf("run err=%v; want suspended at the wait", err)
+	}
+	wait, err := j.WaitAt(ctx, run, "approval", engine.RootIteration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "wait:a12934e45ac22f6122919d6c9f099d113db0f24599fadcaf75ccec44bda4afec"; wait.WaitID != want {
+		t.Fatalf("scheduled WaitID=%s; want %s: the engine's step-identity digest moved, and every run suspended before the change is signalled at an address that no longer exists", wait.WaitID, want)
 	}
 }
 
