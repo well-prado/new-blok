@@ -154,7 +154,7 @@ func testWithTxExit(t *testing.T, path string, marked bool, exit exit) {
 	// The writer queue's one slot: had it leaked, every later marked writer
 	// on this handle would wait out the busy timeout for a turn nobody holds
 	// (#214).
-	if held := len(conn.writers); held != 0 {
+	if held := conn.writers.heldTurns(); held != 0 {
 		t.Fatalf("%d writer turn(s) still held after the exit; want the turn released", held)
 	}
 	// Another handle on the same database: its own pool, its own writer
