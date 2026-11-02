@@ -302,6 +302,25 @@ func TestImportsOfReadsTheHeaderWithinItsBound(t *testing.T) {
 	}
 }
 
+// TestImportsOfRefusesWhatItCannotRead (#347): importsOf fails closed. A
+// file that is missing (deleted between the scan and the build) or is not
+// a regular file is project_unreadable, never "no imports".
+func TestImportsOfRefusesWhatItCannotRead(t *testing.T) {
+	root := t.TempDir()
+	writeFiles(t, root, map[string]string{"dir.go/keep.txt": ""})
+	fsRoot, err := os.OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fsRoot.Close()
+	for _, name := range []string{"missing.go", "dir.go"} {
+		imports, problem := importsOf(fsRoot, name)
+		if problem == nil || problem.Code != "project_unreadable" || problem.Source != name || imports != nil {
+			t.Errorf("%s: %v %v, want project_unreadable", name, imports, problem)
+		}
+	}
+}
+
 // TestDevRefusesChainsThroughUnwatchedLinks (review R round 3, nit a): the
 // build reads a package through every link of a chain, so every hop must
 // be a link the walk records. A hop whose name starts with a dot, or that
