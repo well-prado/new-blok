@@ -339,6 +339,7 @@ value is a wire change of its own.
 | `node.ClassNotFound`, `trigger.ClassNotFound` (#306) | additive | none |
 | HTTP answers class `not_found` 404 with its code (#306) | behavioral | it was a 500 `internal error` that hid the code. No code in this repository used the class; code `not_found` with class `validation` still answers 400 until it switches class |
 | gRPC answers class `not_found` `NotFound` (#306) | behavioral | it was `FailedPrecondition` with the same reason |
+| HTTP's 400 for a body refused by input-schema validation carries `requestId` (#375) | additive | none; `{"error":"invalid request"}` gains one field, the same one the node-refusal responses already carry, so clients that ignore unknown fields are unaffected. Covered by `TestHTTPRejectsWrongTypesOversizedAndHidesInternalDetails` |
 
 ## Limits
 

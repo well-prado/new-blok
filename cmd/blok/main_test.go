@@ -45,6 +45,29 @@ func TestCommands(t *testing.T) {
 	}
 }
 
+// TestVersionPrintsModuleVersion pins that blok version reports the module
+// version the go command stamped, and 0.0.0-dev only for local builds.
+func TestVersionPrintsModuleVersion(t *testing.T) {
+	original := buildVersion
+	t.Cleanup(func() { buildVersion = original })
+	for stamped, want := range map[string]string{
+		"v0.1.0-alpha":                       "blok v0.1.0-alpha\n",
+		"v0.0.0-20261005000000-abcdefabcdef": "blok v0.0.0-20261005000000-abcdefabcdef\n",
+		"(devel)":                            "blok 0.0.0-dev\n",
+		"":                                   "blok 0.0.0-dev\n",
+		"v0.1.0-alpha+dirty":                 "blok 0.0.0-dev\n",
+	} {
+		buildVersion = func() string { return stamped }
+		var out bytes.Buffer
+		if err := run([]string{"version"}, &out); err != nil {
+			t.Fatal(err)
+		}
+		if out.String() != want {
+			t.Fatalf("stamped %q: output %q, want %q", stamped, out.String(), want)
+		}
+	}
+}
+
 // repoRoot is this repository, a local framework checkout for --framework.
 func repoRoot(t *testing.T) string {
 	t.Helper()
