@@ -41,9 +41,13 @@ func TestWritersTakeTheLockInArrivalOrder(t *testing.T) {
 		})
 	}()
 	<-holding
-	// Each writer starts well after the previous one is waiting, so arrival
-	// order is unambiguous. The lock is held long enough for the earliest
-	// writers to back off to SQLite's longest polling sleeps.
+	// Arrival is defined by the queue itself: the next writer starts only
+	// once the previous one has joined the queue (afterEnqueue), not after a
+	// guessed delay, so a slow goroutine start under load cannot reorder
+	// arrivals (#408). The lock is held long enough afterwards for the
+	// earliest writers to have waited well past SQLite's polling sleeps.
+	enqueued := make(chan struct{}, 1)
+	db.(*connection).afterEnqueue = func() { enqueued <- struct{}{} }
 	const writers = 12
 	var group sync.WaitGroup
 	errs := make(chan error, writers)
@@ -56,7 +60,12 @@ func TestWritersTakeTheLockInArrivalOrder(t *testing.T) {
 				return err
 			})
 		}()
-		time.Sleep(40 * time.Millisecond)
+		select {
+		case <-enqueued:
+		case <-time.After(30 * time.Second):
+			close(release)
+			t.Fatalf("writer %d never joined the queue", i)
+		}
 	}
 	time.Sleep(300 * time.Millisecond)
 	close(release)
@@ -95,6 +104,67 @@ func TestWritersTakeTheLockInArrivalOrder(t *testing.T) {
 	}
 	if len(order) != writers {
 		t.Fatalf("%d of %d writers committed", len(order), writers)
+	}
+}
+
+// TestWriterQueueGrantsTurnsInEnqueueOrder pins the queue without a
+// database: waiters are enqueued one by one (the hook marks each arrival),
+// then the turn is passed along, and a waiter that gives up leaves the line
+// without disturbing the others or leaking the turn (#408).
+func TestWriterQueueGrantsTurnsInEnqueueOrder(t *testing.T) {
+	var queue writerQueue
+	holder, _, err := queue.acquire(context.Background(), time.Second, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const waiters = 20
+	enqueued := make(chan struct{}, 1)
+	granted := make(chan int, waiters)
+	cancelled := make(chan error, 1)
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	start := func(id int, ctx context.Context) {
+		go func() {
+			release, _, err := queue.acquire(ctx, 30*time.Second, func() { enqueued <- struct{}{} })
+			if err != nil {
+				cancelled <- err
+				return
+			}
+			granted <- id
+			release()
+		}()
+		<-enqueued
+	}
+	for i := range waiters {
+		if i == 5 {
+			start(-1, cancelCtx) // arrives fifth and leaves before its turn
+		}
+		start(i, context.Background())
+	}
+	cancel()
+	if err := <-cancelled; !errors.Is(err, context.Canceled) {
+		t.Fatalf("the cancelled waiter returned %v; want context.Canceled", err)
+	}
+	holder()
+	for want := range waiters {
+		select {
+		case got := <-granted:
+			if got != want {
+				t.Fatalf("turn %d went to waiter %d; want enqueue order", want, got)
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatalf("waiter %d never got its turn", want)
+		}
+	}
+	// Every turn was released: the queue is free again.
+	deadline := time.Now().Add(30 * time.Second)
+	for queue.heldTurns() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the turn stayed held after every waiter released it")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if _, timedOut, err := queue.acquire(context.Background(), time.Millisecond, nil); err != nil || timedOut {
+		t.Fatalf("a free queue made the next caller wait: timedOut=%v err=%v", timedOut, err)
 	}
 }
 

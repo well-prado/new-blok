@@ -55,7 +55,7 @@ const (
 // and sharedMemoryWriters its one writer queue.
 var (
 	sharedMemoryWriteDomain = store.NewWriteDomain()
-	sharedMemoryWriters     = make(chan struct{}, 1)
+	sharedMemoryWriters     = new(writerQueue)
 )
 
 // Backend opens SQLite databases with the durability settings required by the
@@ -105,7 +105,7 @@ func (b Backend) Open(ctx context.Context, path string) (store.Database, error) 
 			_ = database.Close()
 			return nil, fmt.Errorf("sqlite: identify write domain: %w", err)
 		}
-		writeDomain, writers = store.NewFileWriteDomain(file), make(chan struct{}, 1)
+		writeDomain, writers = store.NewFileWriteDomain(file), new(writerQueue)
 	}
 	return &connection{database: database, writeDomain: writeDomain, writers: writers, busyTimeout: timeout}, nil
 }
@@ -240,8 +240,11 @@ type connection struct {
 	writeDomain *store.WriteDomain
 	// writers queues this handle's marked writers (store.Writer), one at a
 	// time, in arrival order.
-	writers      chan struct{}
-	busyTimeout  time.Duration
+	writers     *writerQueue
+	busyTimeout time.Duration
+	// afterEnqueue, test-only, runs once a marked writer that had to wait
+	// has joined the queue.
+	afterEnqueue func()
 	beforeCommit func()
 	afterCommit  func()
 	// restoreHook, test-only, replaces the busy-timeout reset after a log
@@ -319,22 +322,14 @@ func (c *connection) WithTx(ctx context.Context, fn func(*sql.Tx) error) error {
 // writers and writers on other handles and in other processes; a marked
 // writer that meets one waits up to the busy timeout again there.
 func (c *connection) queueWriter(ctx context.Context) (func(), error) {
-	release := func() { <-c.writers }
-	select {
-	case c.writers <- struct{}{}:
-		return release, nil
-	default:
-	}
-	timer := time.NewTimer(c.busyTimeout)
-	defer timer.Stop()
-	select {
-	case c.writers <- struct{}{}:
-		return release, nil
-	case <-ctx.Done():
-		return nil, fmt.Errorf("sqlite: begin: %w", ctx.Err())
-	case <-timer.C:
+	release, timedOut, err := c.writers.acquire(ctx, c.busyTimeout, c.afterEnqueue)
+	switch {
+	case timedOut:
 		return nil, store.WithWriteDomain(fmt.Errorf("sqlite: begin: %w: no write turn within %v", store.ErrBusy, c.busyTimeout), c.writeDomain)
+	case err != nil:
+		return nil, fmt.Errorf("sqlite: begin: %w", err)
 	}
+	return release, nil
 }
 
 // Backup writes a transaction-consistent copy of the database to
