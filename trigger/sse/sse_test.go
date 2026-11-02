@@ -302,7 +302,8 @@ func TestWireFraming(t *testing.T) {
 // TestHeartbeatKeepsSilentStreamsAlive: a silent subscription gets a
 // comment every heartbeat interval, and an event resets the interval.
 func TestHeartbeatKeepsSilentStreamsAlive(t *testing.T) {
-	f := newFixture(t, sse.HubConfig{}, func(e *sse.Endpoint) { e.Heartbeat = 400 * time.Millisecond })
+	const heartbeat = 400 * time.Millisecond
+	f := newFixture(t, sse.HubConfig{}, func(e *sse.Endpoint) { e.Heartbeat = heartbeat })
 	stream := f.started(t, "alice", "k1")
 	s, refused, err := subscribe(context.Background(), f.client, f.url(stream), "alice", "")
 	if err != nil || refused != nil {
@@ -318,8 +319,10 @@ func TestHeartbeatKeepsSilentStreamsAlive(t *testing.T) {
 		}
 	}
 	// Events closer together than the heartbeat interval keep resetting
-	// it: none of the frames in between is a heartbeat.
-	for i := 0; i < 8; i++ {
+	// it: none of the frames in between is a heartbeat. The sequence runs
+	// past a full heartbeat interval, so a timer never reset by events
+	// would fire within it.
+	for i, begin := 0, time.Now(); time.Since(begin) < 3*heartbeat/2; i++ {
 		publish(t, f.hub, stream, 1, "progress")
 		got, err := s.next(time.Second, true)
 		if err != nil || got.Type != "progress" {
