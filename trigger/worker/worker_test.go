@@ -124,6 +124,81 @@ func TestProcessRetriesThenDeadLettersAndSuccessAcknowledges(t *testing.T) {
 	}
 }
 
+// TestRetryBackoffIsHonouredAcrossReopenAndClockJumps: a retryable failure
+// on attempt n makes the job available n seconds later, and that
+// available_at is stored. Predeclared: attempt 1 fails at t0 -> available
+// t0+1s; after a reopen nothing is claimed up to t0+1s-1ns (nor when the
+// clock steps back), the job is claimed at t0+1s; attempt 2 fails then ->
+// available +2s. Without the backoff the job is claimable at t0 (#336).
+func TestRetryBackoffIsHonouredAcrossReopenAndClockJumps(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "worker.db")
+	t0 := time.Unix(5_000, 0)
+	now := t0
+	open := func() (store.Database, *Queue) {
+		database, err := (sqlite.Backend{}).Open(ctx, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		queue, err := New(ctx, database, func() time.Time { return now })
+		if err != nil {
+			database.Close()
+			t.Fatal(err)
+		}
+		return database, queue
+	}
+	fail := func(queue *Queue) bool {
+		processed, err := queue.ProcessOnce(ctx, func(_ context.Context, _ Tx, _ Job) error {
+			return &HandlerError{Retryable: true, Message: "provider timeout"}
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return processed
+	}
+	available := func(database store.Database) time.Time {
+		var nanos int64
+		if err := database.WithTx(ctx, func(tx *sql.Tx) error {
+			return tx.QueryRowContext(ctx, `SELECT available_at FROM worker_jobs WHERE request_key = 'backoff'`).Scan(&nanos)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return time.Unix(0, nanos)
+	}
+	database, queue := open()
+	if _, err := queue.Enqueue(ctx, EnqueueRequest{RequestKey: "backoff", Kind: "test", Payload: []byte(`{}`), MaxAttempts: 3}); err != nil {
+		t.Fatal(err)
+	}
+	if !fail(queue) {
+		t.Fatal("first attempt was not processed")
+	}
+	if got, want := available(database), t0.Add(time.Second); !got.Equal(want) {
+		t.Fatalf("available_at after attempt 1 = %v, want %v", got, want)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	database, queue = open()
+	defer func() { database.Close() }()
+	for _, early := range []time.Time{t0, t0.Add(-time.Hour), t0.Add(time.Second - time.Nanosecond)} {
+		now = early
+		if fail(queue) {
+			t.Fatalf("job claimed at %v, before its backoff ends at %v", early, t0.Add(time.Second))
+		}
+	}
+	now = t0.Add(time.Second)
+	if !fail(queue) {
+		t.Fatal("job not claimed once its backoff ended")
+	}
+	if got, want := available(database), now.Add(2*time.Second); !got.Equal(want) {
+		t.Fatalf("available_at after attempt 2 = %v, want %v", got, want)
+	}
+	now = now.Add(2*time.Second - time.Nanosecond)
+	if fail(queue) {
+		t.Fatal("job claimed before the second backoff ended")
+	}
+}
+
 func TestHandlerFailureRollsBackBusinessWritesBeforeRetryState(t *testing.T) {
 	database, err := (sqlite.Backend{}).Open(context.Background(), filepath.Join(t.TempDir(), "worker.db"))
 	if err != nil {
